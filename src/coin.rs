@@ -59,4 +59,9 @@ impl Coin {
         let creator: [u8; 32] = creator.try_into().unwrap();
         Coin::new(epoch_hash, u64::from_le_bytes(nonce), creator, pow_hash)
     }
+
+    /// Convert coin ID to leaf hash for Merkle tree
+    pub fn id_to_leaf_hash(coin_id: &[u8; 32]) -> [u8; 32] {
+        crate::crypto::blake3_hash(coin_id)
+    }
 }

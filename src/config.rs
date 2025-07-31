@@ -27,6 +27,12 @@ pub struct Storage {
 pub struct Epoch {
     pub seconds: u64,
     pub target_leading_zeros: usize,
+    #[serde(default = "default_target_coins")]
+    pub target_coins_per_epoch: u32,
+    #[serde(default = "default_retarget_interval")]
+    pub retarget_interval: u64,
+    #[serde(default = "default_max_difficulty_adjustment")]
+    pub max_difficulty_adjustment: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -37,6 +43,12 @@ pub struct Mining {
     pub mem_kib: u32,
     #[serde(default = "default_lanes")]
     pub lanes: u32,
+    #[serde(default = "default_min_mem")]
+    pub min_mem_kib: u32,
+    #[serde(default = "default_max_mem")]
+    pub max_mem_kib: u32,
+    #[serde(default = "default_max_memory_adjustment")]
+    pub max_memory_adjustment: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,6 +60,16 @@ pub struct Metrics {
 fn default_mem() -> u32   { 65_536 }          // 64 MiB
 fn default_lanes() -> u32 { 4 }
 fn default_bind() -> String { "0.0.0.0:9100".into() }
+
+// Epoch retargeting defaults
+fn default_target_coins() -> u32 { 100 }
+fn default_retarget_interval() -> u64 { 10 }
+fn default_max_difficulty_adjustment() -> f64 { 2.0 }
+
+// Mining memory retargeting defaults
+fn default_min_mem() -> u32 { 16_384 }        // 16 MiB
+fn default_max_mem() -> u32 { 262_144 }       // 256 MiB  
+fn default_max_memory_adjustment() -> f64 { 1.5 }
 
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.

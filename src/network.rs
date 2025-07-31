@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 const TOP_ANCHOR: &str = "anchor";
 const TOP_COIN:   &str = "coin";
 const TOP_TX:     &str = "tx";
+const TOP_COIN_REQUEST: &str = "coin_request";
 
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
@@ -26,6 +27,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(Coin),
     RequestEpoch(u64),
+    RequestCoin([u8; 32]),
 }
 pub type NetHandle = Arc<Network>;
 
@@ -46,7 +48,7 @@ pub async fn spawn(cfg: crate::config::Net,
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub::Config::default(),
     ).map_err(|e| anyhow::anyhow!("Failed to create Gossipsub: {}", e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX] {
+    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_COIN_REQUEST] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -54,7 +56,7 @@ pub async fn spawn(cfg: crate::config::Net,
     let swarm_config = libp2p::swarm::Config::with_tokio_executor();
     let mut swarm = Swarm::new(transport, gs, peer_id, swarm_config);
 
-    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic", cfg.listen_port).parse::<Multiaddr>()?)?;
+    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port).parse::<Multiaddr>()?)?;
     for addr in &cfg.bootstrap {
         swarm.dial(addr.parse::<Multiaddr>()?)?;
     }
@@ -96,6 +98,15 @@ pub async fn spawn(cfg: crate::config::Net,
                                         db.put("head", &t.coin_id, &t);
                                     }
                                 }
+                                TOP_COIN_REQUEST => {
+                                    if let Ok(coin_id) = serde_json::from_slice::<[u8; 32]>(&message.data) {
+                                        // Check if we have this coin and serve it
+                                        if let Some(coin) = db.get::<Coin>("coin", &coin_id) {
+                                            let bytes = serde_json::to_vec(&coin).unwrap();
+                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes);
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -113,6 +124,10 @@ pub async fn spawn(cfg: crate::config::Net,
                             NetworkCommand::RequestEpoch(n) => {
                                 let ctrl = serde_json::to_vec(&n).unwrap();
                                 let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), ctrl);
+                            }
+                            NetworkCommand::RequestCoin(coin_id) => {
+                                let bytes = serde_json::to_vec(&coin_id).unwrap();
+                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_REQUEST), bytes);
                             }
                         }
                     }
@@ -136,5 +151,8 @@ impl Network {
     }
     pub async fn request_epoch(&self, n: u64) {
         let _ = self._command_tx.send(NetworkCommand::RequestEpoch(n));
+    }
+    pub async fn request_coin(&self, coin_id: [u8; 32]) {
+        let _ = self._command_tx.send(NetworkCommand::RequestCoin(coin_id));
     }
 }

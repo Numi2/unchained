@@ -12,10 +12,12 @@ pub fn spawn(cfg: crate::config::Mining,
     let mut rx: Receiver<Anchor> = net.anchor_subscribe();   // get epoch anchors
     task::spawn(async move {
         let (pk, _sk) = crypto::dilithium3_keypair(); // random creator key
-        let mem = cfg.mem_kib; let lanes = cfg.lanes;
+        let lanes = cfg.lanes;  // lanes stay static
         loop {
             let anchor = rx.recv().await.unwrap();        // current epoch
-            mine_epoch(anchor, mem, lanes, &pk, &db, &net, &coin_tx).await;
+            // Use dynamic memory and difficulty from anchor
+            let mem_kib = anchor.mem_kib;
+            mine_epoch(anchor, mem_kib, lanes, &pk, &db, &net, &coin_tx).await;
         }
     });
 }

@@ -1,0 +1,43 @@
+# UnchainedCoin Configuration File
+
+[net]
+# Port to listen on for P2P connections
+listen_port = 7777
+# Bootstrap nodes to connect to (empty for now)
+bootstrap = []
+
+[storage]
+# Path where blockchain data will be stored
+path = "./data"
+
+[epoch]
+# Duration of each epoch in seconds (10 minutes)
+seconds = 600
+# Target number of leading zeros for proof-of-work difficulty (initial value)
+target_leading_zeros = 4
+# Retargeting parameters
+# Target number of coins per epoch for difficulty adjustment
+target_coins_per_epoch = 100
+# How often to retarget (every N epochs)
+retarget_interval = 10
+# Maximum difficulty adjustment factor (2.0 = can double or halve)
+max_difficulty_adjustment = 2.0
+
+[mining]
+# Enable mining by default
+enabled = true
+# Memory usage for Argon2 hashing in KiB (64 MiB, initial value)
+mem_kib = 65536
+# Number of parallel lanes for Argon2
+lanes = 4
+# Memory retargeting parameters
+# Minimum memory in KiB
+min_mem_kib = 16384  # 16 MiB minimum
+# Maximum memory in KiB  
+max_mem_kib = 262144 # 256 MiB maximum
+# Memory adjustment factor (1.5 = 50% increase/decrease max)
+max_memory_adjustment = 1.5
+
+[metrics]
+# Address to bind metrics server (Prometheus format)
+bind = "0.0.0.0:9100"

@@ -25,14 +25,26 @@ pub fn spawn(db: Arc<Store>, net: NetHandle) {
         loop {
             match anchor_rx.recv().await {
                 Ok(anchor) => {
-                    // If we’re behind, request missing epochs one by one
-                    if anchor.num > local_epoch + 1 {
-                        for missing in (local_epoch + 1)..anchor.num {
-                            net.request_epoch(missing).await;
+                    // Check if this anchor has more cumulative work than our current best
+                    let should_accept = if let Some(current_best) = db.get::<Anchor>("epoch", b"latest") {
+                        // Accept if more cumulative work, or same work but higher epoch number (tie-breaker)
+                        anchor.cumulative_work > current_best.cumulative_work ||
+                        (anchor.cumulative_work == current_best.cumulative_work && anchor.num > current_best.num)
+                    } else {
+                        // No anchor stored yet, accept this one
+                        true
+                    };
+                    
+                    if should_accept {
+                        // If we're behind, request missing epochs one by one
+                        if anchor.num > local_epoch + 1 {
+                            for missing in (local_epoch + 1)..anchor.num {
+                                net.request_epoch(missing).await;
+                            }
                         }
+                        // Update our local highest epoch
+                        local_epoch = anchor.num;
                     }
-                    // Update our local highest epoch
-                    local_epoch = anchor.num;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     eprintln!("⚠️  Sync lagged {n} anchors behind; resetting cursor");

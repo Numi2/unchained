@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
         cfg.epoch.clone(),
+        cfg.mining.clone(),
         net.clone(),
         coin_rx,            // receives coin IDs mined locally
     );
@@ -53,7 +54,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     //---------------------------------- metrics server --------------
-    metrics::serve(cfg.metrics)?;                                // hyper service  [oai_citation:5‡Docs.rs](https://docs.rs/blake3/latest/blake3/?utm_source=chatgpt.com)
+    let metrics_bind = cfg.metrics.bind.clone();
+    metrics::serve(cfg.metrics)?;
+
+    //---------------------------------- node is running -------------
+    println!("🚀 UnchainedCoin node is running!");
+    println!("   📡 P2P listening on port {}", cfg.net.listen_port);
+    println!("   📊 Metrics available on {}", metrics_bind);
+    println!("   ⛏️  Mining: {}", if cfg.mining.enabled || matches!(cli.cmd, Some(Cmd::Mine)) { "enabled" } else { "disabled" });
+    println!("   Press Ctrl+C to stop");
 
     //---------------------------------- park forever ---------------
     std::future::pending::<()>().await;

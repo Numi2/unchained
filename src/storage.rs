@@ -7,13 +7,16 @@ pub struct Store { db: DB }
 impl Store {
     pub fn open(path: &str) -> Self {
         let cf = |name| ColumnFamilyDescriptor::new(name, Options::default());
-        let db = DB::open_cf_descriptors(&Options::default(), path,
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf_descriptors(&opts, path,
                  vec![cf("epoch"), cf("coin"), cf("head")]).unwrap();
         Store{db}
     }
     pub fn put<T: Serialize>(&self, cf: &str, key: &[u8], v: &T) {
         let b = compress_prepend_size(&serde_json::to_vec(v).unwrap());
-        self.db.cf_handle(cf).map(|h| self.db.put_cf(h, key, b)).unwrap();
+        let _ = self.db.cf_handle(cf).map(|h| self.db.put_cf(h, key, b)).unwrap();
     }
     pub fn get<T: DeserializeOwned>(&self, cf: &str, key: &[u8]) -> Option<T> {
         let h = self.db.cf_handle(cf)?;
