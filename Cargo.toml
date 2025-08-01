@@ -24,5 +24,9 @@ hex = "0.4"
 tiny_http = "0.12"
 serde-big-array = "0.5"
 
+[[bin]]
+name = "inspect_db"
+path = "src/bin/inspect_db.rs"
+
 [dev-dependencies]
 tempfile = "3.8"

@@ -174,13 +174,13 @@ pub struct Manager {
     cfg:  crate::config::Epoch,
     mining_cfg: crate::config::Mining,
     net:  NetHandle,
-    tx:   broadcast::Sender<Anchor>,
+    anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
 }
 impl Manager {
     pub fn new(db: Arc<Store>, cfg: crate::config::Epoch, mining_cfg: crate::config::Mining, net: NetHandle, coin_rx: mpsc::UnboundedReceiver<[u8; 32]>) -> Self {
-        let (tx, _) = broadcast::channel(32);
-        Self { db, cfg, mining_cfg, net, tx, coin_rx }
+        let anchor_tx = net.anchor_sender();
+        Self { db, cfg, mining_cfg, net, anchor_tx, coin_rx }
     }
 
     pub fn spawn(mut self) {
@@ -195,8 +195,32 @@ impl Manager {
 
             loop {
                 tokio::select! {
-                    Some(id) = self.coin_rx.recv() => { buffer.insert(id); },
+                    // Prioritize receiving coins to avoid race conditions
+                    biased;
+                    
+                    Some(id) = self.coin_rx.recv() => { 
+                        println!("📥 Epoch manager received coin: {}", hex::encode(&id));
+                        buffer.insert(id);
+                        // Drain any additional pending coins to avoid race condition
+                        while let Ok(additional_id) = self.coin_rx.try_recv() {
+                            println!("📥 Epoch manager received additional coin: {}", hex::encode(&additional_id));
+                            buffer.insert(additional_id);
+                        }
+                        println!("🗂️ Current buffer has {} coins", buffer.len());
+                    },
                     _ = ticker.tick() => {
+                        // Final drain of any coins that arrived just before epoch creation
+                        let mut late_coins = 0;
+                        while let Ok(id) = self.coin_rx.try_recv() {
+                            println!("📥 Last-minute coin received: {}", hex::encode(&id));
+                            buffer.insert(id);
+                            late_coins += 1;
+                        }
+                        if late_coins > 0 {
+                            println!("⏰ Collected {} late coins before epoch creation", late_coins);
+                        }
+                        println!("🏭 Creating epoch #{} with {} coins in buffer", current_epoch, buffer.len());
+                        
                         let merkle_root = MerkleTree::build_root(&buffer);
                         let mut h = blake3::Hasher::new();
                         h.update(&merkle_root);
@@ -235,8 +259,54 @@ impl Manager {
                         if let Err(e) = self.db.write_batch(batch) {
                             eprintln!("🔥 Failed to write new epoch to DB: {e}");
                         } else {
-                            self.net.gossip_anchor(&anchor).await;
-                            let _ = self.tx.send(anchor.clone());
+                            // Force flush to ensure epoch is persisted to disk
+                            if let Err(e) = self.db.flush() {
+                                eprintln!("🔥 Failed to flush epoch to disk: {e}");
+                            }
+                            
+                            // Wait a bit for any in-flight coins from current mining to arrive
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            
+                            // Final final drain after the delay
+                            let mut very_late_coins = 0;
+                            while let Ok(id) = self.coin_rx.try_recv() {
+                                println!("📥 Very late coin received after delay: {}", hex::encode(&id));
+                                buffer.insert(id);
+                                very_late_coins += 1;
+                            }
+                            
+                            if very_late_coins > 0 {
+                                println!("🚨 WARNING: {} coins arrived after epoch creation! Updating epoch #{}", very_late_coins, current_epoch);
+                                // Update the epoch with the additional coins
+                                let updated_anchor = Anchor { 
+                                    num: current_epoch, 
+                                    hash: anchor.hash, 
+                                    difficulty: anchor.difficulty, 
+                                    coin_count: buffer.len() as u32, 
+                                    cumulative_work: anchor.cumulative_work, 
+                                    mem_kib: anchor.mem_kib 
+                                };
+                                
+                                let mut update_batch = WriteBatch::default();
+                                let updated_serialized = bincode::serialize(&updated_anchor).unwrap();
+                                let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
+                                update_batch.put_cf(epoch_cf, &current_epoch.to_le_bytes(), &updated_serialized);
+                                update_batch.put_cf(epoch_cf, b"latest", &updated_serialized);
+                                
+                                if let Err(e) = self.db.write_batch(update_batch) {
+                                    eprintln!("🔥 Failed to update epoch with late coins: {e}");
+                                } else {
+                                    self.db.flush().ok();
+                                    // Broadcast the corrected epoch
+                                    self.net.gossip_anchor(&updated_anchor).await;
+                                    let _ = self.anchor_tx.send(updated_anchor);
+                                }
+                            } else {
+                                // No late coins, broadcast original epoch
+                                self.net.gossip_anchor(&anchor).await;
+                                let _ = self.anchor_tx.send(anchor);
+                            }
+                            
                             buffer.clear();
                             current_epoch += 1;
                         }

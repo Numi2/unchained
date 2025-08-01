@@ -11,10 +11,10 @@ bootstrap = []
 path = "./data"
 
 [epoch]
-# Duration of each epoch in seconds (30 seconds for testing)
-seconds = 30
+# Duration of each epoch in seconds (111 seconds)
+seconds = 111
 # Target number of leading zeros for proof-of-work difficulty (initial value)
-target_leading_zeros = 4
+target_leading_zeros = 1
 # Retargeting parameters
 # Target number of coins per epoch for difficulty adjustment
 target_coins_per_epoch = 100
@@ -29,7 +29,7 @@ enabled = true
 # Memory usage for Argon2 hashing in KiB (64 MiB, initial value)
 mem_kib = 65536
 # Number of parallel lanes for Argon2
-lanes = 4
+lanes = 1
 # Memory retargeting parameters
 # Minimum memory in KiB
 min_mem_kib = 16384  # 16 MiB minimum
@@ -37,6 +37,13 @@ min_mem_kib = 16384  # 16 MiB minimum
 max_mem_kib = 262144 # 256 MiB maximum
 # Memory adjustment factor (1.5 = 50% increase/decrease max)
 max_memory_adjustment = 1.5
+# Miner stability settings for multi-node environments
+# Heartbeat interval in seconds (how often to check for missed anchors)
+heartbeat_interval_secs = 60
+# Maximum consecutive failures before restarting miner
+max_consecutive_failures = 5
+# Maximum mining attempts per epoch before moving to next epoch
+max_mining_attempts = 1000000
 
 [metrics]
 # Address to bind metrics server (Prometheus format)

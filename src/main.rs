@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
+use tokio::signal;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
@@ -63,6 +64,24 @@ async fn main() -> anyhow::Result<()> {
     println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");
 
-    std::future::pending::<()>().await;
-    Ok(())
+    // Wait for shutdown signal and perform clean shutdown
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            println!("\n🛑 Shutdown signal received, cleaning up...");
+            
+            // Properly close database to prevent file conflicts
+            if let Err(e) = db.close() {
+                eprintln!("Warning: Database cleanup failed: {}", e);
+            } else {
+                println!("✅ Database closed cleanly");
+            }
+            
+            println!("👋 UnchainedCoin node stopped");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Error waiting for shutdown signal: {}", err);
+            Err(err.into())
+        }
+    }
 }

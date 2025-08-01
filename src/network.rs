@@ -59,7 +59,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         swarm.dial(addr.parse::<Multiaddr>()?)?;
     }
 
-    let (anchor_tx, _) = broadcast::channel(32);
+    let (anchor_tx, _) = broadcast::channel(256); // Increased from 32 to 256 for multi-node stability
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     
     let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx });
@@ -123,6 +123,13 @@ impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &Coin) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
+    pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
+    pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     
+    /// Request a specific epoch by number for recovery purposes
+    pub async fn request_specific_epoch(&self, epoch_num: u64) {
+        println!("🔄 Requesting specific epoch #{} for recovery", epoch_num);
+        self.request_epoch(epoch_num).await;
+    }
 }

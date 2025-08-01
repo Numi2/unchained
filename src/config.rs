@@ -48,6 +48,12 @@ pub struct Mining {
     pub max_mem_kib: u32,
     #[serde(default = "default_max_memory_adjustment")]
     pub max_memory_adjustment: f64,
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    #[serde(default = "default_max_mining_attempts")]
+    pub max_mining_attempts: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -69,6 +75,11 @@ fn default_max_difficulty_adjustment() -> f64 { 2.0 }
 fn default_min_mem() -> u32 { 16_384 }        // 16 MiB
 fn default_max_mem() -> u32 { 262_144 }       // 256 MiB  
 fn default_max_memory_adjustment() -> f64 { 1.5 }
+
+// Miner stability defaults
+fn default_heartbeat_interval() -> u64 { 30 }  // 30 seconds
+fn default_max_consecutive_failures() -> u32 { 5 }
+fn default_max_mining_attempts() -> u64 { 1_000_000 }
 
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.
