@@ -1,4 +1,4 @@
-use unchainedcoin::{storage, epoch::Anchor, coin::Coin};
+use unchainedcoin::{storage, epoch::Anchor};
 
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting UnchainedCoin Database...");
@@ -31,13 +31,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     
-    // Now ACTUALLY scan the coin column family for real coin records
-    println!("\n🔍 ACTUALLY scanning coin column family...");
-    let mut actual_coins_found = 0;
-    
-    // This is a hack since rocksdb-rs doesn't expose easy iteration
-    // We'll try to find coins by scanning some reasonable coin ID space
-    println!("   Attempting to find actual coin records...");
+    //ng to find actual coin records...");
     
     // Let's try a different approach - scan recent epochs and try to find their actual coins
     for epoch_num in 0u64..=20 {

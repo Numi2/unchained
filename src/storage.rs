@@ -1,7 +1,6 @@
 use rocksdb::{Options, DB, ColumnFamilyDescriptor, WriteBatch, WriteOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
-use std::path::Path;
 use serde::{Serialize, de::DeserializeOwned};
 use anyhow::{Result, Context};
 use std::sync::Arc;

@@ -69,7 +69,7 @@ fn default_bind() -> String { "0.0.0.0:9100".into() }
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
 fn default_retarget_interval() -> u64 { 10 }
-fn default_max_difficulty_adjustment() -> f64 { 2.0 }
+
 
 // Mining memory retargeting defaults
 fn default_min_mem() -> u32 { 16_384 }        // 16 MiB
