@@ -1,38 +1,25 @@
 use serde::{Serialize, Deserialize};
-use crate::crypto;
-use pqcrypto_dilithium::dilithium3::{PublicKey, DetachedSignature};
-use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
+use crate::crypto::{Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SIG_BYTES};
 
-/// A coin transfer signed by its current owner
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use serde_big_array::BigArray;
+
+/// A coin transfer, which includes the sender's full public key to enable
+/// verification, and a signature over the content. This forms a spendable UTXO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transfer {
     pub coin_id: [u8; 32],
-    pub to: [u8; 32],             // receiver pubkey hash
-    pub prev_tx_hash: [u8; 32],   // for per-coin micro-chain
-    pub sig: Vec<u8>,             // Dilithium3 signature
+    // The sender's full public key is required for stateless signature verification.
+    #[serde(with = "BigArray")]
+    pub sender_pk: [u8; DILITHIUM3_PK_BYTES],
+    // The address of the new owner.
+    pub to: Address,
+    // The hash of the previous transaction, forming a per-coin chain.
+    pub prev_tx_hash: [u8; 32],
+    // A Dilithium3 signature from the sender.
+    #[serde(with = "BigArray")]
+    pub sig: [u8; DILITHIUM3_SIG_BYTES],
 }
 
 impl Transfer {
-    /// Returns the message that was signed
-    pub fn signed_content(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.coin_id);
-        data.extend_from_slice(&self.to);
-        data.extend_from_slice(&self.prev_tx_hash);
-        data
-    }
-
-    /// Returns the BLAKE3 hash of the transfer (used as new head)
-    pub fn tx_hash(&self) -> [u8; 32] {
-        crypto::blake3_hash(&self.signed_content())
-    }
-
-    /// Verifies the signature against the sender pubkey
-    pub fn verify(&self, sender_pk: &PublicKey) -> bool {
-        if let Ok(sig) = DetachedSignature::from_bytes(&self.sig) {
-            crypto::verify(&self.signed_content(), &sig, sender_pk)
-        } else {
-            false
-        }
-    }
+    
 }

@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
-mod config;    mod crypto;   mod storage;  mod epoch;
-mod coin;      mod transfer; mod miner;    mod network;
-mod sync;      mod metrics;
+use std::sync::Arc;
+
+pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
+pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
+pub mod sync;      pub mod metrics;  pub mod wallet;
 
 #[derive(Parser)]
-#[command(author, version, about = "UnchainedCoin node v0.2")]
+#[command(author, version, about = "UnchainedCoin Node v0.3 (Post-Quantum Hardened)")]
 struct Cli {
     /// Path to the TOML config file
     #[arg(short, long, default_value = "config.toml")]
@@ -22,49 +24,45 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    //---------------------------------- parse CLI & load config -----
-    let cli   = Cli::parse();                                    // clap derive  [oai_citation:0‡Docs.rs](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html?utm_source=chatgpt.com)
-    let cfg   = config::load(&cli.config)?;                      // toml → struct  [oai_citation:1‡GitHub](https://github.com/pq-crystals/dilithium?utm_source=chatgpt.com)
+    println!("--- UnchainedCoin Node ---");
 
-    //---------------------------------- embed-DB --------------------
-    let db    = storage::open(&cfg.storage);                     // RocksDB with CFs  [oai_citation:2‡Docs.rs](https://docs.rs/blake3/latest/blake3/?utm_source=chatgpt.com)
+    let cli = Cli::parse();
+    let cfg = config::load(&cli.config)?;
 
-    //---------------------------------- p2p network -----------------
-    let net   = network::spawn(cfg.net.clone(), db.clone()).await?; // libp2p SwarmBuilder  [oai_citation:3‡libp2p.github.io](https://libp2p.github.io/rust-libp2p/libp2p/struct.SwarmBuilder.html?utm_source=chatgpt.com)
+    let db = storage::open(&cfg.storage);
+    println!("🗄️  Database opened at '{}'", cfg.storage.path);
 
-    //---------------------------------- channels --------------------
-    let (coin_tx,  coin_rx)  = tokio::sync::mpsc::unbounded_channel(); // mpsc unbounded  [oai_citation:4‡Docs.rs](https://docs.rs/tokio/latest/tokio/sync/mpsc/fn.unbounded_channel.html?utm_source=chatgpt.com)
+    let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
 
-    //---------------------------------- epoch roller ----------------
+    let net = network::spawn(cfg.net.clone(), db.clone()).await?;
+
+    let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
+
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
         cfg.epoch.clone(),
         cfg.mining.clone(),
         net.clone(),
-        coin_rx,            // receives coin IDs mined locally
+        coin_rx,
     );
-    epoch_mgr.spawn();                                           // ticker + broadcast
+    epoch_mgr.spawn();
 
-    //---------------------------------- historical sync -------------
-    sync::spawn(db.clone(), net.clone());                        // catches gaps
+    sync::spawn(db.clone(), net.clone());
 
-    //---------------------------------- optional miner --------------
-    if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled {
-        miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), coin_tx);
+    let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
+    if mining_enabled {
+        miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx);
     }
 
-    //---------------------------------- metrics server --------------
     let metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
 
-    //---------------------------------- node is running -------------
-    println!("🚀 UnchainedCoin node is running!");
+    println!("\n🚀 UnchainedCoin node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
-    println!("   📊 Metrics available on {}", metrics_bind);
-    println!("   ⛏️  Mining: {}", if cfg.mining.enabled || matches!(cli.cmd, Some(Cmd::Mine)) { "enabled" } else { "disabled" });
+    println!("   📊 Metrics available on http://{}", metrics_bind);
+    println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");
 
-    //---------------------------------- park forever ---------------
     std::future::pending::<()>().await;
     Ok(())
 }

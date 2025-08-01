@@ -11,8 +11,8 @@ bootstrap = []
 path = "./data"
 
 [epoch]
-# Duration of each epoch in seconds (10 minutes)
-seconds = 600
+# Duration of each epoch in seconds (30 seconds for testing)
+seconds = 30
 # Target number of leading zeros for proof-of-work difficulty (initial value)
 target_leading_zeros = 4
 # Retargeting parameters

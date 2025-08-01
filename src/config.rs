@@ -31,7 +31,6 @@ pub struct Epoch {
     pub target_coins_per_epoch: u32,
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
-    #[serde(default = "default_max_difficulty_adjustment")]
     pub max_difficulty_adjustment: f64,
 }
 
