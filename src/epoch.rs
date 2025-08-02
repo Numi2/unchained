@@ -207,6 +207,50 @@ impl Manager {
                             buffer.insert(additional_id);
                         }
                         println!("🗂️ Current buffer has {} coins", buffer.len());
+
+                        if buffer.len() as u32 >= self.cfg.target_coins_per_epoch {
+                            println!("🏭 Target coin count reached -> creating epoch #{}", current_epoch);
+                            let merkle_root = MerkleTree::build_root(&buffer);
+                            let mut h = blake3::Hasher::new();
+                            h.update(&merkle_root);
+                            let prev_anchor = match self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()) {
+                                Ok(anchor) => anchor,
+                                Err(_) => None,
+                            };
+                            if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
+                            let hash = *h.finalize().as_bytes();
+
+                            let (difficulty, mem_kib) = if current_epoch % self.cfg.retarget_interval == 0 && current_epoch > 0 {
+                                let mut recent_anchors = Vec::new();
+                                for i in 0..self.cfg.retarget_interval {
+                                    let epoch_num = current_epoch.saturating_sub(self.cfg.retarget_interval - i);
+                                    if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
+                                        recent_anchors.push(anchor);
+                                    }
+                                }
+                                Anchor::calculate_retarget(&recent_anchors, &self.cfg, &self.mining_cfg)
+                            } else {
+                                prev_anchor.as_ref().map_or((self.cfg.target_leading_zeros, self.mining_cfg.mem_kib), |p| (p.difficulty, p.mem_kib))
+                            };
+
+                            let current_work = Anchor::expected_work_for_difficulty(difficulty);
+                            let cumulative_work = prev_anchor.as_ref().map_or(current_work, |p| p.cumulative_work.saturating_add(current_work));
+                            let anchor = Anchor { num: current_epoch, hash, difficulty, coin_count: buffer.len() as u32, cumulative_work, mem_kib };
+                            let mut batch = WriteBatch::default();
+                            let serialized_anchor = bincode::serialize(&anchor).unwrap();
+                            let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
+                            batch.put_cf(epoch_cf, &current_epoch.to_le_bytes(), &serialized_anchor);
+                            batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                            if let Err(e) = self.db.write_batch(batch) {
+                                eprintln!("🔥 Failed to write new epoch to DB: {e}");
+                            } else {
+                                self.db.flush().ok();
+                                self.net.gossip_anchor(&anchor).await;
+                                let _ = self.anchor_tx.send(anchor);
+                                buffer.clear();
+                                current_epoch += 1;
+                            }
+                        }
                     },
                     _ = ticker.tick() => {
                         // Final drain of any coins that arrived just before epoch creation

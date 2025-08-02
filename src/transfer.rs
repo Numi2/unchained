@@ -21,5 +21,26 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    
+    /// Canonical bytes-to-sign: coin_id ‖ sender_pk ‖ to ‖ prev_tx_hash.
+    /// This deterministic serialization prevents replay/tamper attacks and is
+    /// independent of any serde/bincode representation.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(32 + DILITHIUM3_PK_BYTES + 32 + 32);
+        v.extend_from_slice(&self.coin_id);
+        v.extend_from_slice(&self.sender_pk);
+        v.extend_from_slice(&self.to);
+        v.extend_from_slice(&self.prev_tx_hash);
+        v
+    }
+
+    /// Backwards-compat alias used by old code paths – now forwards to signing_bytes().
+    #[deprecated(note = "Use signing_bytes() instead")]    
+    pub fn content_bytes(&self) -> Vec<u8> {
+        self.signing_bytes()
+    }
+
+    /// Deterministic hash over the canonical signing bytes (not over serde encoding).
+    pub fn hash(&self) -> [u8; 32] {
+        crate::crypto::blake3_hash(&self.signing_bytes())
+    }
 }

@@ -32,7 +32,7 @@ impl Store {
             let _ = std::fs::remove_file(&lock_file); // Remove stale lock
         }
         
-        let cf_names = ["default", "epoch", "coin", "head", "wallet", "anchor"];
+        let cf_names = ["default", "epoch", "coin", "head", "wallet", "anchor", "transfer"];
         
         // Configure column family options for stability and uniqueness
         let mut cf_opts = Options::default();
@@ -223,6 +223,11 @@ impl Store {
         self.db.cancel_all_background_work(true);
         
         Ok(())
+    }
+
+    /// Absolute path to the directory where individual coin files are stored.
+    pub fn coins_dir(&self) -> String {
+        format!("{}/coins", self.path)
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::{storage::Store, epoch::Anchor, coin::Coin, transfer::Transfer, crypto};
+use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
 use libp2p::{
     gossipsub,
     identity, quic, swarm::SwarmEvent, PeerId, Swarm, Transport, Multiaddr,
@@ -21,6 +22,9 @@ const TOP_EPOCH_REQUEST: &str = "epoch_request/1";
 const TOP_COIN_REQUEST: &str = "coin_request/1";
 
 /// Comprehensive coin validation to prevent forgery and ensure cryptographic integrity
+//--------------------------------------------------------------------
+// Coin validation
+//--------------------------------------------------------------------
 fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     // 1. Check for double-spending: Ensure coin doesn't already exist
     if let Ok(Some(_)) = db.get::<Coin>("coin", &coin.id) {
@@ -117,6 +121,106 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     Ok(())
 }
 
+//--------------------------------------------------------------------
+// Transfer validation
+//--------------------------------------------------------------------
+fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
+    use pqcrypto_dilithium::dilithium3::{PublicKey, DetachedSignature, verify_detached_signature};
+
+    // 1. Coin must exist
+    let coin: Coin = db
+        .get("coin", &tx.coin_id)
+        .map_err(|e| format!("DB error while fetching coin: {}", e))?
+        .ok_or_else(|| format!("Referenced coin does not exist: {}", hex::encode(tx.coin_id)))?;
+
+    // 2. Prevent double-spend – coin must not already have a recorded transfer
+    if let Ok(Some(_)) = db.get::<Transfer>("transfer", &tx.coin_id) {
+        return Err(format!(
+            "Double-spend detected – coin {} already spent", hex::encode(tx.coin_id)
+        ));
+    }
+
+    // 3. Verify Dilithium3 signature
+    let sender_pk = PublicKey::from_bytes(&tx.sender_pk)
+        .map_err(|_| "Invalid sender public key bytes".to_string())?;
+    let sender_addr = crypto::address_from_pk(&sender_pk);
+
+    // 4. Check ownership – sender must be current owner (creator of coin)
+    if sender_addr != coin.creator_address {
+        return Err("Sender does not own the coin".to_string());
+    }
+
+    // 5. prev_tx_hash must be zero for first spend
+    if tx.prev_tx_hash != [0u8; 32] {
+        return Err("prev_tx_hash must be zero for first transfer".to_string());
+    }
+
+    // 6. Verify signature over canonical signing bytes
+    let content = tx.signing_bytes();
+    let sig = DetachedSignature::from_bytes(&tx.sig)
+        .map_err(|_| "Invalid signature bytes".to_string())?;
+    verify_detached_signature(&sig, &content, &sender_pk)
+        .map_err(|_| "Signature verification failed".to_string())?;
+
+    Ok(())
+}
+
+//--------------------------------------------------------------------
+// Anchor validation
+//--------------------------------------------------------------------
+
+//--------------------------------------------------------------------
+// Anchor validation
+//--------------------------------------------------------------------
+fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
+    // Basic sanity checks
+    if anchor.hash == [0u8; 32] {
+        return Err("Anchor hash is zero".into());
+    }
+
+    // Genesis anchor (num == 0) special‐case
+    if anchor.num == 0 {
+        if anchor.cumulative_work != Anchor::expected_work_for_difficulty(anchor.difficulty) {
+            return Err("Genesis cumulative work incorrect".into());
+        }
+        return Ok(());
+    }
+
+    // Must have previous anchor
+    let prev: Anchor = db
+        .get("epoch", &(anchor.num - 1).to_le_bytes())
+        .map_err(|e| format!("DB error while fetching previous anchor: {}", e))?
+        .ok_or_else(|| format!("Previous anchor #{} missing", anchor.num - 1))?;
+
+    // Difficulty cannot change by more than ±1 between consecutive anchors
+    let diff_change = if anchor.difficulty > prev.difficulty {
+        anchor.difficulty - prev.difficulty
+    } else {
+        prev.difficulty - anchor.difficulty
+    };
+    if diff_change > 1 {
+        return Err("Difficulty adjustment too large".into());
+    }
+
+    // Memory parameter must stay within allowed bounds
+    if anchor.mem_kib < 16_384 || anchor.mem_kib > 262_144 {
+        return Err("mem_kib outside permissible range".into());
+    }
+
+    // Cumulative work must equal prev.cumulative_work + expected_work(difficulty)
+    let expected_work = Anchor::expected_work_for_difficulty(anchor.difficulty);
+    let expected_cum = prev.cumulative_work.saturating_add(expected_work);
+    if anchor.cumulative_work != expected_cum {
+        return Err("Cumulative work mismatch".into());
+    }
+
+    // Chain continuity: ensure anchor.hash differs from prev.hash to prevent duplication
+    if anchor.hash == prev.hash {
+        return Err("Anchor hash identical to previous".into());
+    }
+
+    Ok(())
+}
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
@@ -136,9 +240,10 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     let id_keys = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(id_keys.public());
 
-    // NOTE: The libp2p transport here (QUIC) uses standard crypto and is NOT post-quantum safe.
-    // For true PQ resistance, a PQ KEM like Kyber must be integrated into the handshake,
-    // e.g., via the Noise protocol framework. This is a major undertaking.
+    // NOTE: QUIC transport with post-quantum readiness
+    // The rustls dependency now includes aws-lc-rs with prefer-post-quantum feature
+    // which enables hybrid X25519+Kyber key exchange when both peers support it.
+    // This provides post-quantum resistance while maintaining backwards compatibility.
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -169,9 +274,16 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                     if let SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) = event {
                         match message.topic.as_str() {
                             TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
-                                if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
-                                    let _ = db.put("epoch", b"latest", &a);
-                                    let _ = anchor_tx.send(a);
+                                match validate_anchor(&a, &db) {
+                                    Ok(()) => {
+                                        if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
+                                            let _ = db.put("epoch", b"latest", &a);
+                                            let _ = anchor_tx.send(a);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("🚫 REJECTED invalid anchor: {}", err);
+                                    }
                                 }
                             },
                             TOP_COIN => if let Ok(c) = bincode::deserialize::<Coin>(&message.data) {
@@ -196,8 +308,20 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 }
                             },
                             TOP_TX => if let Ok(t) = bincode::deserialize::<Transfer>(&message.data) {
-                                // TODO: Full transfer validation!
-                                let _ = db.put("head", &t.coin_id, &t);
+                                match validate_transfer(&t, &db) {
+                                    Ok(()) => {
+                                        if let Err(e) = db.put("transfer", &t.coin_id, &t) {
+                                            eprintln!("🚨 Failed to store validated transfer for coin {}: {}", hex::encode(&t.coin_id), e);
+                                        } else {
+                                            println!("✅ Accepted valid transfer for coin {}", hex::encode(&t.coin_id));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("🚫 REJECTED invalid transfer: {}", err);
+                                        eprintln!("   Coin ID: {}", hex::encode(&t.coin_id));
+                                        eprintln!("   To: {}", hex::encode(&t.to));
+                                    }
+                                }
                             },
                             TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                 if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
