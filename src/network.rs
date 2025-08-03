@@ -350,6 +350,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .mesh_n(2)                                                       // Target 2 peers in mesh
         .mesh_n_low(1)                                                   // Minimum 1 peer before publishing is allowed
         .mesh_n_high(3)                                                  // Upper bound keeps mesh small
+        .mesh_outbound_min(1)                                              // Allow publishing with only 1 outbound peer
         .gossip_lazy(1)                                                  // Send gossip to 1 peer/heartbeat
         .message_id_fn(|message| {                                       // Custom message ID to prevent duplicates
             use std::collections::hash_map::DefaultHasher;
