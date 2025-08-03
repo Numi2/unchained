@@ -367,11 +367,31 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
 
     let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
     
-    // Debug: Show what we're listening on
-    let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port);
-    println!("🔍 Attempting to listen on: {}", listen_addr);
-    
-    swarm.listen_on(listen_addr.parse()?)?;
+    // Bind the QUIC listener, automatically retrying the next port if the desired
+    // port is already occupied. This improves UX when multiple nodes are started
+    // on the same machine (e.g. during testing).
+    let mut port = cfg.listen_port;
+    let mut bound = false;
+    for _ in 0..10 { // try up to 10 consecutive ports
+        let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
+        println!("🔍 Attempting to listen on: {}", listen_addr);
+        match swarm.listen_on(listen_addr.parse()?) {
+            Ok(_) => { bound = true; break; },
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("address already in use") {
+                    println!("⚠️  Port {} already in use, trying {}", port, port + 1);
+                    port = port.saturating_add(1);
+                    continue;
+                } else {
+                    return Err(anyhow::anyhow!("Failed to bind listener: {}", e));
+                }
+            }
+        }
+    }
+    if !bound {
+        return Err(anyhow::anyhow!("Could not bind to any port starting from {}", cfg.listen_port));
+    }
     
     // Debug: Show what we're trying to connect to
     println!("🔍 Local peer ID: {}", peer_id);
