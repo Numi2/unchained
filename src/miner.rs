@@ -212,7 +212,7 @@ impl Miner {
         loop {
             attempts += 1;
             if attempts > max_attempts {
-                eprintln!("⚠️  Reached max attempts for epoch #{}, continuing to next epoch", anchor.num);
+                eprintln!("⚠️  Reached max attempts ({}) for epoch #{}, continuing to next epoch", max_attempts, anchor.num);
                 return Ok(()); // Continue to next epoch
             }
 
