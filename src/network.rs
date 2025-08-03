@@ -352,6 +352,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .mesh_n_high(3)                                                  // Upper bound keeps mesh small
         .mesh_outbound_min(0)                                              // Allow publishing even with only inbound peers
         .gossip_lazy(1)                                                  // Send gossip to 1 peer/heartbeat
+        .flood_publish(true)                                             // Publish even if mesh thresholds not met
         .message_id_fn(|message| {                                       // Custom message ID to prevent duplicates
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
