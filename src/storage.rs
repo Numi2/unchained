@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use anyhow::{Result, Context};
 use hex;
 use std::sync::Arc;
+use std::process;
 
 // Using bincode for fast, compact binary serialization instead of JSON.
 // Using zstd for a better compression ratio and speed than lz4.
@@ -322,5 +323,12 @@ fn copy_dir_all(src: &str, dst: &str) -> Result<()> {
 }
 
 pub fn open(cfg: &crate::config::Storage) -> Arc<Store> {
-    Arc::new(Store::open(&cfg.path).expect("Database open failed"))
+    Arc::new(Store::open(&cfg.path).unwrap_or_else(|e| {
+        eprintln!("❌ Critical: Database failed to open at '{}': {}", cfg.path, e);
+        eprintln!("💡 Possible solutions:");
+        eprintln!("   - Check if directory exists and is writable");
+        eprintln!("   - Verify no other instances are running");
+        eprintln!("   - Try removing lock files: rm {}/LOCK", cfg.path);
+        process::exit(1);
+    }))
 }

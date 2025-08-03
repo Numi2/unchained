@@ -319,7 +319,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub::Config::default(),
     ).map_err(|e| anyhow::anyhow!("Failed to create Gossipsub: {}", e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST] {
+    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -493,9 +493,14 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                             }
                                             
                                             if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
-                                                let _ = db.put("epoch", b"latest", &a);
+                                                if let Err(e) = db.put("epoch", b"latest", &a) {
+                                                    eprintln!("❌ Critical: Failed to update latest anchor #{}: {}", a.num, e);
+                                                }
                                                 println!("✅ Accepted better chain anchor #{} from network", a.num);
-                                                let _ = anchor_tx.send(a);
+                                                let anchor_num = a.num;
+                                                if let Err(e) = anchor_tx.send(a) {
+                                                    eprintln!("⚠️  Failed to broadcast anchor #{} internally: {}", anchor_num, e);
+                                                }
                                             }
                                         } else {
                                             // Still store the anchor but don't update latest
@@ -599,7 +604,9 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                         NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                     };
                     if let Some(d) = data {
-                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(topic), d);
+                        if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), d) {
+                            eprintln!("⚠️  Failed to publish {} message: {}", topic, e);
+                        }
                     }
                 }
             }
