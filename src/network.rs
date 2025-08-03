@@ -8,6 +8,7 @@ use libp2p::{
 use libp2p::gossipsub::{
     IdentTopic, MessageAuthenticity, IdentityTransform,
     AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent,
+    ValidationMode,
 };
 use bincode;
 use std::sync::Arc;
@@ -269,14 +270,14 @@ impl PeerScore {
         self.last_failure = Some(Instant::now());
         
         if self.validation_failures >= MAX_VALIDATION_FAILURES_PER_PEER {
-            self.banned_until = Some(Instant::now() + Duration::from_secs(PEER_BAN_DURATION_SECS));
+            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(PEER_BAN_DURATION_SECS));
             println!("🚫 Peer banned for {} validation failures", self.validation_failures);
         }
     }
     
     fn check_rate_limit(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.window_start) > Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
+        if now.duration_since(self.window_start) > std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
             // Reset window
             self.window_start = now;
             self.message_count = 1;
@@ -346,6 +347,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
 
+    // Configure gossipsub for better stability
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub::Config::default(),
@@ -356,8 +358,24 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
 
     let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port).parse()?)?;
+    
+    // Connect to bootstrap peers, but skip if it's our own peer ID
     for addr in &cfg.bootstrap {
-        swarm.dial(addr.parse::<Multiaddr>()?)?;
+        let parsed_addr = addr.parse::<Multiaddr>()?;
+        // Extract peer ID from the multiaddr to check if it's our own
+        if let Some(addr_peer_id) = parsed_addr.iter().last() {
+            if let libp2p::multiaddr::Protocol::P2p(peer_id_bytes) = addr_peer_id {
+                let addr_peer_id = PeerId::try_from(peer_id_bytes);
+                if let Ok(addr_peer_id) = addr_peer_id {
+                    if addr_peer_id == peer_id {
+                        println!("⚠️  Skipping bootstrap connection to self (peer ID: {})", peer_id);
+                        continue;
+                    }
+                }
+            }
+        }
+        println!("🔗 Attempting to connect to bootstrap peer: {}", addr);
+        swarm.dial(parsed_addr)?;
     }
 
     let (anchor_tx, _) = broadcast::channel(256); // Increased from 32 to 256 for multi-node stability
@@ -368,6 +386,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     // Initialize peer management
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut connected_peers = 0u32;
+    let mut recently_connected_peers: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
     tokio::spawn(async move {
         loop {
@@ -382,6 +401,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 connected_peers -= 1;
                             } else {
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
+                                recently_connected_peers.insert(peer_id, tokio::time::Instant::now());
                                 println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
                                 
                                 // Request latest state from new peer if we're starting fresh
@@ -407,12 +427,19 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                             // Give the message time to be sent before potential disconnection
                                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                         }
+                                        
+                                        // Send a keepalive message to maintain connection
+                                        println!("💓 Sending keepalive message to peer {}", peer_id);
+                                        if let Ok(keepalive_bytes) = bincode::serialize(&0u64) {
+                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), keepalive_bytes);
+                                        }
                                     }
                                 }
                             }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
                             connected_peers = connected_peers.saturating_sub(1);
+                            recently_connected_peers.remove(&peer_id);
                             println!("👋 Disconnected from peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
                         },
                         SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _ } => {
