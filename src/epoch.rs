@@ -221,13 +221,13 @@ impl Manager {
             if current_epoch == 0 {
                 println!("🔄 Initial network synchronization phase...");
                 println!("   Waiting for peers to share current blockchain state...");
-                println!("   Timeout: 30 seconds");
+                println!("   Timeout: 60 seconds");
                 
                 // Actively request latest state from network
                 self.net.request_latest_epoch().await;
                 
-                // Wait for network synchronization with a timeout
-                let sync_timeout = tokio::time::Duration::from_secs(30);
+                // Wait for network synchronization with a longer timeout
+                let sync_timeout = tokio::time::Duration::from_secs(60);
                 let sync_start = tokio::time::Instant::now();
                 let mut synced = false;
                 let mut last_request = tokio::time::Instant::now();
@@ -244,9 +244,9 @@ impl Manager {
                             println!("   Received anchor #{} with {} coins and {} cumulative work", 
                                    latest_anchor.num, latest_anchor.coin_count, latest_anchor.cumulative_work);
                             
-                            // Give the sync module a moment to process any additional epochs
-                            println!("   Waiting 2 seconds for additional synchronization...");
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            // Give the sync module more time to process any additional epochs
+                            println!("   Waiting 5 seconds for additional synchronization...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             
                             // Re-check the latest epoch in case we received more anchors
                             if let Ok(Some(final_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
@@ -264,14 +264,14 @@ impl Manager {
                     }
                     
                     // Periodically request latest state if we haven't received anything yet
-                    if last_request.elapsed() > tokio::time::Duration::from_secs(5) {
+                    if last_request.elapsed() > tokio::time::Duration::from_secs(10) {
                         println!("🔄 Still waiting for network response (check #{check_count}), requesting latest state again...");
                         self.net.request_latest_epoch().await;
                         last_request = tokio::time::Instant::now();
                     }
                     
                     // Wait a bit before checking again
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                 }
                 
                 if !synced {
@@ -282,6 +282,7 @@ impl Manager {
                     println!("   - The bootstrap peer is running and accessible");
                     println!("   - The peer ID in config.toml matches the running peer");
                     println!("   - Port 7777 is open and accessible");
+                    println!("   - Both nodes are on the same network");
                 }
             }
 

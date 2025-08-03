@@ -374,7 +374,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
             tokio::select! {
                 event = swarm.select_next_some() => {
                     match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             connected_peers += 1;
                             if connected_peers > cfg.max_peers {
                                 println!("⚠️  Max peers ({}) exceeded, disconnecting {}", cfg.max_peers, peer_id);
@@ -382,7 +382,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 connected_peers -= 1;
                             } else {
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
-                                println!("🤝 Connected to peer {} ({}/{} peers)", peer_id, connected_peers, cfg.max_peers);
+                                println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
                                 
                                 // Request latest state from new peer if we're starting fresh
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
@@ -399,16 +399,27 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                     if latest_anchor.num > 0 {
                                         println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
+                                        // Wait a moment to ensure connection is stable before broadcasting
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         if let Ok(bytes) = bincode::serialize(&latest_anchor) {
                                             let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                            println!("📤 Anchor #{} broadcast sent to peer {}", latest_anchor.num, peer_id);
+                                            // Give the message time to be sent before potential disconnection
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                         }
                                     }
                                 }
                             }
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
                             connected_peers = connected_peers.saturating_sub(1);
-                            println!("👋 Disconnected from peer {} ({}/{} peers)", peer_id, connected_peers, cfg.max_peers);
+                            println!("👋 Disconnected from peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
+                        },
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _ } => {
+                            eprintln!("❌ Failed to connect to peer {:?}: {:?}", peer_id, error);
+                        },
+                        SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, connection_id: _ } => {
+                            eprintln!("❌ Incoming connection failed from {} to {}: {:?}", send_back_addr, local_addr, error);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
