@@ -24,6 +24,15 @@ impl Coin {
         bytes
     }
 
+    /// Calculate the coin ID from its components
+    pub fn calculate_id(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
+        let mut id_hasher = blake3::Hasher::new();
+        id_hasher.update(epoch_hash);
+        id_hasher.update(&nonce.to_le_bytes());
+        id_hasher.update(creator_address);
+        *id_hasher.finalize().as_bytes()
+    }
+
     /// Creates a new coin from raw fields + PoW hash.
     pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, pow_hash: [u8; 32]) -> Self {
         let mut id_hasher = blake3::Hasher::new();
