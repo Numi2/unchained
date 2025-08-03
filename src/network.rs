@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::time::{Instant, Duration};
 use tokio::sync::{broadcast, mpsc};
 use hex;
+use std::fs;
+use std::path::Path;
 
 // Topics are versioned for future protocol upgrades.
 const TOP_ANCHOR: &str = "anchor/1";
@@ -286,8 +288,53 @@ impl PeerScore {
     }
 }
 
+/// Load or create a persistent peer identity
+fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
+    let identity_path = "peer_identity.key";
+    
+    // Try to load existing identity
+    if Path::new(identity_path).exists() {
+        match fs::read(identity_path) {
+            Ok(key_data) => {
+                match identity::Keypair::from_protobuf_encoding(&key_data) {
+                    Ok(keypair) => {
+                        println!("🔑 Loaded existing peer identity from {}", identity_path);
+                        return Ok(keypair);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to load peer identity: {}. Creating new one.", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to read peer identity file: {}. Creating new one.", e);
+            }
+        }
+    }
+    
+    // Create new identity
+    let keypair = identity::Keypair::generate_ed25519();
+    
+    // Save the new identity
+    match keypair.to_protobuf_encoding() {
+        Ok(key_data) => {
+            if let Err(e) = fs::write(identity_path, key_data) {
+                eprintln!("⚠️  Failed to save peer identity: {}. Identity will not persist.", e);
+            } else {
+                println!("🔑 Created and saved new peer identity to {}", identity_path);
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to encode peer identity: {}. Identity will not persist.", e);
+        }
+    }
+    
+    Ok(keypair)
+}
+
 pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
-    let id_keys = identity::Keypair::generate_ed25519();
+    // Load or create persistent peer identity
+    let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
     println!("📡 Local peer-ID: {peer_id}");
 
