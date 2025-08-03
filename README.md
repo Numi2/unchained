@@ -1,11 +1,12 @@
-# unchainedcoin
+# unchained
 
 post-quantum blockchain implementation using dilithium3 signatures and argon2id proof-of-work, kem pqs
 
 ## features
 
-- memory-hard proof-of-work with configurable difficulty
+- memory-hard proof-of-work with argon2
 - libp2p gossipsub for transaction propagation  
+- dilithium3 sigs
 - comprehensive validation of coins and transfers
 - rocksdb persistence layer
 - hybrid x25519+kyber key exchange for quantum resistance
