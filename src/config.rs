@@ -16,6 +16,10 @@ pub struct Net {
     pub listen_port: u16,
     #[serde(default)]
     pub bootstrap: Vec<String>,          // multiaddrs
+    #[serde(default = "default_max_peers")]
+    pub max_peers: u32,                  // maximum peer connections
+    #[serde(default = "default_connection_timeout")]
+    pub connection_timeout_secs: u64,    // connection timeout
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -80,6 +84,10 @@ fn default_max_memory_adjustment() -> f64 { 1.5 }
 fn default_heartbeat_interval() -> u64 { 30 }  // 30 seconds
 fn default_max_consecutive_failures() -> u32 { 5 }
 fn default_max_mining_attempts() -> u64 { 1_000_000 }
+
+// Network defaults for production deployment
+fn default_max_peers() -> u32 { 100 }
+fn default_connection_timeout() -> u64 { 30 }
 
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.

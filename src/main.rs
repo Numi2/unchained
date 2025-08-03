@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::broadcast;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
@@ -33,6 +34,9 @@ async fn main() -> anyhow::Result<()> {
     let db = storage::open(&cfg.storage);
     println!("🗄️  Database opened at '{}'", cfg.storage.path);
 
+    // Create shutdown broadcast channel for coordinated shutdown
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
     let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
 
     let net = network::spawn(cfg.net.clone(), db.clone()).await?;
@@ -45,14 +49,15 @@ async fn main() -> anyhow::Result<()> {
         cfg.mining.clone(),
         net.clone(),
         coin_rx,
+        shutdown_tx.subscribe(),
     );
     epoch_mgr.spawn();
 
-    sync::spawn(db.clone(), net.clone());
+    sync::spawn(db.clone(), net.clone(), shutdown_tx.subscribe());
 
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
     if mining_enabled {
-        miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx);
+        miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe());
     }
 
     let metrics_bind = cfg.metrics.bind.clone();
@@ -60,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("\n🚀 UnchainedCoin node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
-    println!("   📊 Metrics available on http://{}", metrics_bind);
+    println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");
 
@@ -69,9 +74,17 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => {
             println!("\n🛑 Shutdown signal received, cleaning up...");
             
+            // Signal all background tasks to shutdown
+            println!("📡 Signaling background tasks to shutdown...");
+            let _ = shutdown_tx.send(());
+            
+            // Give tasks a reasonable time to shutdown gracefully
+            println!("⏳ Waiting for tasks to shutdown gracefully...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            
             // Properly close database to prevent file conflicts
             if let Err(e) = db.close() {
-                eprintln!("Warning: Database cleanup failed: {}", e);
+                eprintln!("Warning: Database cleanup failed: {e}");
             } else {
                 println!("✅ Database closed cleanly");
             }
@@ -80,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Err(err) => {
-            eprintln!("Error waiting for shutdown signal: {}", err);
+            eprintln!("Error waiting for shutdown signal: {err}");
             Err(err.into())
         }
     }

@@ -11,6 +11,8 @@ use libp2p::gossipsub::{
 };
 use bincode;
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::time::{Instant, Duration};
 use tokio::sync::{broadcast, mpsc};
 use hex;
 
@@ -21,6 +23,21 @@ const TOP_TX:     &str = "tx/1";
 const TOP_EPOCH_REQUEST: &str = "epoch_request/1";
 const TOP_COIN_REQUEST: &str = "coin_request/1";
 
+// Peer management constants
+const MAX_VALIDATION_FAILURES_PER_PEER: u32 = 10;
+const PEER_BAN_DURATION_SECS: u64 = 3600; // 1 hour
+const RATE_LIMIT_WINDOW_SECS: u64 = 60; // 1 minute window
+const MAX_MESSAGES_PER_WINDOW: u32 = 100; // messages per window per peer
+
+#[derive(Debug, Clone)]
+struct PeerScore {
+    validation_failures: u32,
+    last_failure: Option<Instant>,
+    banned_until: Option<Instant>,
+    message_count: u32,
+    window_start: Instant,
+}
+
 /// Comprehensive coin validation to prevent forgery and ensure cryptographic integrity
 //--------------------------------------------------------------------
 // Coin validation
@@ -28,7 +45,7 @@ const TOP_COIN_REQUEST: &str = "coin_request/1";
 fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     // 1. Check for double-spending: Ensure coin doesn't already exist
     if let Ok(Some(_)) = db.get::<Coin>("coin", &coin.id) {
-        return Err(format!("Double-spend detected for coin ID: {}", hex::encode(&coin.id)));
+        return Err(format!("Double-spend detected for coin ID: {}", hex::encode(coin.id)));
     }
 
     // 2. Validate coin ID integrity: Verify it's correctly computed from component fields
@@ -44,30 +61,23 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     if coin.id != expected_id {
         return Err(format!(
             "Invalid coin ID. Expected: {}, Got: {}",
-            hex::encode(&expected_id),
-            hex::encode(&coin.id)
+            hex::encode(expected_id),
+            hex::encode(coin.id)
         ));
     }
 
     // 3. Validate epoch exists: Ensure epoch hash corresponds to a known anchor
-    let epoch_exists = match db.get::<Anchor>("epoch", b"latest") {
-        Ok(Some(latest_anchor)) => {
-            // Check if coin's epoch matches current or recent epochs
-            coin.epoch_hash == latest_anchor.hash || 
-            // Also check if this epoch hash exists in our database
-            matches!(db.get::<Vec<u8>>("epoch", &coin.epoch_hash), Ok(Some(_)))
-        }
-        Ok(None) => {
-            // If no latest anchor, check if epoch hash exists directly
-            matches!(db.get::<Vec<u8>>("epoch", &coin.epoch_hash), Ok(Some(_)))
-        }
-        Err(_) => false,
+    // Anchors are stored under column family "epoch" keyed by epoch number, **and**
+    // under column family "anchor" keyed by their hash (added for fast lookup).
+    let epoch_exists = match db.get::<Anchor>("anchor", &coin.epoch_hash) {
+        Ok(Some(_)) => true,
+        _ => false,
     };
 
     if !epoch_exists {
         return Err(format!(
             "Invalid or unknown epoch hash: {}",
-            hex::encode(&coin.epoch_hash)
+            hex::encode(coin.epoch_hash)
         ));
     }
 
@@ -83,7 +93,7 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     let calculated_pow = match crypto::argon2id_pow(&header, mem_kib, 1) {
         Ok(hash) => hash,
         Err(e) => {
-            return Err(format!("Failed to calculate PoW hash: {}", e));
+            return Err(format!("Failed to calculate PoW hash: {e}"));
         }
     };
 
@@ -91,8 +101,8 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     if calculated_pow != coin.pow_hash {
         return Err(format!(
             "Invalid PoW hash. Expected: {}, Got: {}",
-            hex::encode(&calculated_pow),
-            hex::encode(&coin.pow_hash)
+            hex::encode(calculated_pow),
+            hex::encode(coin.pow_hash)
         ));
     }
 
@@ -101,7 +111,7 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
         return Err(format!(
             "PoW hash does not meet difficulty requirement of {} leading zero bytes. Hash: {}",
             difficulty,
-            hex::encode(&calculated_pow)
+            hex::encode(calculated_pow)
         ));
     }
 
@@ -130,7 +140,7 @@ fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
     // 1. Coin must exist
     let coin: Coin = db
         .get("coin", &tx.coin_id)
-        .map_err(|e| format!("DB error while fetching coin: {}", e))?
+        .map_err(|e| format!("DB error while fetching coin: {e}"))?
         .ok_or_else(|| format!("Referenced coin does not exist: {}", hex::encode(tx.coin_id)))?;
 
     // 2. Prevent double-spend – coin must not already have a recorded transfer
@@ -189,15 +199,11 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     // Must have previous anchor
     let prev: Anchor = db
         .get("epoch", &(anchor.num - 1).to_le_bytes())
-        .map_err(|e| format!("DB error while fetching previous anchor: {}", e))?
+        .map_err(|e| format!("DB error while fetching previous anchor: {e}"))?
         .ok_or_else(|| format!("Previous anchor #{} missing", anchor.num - 1))?;
 
     // Difficulty cannot change by more than ±1 between consecutive anchors
-    let diff_change = if anchor.difficulty > prev.difficulty {
-        anchor.difficulty - prev.difficulty
-    } else {
-        prev.difficulty - anchor.difficulty
-    };
+    let diff_change = anchor.difficulty.abs_diff(prev.difficulty);
     if diff_change > 1 {
         return Err("Difficulty adjustment too large".into());
     }
@@ -236,6 +242,50 @@ enum NetworkCommand {
 }
 pub type NetHandle = Arc<Network>;
 
+// Peer management helper functions
+impl PeerScore {
+    fn new() -> Self {
+        Self {
+            validation_failures: 0,
+            last_failure: None,
+            banned_until: None,
+            message_count: 0,
+            window_start: Instant::now(),
+        }
+    }
+    
+    fn is_banned(&self) -> bool {
+        if let Some(ban_time) = self.banned_until {
+            Instant::now() < ban_time
+        } else {
+            false
+        }
+    }
+    
+    fn record_validation_failure(&mut self) {
+        self.validation_failures += 1;
+        self.last_failure = Some(Instant::now());
+        
+        if self.validation_failures >= MAX_VALIDATION_FAILURES_PER_PEER {
+            self.banned_until = Some(Instant::now() + Duration::from_secs(PEER_BAN_DURATION_SECS));
+            println!("🚫 Peer banned for {} validation failures", self.validation_failures);
+        }
+    }
+    
+    fn check_rate_limit(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) > Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
+            // Reset window
+            self.window_start = now;
+            self.message_count = 1;
+            true
+        } else {
+            self.message_count += 1;
+            self.message_count <= MAX_MESSAGES_PER_WINDOW
+        }
+    }
+}
+
 pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
     let id_keys = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(id_keys.public());
@@ -267,78 +317,149 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     
     let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx });
 
+    // Initialize peer management
+    let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
+    let mut connected_peers = 0u32;
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
-                    if let SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) = event {
-                        match message.topic.as_str() {
-                            TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            connected_peers += 1;
+                            if connected_peers > cfg.max_peers {
+                                println!("⚠️  Max peers ({}) exceeded, disconnecting {}", cfg.max_peers, peer_id);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                connected_peers -= 1;
+                            } else {
+                                peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
+                                println!("🤝 Connected to peer {} ({}/{} peers)", peer_id, connected_peers, cfg.max_peers);
+                            }
+                        },
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            connected_peers = connected_peers.saturating_sub(1);
+                            println!("👋 Disconnected from peer {} ({}/{} peers)", peer_id, connected_peers, cfg.max_peers);
+                        },
+                        SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
+                            let peer_id = message.source.unwrap_or_else(PeerId::random);
+                            
+                            // Check peer scoring and rate limiting
+                            let should_process = {
+                                let score = peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
+                                
+                                if score.is_banned() {
+                                    println!("🚫 Ignoring message from banned peer {peer_id}");
+                                    false
+                                } else if !score.check_rate_limit() {
+                                    println!("🚨 Rate limit exceeded for peer {peer_id}, ignoring message");
+                                    false
+                                } else {
+                                    true
+                                }
+                            };
+                            
+                            if !should_process {
+                                continue;
+                            }
+                            
+                            match message.topic.as_str() {
+                                TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
                                 match validate_anchor(&a, &db) {
                                     Ok(()) => {
-                                        if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
-                                            let _ = db.put("epoch", b"latest", &a);
-                                            let _ = anchor_tx.send(a);
+                                        // Check for potential fork/reorg
+                                        let current_best: Option<Anchor> = db.get("epoch", b"latest").unwrap_or(None);
+                                        let should_reorg = a.is_better_chain(&current_best);
+                                        
+                                        if should_reorg {
+                                            if let Some(current) = &current_best {
+                                                if a.num < current.num {
+                                                    println!("🔄 CHAIN REORGANIZATION: New chain with higher work at epoch {} (current: {})", a.num, current.num);
+                                                    println!("   New cumulative work: {}", a.cumulative_work);
+                                                    println!("   Old cumulative work: {}", current.cumulative_work);
+                                                }
+                                            }
+                                            
+                                            if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
+                                                let _ = db.put("epoch", b"latest", &a);
+                                                println!("✅ Accepted better chain anchor #{} from network", a.num);
+                                                let _ = anchor_tx.send(a);
+                                            }
+                                        } else {
+                                            // Still store the anchor but don't update latest
+                                            if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
+                                                println!("📝 Stored alternative anchor #{} (not best chain)", a.num);
+                                            }
                                         }
                                     }
                                     Err(err) => {
-                                        eprintln!("🚫 REJECTED invalid anchor: {}", err);
+                                        eprintln!("🚫 REJECTED invalid anchor from {peer_id}: {err}");
+                                        if let Some(score) = peer_scores.get_mut(&peer_id) {
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 }
-                            },
-                            TOP_COIN => if let Ok(c) = bincode::deserialize::<Coin>(&message.data) {
+                                },
+                                TOP_COIN => if let Ok(c) = bincode::deserialize::<Coin>(&message.data) {
                                 // 🔒 CRITICAL SECURITY: Validate coin before storing to prevent forgery
                                 match validate_coin(&c, &db) {
                                     Ok(()) => {
                                         if let Err(e) = db.put("coin", &c.id, &c) {
-                                            eprintln!("🚨 Failed to store validated coin {}: {}", hex::encode(&c.id), e);
+                                            eprintln!("🚨 Failed to store validated coin {}: {e}", hex::encode(c.id));
                                         } else {
-                                            println!("✅ Accepted valid coin from network: {}", hex::encode(&c.id));
+                                            println!("✅ Accepted valid coin from network: {}", hex::encode(c.id));
                                         }
                                     }
                                     Err(validation_error) => {
-                                        eprintln!("🚫 REJECTED invalid coin from network: {}", validation_error);
-                                        eprintln!("   Coin ID: {}", hex::encode(&c.id));
-                                        eprintln!("   Epoch Hash: {}", hex::encode(&c.epoch_hash));
-                                        eprintln!("   Creator: {}", hex::encode(&c.creator_address));
+                                        eprintln!("🚫 REJECTED invalid coin from {peer_id}: {validation_error}");
+                                        eprintln!("   Coin ID: {}", hex::encode(c.id));
+                                        eprintln!("   Epoch Hash: {}", hex::encode(c.epoch_hash));
+                                        eprintln!("   Creator: {}", hex::encode(c.creator_address));
                                         eprintln!("   Nonce: {}", c.nonce);
-                                        eprintln!("   PoW Hash: {}", hex::encode(&c.pow_hash));
-                                        // Do not store invalid coins - this prevents forgery attacks
+                                        eprintln!("   PoW Hash: {}", hex::encode(c.pow_hash));
+                                        if let Some(score) = peer_scores.get_mut(&peer_id) {
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 }
-                            },
-                            TOP_TX => if let Ok(t) = bincode::deserialize::<Transfer>(&message.data) {
+                                },
+                                TOP_TX => if let Ok(t) = bincode::deserialize::<Transfer>(&message.data) {
                                 match validate_transfer(&t, &db) {
                                     Ok(()) => {
                                         if let Err(e) = db.put("transfer", &t.coin_id, &t) {
-                                            eprintln!("🚨 Failed to store validated transfer for coin {}: {}", hex::encode(&t.coin_id), e);
+                                            eprintln!("🚨 Failed to store validated transfer for coin {}: {e}", hex::encode(t.coin_id));
                                         } else {
-                                            println!("✅ Accepted valid transfer for coin {}", hex::encode(&t.coin_id));
+                                            println!("✅ Accepted valid transfer for coin {}", hex::encode(t.coin_id));
                                         }
                                     }
                                     Err(err) => {
-                                        eprintln!("🚫 REJECTED invalid transfer: {}", err);
-                                        eprintln!("   Coin ID: {}", hex::encode(&t.coin_id));
-                                        eprintln!("   To: {}", hex::encode(&t.to));
+                                        eprintln!("🚫 REJECTED invalid transfer from {peer_id}: {err}");
+                                        eprintln!("   Coin ID: {}", hex::encode(t.coin_id));
+                                        eprintln!("   To: {}", hex::encode(t.to));
+                                        if let Some(score) = peer_scores.get_mut(&peer_id) {
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 }
-                            },
-                            TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
+                                },
+                                TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                 if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                     if let Ok(bytes) = bincode::serialize(&coin) {
                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes);
                                     }
                                 }
-                            },
-                            TOP_EPOCH_REQUEST => if let Ok(num) = bincode::deserialize::<u64>(&message.data) {
+                                },
+                                TOP_EPOCH_REQUEST => if let Ok(num) = bincode::deserialize::<u64>(&message.data) {
                                 if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &num.to_le_bytes()) {
                                     if let Ok(bytes) = bincode::serialize(&anchor) {
                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
                                     }
                                 }
-                            },
-                            _ => {}
-                        }
+                                },
+                                _ => {}
+                            }
+                        },
+                        _ => {} // Handle other swarm events as needed
                     }
                 },
                 Some(command) = command_rx.recv() => {
@@ -368,7 +489,7 @@ impl Network {
     
     /// Request a specific epoch by number for recovery purposes
     pub async fn request_specific_epoch(&self, epoch_num: u64) {
-        println!("🔄 Requesting specific epoch #{} for recovery", epoch_num);
+        println!("🔄 Requesting specific epoch #{epoch_num} for recovery");
         self.request_epoch(epoch_num).await;
     }
 }

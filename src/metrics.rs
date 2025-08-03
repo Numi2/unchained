@@ -11,13 +11,28 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // In a real app, this gauge would be updated by the network module.
     peers.set(0);
 
+    // Start metrics server, retrying on port conflicts by incrementing port number.
     let bind_addr = cfg.bind.clone();
     thread::spawn(move || {
-        let server = match tiny_http::Server::http(&bind_addr) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("🔥 Could not start metrics server on {}: {}", bind_addr, e);
-                return;
+        let mut addr = bind_addr.clone();
+        let server = loop {
+            match tiny_http::Server::http(&addr) {
+                Ok(s) => break s,
+                Err(e) => {
+                    if e.to_string().contains("Address already in use") {
+                        // Try next port
+                        if let Some((host, port_str)) = addr.rsplit_once(':') {
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                let next_port = port.saturating_add(1);
+                                addr = format!("{}:{}", host, next_port);
+                                eprintln!("🔥 Metrics port in use, trying {}", addr);
+                                continue;
+                            }
+                        }
+                    }
+                    eprintln!("🔥 Could not start metrics server on {addr}: {e}");
+                    return;
+                }
             }
         };
         

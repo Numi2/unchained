@@ -37,6 +37,7 @@ libp2p-core = "0.43.1"
 rcgen = "0.13"
 rustls = { version = "0.23.22", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 webpki-roots = "0.26"
+chrono = { version = "0.4", features = ["serde"] }
 
 [[bin]]
 name = "inspect_db"

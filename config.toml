@@ -3,47 +3,62 @@
 [net]
 # Port to listen on for P2P connections
 listen_port = 7777
-# Bootstrap nodes to connect to (empty for now)
-bootstrap = []
+# Maximum number of peer connections (prevents resource exhaustion)
+max_peers = 1000
+# Connection timeout in seconds
+connection_timeout_secs = 30
+# Bootstrap nodes to connect to - add your seed nodes here for public deployment
+# Format: /ip4/IP_ADDRESS/udp/PORT/quic-v1/p2p/PEER_ID
+bootstrap = [
+    # Example: "/ip4/192.168.1.100/udp/7777/quic-v1/p2p/12D3KooWExample..."
+    # Add your production bootstrap nodes here before public deployment
+]
 
 [storage]
-# Path where blockchain data will be stored
-path = "./data"
+# Path where blockchain data will be stored (outside src-tauri to avoid rebuild loops)
+# Move runtime data one directory up so that it no longer lives inside
+# `src-tauri` – this prevents the Tauri development file-watcher from
+# rebuilding the app every time the node writes to its database.
+path = "../blockchain_data"
 
 [epoch]
-# Duration of each epoch in seconds (111 seconds)
+# Duration of each epoch in seconds 
 seconds = 111
-# Target number of leading zeros for proof-of-work difficulty (initial value)
-target_leading_zeros = 1
+# Target number of leading zeros for proof-of-work difficulty (start with 1 for public mining)
+target_leading_zeros = 2
 # Retargeting parameters
-# Target number of coins per epoch for difficulty adjustment
-target_coins_per_epoch = 100
-# How often to retarget (every N epochs)
-retarget_interval = 10
-# Maximum difficulty adjustment factor (2.0 = can double or halve)
-max_difficulty_adjustment = 2.0
+# Target number of coins per epoch for difficulty adjustment (reduced for public mining)
+target_coins_per_epoch = 11
+# How often to retarget (every N epochs - more frequent for dynamic adjustment)
+retarget_interval = 3
+# Maximum difficulty adjustment factor 
+max_difficulty_adjustment = 2
 
 [mining]
 # Enable mining by default
 enabled = true
-# Memory usage for Argon2 hashing in KiB (64 MiB, initial value)
-mem_kib = 65536
-# Number of parallel lanes for Argon2
-lanes = 1
+# Memory usage for Argon2 hashing in KiB ( MiB, balanced for public mining)
+mem_kib = 265536
+# Number of parallel lanes for Argon2 (4 lanes for better parallelization)
+lanes = 2
+
 # Memory retargeting parameters
 # Minimum memory in KiB
-min_mem_kib = 16384  # 16 MiB minimum
-# Maximum memory in KiB  
-max_mem_kib = 262144 # 256 MiB maximum
-# Memory adjustment factor (1.5 = 50% increase/decrease max)
-max_memory_adjustment = 1.5
+min_mem_kib = 28192  
+
+# Maximum memory in KiB 
+max_mem_kib = 1231072 
+
+# Memory adjustment factor 
+max_memory_adjustment = 2
+
 # Miner stability settings for multi-node environments
-# Heartbeat interval in seconds (how often to check for missed anchors)
+# Heartbeat interval in seconds (more frequent for network stability)
 heartbeat_interval_secs = 60
-# Maximum consecutive failures before restarting miner
-max_consecutive_failures = 5
-# Maximum mining attempts per epoch before moving to next epoch
-max_mining_attempts = 1000000
+# Maximum consecutive failures before restarting miner (more forgiving for network issues)
+max_consecutive_failures = 20
+# Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
+max_mining_attempts = 15000000
 
 [metrics]
 # Address to bind metrics server (Prometheus format)

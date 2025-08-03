@@ -1,7 +1,7 @@
 use crate::{storage::Store, crypto, epoch::Anchor, coin::Coin, network::NetHandle, wallet::Wallet};
 use rand::Rng;
 use std::sync::Arc;
-use tokio::{sync::{mpsc}, task, time::{self, Duration}};
+use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
 use tokio::sync::broadcast::error::RecvError;
 
 pub fn spawn(
@@ -10,9 +10,10 @@ pub fn spawn(
     net: NetHandle,
     wallet: Arc<Wallet>, // The miner needs a persistent identity
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
+    shutdown_rx: Receiver<()>,
 ) {
     task::spawn(async move {
-        let mut miner = Miner::new(cfg, db, net, wallet, coin_tx);
+        let mut miner = Miner::new(cfg, db, net, wallet, coin_tx, shutdown_rx);
         miner.run().await;
     });
 }
@@ -23,6 +24,7 @@ struct Miner {
     net: NetHandle,
     wallet: Arc<Wallet>,
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
+    shutdown_rx: Receiver<()>,
     current_epoch: Option<u64>,
     last_heartbeat: time::Instant,
     consecutive_failures: u32,
@@ -36,6 +38,7 @@ impl Miner {
         net: NetHandle,
         wallet: Arc<Wallet>,
         coin_tx: mpsc::UnboundedSender<[u8; 32]>,
+        shutdown_rx: Receiver<()>,
     ) -> Self {
         Self {
             cfg: cfg.clone(),
@@ -43,6 +46,7 @@ impl Miner {
             net,
             wallet,
             coin_tx,
+            shutdown_rx,
             current_epoch: None,
             last_heartbeat: time::Instant::now(),
             consecutive_failures: 0,
@@ -51,7 +55,7 @@ impl Miner {
     }
 
     async fn run(&mut self) {
-        println!("⛏️  Starting enhanced miner with reconnection and fallback capabilities");
+        println!("⛏️  Starting miner with reconnection and fallback capabilities");
         
         loop {
             match self.try_connect_and_mine().await {
@@ -89,6 +93,12 @@ impl Miner {
         
         loop {
             tokio::select! {
+                // Handle shutdown signal
+                _ = self.shutdown_rx.recv() => {
+                    println!("🛑 Miner received shutdown signal");
+                    return Ok(());
+                }
+                
                 // Handle incoming anchors
                 anchor_result = anchor_rx.recv() => {
                     match anchor_result {
@@ -108,7 +118,7 @@ impl Miner {
                             return Err("Anchor broadcast channel closed".into());
                         }
                         Err(RecvError::Lagged(skipped)) => {
-                            eprintln!("⚠️  Anchor channel lagged, skipped {} messages", skipped);
+                            eprintln!("⚠️  Anchor channel lagged, skipped {skipped} messages");
                             
                             // Try to recover by requesting the latest epoch
                             if let Some(current_epoch) = self.current_epoch {
@@ -137,14 +147,16 @@ impl Miner {
                 // Heartbeat monitoring
                 _ = heartbeat_interval.tick() => {
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
-                    if since_last_heartbeat > Duration::from_secs(self.cfg.heartbeat_interval_secs * 2) {
+                    // Allow a more generous timeout (4× heartbeat interval) to avoid premature failures when epoch length exceeds 2×heartbeat.
+                    let timeout_secs = self.cfg.heartbeat_interval_secs * 4;
+                    if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());
                         
                         // Try to recover by requesting the next expected epoch
                         if let Some(current_epoch) = self.current_epoch {
                             let next_epoch = current_epoch + 1;
-                            println!("🔄 Requesting epoch #{} due to heartbeat timeout", next_epoch);
+                            println!("🔄 Requesting epoch #{next_epoch} due to heartbeat timeout");
                             self.net.request_epoch(next_epoch).await;
                             
                             // Also try to get from database
@@ -188,7 +200,7 @@ impl Miner {
             if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib, self.cfg.lanes) {
                 if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
                     let coin = Coin::new(anchor.hash, nonce, creator_address, pow_hash);
-                    println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(&coin.id), attempts);
+                    println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(coin.id), attempts);
 
                     if let Err(e) = self.db.put("coin", &coin.id, &coin) {
                         eprintln!("🔥 Failed to save coin to DB: {e}");
@@ -200,8 +212,8 @@ impl Miner {
                     }
                     
                     match self.coin_tx.send(coin.id) {
-                        Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(&coin.id)),
-                        Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {}", e),
+                        Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(coin.id)),
+                        Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {e}"),
                     }
                     
                     self.net.gossip_coin(&coin).await;

@@ -181,28 +181,26 @@ impl Wallet {
     /// The function is implemented defensively so once `transfer` persistence
     /// exists the spent-coin filter can be filled in without changing callers.
     pub fn list_unspent(&self) -> Result<Vec<crate::coin::Coin>> {
-        use std::fs;
-        use std::path::Path;
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
 
-        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
-        let coins_dir = store.coins_dir();
-        if !Path::new(&coins_dir).exists() {
-            return Ok(vec![]); // No coins yet
-        }
+        let cf = store
+            .db
+            .cf_handle("coin")
+            .ok_or_else(|| anyhow!("'coin' column family missing"))?;
 
+        let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut utxos = Vec::new();
-        for entry in fs::read_dir(&coins_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let data = fs::read(entry.path())?;
-                // Skip unreadable entries gracefully to avoid poisoning balance
-                if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&data) {
-                    if coin.creator_address == self.address {
-                        // A coin is unspent if there's no transfer recorded under the same ID
-                        let spent: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-                        if spent.is_none() {
-                            utxos.push(coin);
-                        }
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+                if coin.creator_address == self.address {
+                    let spent: Option<crate::transfer::Transfer> =
+                        store.get("transfer", &coin.id)?;
+                    if spent.is_none() {
+                        utxos.push(coin);
                     }
                 }
             }

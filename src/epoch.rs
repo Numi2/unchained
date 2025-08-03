@@ -19,6 +19,24 @@ impl Anchor {
         if difficulty == 0 { 1 } else { 1u128 << (difficulty * 8) }
     }
     
+    /// Check if this anchor represents a better chain than the current best
+    pub fn is_better_chain(&self, current_best: &Option<Anchor>) -> bool {
+        match current_best {
+            None => true, // Any chain is better than no chain
+            Some(best) => {
+                // Primary: Higher cumulative work wins
+                if self.cumulative_work > best.cumulative_work {
+                    return true;
+                }
+                // Secondary: If equal work, higher epoch number wins (longer chain)
+                if self.cumulative_work == best.cumulative_work && self.num > best.num {
+                    return true;
+                }
+                false
+            }
+        }
+    }
+    
     /// Calculate retargeted difficulty and memory using integer-only arithmetic
     /// to ensure cross-platform determinism, which is critical for consensus.
     pub fn calculate_retarget(
@@ -73,7 +91,7 @@ pub struct MerkleTree;
 impl MerkleTree {
     pub fn build_root(coin_ids: &HashSet<[u8; 32]>) -> [u8; 32] {
         if coin_ids.is_empty() { return [0u8; 32]; }
-        let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(|id| Coin::id_to_leaf_hash(id)).collect();
+        let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
         leaves.sort();
         while leaves.len() > 1 {
             let mut next_level = Vec::new();
@@ -107,7 +125,7 @@ impl MerkleTree {
         // Convert all coin IDs to leaf hashes and sort deterministically
         let mut leaves: Vec<[u8; 32]> = coin_ids
             .iter()
-            .map(|id| Coin::id_to_leaf_hash(id))
+            .map(Coin::id_to_leaf_hash)
             .collect();
         leaves.sort();
 
@@ -130,7 +148,7 @@ impl MerkleTree {
             proof.push((sibling_hash, sibling_is_left));
 
             // Build next tree level
-            let mut next_level = Vec::with_capacity((level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
             for chunk in level.chunks(2) {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&chunk[0]);
@@ -176,11 +194,19 @@ pub struct Manager {
     net:  NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
+    shutdown_rx: broadcast::Receiver<()>,
 }
 impl Manager {
-    pub fn new(db: Arc<Store>, cfg: crate::config::Epoch, mining_cfg: crate::config::Mining, net: NetHandle, coin_rx: mpsc::UnboundedReceiver<[u8; 32]>) -> Self {
+    pub fn new(
+        db: Arc<Store>, 
+        cfg: crate::config::Epoch, 
+        mining_cfg: crate::config::Mining, 
+        net: NetHandle, 
+        coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
+        shutdown_rx: broadcast::Receiver<()>
+    ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, mining_cfg, net, anchor_tx, coin_rx }
+        Self { db, cfg, mining_cfg, net, anchor_tx, coin_rx, shutdown_rx }
     }
 
     pub fn spawn(mut self) {
@@ -195,28 +221,31 @@ impl Manager {
 
             loop {
                 tokio::select! {
-                    // Prioritize receiving coins to avoid race conditions
                     biased;
                     
+                    // Handle shutdown signal
+                    _ = self.shutdown_rx.recv() => {
+                        println!("🛑 Epoch manager received shutdown signal");
+                        break;
+                    }
+                    
+                    // Prioritize receiving coins to avoid race conditions
                     Some(id) = self.coin_rx.recv() => { 
-                        println!("📥 Epoch manager received coin: {}", hex::encode(&id));
+                        println!("📥 Epoch manager received coin: {}", hex::encode(id));
                         buffer.insert(id);
                         // Drain any additional pending coins to avoid race condition
                         while let Ok(additional_id) = self.coin_rx.try_recv() {
-                            println!("📥 Epoch manager received additional coin: {}", hex::encode(&additional_id));
+                            println!("📥 Epoch manager received additional coin: {}", hex::encode(additional_id));
                             buffer.insert(additional_id);
                         }
                         println!("🗂️ Current buffer has {} coins", buffer.len());
 
                         if buffer.len() as u32 >= self.cfg.target_coins_per_epoch {
-                            println!("🏭 Target coin count reached -> creating epoch #{}", current_epoch);
+                            println!("🏭 Target coin count reached -> creating epoch #{current_epoch}");
                             let merkle_root = MerkleTree::build_root(&buffer);
                             let mut h = blake3::Hasher::new();
                             h.update(&merkle_root);
-                            let prev_anchor = match self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()) {
-                                Ok(anchor) => anchor,
-                                Err(_) => None,
-                            };
+                            let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
                             if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
                             let hash = *h.finalize().as_bytes();
 
@@ -239,8 +268,12 @@ impl Manager {
                             let mut batch = WriteBatch::default();
                             let serialized_anchor = bincode::serialize(&anchor).unwrap();
                             let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
-                            batch.put_cf(epoch_cf, &current_epoch.to_le_bytes(), &serialized_anchor);
+                            batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
                             batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                            // Index by hash for quick lookup during coin validation
+                            if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
+                                batch.put_cf(anchor_cf, &hash, &serialized_anchor);
+                            }
                             if let Err(e) = self.db.write_batch(batch) {
                                 eprintln!("🔥 Failed to write new epoch to DB: {e}");
                             } else {
@@ -256,12 +289,12 @@ impl Manager {
                         // Final drain of any coins that arrived just before epoch creation
                         let mut late_coins = 0;
                         while let Ok(id) = self.coin_rx.try_recv() {
-                            println!("📥 Last-minute coin received: {}", hex::encode(&id));
+                            println!("📥 Last-minute coin received: {}", hex::encode(id));
                             buffer.insert(id);
                             late_coins += 1;
                         }
                         if late_coins > 0 {
-                            println!("⏰ Collected {} late coins before epoch creation", late_coins);
+                            println!("⏰ Collected {late_coins} late coins before epoch creation");
                         }
                         println!("🏭 Creating epoch #{} with {} coins in buffer", current_epoch, buffer.len());
                         
@@ -269,10 +302,7 @@ impl Manager {
                         let mut h = blake3::Hasher::new();
                         h.update(&merkle_root);
                         
-                        let prev_anchor = match self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()) {
-                            Ok(anchor) => anchor,
-                            Err(_) => None,
-                        };
+                        let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
                         if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
                         let hash = *h.finalize().as_bytes();
                         
@@ -297,8 +327,12 @@ impl Manager {
                         let mut batch = WriteBatch::default();
                         let serialized_anchor = bincode::serialize(&anchor).unwrap();
                         let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
-                        batch.put_cf(epoch_cf, &current_epoch.to_le_bytes(), &serialized_anchor);
-                        batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                        batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
+                            batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                            // Index by hash for quick lookup during coin validation
+                            if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
+                                batch.put_cf(anchor_cf, &hash, &serialized_anchor);
+                            }
                         
                         if let Err(e) = self.db.write_batch(batch) {
                             eprintln!("🔥 Failed to write new epoch to DB: {e}");
@@ -314,13 +348,13 @@ impl Manager {
                             // Final final drain after the delay
                             let mut very_late_coins = 0;
                             while let Ok(id) = self.coin_rx.try_recv() {
-                                println!("📥 Very late coin received after delay: {}", hex::encode(&id));
+                                println!("📥 Very late coin received after delay: {}", hex::encode(id));
                                 buffer.insert(id);
                                 very_late_coins += 1;
                             }
                             
                             if very_late_coins > 0 {
-                                println!("🚨 WARNING: {} coins arrived after epoch creation! Updating epoch #{}", very_late_coins, current_epoch);
+                                println!("🚨 WARNING: {very_late_coins} coins arrived after epoch creation! Updating epoch #{current_epoch}");
                                 // Update the epoch with the additional coins
                                 let updated_anchor = Anchor { 
                                     num: current_epoch, 
@@ -334,8 +368,12 @@ impl Manager {
                                 let mut update_batch = WriteBatch::default();
                                 let updated_serialized = bincode::serialize(&updated_anchor).unwrap();
                                 let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
-                                update_batch.put_cf(epoch_cf, &current_epoch.to_le_bytes(), &updated_serialized);
+                                update_batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &updated_serialized);
                                 update_batch.put_cf(epoch_cf, b"latest", &updated_serialized);
+                                // Keep hash index in sync with any late-coin corrections
+                                if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
+                                    update_batch.put_cf(anchor_cf, &anchor.hash, &updated_serialized);
+                                }
                                 
                                 if let Err(e) = self.db.write_batch(update_batch) {
                                     eprintln!("🔥 Failed to update epoch with late coins: {e}");
@@ -357,6 +395,8 @@ impl Manager {
                     }
                 }
             }
+            
+            println!("✅ Epoch manager shutdown complete");
         });
     }
     

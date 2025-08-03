@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
         println!("   Difficulty: {}", latest_epoch.difficulty);
         println!("   Memory: {} KiB", latest_epoch.mem_kib);
         println!("   Coins in epoch: {}", latest_epoch.coin_count);
-        println!("   Hash: {}", hex::encode(&latest_epoch.hash));
+        println!("   Hash: {}", hex::encode(latest_epoch.hash));
     } else {
         println!("❌ No epochs found in database");
     }
@@ -42,8 +42,8 @@ fn main() -> anyhow::Result<()> {
     }
     
     println!("\n📈 Summary:");
-    println!("   Total epochs: {}", total_epochs);
-    println!("   Total coins (from epoch metadata): {}", coin_count_from_epochs);
+    println!("   Total epochs: {total_epochs}");
+    println!("   Total coins (from epoch metadata): {coin_count_from_epochs}");
     println!("   ⚠️  WARNING: This only counts coins recorded in epoch metadata!");
     println!("   ⚠️  Some coins may be mined but not properly recorded in epochs!");
     
@@ -54,8 +54,7 @@ fn main() -> anyhow::Result<()> {
         let mut log_files = 0;
         let mut total_size = 0u64;
         
-        for entry in entries {
-            if let Ok(entry) = entry {
+        for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if ext == "sst" {
@@ -67,12 +66,11 @@ fn main() -> anyhow::Result<()> {
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     total_size += metadata.len();
                 }
-            }
         }
         
-        println!("   SST files: {}", sst_files);
-        println!("   Log files: {}", log_files);
-        println!("   Total size: {} bytes", total_size);
+        println!("   SST files: {sst_files}");
+        println!("   Log files: {log_files}");
+        println!("   Total size: {total_size} bytes");
     }
     
     Ok(())
