@@ -357,8 +357,20 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     }
 
     let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
-    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port).parse()?)?;
     
+    // Debug: Show what we're listening on
+    let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port);
+    println!("🔍 Attempting to listen on: {}", listen_addr);
+    
+    swarm.listen_on(listen_addr.parse()?)?;
+    
+    // Debug: Show what we're trying to connect to
+    println!("🔍 Local peer ID: {}", peer_id);
+    println!("🔍 Local IP addresses:");
+    for addr in &cfg.bootstrap {
+        println!("   - {}", addr);
+    }
+
     // Connect to bootstrap peers, but skip if it's our own peer ID
     for addr in &cfg.bootstrap {
         let parsed_addr = addr.parse::<Multiaddr>()?;
@@ -444,6 +456,13 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                         },
                         SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _ } => {
                             eprintln!("❌ Failed to connect to peer {:?}: {:?}", peer_id, error);
+                            if let Some(peer_id) = peer_id {
+                                eprintln!("   This might be due to:");
+                                eprintln!("   - Firewall blocking port 7777");
+                                eprintln!("   - Target peer not running");
+                                eprintln!("   - Network connectivity issues");
+                                eprintln!("   - Wrong IP address in config.toml");
+                            }
                         },
                         SwarmEvent::IncomingConnectionError { local_addr, send_back_addr, error, connection_id: _ } => {
                             eprintln!("❌ Incoming connection failed from {} to {}: {:?}", send_back_addr, local_addr, error);

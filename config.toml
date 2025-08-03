@@ -23,7 +23,7 @@ path = "../blockchain_data"
 
 [epoch]
 # Duration of each epoch in seconds 
-seconds = 11
+seconds = 22
 # Target number of leading zeros for proof-of-work difficulty (start with 1 for public mining)
 target_leading_zeros = 1
 # Retargeting parameters
@@ -44,17 +44,17 @@ lanes = 2
 
 # Memory retargeting parameters
 # Minimum memory in KiB
-min_mem_kib = 16192  
+min_mem_kib = 16192
 
 # Maximum memor in KiB 
-max_mem_kib = 512007 
+max_mem_kib = 512007
 
 # Memory adjustment factor 
 max_memory_adjustment = 1.02
 
 # Miner stability settings for multi-node environments
 # Heartbeat interval in seconds (more frequent for network stability)
-heartbeat_interval_secs = 40
+heartbeat_interval_secs = 140
 # Maximum consecutive failures before restarting miner (more forgiving for network issues)
 max_consecutive_failures = 3
 # Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
