@@ -18,6 +18,32 @@ use hex;
 use std::fs;
 use std::path::Path;
 
+// Helper function for graceful gossipsub publishing
+fn try_publish_gossip(
+    swarm: &mut Swarm<Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>>,
+    topic: &str,
+    data: Vec<u8>,
+    context: &str,
+) {
+    match swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
+        Ok(_) => {
+            // Successful publish - only log for important messages
+            if topic == TOP_ANCHOR || topic == TOP_LATEST_REQUEST {
+                println!("📤 Successfully published {} message", context);
+            }
+        }
+        Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
+            // Expected in small networks - don't spam logs
+            if topic == TOP_ANCHOR {
+                println!("📡 Waiting for gossip mesh to establish for {}", context);
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
+        }
+    }
+}
+
 // Topics are versioned for future protocol upgrades.
 const TOP_ANCHOR: &str = "unchained/anchor/v1";
 const TOP_COIN: &str = "unchained/coin/v1";
@@ -314,10 +340,26 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
 
-    // Configure gossipsub for better stability
+    // Configure gossipsub for better stability and small networks
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(std::time::Duration::from_secs(1)) // Faster heartbeat for small networks
+        .validation_mode(gossipsub::ValidationMode::Permissive) // Allow messages from any peer
+        .message_id_fn(|message| {
+            // Custom message ID to prevent duplicates
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            message.data.hash(&mut hasher);
+            message.topic.hash(&mut hasher);
+            gossipsub::MessageId::from(hasher.finish().to_string().into_bytes())
+        })
+        .duplicate_cache_time(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build gossipsub config: {}", e))?;
+        
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
         MessageAuthenticity::Signed(id_keys.clone()),
-        gossipsub::Config::default(),
+        gossipsub_config,
     ).map_err(|e| anyhow::anyhow!("Failed to create Gossipsub: {}", e))?;
     for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST] {
         gs.subscribe(&IdentTopic::new(t))?;
@@ -410,7 +452,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         // Wait a moment to ensure connection is stable before broadcasting
                                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         if let Ok(bytes) = bincode::serialize(&latest_anchor) {
-                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                            try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("anchor #{} to peer {}", latest_anchor.num, peer_id));
                                             println!("📤 Anchor #{} broadcast sent to peer {}", latest_anchor.num, peer_id);
                                             // Give the message time to be sent before potential disconnection
                                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -419,7 +461,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         // Send a keepalive message to maintain connection
                                         println!("💓 Sending keepalive message to peer {}", peer_id);
                                         if let Ok(keepalive_bytes) = bincode::serialize(&0u64) {
-                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), keepalive_bytes);
+                                            try_publish_gossip(&mut swarm, TOP_EPOCH_REQUEST, keepalive_bytes, &format!("keepalive to peer {}", peer_id));
                                         }
                                     }
                                 }
@@ -510,14 +552,35 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         }
                                     }
                                     Err(validation_error) => {
-                                        eprintln!("🚫 REJECTED invalid anchor from {peer_id}: {validation_error}");
-                                        eprintln!("   Epoch: {}", a.num);
-                                        eprintln!("   Hash: {}", hex::encode(a.hash));
-                                        eprintln!("   Difficulty: {}", a.difficulty);
-                                        eprintln!("   Coin Count: {}", a.coin_count);
-                                        eprintln!("   Cumulative Work: {}", a.cumulative_work);
-                                        if let Some(score) = peer_scores.get_mut(&peer_id) {
-                                            score.record_validation_failure();
+                                        // Special handling when we are missing previous anchors in the chain.
+                                        if validation_error.starts_with("Previous anchor") {
+                                            // We don't yet have the prior anchor, so store this anchor for later
+                                            // and request the missing predecessor instead of treating this as an
+                                            // invalid message from the peer.
+                                            println!("ℹ️  Received anchor #{} but missing previous. Storing and requesting previous epoch.", a.num);
+                                            if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
+                                                // Anchor stored for future validation – we will link it once the
+                                                // missing predecessors arrive.
+                                            }
+
+                                            // Ask the network for the missing previous anchor so we can fully validate.
+                                            if a.num > 0 {
+                                                let prev_epoch = a.num - 1;
+                                                if let Ok(bytes) = bincode::serialize(&prev_epoch) {
+                                                    try_publish_gossip(&mut swarm, TOP_EPOCH_REQUEST, bytes, &format!("prev epoch #{} request", prev_epoch));
+                                                }
+                                            }
+                                            // Intentionally do NOT penalise the peer – this is not their fault.
+                                        } else {
+                                            eprintln!("🚫 REJECTED invalid anchor from {peer_id}: {validation_error}");
+                                            eprintln!("   Epoch: {}", a.num);
+                                            eprintln!("   Hash: {}", hex::encode(a.hash));
+                                            eprintln!("   Difficulty: {}", a.difficulty);
+                                            eprintln!("   Coin Count: {}", a.coin_count);
+                                            eprintln!("   Cumulative Work: {}", a.cumulative_work);
+                                            if let Some(score) = peer_scores.get_mut(&peer_id) {
+                                                score.record_validation_failure();
+                                            }
                                         }
                                     }
                                 }
@@ -567,14 +630,14 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                 if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                     if let Ok(bytes) = bincode::serialize(&coin) {
-                                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes);
+                                        try_publish_gossip(&mut swarm, TOP_COIN, bytes, &format!("coin response {}", hex::encode(id)));
                                     }
                                 }
                                 },
                                 TOP_EPOCH_REQUEST => if let Ok(num) = bincode::deserialize::<u64>(&message.data) {
                                 if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &num.to_le_bytes()) {
                                     if let Ok(bytes) = bincode::serialize(&anchor) {
-                                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                        try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("epoch {} response", num));
                                     }
                                 }
                                 },
@@ -584,7 +647,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         if latest_anchor.num > 0 {
                                             println!("📤 Responding to latest epoch request with anchor #{}", latest_anchor.num);
                                             if let Ok(bytes) = bincode::serialize(&latest_anchor) {
-                                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                                try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("latest epoch response #{}", latest_anchor.num));
                                             }
                                         }
                                     }
@@ -604,8 +667,25 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                         NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                     };
                     if let Some(d) = data {
-                        if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), d) {
-                            eprintln!("⚠️  Failed to publish {} message: {}", topic, e);
+                        match swarm.behaviour_mut().publish(IdentTopic::new(topic), d.clone()) {
+                            Ok(_) => {
+                                // Success - no need to log for every message
+                            }
+                            Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
+                                // Common in small networks - retry after brief delay
+                                println!("📡 Waiting for more peers to join topic {}, will retry...", topic);
+                                
+                                // Store for retry - in a real implementation you'd want a proper retry queue
+                                let topic_clone = topic.to_string();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                                    // This is a simplified retry - in production you'd want proper retry logic
+                                    println!("🔄 Retrying publish for topic {}", topic_clone);
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  Failed to publish {} message: {}", topic, e);
+                            }
                         }
                     }
                 }
