@@ -22,7 +22,7 @@ export function Wallet({ walletInfo, onUnlockWallet, loading }: WalletProps) {
     e.preventDefault();
     if (passphrase.trim()) {
       try {
-        await onUnlockWallet(passphrase);
+        await onUnlockWallet(passphrase.trim());
         setPassphrase('');
       } catch (error) {
         // Error is handled by the parent component

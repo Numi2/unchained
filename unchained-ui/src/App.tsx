@@ -27,10 +27,12 @@ function App() {
     walletInfo,
     nodeStatus,
     recentEpochs,
+    recentBlocks,
     loading,
     error,
     clearError,
     loadConfig,
+    getNodeStatus,
     unlockWallet,
     startNode,
     stopNode,
@@ -48,8 +50,10 @@ function App() {
 
   const handleStartNode = async () => {
     try {
-      // Try multiple possible config paths
-      await startNode('../../config.toml');
+      // Only start if not already running
+      if (!nodeStatus.running) {
+        await startNode('../../config.toml');
+      }
     } catch (error) {
       // Error is handled by the hook
     }
@@ -73,7 +77,7 @@ function App() {
 
   const handleUnlockWallet = async (passphrase: string) => {
     try {
-      await unlockWallet(passphrase);
+      await unlockWallet(passphrase.trim());
     } catch (error) {
       // Error is handled by the hook
       throw error;
@@ -105,6 +109,7 @@ function App() {
         startNode={startNode}
         unlockWallet={unlockWallet}
         toggleMining={toggleMining}
+        getNodeStatus={getNodeStatus}
         onComplete={() => setOnboardingDone(true)}
       />
     );
@@ -215,6 +220,7 @@ function App() {
               <Mining
                 nodeStatus={nodeStatus}
                 recentEpochs={recentEpochs}
+                recentBlocks={recentBlocks}
                 onToggleMining={handleToggleMining}
                 loading={loading}
               />

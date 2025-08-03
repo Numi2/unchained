@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { WalletInfo, NodeStatus, EpochInfo } from '@/types/blockchain';
+import { WalletInfo, NodeStatus, EpochInfo, BlockInfo } from '@/types/blockchain';
 
 export const useBlockchain = () => {
   const [walletInfo, setWalletInfo] = useState<WalletInfo | null>(null);
@@ -11,6 +11,7 @@ export const useBlockchain = () => {
     coins_mined: 0,
   });
   const [recentEpochs, setRecentEpochs] = useState<EpochInfo[]>([]);
+  const [recentBlocks, setRecentBlocks] = useState<BlockInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>('');
 
@@ -58,9 +59,14 @@ export const useBlockchain = () => {
       return status;
     } catch (err) {
       setError(`Failed to get node status: ${err}`);
-      return nodeStatus;
+      return {
+        running: false,
+        mining: false,
+        peers: 0,
+        coins_mined: 0,
+      } as NodeStatus;
     }
-  }, [nodeStatus]);
+  }, []);
 
   const getRecentEpochs = useCallback(async (limit: number = 10) => {
     try {
@@ -69,6 +75,17 @@ export const useBlockchain = () => {
       return epochs;
     } catch (err) {
       setError(`Failed to get recent epochs: ${err}`);
+      return [];
+    }
+  }, []);
+
+  const getRecentBlocks = useCallback(async (limit: number = 10) => {
+    try {
+      const blocks = await invoke<BlockInfo[]>('get_recent_blocks', { limit });
+      setRecentBlocks(blocks);
+      return blocks;
+    } catch (err) {
+      setError(`Failed to get recent blocks: ${err}`);
       return [];
     }
   }, []);
@@ -110,6 +127,10 @@ export const useBlockchain = () => {
     try {
       const result = await invoke<string>('toggle_mining', { enabled });
       await getNodeStatus();
+      // Refresh wallet info after mining is toggled to get updated balance
+      if (walletInfo) {
+        await getWalletInfo();
+      }
       return result;
     } catch (err) {
       setError(`Failed to toggle mining: ${err}`);
@@ -117,7 +138,7 @@ export const useBlockchain = () => {
     } finally {
       setLoading(false);
     }
-  }, [getNodeStatus]);
+  }, [getNodeStatus, walletInfo, getWalletInfo]);
 
   const createTransfer = useCallback(async (toAddress: string, coinId: string, passphrase: string) => {
     setLoading(true);
@@ -155,19 +176,22 @@ export const useBlockchain = () => {
       const interval = setInterval(() => {
         getNodeStatus();
         getRecentEpochs();
-        if (walletInfo) {
+        getRecentBlocks();
+        // Only refresh wallet info every 30 seconds to reduce CLI spam
+        if (walletInfo && Date.now() % 30000 < 5000) {
           getWalletInfo();
         }
-      }, 5000); // Refresh every 5 seconds
+      }, 10000); // Refresh every 10 seconds instead of 5
 
       return () => clearInterval(interval);
     }
-  }, [nodeStatus.running, walletInfo, getNodeStatus, getRecentEpochs, getWalletInfo]);
+  }, [nodeStatus.running, walletInfo, getNodeStatus, getRecentEpochs, getRecentBlocks, getWalletInfo]);
 
   return {
     walletInfo,
     nodeStatus,
     recentEpochs,
+    recentBlocks,
     loading,
     error,
     clearError,
@@ -176,6 +200,7 @@ export const useBlockchain = () => {
     unlockWallet,
     getNodeStatus,
     getRecentEpochs,
+    getRecentBlocks,
     startNode,
     stopNode,
     toggleMining,

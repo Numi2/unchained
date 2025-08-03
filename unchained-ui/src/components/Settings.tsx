@@ -52,7 +52,7 @@ export function Settings({ onLoadConfig, loading }: SettingsProps) {
             <span>Configuration File</span>
           </CardTitle>
           <CardDescription>
-            Load and view UnchainedCoin node configuration
+            Load and view unchained node configuration
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -278,7 +278,7 @@ export function Settings({ onLoadConfig, loading }: SettingsProps) {
             </p>
             <p>
               <strong className="text-foreground">Network Settings:</strong> Configure bootstrap nodes to 
-              connect to other peers in the UnchainedCoin network.
+              connect to other peers in the unchained network.
             </p>
             <p>
               <strong className="text-foreground">Security:</strong> All settings maintain post-quantum 

@@ -204,7 +204,7 @@ export function Transfer({ walletInfo, onCreateTransfer, onGetOwnedCoins, loadin
                     <code className="text-sm break-all flex-1 mr-2">
                       {coin.slice(0, 16)}...{coin.slice(-16)}
                     </code>
-                    <Badge variant="outline">1 UCC</Badge>
+                    <Badge variant="outline">1 numicoin</Badge>
                   </div>
                 ))}
               </div>
@@ -235,7 +235,7 @@ export function Transfer({ walletInfo, onCreateTransfer, onGetOwnedCoins, loadin
         </CardHeader>
         <CardContent>
           <div className="space-y-2 text-sm text-muted-foreground">
-            <p>• Each coin has a value of 1 UCC and can be transferred individually</p>
+            <p>• Each coin has a value of 1 numicoin and can be transferred individually</p>
             <p>• Addresses are 32-byte hex strings (64 characters)</p>
             <p>• Transfers require your wallet passphrase for security</p>
             <p>• All transfers use post-quantum Dilithium3 signatures</p>

@@ -1,17 +1,19 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { NodeStatus, EpochInfo } from '@/types/blockchain';
+import { NodeStatus, EpochInfo, BlockInfo } from '@/types/blockchain';
 import { Cpu, Zap, Timer, MemoryStick, Target, TrendingUp } from 'lucide-react';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
 interface MiningProps {
   nodeStatus: NodeStatus;
   recentEpochs: EpochInfo[];
+  recentBlocks: BlockInfo[];
   onToggleMining: (enabled: boolean) => Promise<void>;
   loading: boolean;
 }
 
-export function Mining({ nodeStatus, recentEpochs, onToggleMining, loading }: MiningProps) {
+export function Mining({ nodeStatus, recentEpochs, recentBlocks, onToggleMining, loading }: MiningProps) {
   const latestEpoch = recentEpochs[0];
   
   // Calculate mining efficiency metrics
@@ -110,9 +112,37 @@ export function Mining({ nodeStatus, recentEpochs, onToggleMining, loading }: Mi
           </div>
           {nodeStatus.mining && (
             <p className="text-sm text-muted-foreground mt-2">
-              Mining with Argon2id proof-of-work algorithm using post-quantum security
+              Mining with Argon2id proof-of-work algorithm
             </p>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Recent Blocks */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Blocks</CardTitle>
+          <CardDescription>Recently mined blocks</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>ID</TableHead>
+                <TableHead>Epoch</TableHead>
+                <TableHead>Height</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {recentBlocks.map((block) => (
+                <TableRow key={block.id}>
+                  <TableCell className="font-mono">{block.id.substring(0, 16)}...</TableCell>
+                  <TableCell>{block.created_at_epoch}</TableCell>
+                  <TableCell>{block.created_at_height}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
 
@@ -120,7 +150,7 @@ export function Mining({ nodeStatus, recentEpochs, onToggleMining, loading }: Mi
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Coins Mined</CardTitle>
+            <CardTitle className="text-sm font-medium"> Blocks unchained</CardTitle>
             <Target className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
@@ -239,12 +269,12 @@ export function Mining({ nodeStatus, recentEpochs, onToggleMining, loading }: Mi
       {/* Mining Info */}
       <Card>
         <CardHeader>
-          <CardTitle>About UnchainedCoin Mining</CardTitle>
+          <CardTitle>About unchained Mining</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="space-y-3 text-sm text-muted-foreground">
             <p>
-              <strong className="text-foreground">Post-Quantum Security:</strong> UnchainedCoin uses Dilithium3 
+              <strong className="text-foreground">Post-Quantum Security:</strong> unchained uses Dilithium3 
               signatures and hybrid key exchange to resist quantum computer attacks.
             </p>
             <p>

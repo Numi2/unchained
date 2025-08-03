@@ -27,8 +27,8 @@ export function Dashboard({
     <div className="space-y-6 p-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold">UnchainedCoin Dashboard</h1>
-          <p className="text-muted-foreground">Post-quantum blockchain node management</p>
+          <h1 className="text-3xl font-bold">Unchained Dashboard</h1>
+          <p className="text-muted-foreground">Post-quantum blockchain</p>
         </div>
         <div className="flex gap-2">
           {!nodeStatus.running ? (
@@ -97,7 +97,7 @@ export function Dashboard({
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Coins Mined</CardTitle>
+            <CardTitle className="text-sm font-medium">Blocks unchained</CardTitle>
             <Coins className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>

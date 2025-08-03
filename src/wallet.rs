@@ -210,7 +210,9 @@ impl Wallet {
 
     /// Sum of `value` across all unspent coins.
     pub fn balance(&self) -> Result<u64> {
-        Ok(self.list_unspent()?.iter().map(|c| c.value).sum())
+        let unspent = self.list_unspent()?;
+        let balance = unspent.iter().map(|c| c.value).sum();
+        Ok(balance)
     }
 
     /// Selects a minimal set of inputs whose combined value ≥ `amount`.

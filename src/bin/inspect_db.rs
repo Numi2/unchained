@@ -1,7 +1,7 @@
 use unchainedcoin::{storage, epoch::Anchor};
 
 fn main() -> anyhow::Result<()> {
-    println!("🔍 Inspecting UnchainedCoin Database...");
+    println!("🔍 Inspecting unchained Database...");
     
     let db = storage::open(&unchainedcoin::config::Storage { path: "./data".to_string() });
     

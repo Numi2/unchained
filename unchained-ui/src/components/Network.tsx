@@ -129,7 +129,7 @@ export function Network({ nodeStatus, loading }: NetworkProps) {
           <CardContent>
             <div className="text-lg font-bold">QUIC</div>
             <p className="text-xs text-muted-foreground">
-              Post-quantum ready
+             
             </p>
           </CardContent>
         </Card>
@@ -140,7 +140,7 @@ export function Network({ nodeStatus, loading }: NetworkProps) {
         <CardHeader>
           <CardTitle>Connected Peers</CardTitle>
           <CardDescription>
-            Other UnchainedCoin nodes in the network
+            
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -216,7 +216,7 @@ export function Network({ nodeStatus, loading }: NetworkProps) {
         <CardHeader>
           <CardTitle>Network Information</CardTitle>
           <CardDescription>
-            Technical details about the UnchainedCoin network
+            Technical details about the unchained network
           </CardDescription>
         </CardHeader>
         <CardContent>

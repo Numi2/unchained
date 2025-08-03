@@ -59,13 +59,17 @@ impl Miner {
         
         loop {
             match self.try_connect_and_mine().await {
-                Ok(_) => {
-                    // Successful mining session completed
+                Ok(()) => {
+                    // Successful mining session (found coin or epoch finished)
                     self.consecutive_failures = 0;
                     println!("✅ Mining session completed successfully");
                 }
                 Err(e) => {
                     self.consecutive_failures += 1;
+                    if e.to_string() == "Shutdown" {
+                        println!("🛑 Miner shut down gracefully");
+                        break;
+                    }
                     eprintln!("❌ Mining session failed (attempt {}/{}): {}", 
                              self.consecutive_failures, self.max_consecutive_failures, e);
                     
@@ -85,18 +89,31 @@ impl Miner {
         }
     }
 
-    async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { /* actual code continues */
         let mut anchor_rx = self.net.anchor_subscribe();
         let mut heartbeat_interval = time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
         
         println!("🔗 Connected to anchor broadcast channel");
+        
+        // NEW: Immediately fetch the latest epoch from the database so that a miner started mid-epoch
+        // doesn’t have to wait for the next anchor broadcast (which can be several minutes away).
+        if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+            println!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
+            self.current_epoch = Some(latest_anchor.num);
+            self.last_heartbeat = time::Instant::now();
+            // Start mining straight away. If this fails (e.g., because the epoch already finished)
+            // we’ll simply continue to the select! loop and await the next anchor.
+            if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
+                eprintln!("⚠️  Initial mining attempt failed: {e}");
+            }
+        }
         
         loop {
             tokio::select! {
                 // Handle shutdown signal
                 _ = self.shutdown_rx.recv() => {
                     println!("🛑 Miner received shutdown signal");
-                    return Ok(());
+                    return Err("Shutdown".into());
                 }
                 
                 // Handle incoming anchors
@@ -147,8 +164,9 @@ impl Miner {
                 // Heartbeat monitoring
                 _ = heartbeat_interval.tick() => {
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
-                    // Allow a more generous timeout (4× heartbeat interval) to avoid premature failures when epoch length exceeds 2×heartbeat.
-                    let timeout_secs = self.cfg.heartbeat_interval_secs * 4;
+                    // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
+                    // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
+                    let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());
@@ -178,7 +196,10 @@ impl Miner {
         }
     }
 
-    async fn mine_epoch(&self, anchor: Anchor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn mine_epoch(&mut self, anchor: Anchor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Subscribe to anchor broadcasts so we can abort immediately when a newer epoch arrives.
+        let mut live_anchor_rx = self.net.anchor_subscribe();
+
         let creator_address = self.wallet.address();
         let mem_kib = anchor.mem_kib;
         let difficulty = anchor.difficulty;
@@ -186,19 +207,24 @@ impl Miner {
         let max_attempts = self.cfg.max_mining_attempts;
 
         println!("🎯 Starting mining for epoch #{} with {} lanes", anchor.num, self.cfg.lanes);
+        println!("⚙️  Mining parameters: difficulty={}, mem_kib={}", difficulty, mem_kib);
 
         loop {
             attempts += 1;
             if attempts > max_attempts {
                 eprintln!("⚠️  Reached max attempts for epoch #{}, continuing to next epoch", anchor.num);
-                return Ok(()); // Continue to next epoch rather than failing completely
+                return Ok(()); // Continue to next epoch
             }
 
             let nonce: u64 = rand::thread_rng().gen();
             let header = Coin::header_bytes(&anchor.hash, nonce, &creator_address);
             
             if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib, self.cfg.lanes) {
-                if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+                                    if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+                    // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
+                    // Finding a coin proves the current epoch is still active.
+                    self.last_heartbeat = time::Instant::now();
+
                     let coin = Coin::new(anchor.hash, nonce, creator_address, pow_hash);
                     println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(coin.id), attempts);
 
@@ -221,9 +247,37 @@ impl Miner {
                 }
             }
             
-            // Progress indicator every 10000 attempts
-            if attempts % 10000 == 0 {
+            // Every 10 000 attempts yield to the scheduler and check if a newer epoch exists.
+            if attempts % 10_000 == 0 {
+                // Progress indicator
                 println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
+
+                // NEW: abort early if the chain has already advanced.
+                // First, non-blocking check of the live anchor broadcast channel (fast-path).
+                match live_anchor_rx.try_recv() {
+                    Ok(new_anchor) => {
+                        if new_anchor.num > anchor.num {
+                            println!("🔄 Received newer epoch #{} while mining #{} – switching epochs", new_anchor.num, anchor.num);
+                            return Ok(()); // Outer loop will handle the fresh anchor
+                        }
+                    },
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        // Channel closed: treat as abort signal
+                        return Err("Anchor broadcast channel closed".into());
+                    },
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                }
+
+                // Slow-path: also verify DB in case we missed the broadcast (unlikely but safe on multi-node).
+                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                    if latest_anchor.num > anchor.num {
+                        println!("🔄 Detected newer epoch #{} in DB while mining #{}, stopping current mining", latest_anchor.num, anchor.num);
+                        return Ok(());
+                    }
+                }
+
+                // Let other tasks run so we don’t starve the runtime.
+                tokio::task::yield_now().await;
             }
         }
     }

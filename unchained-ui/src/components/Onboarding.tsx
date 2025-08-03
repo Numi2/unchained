@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -27,6 +27,8 @@ interface OnboardingProps {
   unlockWallet: (passphrase: string) => Promise<any>;
   /** Enables / disables mining */
   toggleMining: (enabled: boolean) => Promise<any>;
+  /** Gets current node status */
+  getNodeStatus: () => Promise<NodeStatus>;
 
   /** Called once the onboarding flow has successfully completed */
   onComplete: () => void;
@@ -48,6 +50,7 @@ export function Onboarding({
   startNode,
   unlockWallet,
   toggleMining,
+  getNodeStatus,
   onComplete,
 }: OnboardingProps) {
   /** Local wizard step */
@@ -59,16 +62,23 @@ export function Onboarding({
   /** Internal loading state so that we can disable the buttons while we wait */
   const [submitting, setSubmitting] = useState(false);
 
-  /** Handles the primary “Start” button: spins up the node then unlocks wallet */
+  // Check node status on mount
+  useEffect(() => {
+    getNodeStatus();
+  }, [getNodeStatus]);
+
+  /** Handles the primary "Start" button: spins up the node then unlocks wallet */
   const handleStart = async () => {
     if (submitting) return;
     setSubmitting(true);
     clearError();
 
     try {
-      // 1) Boot the node. The config file lives two directories above the
-      //    frontend source (../../config.toml when executed from the FE).
-      await startNode('../../config.toml');
+      // 1) Boot the node (only if not already running)
+      if (!nodeStatus.running) {
+        // The config file lives two directories above the frontend source
+        await startNode('../../config.toml');
+      }
 
       // 2) Unlock or create the wallet using the given pass-phrase. Falling
       //    back to a default pass-phrase feels wrong from a security stand-
@@ -127,7 +137,7 @@ export function Onboarding({
             {step === 'readyToMine' && 'All set!'}
           </CardTitle>
           <CardDescription>
-            {step === 'form' && 'Enter a passphrase to create / unlock your wallet and start the node.'}
+            {step === 'form' && 'Enter a passphrase to create your wallet and start the node.'}
             {step === 'readyToMine' && 'Your node & wallet are ready. Start mining to earn coins.'}
           </CardDescription>
         </CardHeader>

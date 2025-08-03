@@ -5983,8 +5983,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-opener"
 version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecee219f11cdac713ab32959db5d0cceec4810ba4f4458da992292ecf9660321"
+source = "git+https://github.com/tauri-apps/plugins-workspace?branch=v2#fe23a5e01399a6ad61426bf8a94a6bb97227cf88"
 dependencies = [
  "dunce",
  "glob",
@@ -6110,7 +6109,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.8",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6547,10 +6546,12 @@ name = "unchainedcoin-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
- "blake3",
+ "bincode",
  "chrono",
  "hex",
+ "log",
+ "rand 0.8.5",
+ "rocksdb",
  "serde",
  "serde_json",
  "tauri",

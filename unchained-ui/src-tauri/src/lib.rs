@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use tauri::State;
 use tokio::sync::{broadcast, mpsc};
 use std::collections::HashMap;
+use rocksdb;
+use bincode;
 
 // Import UnchainedCoin modules
-use unchainedcoin::{
+use unchainedcoin::{coin::Coin, 
     config::{self},
     storage::{self, Store},
     wallet::Wallet,
@@ -31,6 +33,8 @@ pub struct AppState {
     pub shutdown_tx: Option<broadcast::Sender<()>>,
     pub coin_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
     pub background_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    // Mining-specific shutdown
+    pub mining_shutdown_tx: Option<broadcast::Sender<()>>,
 }
 
 // Response types for the frontend
@@ -59,6 +63,13 @@ pub struct EpochInfo {
     pub coin_count: u32,
     pub cumulative_work: String, // u128 as string for JSON compatibility
     pub mem_kib: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BlockInfo {
+    pub id: String,
+    pub created_at_epoch: u64,
+    pub created_at_height: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -260,6 +271,35 @@ async fn get_recent_epochs(
 }
 
 #[tauri::command]
+async fn get_recent_blocks(
+    limit: usize,
+    state: State<'_, Mutex<AppState>>
+) -> Result<Vec<BlockInfo>, String> {
+    let app_state = state.lock().unwrap();
+    match &app_state.db {
+        Some(db) => {
+            let mut blocks = Vec::new();
+            let cf = db.db.cf_handle("coin").unwrap();
+            let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::End);
+
+            for item in iter.take(limit) {
+                if let Ok((_key, value)) = item {
+                    if let Ok(coin) = bincode::deserialize::<Coin>(&value) {
+                        blocks.push(BlockInfo {
+                            id: hex::encode(coin.id),
+                            created_at_epoch: 0,
+                            created_at_height: 0,
+                        });
+                    }
+                }
+            }
+            Ok(blocks)
+        }
+        None => Err("Database not initialized".to_string()),
+    }
+}
+
+#[tauri::command]
 async fn start_node(
     config_path: String,
     state: State<'_, Mutex<AppState>>
@@ -301,14 +341,38 @@ async fn start_node_impl(
         .or_else(|| resolve_config_path("config.toml"))
         .ok_or_else(|| format!("Failed to locate config file: tried '{}', '../config.toml', '../../config.toml', 'config.toml'", config_path))?;
 
-    let cfg = config::load(&cfg_path)
+    let mut cfg = config::load(&cfg_path)
         .map_err(|e| format!("Failed to load config: {}", e))?;
     println!("✅ Configuration loaded successfully");
+
+    // ------------------------------------------------------------------
+    // Resolve storage path relative to the config file’s directory so that
+    // the Tauri app (launched from a deeper folder) shares the **same** DB
+    // location as the CLI.
+    // ------------------------------------------------------------------
+    if std::path::Path::new(&cfg.storage.path).is_relative() {
+        if let Some(cfg_dir) = std::path::Path::new(&cfg_path).parent() {
+            let abs = cfg_dir.join(&cfg.storage.path);
+            cfg.storage.path = abs.to_string_lossy().into_owned();
+        }
+    }
     
-    // Open database
-    println!("🗄️  Opening database at: {}", cfg.storage.path);
-    let db = storage::open(&cfg.storage);
-    println!("✅ Database opened successfully");
+    // Open or reuse database
+    let db = {
+        let existing = {
+            let app_state = state.lock().unwrap();
+            app_state.db.clone()
+        };
+        if let Some(db) = existing {
+            println!("🔄 Reusing existing database connection");
+            db
+        } else {
+            println!("🗄️  Opening database at: {}", cfg.storage.path);
+            let db = storage::open(&cfg.storage);
+            println!("✅ Database opened successfully");
+            db
+        }
+    };
     
     // Create shutdown broadcast channel for coordinated shutdown
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -316,23 +380,20 @@ async fn start_node_impl(
     // ------------------------------------------------------------------
     // Wallet handling
     // ------------------------------------------------------------------
-    // A wallet should only be loaded once the user has provided a valid
-    // pass-phrase.  At node start-up this is not yet the case, therefore we
-    // attempt to load the wallet *only* if the WALLET_PASSPHRASE environment
-    // variable is already set **and non-empty**.  This prevents the previous
-    // behaviour of silently creating a wallet protected by the insecure
-    // default pass-phrase "default".
-    //
-    // The wallet will typically be loaded later through the `unlock_wallet`
-    // command which sets the environment variable and updates the app state.
+    // The node can start without an unlocked wallet. Mining (and any wallet
+    // related operations) will only be enabled once the user provides a
+    // pass-phrase through the `unlock_wallet` command. If a pass-phrase is
+    // supplied via the `WALLET_PASSPHRASE` environment variable we'll attempt
+    // to load (or create) the wallet immediately, otherwise we postpone wallet
+    // creation to the explicit unlock step.
     // ------------------------------------------------------------------
 
     let wallet: Option<Arc<Wallet>> = match std::env::var("WALLET_PASSPHRASE") {
         Ok(ref p) if !p.trim().is_empty() => {
-            println!("👛 Loading wallet with provided passphrase…");
+            println!("👛 Loading/creating wallet with provided passphrase…");
             match Wallet::load_or_create(db.clone()) {
                 Ok(w) => {
-                    println!("✅ Wallet loaded successfully");
+                    println!("✅ Wallet ready. Address: {}", hex::encode(w.address()));
                     Some(Arc::new(w))
                 }
                 Err(e) => {
@@ -342,7 +403,7 @@ async fn start_node_impl(
             }
         }
         _ => {
-            println!("🔐 No wallet passphrase supplied – skipping wallet loading");
+            println!("🔑 No wallet passphrase provided – node will start without wallet. You can unlock or create one later.");
             None
         }
     };
@@ -400,9 +461,11 @@ async fn start_node_impl(
         app_state.shutdown_tx = Some(shutdown_tx);
         app_state.coin_tx = Some(coin_tx);
         app_state.node_running = true;
+        // Clear previous mining flag so UI reflects fresh state
+        app_state.mining_enabled = false;
     } // Lock dropped here
     
-    println!("🚀 UnchainedCoin node started successfully!");
+    println!("🚀 unchained node started successfully!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
     println!("   📊 Metrics available on http://{}", cfg.metrics.bind);
     
@@ -445,33 +508,31 @@ async fn stop_node(state: State<'_, Mutex<AppState>>) -> Result<String, String> 
         handle.abort();
     }
     
-    // Clean shutdown
-    if let Some(db) = db {
-        if let Err(e) = db.close() {
-            eprintln!("Warning: Database cleanup failed: {}", e);
-        } else {
-            println!("✅ Database closed cleanly");
+    // Flush DB (keep open) so next start reuses the same handle
+    if let Some(db) = db.as_ref() {
+        if let Err(e) = db.flush() {
+            eprintln!("Warning: Database flush failed: {}", e);
         }
+        println!("✅ Database flushed");
     }
     
-    // Reset app state
+    // Reset runtime state but keep DB handle for quick restart
     {
         let mut app_state = state.lock().unwrap();
         app_state.node_running = false;
         app_state.mining_enabled = false;
         app_state.network = None;
-        app_state.db = None;
-        app_state.wallet = None;
-        app_state.config = None;
+        // Keep db and wallet so they can be reused on next start
         app_state.shutdown_tx = None;
         app_state.coin_tx = None;
+        app_state.mining_shutdown_tx = None;
+        // Don’t clear config so relative paths remain resolved
 
-        // Clear wallet passphrase from environment so that the next session
-        // requires the user to re-enter it.
+        // Clear wallet passphrase so the next session requires the user to re-enter it.
         std::env::remove_var("WALLET_PASSPHRASE");
     } // Lock dropped here
     
-    println!("👋 UnchainedCoin node stopped");
+    println!("👋 unchained node stopped");
     Ok("Node stopped successfully".to_string())
 }
 
@@ -485,33 +546,40 @@ async fn toggle_mining(
     if !app_state.node_running {
         return Err("Node must be running to control mining".to_string());
     }
+    if enabled && app_state.wallet.is_none() {
+        return Err("Unlock or create a wallet before starting mining".to_string());
+    }
     
     // Get required components for mining
-    let (config, db, network, wallet, coin_tx, shutdown_tx) = {
+    let (config, db, network, wallet, coin_tx) = {
         let cfg = app_state.config.as_ref().ok_or("Configuration not loaded")?;
         let db = app_state.db.as_ref().ok_or("Database not initialized")?;
         let net = app_state.network.as_ref().ok_or("Network not running")?;
         let wallet = app_state.wallet.as_ref().ok_or("Wallet not loaded")?;
         let coin_tx = app_state.coin_tx.as_ref().ok_or("Coin channel not available")?;
-        let shutdown_tx = app_state.shutdown_tx.as_ref().ok_or("Shutdown channel not available")?;
         
-        (cfg.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx.clone(), shutdown_tx.clone())
+        (cfg.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx.clone())
     };
     
     if enabled && !app_state.mining_enabled {
         // Start mining
         println!("⛏️  Starting mining...");
         
-        // Spawn the miner
+        // Create a dedicated shutdown channel for mining
+        let (mining_shutdown_tx, _) = broadcast::channel::<()>(1);
+        
+        // Spawn the miner using the existing miner::spawn function
         miner::spawn(
             config.mining.clone(),
             db,
             network,
             wallet,
             coin_tx,
-            shutdown_tx.subscribe(),
+            mining_shutdown_tx.subscribe(),
         );
         
+        // Store the mining shutdown sender
+        app_state.mining_shutdown_tx = Some(mining_shutdown_tx);
         app_state.mining_enabled = true;
         println!("✅ Mining started successfully");
         Ok("Mining started".to_string())
@@ -520,9 +588,13 @@ async fn toggle_mining(
         // Stop mining
         println!("🛑 Stopping mining...");
         
-        // Mining will stop automatically when it receives the shutdown signal
-        // We don't send a global shutdown signal since we only want to stop mining
-        // The miner will naturally stop when the next epoch comes and it checks the state
+        // Send shutdown signal to mining task
+        if let Some(mining_shutdown_tx) = &app_state.mining_shutdown_tx {
+            let _ = mining_shutdown_tx.send(());
+        }
+        
+        // Clear the mining shutdown sender
+        app_state.mining_shutdown_tx = None;
         app_state.mining_enabled = false;
         
         println!("✅ Mining stopped");
@@ -588,11 +660,21 @@ async fn get_owned_coins(
 }
 
 // Helper functions
-async fn calculate_wallet_balance(_db: &Arc<Store>, _wallet: &Arc<Wallet>) -> Result<u64> {
-    // In a real implementation, scan the database for unspent coins
-    // belonging to this wallet's address
-    // For now, return 0
-    Ok(0)
+async fn calculate_wallet_balance(_db: &Arc<Store>, wallet: &Arc<Wallet>) -> Result<u64> {
+    // Use the wallet's built-in balance calculation method
+    // Only log when balance changes significantly (for debugging)
+    let balance = wallet.balance()?;
+    if balance > 0 {
+        // Only log once per balance value to reduce spam
+        static mut LAST_BALANCE: u64 = 0;
+        unsafe {
+            if balance != LAST_BALANCE {
+                println!("💰 Wallet balance: {} coins", balance);
+                LAST_BALANCE = balance;
+            }
+        }
+    }
+    Ok(balance)
 }
 
 async fn count_total_coins(db: &Arc<Store>) -> Result<u64> {
@@ -621,6 +703,7 @@ pub fn run() {
             unlock_wallet,
             get_node_status,
             get_recent_epochs,
+            get_recent_blocks,
             start_node,
             stop_node,
             toggle_mining,

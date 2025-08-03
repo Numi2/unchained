@@ -1,12 +1,13 @@
-# UnchainedCoin Configuration File
+# unchained Configuration File
 
 [net]
 # Port to listen on for P2P connections
 listen_port = 7777
 # Maximum number of peer connections (prevents resource exhaustion)
-max_peers = 1000
+max_peers = 10000
 # Connection timeout in seconds
 connection_timeout_secs = 30
+
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 # Format: /ip4/IP_ADDRESS/udp/PORT/quic-v1/p2p/PEER_ID
 bootstrap = [
@@ -23,43 +24,43 @@ path = "../blockchain_data"
 
 [epoch]
 # Duration of each epoch in seconds 
-seconds = 111
+seconds = 11
 # Target number of leading zeros for proof-of-work difficulty (start with 1 for public mining)
-target_leading_zeros = 2
+target_leading_zeros = 1
 # Retargeting parameters
 # Target number of coins per epoch for difficulty adjustment (reduced for public mining)
-target_coins_per_epoch = 11
+target_coins_per_epoch = 3
 # How often to retarget (every N epochs - more frequent for dynamic adjustment)
-retarget_interval = 3
+retarget_interval = 2000
 # Maximum difficulty adjustment factor 
-max_difficulty_adjustment = 2
+max_difficulty_adjustment = 1.05
 
 [mining]
 # Enable mining by default
 enabled = true
-# Memory usage for Argon2 hashing in KiB ( MiB, balanced for public mining)
-mem_kib = 265536
-# Number of parallel lanes for Argon2 (4 lanes for better parallelization)
+# Memory usage for Argon2 hashing in KiB (32 MiB, optimized for mining speed)
+mem_kib = 16192
+# Number of parallel lanes for Argon2 (2 lanes for better parallelization)
 lanes = 2
 
 # Memory retargeting parameters
 # Minimum memory in KiB
-min_mem_kib = 28192  
+min_mem_kib = 16192  
 
-# Maximum memory in KiB 
-max_mem_kib = 1231072 
+# Maximum memor in KiB 
+max_mem_kib = 512007 
 
 # Memory adjustment factor 
-max_memory_adjustment = 2
+max_memory_adjustment = 1.02
 
 # Miner stability settings for multi-node environments
 # Heartbeat interval in seconds (more frequent for network stability)
-heartbeat_interval_secs = 60
+heartbeat_interval_secs = 40
 # Maximum consecutive failures before restarting miner (more forgiving for network issues)
-max_consecutive_failures = 20
+max_consecutive_failures = 3
 # Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
-max_mining_attempts = 15000000
+max_mining_attempts = 50000
 
 [metrics]
-# Address to bind metrics server (Prometheus format)
+# Optional – leave out to use the default "0.0.0.0:9100"
 bind = "0.0.0.0:9100"

@@ -23,6 +23,12 @@ export interface EpochInfo {
   mem_kib: number;
 }
 
+export interface BlockInfo {
+  id: string;
+  created_at_epoch: number;
+  created_at_height: number;
+}
+
 export interface TransferRequest {
   to_address: string;
   coin_id: string;

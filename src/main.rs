@@ -8,7 +8,7 @@ pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;
 
 #[derive(Parser)]
-#[command(author, version, about = "UnchainedCoin Node v0.3 (Post-Quantum Hardened)")]
+#[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
 struct Cli {
     /// Path to the TOML config file
     #[arg(short, long, default_value = "config.toml")]
@@ -26,10 +26,19 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("--- UnchainedCoin Node ---");
+    println!("--- unchained Node ---");
 
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config)?;
+    let cfg_path = std::path::Path::new(&cli.config);
+    let cfg_dir = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+    let mut cfg = config::load(&cli.config)?;
+
+    // Resolve storage path relative to the config file location so that
+    // running the binary from any working directory uses the **same** DB.
+    if std::path::Path::new(&cfg.storage.path).is_relative() {
+        let abs = cfg_dir.join(&cfg.storage.path);
+        cfg.storage.path = abs.to_string_lossy().into_owned();
+    }
 
     let db = storage::open(&cfg.storage);
     println!("🗄️  Database opened at '{}'", cfg.storage.path);
@@ -63,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
 
-    println!("\n🚀 UnchainedCoin node is running!");
+    println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
     println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
@@ -89,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("✅ Database closed cleanly");
             }
             
-            println!("👋 UnchainedCoin node stopped");
+            println!("👋 unchained node stopped");
             Ok(())
         }
         Err(err) => {
