@@ -2,14 +2,13 @@ use crate::{storage::Store, epoch::Anchor, coin::Coin, transfer::Transfer, crypt
 use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
 use libp2p::{
     gossipsub,
-    futures::StreamExt,
-    Transport,
+    identity, quic, swarm::SwarmEvent, PeerId, Swarm, Transport, Multiaddr,
+    futures::StreamExt, core::muxing::StreamMuxerBox,
 };
 use libp2p::gossipsub::{
     IdentTopic, MessageAuthenticity, IdentityTransform,
     AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent,
 };
-use libp2p::swarm::SwarmEvent;
 use bincode;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -20,29 +19,71 @@ use std::fs;
 use std::path::Path;
 
 // Topics are versioned for future protocol upgrades.
-const TOP_ANCHOR: &str = "anchor/1";
-const TOP_COIN:   &str = "coin/1";
-const TOP_TX:     &str = "tx/1";
-const TOP_EPOCH_REQUEST: &str = "epoch_request/1";
-const TOP_COIN_REQUEST: &str = "coin_request/1";
+const TOP_ANCHOR: &str = "unchained/anchor/v1";
+const TOP_COIN: &str = "unchained/coin/v1";
+const TOP_TX: &str = "unchained/tx/v1";
+const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
+const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 
-// Peer management constants
+// Peer scoring and rate limiting constants
 const MAX_VALIDATION_FAILURES_PER_PEER: u32 = 10;
 const PEER_BAN_DURATION_SECS: u64 = 3600; // 1 hour
-const RATE_LIMIT_WINDOW_SECS: u64 = 60; // 1 minute window
-const MAX_MESSAGES_PER_WINDOW: u32 = 100; // messages per window per peer
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const MAX_MESSAGES_PER_WINDOW: u32 = 100;
 
 #[derive(Debug, Clone)]
 struct PeerScore {
     validation_failures: u32,
-    last_failure: Option<Instant>,
     banned_until: Option<Instant>,
     message_count: u32,
     window_start: Instant,
 }
 
-/// Comprehensive coin validation to prevent forgery and ensure cryptographic integrity
-//--------------------------------------------------------------------
+impl PeerScore {
+    fn new() -> Self {
+        Self {
+            validation_failures: 0,
+            banned_until: None,
+            message_count: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    fn record_validation_failure(&mut self) {
+        self.validation_failures += 1;
+        
+        if self.validation_failures >= MAX_VALIDATION_FAILURES_PER_PEER {
+            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(PEER_BAN_DURATION_SECS));
+            println!("🚫 Peer banned for {} validation failures", self.validation_failures);
+        }
+    }
+
+    fn is_banned(&mut self) -> bool {
+        if let Some(banned_until) = self.banned_until {
+            if Instant::now() < banned_until {
+                return true;
+            }
+            // Ban expired, reset
+            self.banned_until = None;
+            self.validation_failures = 0;
+        }
+        false
+    }
+
+    fn check_rate_limit(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) > std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
+            // Reset window
+            self.window_start = now;
+            self.message_count = 0;
+        }
+        
+        self.message_count += 1;
+        
+        self.message_count <= MAX_MESSAGES_PER_WINDOW
+    }
+}
+
 // Coin validation
 //--------------------------------------------------------------------
 fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
@@ -103,7 +144,6 @@ fn validate_coin(coin: &Coin, db: &Store) -> Result<(), String> {
     Ok(())
 }
 
-//--------------------------------------------------------------------
 // Transfer validation
 //--------------------------------------------------------------------
 fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
@@ -155,11 +195,6 @@ fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
     Ok(())
 }
 
-//--------------------------------------------------------------------
-// Anchor validation
-//--------------------------------------------------------------------
-
-//--------------------------------------------------------------------
 // Anchor validation
 //--------------------------------------------------------------------
 fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
@@ -202,74 +237,32 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
 
     Ok(())
 }
+
+pub type NetHandle = Arc<Network>;
+
 #[derive(Clone)]
 pub struct Network {
-    anchor_tx: broadcast::Sender<crate::epoch::Anchor>,
+    anchor_tx: broadcast::Sender<Anchor>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
 }
 
 #[derive(Debug)]
 enum NetworkCommand {
-    GossipAnchor(crate::epoch::Anchor),
-    GossipCoin(crate::coin::Coin),
+    GossipAnchor(Anchor),
+    GossipCoin(Coin),
     RequestEpoch(u64),
     RequestCoin([u8; 32]),
 }
-pub type NetHandle = Arc<Network>;
-
-// Peer management helper functions
-impl PeerScore {
-    fn new() -> Self {
-        Self {
-            validation_failures: 0,
-            last_failure: None,
-            banned_until: None,
-            message_count: 0,
-            window_start: Instant::now(),
-        }
-    }
-    
-    fn is_banned(&self) -> bool {
-        if let Some(ban_time) = self.banned_until {
-            Instant::now() < ban_time
-        } else {
-            false
-        }
-    }
-    
-    fn record_validation_failure(&mut self) {
-        self.validation_failures += 1;
-        self.last_failure = Some(Instant::now());
-        
-        if self.validation_failures >= MAX_VALIDATION_FAILURES_PER_PEER {
-            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(PEER_BAN_DURATION_SECS));
-            println!("🚫 Peer banned for {} validation failures", self.validation_failures);
-        }
-    }
-    
-    fn check_rate_limit(&mut self) -> bool {
-        let now = Instant::now();
-        if now.duration_since(self.window_start) > std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
-            // Reset window
-            self.window_start = now;
-            self.message_count = 1;
-            true
-        } else {
-            self.message_count += 1;
-            self.message_count <= MAX_MESSAGES_PER_WINDOW
-        }
-    }
-}
 
 /// Load or create a persistent peer identity
-fn load_or_create_peer_identity() -> anyhow::Result<libp2p::identity::Keypair> {
+fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
     let identity_path = "peer_identity.key";
     
     // Try to load existing identity
     if Path::new(identity_path).exists() {
         match fs::read(identity_path) {
             Ok(key_data) => {
-                match libp2p::identity::Keypair::from_protobuf_encoding(&key_data) {
+                match identity::Keypair::from_protobuf_encoding(&key_data) {
                     Ok(keypair) => {
                         println!("🔑 Loaded existing peer identity from {}", identity_path);
                         return Ok(keypair);
@@ -286,7 +279,7 @@ fn load_or_create_peer_identity() -> anyhow::Result<libp2p::identity::Keypair> {
     }
     
     // Create new identity
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let keypair = identity::Keypair::generate_ed25519();
     
     // Save the new identity
     match keypair.to_protobuf_encoding() {
@@ -305,18 +298,18 @@ fn load_or_create_peer_identity() -> anyhow::Result<libp2p::identity::Keypair> {
     Ok(keypair)
 }
 
-pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> anyhow::Result<NetHandle> {
+pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
     // Load or create persistent peer identity
     let id_keys = load_or_create_peer_identity()?;
-    let peer_id = libp2p::PeerId::from(id_keys.public());
+    let peer_id = PeerId::from(id_keys.public());
     println!("📡 Local peer-ID: {peer_id}");
 
     // NOTE: QUIC transport with post-quantum readiness
     // The rustls dependency now includes aws-lc-rs with prefer-post-quantum feature
     // which enables hybrid X25519+Kyber key exchange when both peers support it.
     // This provides post-quantum resistance while maintaining backwards compatibility.
-    let transport = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(&id_keys))
-        .map(|(peer_id, muxer), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
+    let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
 
     // Configure gossipsub for better stability
@@ -328,7 +321,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
-    let mut swarm = libp2p::Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
+    let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
     
     // Debug: Show what we're listening on
     let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", cfg.listen_port);
@@ -345,11 +338,11 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
 
     // Connect to bootstrap peers, but skip if it's our own peer ID
     for addr in &cfg.bootstrap {
-        let parsed_addr = addr.parse::<libp2p::Multiaddr>()?;
+        let parsed_addr = addr.parse::<Multiaddr>()?;
         // Extract peer ID from the multiaddr to check if it's our own
         if let Some(addr_peer_id) = parsed_addr.iter().last() {
             if let libp2p::multiaddr::Protocol::P2p(peer_id_bytes) = addr_peer_id {
-                let addr_peer_id = libp2p::PeerId::try_from(peer_id_bytes);
+                let addr_peer_id = PeerId::try_from(peer_id_bytes);
                 if addr_peer_id.is_ok() {
                     let addr_peer_id = addr_peer_id.unwrap();
                     if addr_peer_id == peer_id {
@@ -369,9 +362,9 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
     let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx });
 
     // Initialize peer management
-    let mut peer_scores: HashMap<libp2p::PeerId, PeerScore> = HashMap::new();
+    let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut connected_peers = 0u32;
-    let mut recently_connected_peers: HashMap<libp2p::PeerId, tokio::time::Instant> = HashMap::new();
+    let mut recently_connected_peers: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
     tokio::spawn(async move {
         loop {
@@ -393,7 +386,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                                 
                                 // Request latest state from new peer if we're starting fresh
-                                if let Ok(Some(latest_anchor)) = db.get::<crate::epoch::Anchor>("epoch", b"latest") {
+                                if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                     if latest_anchor.num == 0 {
                                         println!("🔄 Requesting latest blockchain state from new peer {}", peer_id);
                                         // Request the latest epoch from this peer
@@ -404,7 +397,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                                 }
                                 
                                 // Broadcast our latest anchor to help new peers sync
-                                if let Ok(Some(latest_anchor)) = db.get::<crate::epoch::Anchor>("epoch", b"latest") {
+                                if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                     if latest_anchor.num > 0 {
                                         println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
                                         // Wait a moment to ensure connection is stable before broadcasting
@@ -442,7 +435,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                         },
                         SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _ } => {
                             eprintln!("❌ Failed to connect to peer {:?}: {:?}", peer_id, error);
-                            if let Some(_peer_id) = peer_id {
+                            if peer_id.is_some() {
                                 eprintln!("   This might be due to:");
                                 eprintln!("   - Firewall blocking port 7777");
                                 eprintln!("   - Target peer not running");
@@ -454,7 +447,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                             eprintln!("❌ Incoming connection failed from {} to {}: {:?}", send_back_addr, local_addr, error);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
-                            let peer_id = message.source.unwrap_or_else(libp2p::PeerId::random);
+                            let peer_id = message.source.unwrap_or_else(PeerId::random);
                             
                             // Check peer scoring and rate limiting
                             let should_process = {
@@ -476,11 +469,11 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                             }
                             
                             match message.topic.as_str() {
-                                TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<crate::epoch::Anchor>(&message.data) {
+                                TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
                                 match validate_anchor(&a, &db) {
                                     Ok(()) => {
                                         // Check for potential fork/reorg
-                                        let current_best: Option<crate::epoch::Anchor> = db.get("epoch", b"latest").unwrap_or(None);
+                                        let current_best: Option<Anchor> = db.get("epoch", b"latest").unwrap_or(None);
                                         let should_reorg = a.is_better_chain(&current_best);
                                         
                                         if should_reorg {
@@ -517,7 +510,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                                     }
                                 }
                                 },
-                                TOP_COIN => if let Ok(c) = bincode::deserialize::<crate::coin::Coin>(&message.data) {
+                                TOP_COIN => if let Ok(c) = bincode::deserialize::<Coin>(&message.data) {
                                 // 🔒 CRITICAL SECURITY: Validate coin before storing to prevent forgery
                                 match validate_coin(&c, &db) {
                                     Ok(()) => {
@@ -540,7 +533,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                                     }
                                 }
                                 },
-                                TOP_TX => if let Ok(t) = bincode::deserialize::<crate::transfer::Transfer>(&message.data) {
+                                TOP_TX => if let Ok(t) = bincode::deserialize::<Transfer>(&message.data) {
                                 match validate_transfer(&t, &db) {
                                     Ok(()) => {
                                         if let Err(e) = db.put("transfer", &t.coin_id, &t) {
@@ -560,14 +553,14 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
                                 }
                                 },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
-                                if let Ok(Some(coin)) = db.get::<crate::coin::Coin>("coin", &id) {
+                                if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                     if let Ok(bytes) = bincode::serialize(&coin) {
                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes);
                                     }
                                 }
                                 },
                                 TOP_EPOCH_REQUEST => if let Ok(num) = bincode::deserialize::<u64>(&message.data) {
-                                if let Ok(Some(anchor)) = db.get::<crate::epoch::Anchor>("epoch", &num.to_le_bytes()) {
+                                if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &num.to_le_bytes()) {
                                     if let Ok(bytes) = bincode::serialize(&anchor) {
                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
                                     }
@@ -597,10 +590,10 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<crate::storage::Store>) -> a
 }
 
 impl Network {
-    pub async fn gossip_anchor(&self, a: &crate::epoch::Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
-    pub async fn gossip_coin(&self, c: &crate::coin::Coin) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
-    pub fn anchor_subscribe(&self) -> broadcast::Receiver<crate::epoch::Anchor> { self.anchor_tx.subscribe() }
-    pub fn anchor_sender(&self) -> broadcast::Sender<crate::epoch::Anchor> { self.anchor_tx.clone() }
+    pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
+    pub async fn gossip_coin(&self, c: &Coin) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
+    pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
+    pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     
