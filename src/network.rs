@@ -340,12 +340,18 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
 
-    // Configure gossipsub for better stability and small networks
+    // Tune mesh parameters so that publishing works even with very small networks (1-2 peers).
+    // The defaults in libp2p assume at least 4 peers in the mesh; otherwise `publish` returns
+    // `InsufficientPeers`. By lowering these thresholds, two nodes can immediately exchange
+    // messages – e.g. the *latest epoch* request/response when a fresh node is bootstrapping.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(std::time::Duration::from_secs(1)) // Faster heartbeat for small networks
-        .validation_mode(gossipsub::ValidationMode::Permissive) // Allow messages from any peer
-        .message_id_fn(|message| {
-            // Custom message ID to prevent duplicates
+        .heartbeat_interval(std::time::Duration::from_secs(1))           // Faster heartbeat for small networks
+        .validation_mode(gossipsub::ValidationMode::Permissive)          // Allow messages from any peer
+        .mesh_n(2)                                                       // Target 2 peers in mesh
+        .mesh_n_low(1)                                                   // Minimum 1 peer before publishing is allowed
+        .mesh_n_high(3)                                                  // Upper bound keeps mesh small
+        .gossip_lazy(1)                                                  // Send gossip to 1 peer/heartbeat
+        .message_id_fn(|message| {                                       // Custom message ID to prevent duplicates
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
