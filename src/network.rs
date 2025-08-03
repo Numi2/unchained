@@ -289,6 +289,7 @@ impl PeerScore {
 pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
     let id_keys = identity::Keypair::generate_ed25519();
     let peer_id = PeerId::from(id_keys.public());
+    println!("📡 Local peer-ID: {peer_id}");
 
     // NOTE: QUIC transport with post-quantum readiness
     // The rustls dependency now includes aws-lc-rs with prefer-post-quantum feature

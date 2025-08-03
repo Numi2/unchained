@@ -11,8 +11,7 @@ connection_timeout_secs = 30
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 # Format: /ip4/IP_ADDRESS/udp/PORT/quic-v1/p2p/PEER_ID
 bootstrap = [
-    # Example: "/ip4/192.168.1.100/udp/7777/quic-v1/p2p/12D3KooWExample..."
-    # Add your production bootstrap nodes here before public deployment
+    "/ip4/192.168.1.101/udp/7777/quic-v1/p2p/12D3KooWPy36UxGKFzUa5ieyp4pc8uacWSqvF1uUVbcZoJF2yFBr",  # ← replace <PEER_ID> with the node’s real peer-id
 ]
 
 [storage]
