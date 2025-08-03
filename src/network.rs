@@ -24,6 +24,7 @@ const TOP_COIN: &str = "unchained/coin/v1";
 const TOP_TX: &str = "unchained/tx/v1";
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
+const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
 
 // Peer scoring and rate limiting constants
 const MAX_VALIDATION_FAILURES_PER_PEER: u32 = 10;
@@ -252,6 +253,7 @@ enum NetworkCommand {
     GossipCoin(Coin),
     RequestEpoch(u64),
     RequestCoin([u8; 32]),
+    RequestLatestEpoch,
 }
 
 /// Load or create a persistent peer identity
@@ -388,10 +390,15 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 // Request latest state from new peer if we're starting fresh
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                     if latest_anchor.num == 0 {
-                                        println!("🔄 Requesting latest blockchain state from new peer {}", peer_id);
-                                        // Request the latest epoch from this peer
-                                        if let Ok(bytes) = bincode::serialize(&0u64) { // Request epoch 0 to get started
-                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                        println!("🔄 Node has only genesis epoch, requesting latest anchor from new peer {}", peer_id);
+                                        // Request the peer's latest anchor to discover the current chain state
+                                        if let Ok(bytes) = bincode::serialize(&()) {
+                                            match swarm.behaviour_mut().publish(IdentTopic::new(TOP_LATEST_REQUEST), bytes) {
+                                                Ok(_) => println!("📤 Latest epoch request sent to peer {}", peer_id),
+                                                Err(e) => println!("⚠️  Failed to publish latest request to peer {}: {}", peer_id, e),
+                                            }
+                                        } else {
+                                            println!("⚠️  Failed to serialize latest epoch request");
                                         }
                                     }
                                 }
@@ -566,6 +573,17 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                     }
                                 }
                                 },
+                                TOP_LATEST_REQUEST => {
+                                    // Respond with our latest anchor
+                                    if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
+                                        if latest_anchor.num > 0 {
+                                            println!("📤 Responding to latest epoch request with anchor #{}", latest_anchor.num);
+                                            if let Ok(bytes) = bincode::serialize(&latest_anchor) {
+                                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                            }
+                                        }
+                                    }
+                                },
                                 _ => {}
                             }
                         },
@@ -578,6 +596,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                         NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
                         NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                         NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
+                        NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                     };
                     if let Some(d) = data {
                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(topic), d);
@@ -605,8 +624,7 @@ impl Network {
     
     /// Request the latest epoch from the network for initial synchronization
     pub async fn request_latest_epoch(&self) {
-        println!("🔄 Requesting latest epoch from network for synchronization");
-        // Request epoch 0 to get started, then the sync module will handle requesting missing epochs
-        self.request_epoch(0).await;
+        println!("🔄 Requesting latest epoch info from network for synchronization");
+        let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch);
     }
 }

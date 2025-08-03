@@ -1,8 +1,9 @@
 use crate::{storage::Store, epoch::Anchor, network::NetHandle};
 use std::sync::Arc;
-use tokio::{sync::{broadcast::Receiver, Semaphore}, task};
+use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 
 const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
+const SYNC_RETRY_INTERVAL_SECS: u64 = 30; // Retry sync every 30 seconds if stuck
 
 pub fn spawn(db: Arc<Store>, net: NetHandle, mut shutdown_rx: Receiver<()>) {
     let mut anchor_rx: Receiver<Anchor> = net.anchor_subscribe();
@@ -10,6 +11,7 @@ pub fn spawn(db: Arc<Store>, net: NetHandle, mut shutdown_rx: Receiver<()>) {
     task::spawn(async move {
         let mut local_epoch = db.get::<Anchor>("epoch", b"latest").unwrap_or_default().map_or(0, |a| a.num);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_REQUESTS));
+        let mut sync_retry_timer = interval(Duration::from_secs(SYNC_RETRY_INTERVAL_SECS));
 
         loop {
             tokio::select! {
@@ -17,6 +19,17 @@ pub fn spawn(db: Arc<Store>, net: NetHandle, mut shutdown_rx: Receiver<()>) {
                 _ = shutdown_rx.recv() => {
                     println!("🛑 Sync task received shutdown signal");
                     break;
+                }
+                
+                // Periodic sync retry for nodes that might be stuck
+                _ = sync_retry_timer.tick() => {
+                    let current_best = db.get::<Anchor>("epoch", b"latest").unwrap_or_default();
+                    if let Some(best) = current_best {
+                        if best.num == 0 {
+                            println!("🔄 Node still has only genesis epoch, requesting latest from network...");
+                            net.request_latest_epoch().await;
+                        }
+                    }
                 }
                 
                 // Handle anchor updates
