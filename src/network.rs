@@ -273,7 +273,7 @@ pub struct Network {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(Coin),
@@ -431,7 +431,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     let (anchor_tx, _) = broadcast::channel(256); // Increased from 32 to 256 for multi-node stability
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx: command_tx.clone() });
 
     // Initialize peer management
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
@@ -687,7 +687,9 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                     }
                 },
                 Some(command) = command_rx.recv() => {
-                    let (topic, data) = match command {
+                    // Clone so we can retry later without reconstructing
+                    let cmd_original = command.clone();
+                    let (topic, data) = match &cmd_original {
                         NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                         NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
                         NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
@@ -702,13 +704,18 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                             Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
                                 // Common in small networks - retry after brief delay
                                 println!("📡 Waiting for more peers to join topic {}, will retry...", topic);
-                                
-                                // Store for retry - in a real implementation you'd want a proper retry queue
+
+                                // Clone variables needed inside async retry task
                                 let topic_clone = topic.to_string();
+                                let cmd_clone = cmd_original.clone();
+                                let tx_clone = command_tx.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                                    // This is a simplified retry - in production you'd want proper retry logic
-                                    println!("🔄 Retrying publish for topic {}", topic_clone);
+                                    if tx_clone.send(cmd_clone).is_ok() {
+                                        println!("🔄 Retrying publish for topic {}", topic_clone);
+                                    } else {
+                                        eprintln!("⚠️  Retry queue closed. Could not re-publish {}", topic_clone);
+                                    }
                                 });
                             }
                             Err(e) => {
