@@ -336,6 +336,27 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                             } else {
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
                                 println!("🤝 Connected to peer {} ({}/{} peers)", peer_id, connected_peers, cfg.max_peers);
+                                
+                                // Request latest state from new peer if we're starting fresh
+                                if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
+                                    if latest_anchor.num == 0 {
+                                        println!("🔄 Requesting latest blockchain state from new peer {}", peer_id);
+                                        // Request the latest epoch from this peer
+                                        if let Ok(bytes) = bincode::serialize(&0u64) { // Request epoch 0 to get started
+                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                        }
+                                    }
+                                }
+                                
+                                // Broadcast our latest anchor to help new peers sync
+                                if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
+                                    if latest_anchor.num > 0 {
+                                        println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
+                                        if let Ok(bytes) = bincode::serialize(&latest_anchor) {
+                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), bytes);
+                                        }
+                                    }
+                                }
                             }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -389,12 +410,17 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         } else {
                                             // Still store the anchor but don't update latest
                                             if db.put("epoch", &a.num.to_le_bytes(), &a).is_ok() {
-                                                println!("📝 Stored alternative anchor #{} (not best chain)", a.num);
+                                                println!("📥 Received anchor #{} from network (not better than current)", a.num);
                                             }
                                         }
                                     }
-                                    Err(err) => {
-                                        eprintln!("🚫 REJECTED invalid anchor from {peer_id}: {err}");
+                                    Err(validation_error) => {
+                                        eprintln!("🚫 REJECTED invalid anchor from {peer_id}: {validation_error}");
+                                        eprintln!("   Epoch: {}", a.num);
+                                        eprintln!("   Hash: {}", hex::encode(a.hash));
+                                        eprintln!("   Difficulty: {}", a.difficulty);
+                                        eprintln!("   Coin Count: {}", a.coin_count);
+                                        eprintln!("   Cumulative Work: {}", a.cumulative_work);
                                         if let Some(score) = peer_scores.get_mut(&peer_id) {
                                             score.record_validation_failure();
                                         }
@@ -492,5 +518,12 @@ impl Network {
     pub async fn request_specific_epoch(&self, epoch_num: u64) {
         println!("🔄 Requesting specific epoch #{epoch_num} for recovery");
         self.request_epoch(epoch_num).await;
+    }
+    
+    /// Request the latest epoch from the network for initial synchronization
+    pub async fn request_latest_epoch(&self) {
+        println!("🔄 Requesting latest epoch from network for synchronization");
+        // Request epoch 0 to get started, then the sync module will handle requesting missing epochs
+        self.request_epoch(0).await;
     }
 }

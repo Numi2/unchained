@@ -216,6 +216,75 @@ impl Manager {
                 Ok(None) => 0,
                 Err(_) => 0, // If there's an error reading, start from epoch 0
             };
+
+            // Initial network synchronization phase
+            if current_epoch == 0 {
+                println!("🔄 Initial network synchronization phase...");
+                println!("   Waiting for peers to share current blockchain state...");
+                println!("   Timeout: 30 seconds");
+                
+                // Actively request latest state from network
+                self.net.request_latest_epoch().await;
+                
+                // Wait for network synchronization with a timeout
+                let sync_timeout = tokio::time::Duration::from_secs(30);
+                let sync_start = tokio::time::Instant::now();
+                let mut synced = false;
+                let mut last_request = tokio::time::Instant::now();
+                let mut check_count = 0;
+                
+                while !synced && sync_start.elapsed() < sync_timeout {
+                    check_count += 1;
+                    
+                    // Check if we received any anchors from the network
+                    if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                        if latest_anchor.num > 0 {
+                            current_epoch = latest_anchor.num + 1;
+                            println!("✅ Network synchronization complete! Starting from epoch {}", current_epoch);
+                            println!("   Received anchor #{} with {} coins and {} cumulative work", 
+                                   latest_anchor.num, latest_anchor.coin_count, latest_anchor.cumulative_work);
+                            
+                            // Give the sync module a moment to process any additional epochs
+                            println!("   Waiting 2 seconds for additional synchronization...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            
+                            // Re-check the latest epoch in case we received more anchors
+                            if let Ok(Some(final_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                                if final_anchor.num > latest_anchor.num {
+                                    current_epoch = final_anchor.num + 1;
+                                    println!("✅ Additional synchronization complete! Now starting from epoch {}", current_epoch);
+                                    println!("   Final anchor #{} with {} coins and {} cumulative work", 
+                                           final_anchor.num, final_anchor.coin_count, final_anchor.cumulative_work);
+                                }
+                            }
+                            
+                            synced = true;
+                            break;
+                        }
+                    }
+                    
+                    // Periodically request latest state if we haven't received anything yet
+                    if last_request.elapsed() > tokio::time::Duration::from_secs(5) {
+                        println!("🔄 Still waiting for network response (check #{check_count}), requesting latest state again...");
+                        self.net.request_latest_epoch().await;
+                        last_request = tokio::time::Instant::now();
+                    }
+                    
+                    // Wait a bit before checking again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                
+                if !synced {
+                    println!("⚠️  Network synchronization timeout after {} checks.", check_count);
+                    println!("   This node will create a new chain. If you want to join an existing network,");
+                    println!("   make sure the bootstrap peers are correctly configured and reachable.");
+                    println!("   Check that:");
+                    println!("   - The bootstrap peer is running and accessible");
+                    println!("   - The peer ID in config.toml matches the running peer");
+                    println!("   - Port 7777 is open and accessible");
+                }
+            }
+
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
             let mut ticker = time::interval(time::Duration::from_secs(self.cfg.seconds));
 
