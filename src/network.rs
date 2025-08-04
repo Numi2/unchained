@@ -25,22 +25,8 @@ fn try_publish_gossip(
     data: Vec<u8>,
     context: &str,
 ) {
-    match swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
-        Ok(_) => {
-            // Successful publish - only log for important messages
-            if topic == TOP_ANCHOR || topic == TOP_LATEST_REQUEST {
-                println!("📤 Successfully published {} message", context);
-            }
-        }
-        Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
-            // Expected in small networks - don't spam logs
-            if topic == TOP_ANCHOR {
-                println!("📡 Waiting for gossip mesh to establish for {}", context);
-            }
-        }
-        Err(e) => {
-            eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
-        }
+    if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
+        eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
     }
 }
 
