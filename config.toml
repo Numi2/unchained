@@ -11,7 +11,8 @@ connection_timeout_secs = 30
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 # Format: /ip4/IP_ADDRESS/udp/PORT/quic-v1/p2p/PEER_ID
 bootstrap = [
-    "/ip4/192.168.1.101/udp/7777/quic-v1/p2p/12D3KooWGGzPNmYnePdAYhAE117hT4ViL8p2negT96MpRjTYjLmV",  # ← replace <PEER_ID> with the node’s real peer-id
+    # Commented out external peer for testing
+    # "/ip4/192.168.1.101/udp/7777/quic-v1/p2p/12D3KooWGGzPNmYnePdAYhAE117hT4ViL8p2negT96MpRjTYjLmV",
 ]
 
 [storage]
@@ -19,7 +20,7 @@ bootstrap = [
 # Move runtime data one directory up so that it no longer lives inside
 # `src-tauri` – this prevents the Tauri development file-watcher from
 # rebuilding the app every time the node writes to its database.
-path = "../blockchain_data"
+path = "blockchain_data"
 
 [epoch]
 # Duration of each epoch in seconds 

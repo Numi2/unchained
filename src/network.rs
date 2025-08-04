@@ -327,7 +327,10 @@ fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
 }
 
 pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
+    println!("🔧 Starting network initialization...");
+    
     // Load or create persistent peer identity
+    println!("🔧 Loading peer identity...");
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
     println!("📡 Local peer-ID: {peer_id}");
@@ -336,14 +339,17 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     // The rustls dependency now includes aws-lc-rs with prefer-post-quantum feature
     // which enables hybrid X25519+Kyber key exchange when both peers support it.
     // This provides post-quantum resistance while maintaining backwards compatibility.
+    println!("🔧 Creating QUIC transport...");
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
+    println!("✅ QUIC transport created");
 
     // Tune mesh parameters so that publishing works even with very small networks (1-2 peers).
     // The defaults in libp2p assume at least 4 peers in the mesh; otherwise `publish` returns
     // `InsufficientPeers`. By lowering these thresholds, two nodes can immediately exchange
     // messages – e.g. the *latest epoch* request/response when a fresh node is bootstrapping.
+    println!("🔧 Creating gossipsub config...");
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(std::time::Duration::from_secs(1))           // Faster heartbeat for small networks
         .validation_mode(gossipsub::ValidationMode::Permissive)          // Allow messages from any peer
@@ -364,20 +370,29 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .duplicate_cache_time(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build gossipsub config: {}", e))?;
+    println!("✅ Gossipsub config created");
         
+    println!("🔧 Creating gossipsub behavior...");
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!("Failed to create Gossipsub: {}", e))?;
+    println!("✅ Gossipsub behavior created");
+    
+    println!("🔧 Subscribing to topics...");
     for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
+    println!("✅ Topics subscribed");
 
+    println!("🔧 Creating swarm...");
     let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
+    println!("✅ Swarm created");
     
     // Bind the QUIC listener, automatically retrying the next port if the desired
     // port is already occupied. This improves UX when multiple nodes are started
     // on the same machine (e.g. during testing).
+    println!("🔧 Binding listener...");
     let mut port = cfg.listen_port;
     let mut bound = false;
     for _ in 0..10 { // try up to 10 consecutive ports
@@ -400,6 +415,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     if !bound {
         return Err(anyhow::anyhow!("Could not bind to any port starting from {}", cfg.listen_port));
     }
+    println!("✅ Listener bound successfully");
     
     // Debug: Show what we're trying to connect to
     println!("🔍 Local peer ID: {}", peer_id);
@@ -409,6 +425,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     }
 
     // Connect to bootstrap peers, but skip if it's our own peer ID
+    println!("🔧 Connecting to bootstrap peers...");
     for addr in &cfg.bootstrap {
         let parsed_addr = addr.parse::<Multiaddr>()?;
         // Extract peer ID from the multiaddr to check if it's our own
@@ -427,6 +444,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         println!("🔗 Attempting to connect to bootstrap peer: {}", addr);
         swarm.dial(parsed_addr)?;
     }
+    println!("✅ Bootstrap connections initiated");
 
     let (anchor_tx, _) = broadcast::channel(256); // Increased from 32 to 256 for multi-node stability
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
