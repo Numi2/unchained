@@ -25,8 +25,22 @@ fn try_publish_gossip(
     data: Vec<u8>,
     context: &str,
 ) {
-    if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
-        eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
+    match swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
+        Ok(_) => {
+            // Successful publish - only log for important messages
+            if topic == TOP_ANCHOR || topic == TOP_LATEST_REQUEST {
+                println!("📤 Successfully published {} message", context);
+            }
+        }
+        Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
+            // Expected in small networks - don't spam logs
+            if topic == TOP_ANCHOR {
+                println!("📡 Waiting for gossip mesh to establish for {}", context);
+            }
+        }
+        Err(e) => {
+            eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
+        }
     }
 }
 
@@ -433,26 +447,31 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             // On new peer, try to flush any queued messages
                             let mut flushed = 0u32;
-                            while let Some(cmd) = pending_commands.pop_front() {
-                                let (t, data) = match &cmd {
-                                    NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                                    NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                    NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
-                                    NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
-                                    NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                                };
-                                if let Some(d) = data {
-                                    if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_ok() {
-                                        flushed += 1;
-                                    } else {
-                                        // Couldn't publish yet, push back and break to avoid tight loop
-                                        pending_commands.push_front(cmd);
-                                        break;
+                            let initial_len = pending_commands.len();
+                            if initial_len > 0 {
+                                let mut still_pending = VecDeque::new();
+                                while let Some(cmd) = pending_commands.pop_front() {
+                                    let (t, data) = match &cmd {
+                                        NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
+                                        NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                                        NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
+                                        NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
+                                        NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
+                                    };
+                                    if let Some(d) = data {
+                                        if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_ok() {
+                                            flushed += 1;
+                                        } else {
+                                            // Couldn't publish yet, put it back
+                                            still_pending.push_back(cmd);
+                                        }
                                     }
                                 }
-                            }
-                            if flushed > 0 {
-                                println!("📤 Flushed {} queued messages after peer join", flushed);
+                                pending_commands.clear();
+                                pending_commands.append(&mut still_pending);
+                                if flushed > 0 {
+                                    println!("📤 Flushed {}/{} queued messages after peer join", flushed, initial_len);
+                                }
                             }
                             connected_peers += 1;
                             if connected_peers > cfg.max_peers {
@@ -463,7 +482,9 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
                                 recently_connected_peers.insert(peer_id, tokio::time::Instant::now());
                                 println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
-                                swarm.behaviour_mut().add_explicit_peer(&peer_id);
+                                
+                                // Wait a moment to stabilize the connection before sending data
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 
                                 // Request latest state from new peer if we're starting fresh
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
@@ -471,7 +492,10 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         println!("🔄 Node has only genesis epoch, requesting latest anchor from new peer {}", peer_id);
                                         // Request the peer's latest anchor to discover the current chain state
                                         if let Ok(bytes) = bincode::serialize(&()) {
-                                            try_publish_gossip(&mut swarm, TOP_LATEST_REQUEST, bytes, &format!("latest epoch request to peer {}", peer_id));
+                                            match swarm.behaviour_mut().publish(IdentTopic::new(TOP_LATEST_REQUEST), bytes) {
+                                                Ok(_) => println!("📤 Latest epoch request sent to peer {}", peer_id),
+                                                Err(e) => println!("⚠️  Failed to publish latest request to peer {}: {}", peer_id, e),
+                                            }
                                         } else {
                                             println!("⚠️  Failed to serialize latest epoch request");
                                         }
@@ -482,7 +506,6 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                     if latest_anchor.num > 0 {
                                         println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
-                                        // Wait a moment to ensure connection is stable before broadcasting
                                         if let Ok(bytes) = bincode::serialize(&latest_anchor) {
                                             try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("anchor #{} to peer {}", latest_anchor.num, peer_id));
                                         }
