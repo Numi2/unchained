@@ -430,8 +430,9 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
 
     let (anchor_tx, _) = broadcast::channel(256); // Increased from 32 to 256 for multi-node stability
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let command_tx_for_task = command_tx.clone();
     
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx: command_tx.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), command_tx: command_tx });
 
     // Initialize peer management
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
@@ -482,38 +483,17 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
                                 recently_connected_peers.insert(peer_id, tokio::time::Instant::now());
                                 println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
-                                
-                                // Wait a moment to stabilize the connection before sending data
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                
-                                // Request latest state from new peer if we're starting fresh
-                                if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
-                                    if latest_anchor.num == 0 {
-                                        println!("🔄 Node has only genesis epoch, requesting latest anchor from new peer {}", peer_id);
-                                        // Request the peer's latest anchor to discover the current chain state
-                                        if let Ok(bytes) = bincode::serialize(&()) {
-                                            match swarm.behaviour_mut().publish(IdentTopic::new(TOP_LATEST_REQUEST), bytes) {
-                                                Ok(_) => println!("📤 Latest epoch request sent to peer {}", peer_id),
-                                                Err(e) => println!("⚠️  Failed to publish latest request to peer {}: {}", peer_id, e),
-                                            }
-                                        } else {
-                                            println!("⚠️  Failed to serialize latest epoch request");
-                                        }
-                                    }
+
+                                // Reliably request latest state and broadcast ours by using the command channel.
+                                // This ensures messages are queued if the network isn't ready.
+                                if let Err(e) = command_tx_for_task.send(NetworkCommand::RequestLatestEpoch) {
+                                    eprintln!("⚠️ Failed to queue latest epoch request: {e}");
                                 }
-                                
-                                // Broadcast our latest anchor to help new peers sync
+
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
-                                    if latest_anchor.num > 0 {
-                                        println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
-                                        if let Ok(bytes) = bincode::serialize(&latest_anchor) {
-                                            try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("anchor #{} to peer {}", latest_anchor.num, peer_id));
-                                        }
-                                        
-                                        // Send a keepalive message to maintain connection
-                                        println!("💓 Sending keepalive message to peer {}", peer_id);
-                                        if let Ok(keepalive_bytes) = bincode::serialize(&()) {
-                                            try_publish_gossip(&mut swarm, TOP_LATEST_REQUEST, keepalive_bytes, &format!("keepalive to peer {}", peer_id));
+                                    if latest_anchor.num > 0 { // Avoid gossiping genesis
+                                        if let Err(e) = command_tx_for_task.send(NetworkCommand::GossipAnchor(latest_anchor.clone())) {
+                                            eprintln!("⚠️ Failed to queue anchor gossip: {e}");
                                         }
                                     }
                                 }

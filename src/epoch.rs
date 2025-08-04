@@ -413,51 +413,15 @@ impl Manager {
                             }
                             
                             // Wait a bit for any in-flight coins from current mining to arrive
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             
                             // Final final drain after the delay
-                            let mut very_late_coins = 0;
                             while let Ok(id) = self.coin_rx.try_recv() {
-                                println!("📥 Very late coin received after delay: {}", hex::encode(id));
                                 buffer.insert(id);
-                                very_late_coins += 1;
                             }
                             
-                            if very_late_coins > 0 {
-                                println!("🚨 WARNING: {very_late_coins} coins arrived after epoch creation! Updating epoch #{current_epoch}");
-                                // Update the epoch with the additional coins
-                                let updated_anchor = Anchor { 
-                                    num: current_epoch, 
-                                    hash: anchor.hash, 
-                                    difficulty: anchor.difficulty, 
-                                    coin_count: buffer.len() as u32, 
-                                    cumulative_work: anchor.cumulative_work, 
-                                    mem_kib: anchor.mem_kib 
-                                };
-                                
-                                let mut update_batch = WriteBatch::default();
-                                let updated_serialized = bincode::serialize(&updated_anchor).unwrap();
-                                let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
-                                update_batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &updated_serialized);
-                                update_batch.put_cf(epoch_cf, b"latest", &updated_serialized);
-                                // Keep hash index in sync with any late-coin corrections
-                                if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
-                                    update_batch.put_cf(anchor_cf, &anchor.hash, &updated_serialized);
-                                }
-                                
-                                if let Err(e) = self.db.write_batch(update_batch) {
-                                    eprintln!("🔥 Failed to update epoch with late coins: {e}");
-                                } else {
-                                    self.db.flush().ok();
-                                    // Broadcast the corrected epoch
-                                    self.net.gossip_anchor(&updated_anchor).await;
-                                    let _ = self.anchor_tx.send(updated_anchor);
-                                }
-                            } else {
-                                // No late coins, broadcast original epoch
-                                self.net.gossip_anchor(&anchor).await;
-                                let _ = self.anchor_tx.send(anchor);
-                            }
+                            self.net.gossip_anchor(&anchor).await;
+                            let _ = self.anchor_tx.send(anchor);
                             
                             buffer.clear();
                             current_epoch += 1;
