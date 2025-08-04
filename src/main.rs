@@ -48,10 +48,13 @@ async fn main() -> anyhow::Result<()> {
 
     let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
 
+    println!("🔧 Starting network spawn...");
     let net = network::spawn(cfg.net.clone(), db.clone()).await?;
+    println!("✅ Network spawn completed");
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    println!("🔧 Creating epoch manager...");
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
         cfg.epoch.clone(),
@@ -61,16 +64,23 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
     );
     epoch_mgr.spawn();
+    println!("✅ Epoch manager spawned");
 
+    println!("🔧 Starting sync...");
     sync::spawn(db.clone(), net.clone(), shutdown_tx.subscribe());
+    println!("✅ Sync spawned");
 
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
     if mining_enabled {
+        println!("🔧 Starting miner...");
         miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe());
+        println!("✅ Miner spawned");
     }
 
+    println!("🔧 Starting metrics...");
     let metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
+    println!("✅ Metrics started");
 
     println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
