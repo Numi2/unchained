@@ -11,7 +11,7 @@ use libp2p::gossipsub::{
 };
 use bincode;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use hex;
@@ -435,6 +435,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
 
     // Initialize peer management
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
+    let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
     let mut connected_peers = 0u32;
     let mut recently_connected_peers: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
@@ -444,6 +445,29 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            // On new peer, try to flush any queued messages
+                            let mut flushed = 0u32;
+                            while let Some(cmd) = pending_commands.pop_front() {
+                                let (t, data) = match &cmd {
+                                    NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
+                                    NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                                    NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
+                                    NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
+                                    NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
+                                };
+                                if let Some(d) = data {
+                                    if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_ok() {
+                                        flushed += 1;
+                                    } else {
+                                        // Couldn't publish yet, push back and break to avoid tight loop
+                                        pending_commands.push_front(cmd);
+                                        break;
+                                    }
+                                }
+                            }
+                            if flushed > 0 {
+                                println!("📤 Flushed {} queued messages after peer join", flushed);
+                            }
                             connected_peers += 1;
                             if connected_peers > cfg.max_peers {
                                 println!("⚠️  Max peers ({}) exceeded, disconnecting {}", cfg.max_peers, peer_id);
@@ -453,9 +477,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
                                 recently_connected_peers.insert(peer_id, tokio::time::Instant::now());
                                 println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
-                                
-                                // Wait a moment to stabilize the connection before sending data
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                                swarm.behaviour_mut().add_explicit_peer(&peer_id);
                                 
                                 // Request latest state from new peer if we're starting fresh
                                 if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
@@ -463,10 +485,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                         println!("🔄 Node has only genesis epoch, requesting latest anchor from new peer {}", peer_id);
                                         // Request the peer's latest anchor to discover the current chain state
                                         if let Ok(bytes) = bincode::serialize(&()) {
-                                            match swarm.behaviour_mut().publish(IdentTopic::new(TOP_LATEST_REQUEST), bytes) {
-                                                Ok(_) => println!("📤 Latest epoch request sent to peer {}", peer_id),
-                                                Err(e) => println!("⚠️  Failed to publish latest request to peer {}: {}", peer_id, e),
-                                            }
+                                            try_publish_gossip(&mut swarm, TOP_LATEST_REQUEST, bytes, &format!("latest epoch request to peer {}", peer_id));
                                         } else {
                                             println!("⚠️  Failed to serialize latest epoch request");
                                         }
@@ -478,18 +497,14 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                     if latest_anchor.num > 0 {
                                         println!("📡 Broadcasting latest anchor #{} to new peer {}", latest_anchor.num, peer_id);
                                         // Wait a moment to ensure connection is stable before broadcasting
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         if let Ok(bytes) = bincode::serialize(&latest_anchor) {
                                             try_publish_gossip(&mut swarm, TOP_ANCHOR, bytes, &format!("anchor #{} to peer {}", latest_anchor.num, peer_id));
-                                            println!("📤 Anchor #{} broadcast sent to peer {}", latest_anchor.num, peer_id);
-                                            // Give the message time to be sent before potential disconnection
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                         }
                                         
                                         // Send a keepalive message to maintain connection
                                         println!("💓 Sending keepalive message to peer {}", peer_id);
-                                        if let Ok(keepalive_bytes) = bincode::serialize(&0u64) {
-                                            try_publish_gossip(&mut swarm, TOP_EPOCH_REQUEST, keepalive_bytes, &format!("keepalive to peer {}", peer_id));
+                                        if let Ok(keepalive_bytes) = bincode::serialize(&()) {
+                                            try_publish_gossip(&mut swarm, TOP_LATEST_REQUEST, keepalive_bytes, &format!("keepalive to peer {}", peer_id));
                                         }
                                     }
                                 }
@@ -702,21 +717,11 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 // Success - no need to log for every message
                             }
                             Err(libp2p::gossipsub::PublishError::InsufficientPeers) => {
-                                // Common in small networks - retry after brief delay
-                                println!("📡 Waiting for more peers to join topic {}, will retry...", topic);
-
-                                // Clone variables needed inside async retry task
-                                let topic_clone = topic.to_string();
-                                let cmd_clone = cmd_original.clone();
-                                let tx_clone = command_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                                    if tx_clone.send(cmd_clone).is_ok() {
-                                        println!("🔄 Retrying publish for topic {}", topic_clone);
-                                    } else {
-                                        eprintln!("⚠️  Retry queue closed. Could not re-publish {}", topic_clone);
-                                    }
-                                });
+                                // Not enough peers yet – queue for later and avoid log spam.
+                                if pending_commands.len() < 100 {
+                                    println!("📡 Queuing {} message until peers join ({} queued)", topic, pending_commands.len() + 1);
+                                    pending_commands.push_back(cmd_original.clone());
+                                }
                             }
                             Err(e) => {
                                 eprintln!("⚠️  Failed to publish {} message: {}", topic, e);
