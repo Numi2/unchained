@@ -2,8 +2,8 @@
 // These tests validate the Merkle proof system against known attacks and edge cases.
 
 use std::collections::HashSet;
-use unchainedcoin::epoch::MerkleTree;
-use unchainedcoin::coin::Coin;
+use unchained::epoch::MerkleTree;
+use unchained::coin::Coin;
 
 // Helper to create a set of coin IDs for testing
 fn generate_coin_ids(count: u8) -> HashSet<[u8; 32]> {

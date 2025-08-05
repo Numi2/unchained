@@ -32,12 +32,12 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": { "env": "APPLE_SIGNING_IDENTITY" },
+      "signingIdentity": null,
       "entitlements": null,
       "exceptionDomain": null
     },
     "windows": {
-      "certificateThumbprint": { "env": "WINDOWS_CERT_THUMBPRINT" },
+      "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com"
     }

@@ -28,7 +28,7 @@ export function Network({ nodeStatus, loading }: NetworkProps) {
         },
         {
           id: "12D3KooWExample2345678901bcdefg",
-          address: "/ip4/10.0.0.50/udp/7777/quic-v1",
+          address: "/ip4/10.0.0.50/udp/7778/quic-v1",
           connected: true,
         },
         {

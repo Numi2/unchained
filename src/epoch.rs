@@ -191,6 +191,7 @@ pub struct Manager {
     db:   Arc<Store>,
     cfg:  crate::config::Epoch,
     mining_cfg: crate::config::Mining,
+    net_cfg: crate::config::Net,
     net:  NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
@@ -201,12 +202,13 @@ impl Manager {
         db: Arc<Store>, 
         cfg: crate::config::Epoch, 
         mining_cfg: crate::config::Mining, 
+        net_cfg: crate::config::Net,
         net: NetHandle, 
         coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
         shutdown_rx: broadcast::Receiver<()>
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, mining_cfg, net, anchor_tx, coin_rx, shutdown_rx }
+        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx }
     }
 
     pub fn spawn(mut self) {
@@ -227,7 +229,7 @@ impl Manager {
                 self.net.request_latest_epoch().await;
                 
                 // Wait for network synchronization with a longer timeout
-                let sync_timeout = tokio::time::Duration::from_secs(60);
+                let sync_timeout = tokio::time::Duration::from_secs(90);
                 let sync_start = tokio::time::Instant::now();
                 let mut synced = false;
                 let mut last_request = tokio::time::Instant::now();
@@ -281,7 +283,7 @@ impl Manager {
                     println!("   Check that:");
                     println!("   - The bootstrap peer is running and accessible");
                     println!("   - The peer ID in config.toml matches the running peer");
-                    println!("   - Port 7777 is open and accessible");
+                    println!("   - Port {} is open and accessible", self.net_cfg.listen_port);
                     println!("   - Both nodes are on the same network");
                 }
             }

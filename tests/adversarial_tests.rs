@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::TempDir;
-use unchainedcoin::{
+use unchained::{
     coin::Coin,
     crypto::{self, dilithium3_keypair, address_from_pk},
     storage::Store,

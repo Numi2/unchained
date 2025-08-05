@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use rocksdb;
 use bincode;
 
-// Import UnchainedCoin modules
-use unchainedcoin::{coin::Coin, 
+// Import unchained modules
+use unchained::{coin::Coin, 
     config::{self},
     storage::{self, Store},
     wallet::Wallet,
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 // Application state with proper task management
 #[derive(Default)]
 pub struct AppState {
-    pub config: Option<unchainedcoin::config::Config>,
+    pub config: Option<unchained::config::Config>,
     pub db: Option<Arc<Store>>,
     pub wallet: Option<Arc<Wallet>>,
     pub network: Option<NetHandle>,
@@ -410,7 +410,7 @@ async fn start_node_impl(
     
     // Start network with better error handling
     println!("📡 Starting network on port {}...", cfg.net.listen_port);
-    let net = match unchainedcoin::network::spawn(cfg.net.clone(), db.clone()).await {
+    let net = match unchained::network::spawn(cfg.net.clone(), db.clone()).await {
         Ok(n) => {
             println!("✅ Network started successfully");
             n

@@ -1,4 +1,6 @@
-use crate::{storage::Store, epoch::Anchor, coin::Coin, transfer::Transfer, crypto};
+use crate::{
+    storage::Store, epoch::Anchor, coin::Coin, transfer::Transfer, crypto, config,
+};
 use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
 use libp2p::{
     gossipsub,
@@ -52,35 +54,37 @@ const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
 
-// Peer scoring and rate limiting constants
-const MAX_VALIDATION_FAILURES_PER_PEER: u32 = 10;
-const PEER_BAN_DURATION_SECS: u64 = 3600; // 1 hour
-const RATE_LIMIT_WINDOW_SECS: u64 = 60;
-const MAX_MESSAGES_PER_WINDOW: u32 = 100;
-
 #[derive(Debug, Clone)]
 struct PeerScore {
     validation_failures: u32,
     banned_until: Option<Instant>,
     message_count: u32,
     window_start: Instant,
+    max_validation_failures: u32,
+    ban_duration_secs: u64,
+    rate_limit_window_secs: u64,
+    max_messages_per_window: u32,
 }
 
 impl PeerScore {
-    fn new() -> Self {
+    fn new(p2p_cfg: &config::P2p) -> Self {
         Self {
             validation_failures: 0,
             banned_until: None,
             message_count: 0,
             window_start: Instant::now(),
+            max_validation_failures: p2p_cfg.max_validation_failures_per_peer,
+            ban_duration_secs: p2p_cfg.peer_ban_duration_secs,
+            rate_limit_window_secs: p2p_cfg.rate_limit_window_secs,
+            max_messages_per_window: p2p_cfg.max_messages_per_window,
         }
     }
 
     fn record_validation_failure(&mut self) {
         self.validation_failures += 1;
         
-        if self.validation_failures >= MAX_VALIDATION_FAILURES_PER_PEER {
-            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(PEER_BAN_DURATION_SECS));
+        if self.validation_failures >= self.max_validation_failures {
+            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(self.ban_duration_secs));
             println!("🚫 Peer banned for {} validation failures", self.validation_failures);
         }
     }
@@ -99,7 +103,7 @@ impl PeerScore {
 
     fn check_rate_limit(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.window_start) > std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS) {
+        if now.duration_since(self.window_start) > std::time::Duration::from_secs(self.rate_limit_window_secs) {
             // Reset window
             self.window_start = now;
             self.message_count = 0;
@@ -107,7 +111,7 @@ impl PeerScore {
         
         self.message_count += 1;
         
-        self.message_count <= MAX_MESSAGES_PER_WINDOW
+        self.message_count <= self.max_messages_per_window
     }
 }
 
@@ -314,7 +318,7 @@ fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
         Ok(key_data) => {
             if let Err(e) = fs::write(identity_path, key_data) {
                 eprintln!("⚠️  Failed to save peer identity: {}. Identity will not persist.", e);
-            } else {
+    } else {
                 println!("🔑 Created and saved new peer identity to {}", identity_path);
             }
         }
@@ -326,7 +330,11 @@ fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
     Ok(keypair)
 }
 
-pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<NetHandle> {
+pub async fn spawn(
+    net_cfg: config::Net,
+    p2p_cfg: config::P2p,
+    db: Arc<Store>,
+) -> anyhow::Result<NetHandle> {
     // Load or create persistent peer identity
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
@@ -348,7 +356,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         .heartbeat_interval(std::time::Duration::from_secs(1))           // Faster heartbeat for small networks
         .validation_mode(gossipsub::ValidationMode::Permissive)          // Allow messages from any peer
         .mesh_n(2)                                                       // Target 2 peers in mesh
-        .mesh_n_low(1)                                                   // Minimum 1 peer before publishing is allowed
+        .mesh_n_low(0)                                                   // Minimum 0 peers before publishing is allowed
         .mesh_n_high(3)                                                  // Upper bound keeps mesh small
         .mesh_outbound_min(0)                                              // Allow publishing even with only inbound peers
         .gossip_lazy(1)                                                  // Send gossip to 1 peer/heartbeat
@@ -378,7 +386,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     // Bind the QUIC listener, automatically retrying the next port if the desired
     // port is already occupied. This improves UX when multiple nodes are started
     // on the same machine (e.g. during testing).
-    let mut port = cfg.listen_port;
+    let mut port = net_cfg.listen_port;
     let mut bound = false;
     for _ in 0..10 { // try up to 10 consecutive ports
         let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
@@ -398,18 +406,25 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
         }
     }
     if !bound {
-        return Err(anyhow::anyhow!("Could not bind to any port starting from {}", cfg.listen_port));
+        return Err(anyhow::anyhow!("Could not bind to any port starting from {}", net_cfg.listen_port));
     }
     
+    // Announce public IP if provided
+    if let Some(public_ip) = &net_cfg.public_ip {
+        let external_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", public_ip, port).parse()?;
+        swarm.add_external_address(external_addr.clone());
+        println!("📢 Announcing public IP: {}", external_addr);
+    }
+
     // Debug: Show what we're trying to connect to
     println!("🔍 Local peer ID: {}", peer_id);
-    println!("🔍 Local IP addresses:");
-    for addr in &cfg.bootstrap {
+    println!("🔍 Bootstrap addresses:");
+    for addr in &net_cfg.bootstrap {
         println!("   - {}", addr);
     }
 
     // Connect to bootstrap peers, but skip if it's our own peer ID
-    for addr in &cfg.bootstrap {
+    for addr in &net_cfg.bootstrap {
         let parsed_addr = addr.parse::<Multiaddr>()?;
         // Extract peer ID from the multiaddr to check if it's our own
         if let Some(addr_peer_id) = parsed_addr.iter().last() {
@@ -439,6 +454,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
     let mut connected_peers = 0u32;
     let mut recently_connected_peers: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+    let p2p_cfg_clone = p2p_cfg.clone();
 
     tokio::spawn(async move {
         loop {
@@ -475,14 +491,14 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                 }
                             }
                             connected_peers += 1;
-                            if connected_peers > cfg.max_peers {
-                                println!("⚠️  Max peers ({}) exceeded, disconnecting {}", cfg.max_peers, peer_id);
+                            if connected_peers > net_cfg.max_peers {
+                                println!("⚠️  Max peers ({}) exceeded, disconnecting {}", net_cfg.max_peers, peer_id);
                                 let _ = swarm.disconnect_peer_id(peer_id);
                                 connected_peers -= 1;
                             } else {
-                                peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
+                                peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg_clone));
                                 recently_connected_peers.insert(peer_id, tokio::time::Instant::now());
-                                println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
+                                println!("🤝 Connected to peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, net_cfg.max_peers, endpoint);
 
                                 // Reliably request latest state and broadcast ours by using the command channel.
                                 // This ensures messages are queued if the network isn't ready.
@@ -512,13 +528,13 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                             
                             connected_peers = connected_peers.saturating_sub(1);
                             recently_connected_peers.remove(&peer_id);
-                            println!("👋 Disconnected from peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, cfg.max_peers, endpoint);
+                            println!("👋 Disconnected from peer {} ({}/{} peers) via {:?}", peer_id, connected_peers, net_cfg.max_peers, endpoint);
                         },
                         SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _ } => {
                             eprintln!("❌ Failed to connect to peer {:?}: {:?}", peer_id, error);
                             if peer_id.is_some() {
                                 eprintln!("   This might be due to:");
-                                eprintln!("   - Firewall blocking port 7777");
+                                eprintln!("   - Firewall blocking port 31000");
                                 eprintln!("   - Target peer not running");
                                 eprintln!("   - Network connectivity issues");
                                 eprintln!("   - Wrong IP address in config.toml");
@@ -532,7 +548,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                             
                             // Check peer scoring and rate limiting
                             let should_process = {
-                                let score = peer_scores.entry(peer_id).or_insert_with(PeerScore::new);
+                                let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg_clone));
                                 
                                 if score.is_banned() {
                                     println!("🚫 Ignoring message from banned peer {peer_id}");
@@ -673,7 +689,7 @@ pub async fn spawn(cfg: crate::config::Net, db: Arc<Store>) -> anyhow::Result<Ne
                                     }
                                 }
                                 },
-                                TOP_LATEST_REQUEST => {
+        TOP_LATEST_REQUEST => {
                                     // Respond with our latest anchor
                                     if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                                         if latest_anchor.num > 0 {

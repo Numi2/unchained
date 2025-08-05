@@ -1,4 +1,4 @@
-// Library interface for UnchainedCoin blockchain
+// Library interface for unchained blockchain
 // This allows tests and external consumers to use the blockchain functionality
 
 pub mod config;

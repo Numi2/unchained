@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature};
 use pqcrypto_dilithium::dilithium3::{detached_sign, verify_detached_signature};
-use unchainedcoin::{
+use unchained::{
     wallet::Wallet,
     storage::Store,
     crypto::{address_from_pk, dilithium3_keypair},

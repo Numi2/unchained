@@ -2,7 +2,7 @@
 // These tests validate SECURITY PROPERTIES, not just basic functionality
 
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
-use unchainedcoin::{
+use unchained::{
     crypto::{dilithium3_keypair, address_from_pk, blake3_hash, argon2id_pow},
 };
 use std::collections::HashSet;
@@ -139,8 +139,8 @@ async fn test_dilithium3_security_properties() {
         secret_keys.insert(sk.as_bytes().to_vec());
         
         // Keys should have expected sizes
-        assert_eq!(pk.as_bytes().len(), unchainedcoin::crypto::DILITHIUM3_PK_BYTES, "Public key wrong size");
-        assert_eq!(sk.as_bytes().len(), unchainedcoin::crypto::DILITHIUM3_SK_BYTES, "Secret key wrong size");
+        assert_eq!(pk.as_bytes().len(), unchained::crypto::DILITHIUM3_PK_BYTES, "Public key wrong size");
+        assert_eq!(sk.as_bytes().len(), unchained::crypto::DILITHIUM3_SK_BYTES, "Secret key wrong size");
     }
     
     println!("  ✅ Generated 10 unique keypairs with correct sizes");

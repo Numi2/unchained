@@ -15,7 +15,7 @@ post-quantum blockchain implementation using dilithium3 signatures and argon2id 
 
 ```bash
 cargo build --release
-cargo run --release --bin unchainedcoin mine
+cargo run --release --bin unchained mine
 ```
 
 generates wallet on first run, begins mining and network participation.

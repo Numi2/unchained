@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub net: Net,
+    pub p2p: P2p,
     pub storage: Storage,
     pub epoch: Epoch,
     pub mining: Mining,
@@ -14,12 +15,27 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Net {
     pub listen_port: u16,
+    pub iroh_key_path: String,
     #[serde(default)]
     pub bootstrap: Vec<String>,          // multiaddrs
     #[serde(default = "default_max_peers")]
     pub max_peers: u32,                  // maximum peer connections
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64,    // connection timeout
+    #[serde(default)]
+    pub public_ip: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct P2p {
+    #[serde(default = "default_max_validation_failures_per_peer")]
+    pub max_validation_failures_per_peer: u32,
+    #[serde(default = "default_peer_ban_duration_secs")]
+    pub peer_ban_duration_secs: u64,
+    #[serde(default = "default_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
+    #[serde(default = "default_max_messages_per_window")]
+    pub max_messages_per_window: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -77,7 +93,7 @@ fn default_retarget_interval() -> u64 { 10 }
 
 // Mining memory retargeting defaults
 fn default_min_mem() -> u32 { 16_384 }        // 16 MiB
-fn default_max_mem() -> u32 { 262_144 }       // 256 MiB  
+fn default_max_mem() -> u32 { 262_144 }       // 256 MiB
 fn default_max_memory_adjustment() -> f64 { 1.5 }
 
 // Miner stability defaults
@@ -88,6 +104,13 @@ fn default_max_mining_attempts() -> u64 { 1_000_000 }
 // Network defaults for production deployment
 fn default_max_peers() -> u32 { 100 }
 fn default_connection_timeout() -> u64 { 30 }
+
+// P2P defaults
+fn default_max_validation_failures_per_peer() -> u32 { 10 }
+fn default_peer_ban_duration_secs() -> u64 { 3600 }
+fn default_rate_limit_window_secs() -> u64 { 60 }
+fn default_max_messages_per_window() -> u32 { 100 }
+
 
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.

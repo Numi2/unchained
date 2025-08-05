@@ -6,13 +6,13 @@ echo ""
 # Check if config.toml exists
 if [ ! -f "config.toml" ]; then
     echo "❌ Error: config.toml not found in current directory"
-    echo "   Please run this script from the unchainedcoin_full directory"
+    echo "   Please run this script from the unchained_full directory"
     exit 1
 fi
 
 # Check if the binary exists
-if [ ! -f "target/debug/unchainedcoin" ]; then
-    echo "❌ Error: unchainedcoin binary not found"
+if [ ! -f "target/debug/unchained" ]; then
+    echo "❌ Error: unchained binary not found"
     echo "   Please run 'cargo build' first"
     exit 1
 fi

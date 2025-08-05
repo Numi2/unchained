@@ -3,8 +3,8 @@
 // MerkleTree::verify_proof work correctly and catch incorrect proofs.
 
 use std::collections::HashSet;
-use unchainedcoin::epoch::MerkleTree;
-use unchainedcoin::coin::Coin;
+use unchained::epoch::MerkleTree;
+use unchained::coin::Coin;
 
 #[tokio::test]
 async fn test_merkle_proof_generation_and_verification() {

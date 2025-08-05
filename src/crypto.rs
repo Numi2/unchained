@@ -24,7 +24,7 @@ pub type Address = [u8; 32];
 
 
 pub fn address_from_pk(pk: &PublicKey) -> Address {
-    *Hasher::new_derive_key("unchainedcoin-address")
+    *Hasher::new_derive_key("unchained-address")
         .update(pk.as_bytes())
         .finalize()
         .as_bytes()
@@ -50,7 +50,7 @@ pub fn argon2id_pow(input: &[u8], mem_kib: u32, lanes: u32) -> Result<[u8; 32]> 
 
 /// Hashes arbitrary data with a domain-specific key for internal consistency.
 pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
-    *Hasher::new_derive_key("unchainedcoin-v1").update(data).finalize().as_bytes()
+    *Hasher::new_derive_key("unchained-v1").update(data).finalize().as_bytes()
 }
 
 pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {

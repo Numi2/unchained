@@ -2,7 +2,7 @@
 // These tests validate CONSENSUS SECURITY and ATTACK RESISTANCE
 
 use std::collections::HashSet;
-use unchainedcoin::{
+use unchained::{
     epoch::{Anchor, MerkleTree},
     config::{Epoch as EpochConfig, Mining as MiningConfig},
     coin::Coin,

@@ -1,9 +1,9 @@
-use unchainedcoin::{storage, epoch::Anchor};
+use unchained::{storage, epoch::Anchor};
 
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting unchained Database...");
     
-    let db = storage::open(&unchainedcoin::config::Storage { path: "./data".to_string() });
+    let db = storage::open(&unchained::config::Storage { path: "./data".to_string() });
     
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use unchainedcoin::{
+use unchained::{
     storage::Store,
     coin::Coin,
     crypto::{self, dilithium3_keypair, address_from_pk},

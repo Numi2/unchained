@@ -156,7 +156,7 @@ export function Mining({ nodeStatus, recentEpochs, recentBlocks, onToggleMining,
           <CardContent>
             <div className="text-2xl font-bold">{nodeStatus.coins_mined}</div>
             <p className="text-xs text-muted-foreground">
-              UnchainedCoins earned
+              unchaineds earned
             </p>
           </CardContent>
         </Card>

@@ -95,16 +95,43 @@ impl Miner {
         
         println!("🔗 Connected to anchor broadcast channel");
         
-        // NEW: Immediately fetch the latest epoch from the database so that a miner started mid-epoch
         // doesn’t have to wait for the next anchor broadcast (which can be several minutes away).
-        if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-            println!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
-            self.current_epoch = Some(latest_anchor.num);
-            self.last_heartbeat = time::Instant::now();
-            // Start mining straight away. If this fails (e.g., because the epoch already finished)
-            // we’ll simply continue to the select! loop and await the next anchor.
-            if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
-                eprintln!("⚠️  Initial mining attempt failed: {e}");
+        match self.db.get::<Anchor>("epoch", b"latest") {
+            Ok(Some(latest_anchor)) => {
+                println!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
+                self.current_epoch = Some(latest_anchor.num);
+                self.last_heartbeat = time::Instant::now();
+                if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
+                    eprintln!("⚠️  Initial mining attempt failed: {e}");
+                }
+            },
+            Ok(None) => {
+                // GENESIS: No anchors exist, create the first one.
+                println!("🌱 No existing epochs found. Creating genesis anchor...");
+                let genesis_anchor = Anchor {
+                    num: 0,
+                    hash: [0; 32], // Genesis has no previous hash
+                    difficulty: 1, // Start with minimal difficulty
+                    coin_count: 0,
+                    cumulative_work: Anchor::expected_work_for_difficulty(1),
+                    mem_kib: self.cfg.mem_kib,
+                };
+
+                // Use the internal anchor broadcaster provided by the network module
+                // to ensure the epoch manager and other components receive it.
+                let anchor_tx = self.net.anchor_sender();
+                if anchor_tx.send(genesis_anchor.clone()).is_ok() {
+                    println!("✅ Genesis anchor broadcasted internally");
+                    // Now mine this epoch
+                    if let Err(e) = self.mine_epoch(genesis_anchor).await {
+                        eprintln!("⚠️  Genesis mining attempt failed: {e}");
+                    }
+                } else {
+                    eprintln!("🔥 Failed to broadcast genesis anchor internally");
+                }
+            },
+            Err(e) => {
+                eprintln!("🔥 Failed to read latest epoch from DB: {e}");
             }
         }
         

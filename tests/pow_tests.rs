@@ -1,7 +1,7 @@
 // REAL Proof-of-Work Tests
 // These tests validate MINING DIFFICULTY and COMPUTATIONAL WORK
 
-use unchainedcoin::{
+use unchained::{
     coin::Coin,
     crypto::{self, dilithium3_keypair, address_from_pk},
 };

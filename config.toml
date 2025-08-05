@@ -2,17 +2,27 @@
 
 [net]
 # Port to listen on for P2P connections
-listen_port = 7777
+listen_port = 31000
+# Path to the Iroh secret key
+iroh_key_path = "iroh.key"
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 10000
 # Connection timeout in seconds
 connection_timeout_secs = 30
+# The public IP address of this node, to be announced to other peers.
+# This is essential for nodes running behind a NAT.
+public_ip = "34.51.215.84"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 # Format: /ip4/IP_ADDRESS/udp/PORT/quic-v1/p2p/PEER_ID
-bootstrap = [
-    "/ip4/192.168.1.101/udp/7777/quic-v1/p2p/12D3KooWGGzPNmYnePdAYhAE117hT4ViL8p2negT96MpRjTYjLmV",  # ← replace <PEER_ID> with the node’s real peer-id
-]
+bootstrap = []
+
+[p2p]
+# Peer scoring and rate limiting constants
+max_validation_failures_per_peer = 10
+peer_ban_duration_secs = 3600 # 1 hour
+rate_limit_window_secs = 60
+max_messages_per_window = 100
 
 [storage]
 # Path where blockchain data will be stored (outside src-tauri to avoid rebuild loops)

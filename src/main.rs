@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
 
-    let net = network::spawn(cfg.net.clone(), db.clone()).await?;
+    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone()).await?;
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
         cfg.epoch.clone(),
         cfg.mining.clone(),
+        cfg.net.clone(),
         net.clone(),
         coin_rx,
         shutdown_tx.subscribe(),
@@ -74,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
 
     println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
+    if let Some(public_ip) = cfg.net.public_ip {
+        println!("   📢 Public IP announced as: {public_ip}");
+    }
     println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");

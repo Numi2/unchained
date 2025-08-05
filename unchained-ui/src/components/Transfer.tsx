@@ -95,7 +95,7 @@ export function Transfer({ walletInfo, onCreateTransfer, onGetOwnedCoins, loadin
           <CardHeader>
             <CardTitle>Send Coins</CardTitle>
             <CardDescription>
-              Transfer UnchainedCoins to another address
+              Transfer unchaineds to another address
             </CardDescription>
           </CardHeader>
           <CardContent>
