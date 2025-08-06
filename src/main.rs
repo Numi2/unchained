@@ -63,23 +63,32 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Active Synchronization Before Mining ---
     // A new node must sync with the network before it can mine. We explicitly
-    // request the latest state and then enter a loop, checking the database
-    // until we see that we have at least one epoch from the network.
+    // request the latest state and then enter a loop, waiting until our local
+    // epoch number matches the highest epoch we've seen from the network.
     println!("🔄 Initiating synchronization with the network...");
     net.request_latest_epoch().await;
     
     let mut synced = false;
-    for _ in 0..30 { // Up to 15 seconds to sync (30 * 500ms)
-        if let Ok(Some(_)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-            println!("✅ Initial synchronization complete.");
+    for _ in 0..260 { // Up to 30 seconds to sync (160 * 500ms)
+        let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+        let local_epoch = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
+
+        // Wait until we've heard from the network and our local chain matches the height.
+        if highest_seen > 0 && local_epoch >= highest_seen {
+            println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
             synced = true;
             break;
         }
+
+        if highest_seen > 0 {
+            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     if !synced {
-        println!("⚠️  Could not sync with network after 15s. Starting as a new chain.");
+        println!("⚠️  Could not sync with network after 160s. Starting as a new chain.");
     }
     
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;

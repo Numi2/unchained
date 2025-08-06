@@ -194,7 +194,7 @@ pub async fn spawn(
         .validation_mode(gossipsub::ValidationMode::Permissive)
         .mesh_n_low(0)
         .mesh_outbound_min(0)
-        .flood_publish(true) // Force publish to all peers, bypassing mesh warmup
+        .flood_publish(true) 
         .build()?;
         
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
@@ -245,6 +245,7 @@ pub async fn spawn(
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
+    let mut orphan_anchors: HashMap<u64, Anchor> = HashMap::new();
 
     tokio::spawn(async move {
         loop {
@@ -280,20 +281,41 @@ pub async fn spawn(
                             if score.is_banned() || !score.check_rate_limit() { continue; }
                             
                             match message.topic.as_str() {
-                                TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
+                                TOP_ANCHOR => if let Ok(mut a) = bincode::deserialize::<Anchor>(&message.data) {
                                     println!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
+                                    
+                                    // Attempt to process the received anchor.
+                                    // If it fails because the parent is missing, buffer it.
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
                                             if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
-                                                println!("✅ Anchor validated and is better chain, storing epoch {}", a.num);
+                                                println!("✅ Storing anchor for epoch {}", a.num);
                                                 db.put("epoch", &a.num.to_le_bytes(), &a).ok();
                                                 db.put("anchor", &a.hash, &a).ok();
                                                 db.put("epoch", b"latest", &a).ok();
-                                                let _ = anchor_tx.send(a);
+                                                let _ = anchor_tx.send(a.clone());
+
+                                                // Now, try to process any orphans that were waiting for this anchor.
+                                                let mut next_num = a.num + 1;
+                                                while let Some(orphan) = orphan_anchors.remove(&next_num) {
+                                                    if validate_anchor(&orphan, &db).is_ok() {
+                                                        println!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
+                                                        db.put("epoch", &orphan.num.to_le_bytes(), &orphan).ok();
+                                                        db.put("anchor", &orphan.hash, &orphan).ok();
+                                                        db.put("epoch", b"latest", &orphan).ok();
+                                                        let _ = anchor_tx.send(orphan);
+                                                        next_num += 1;
+                                                    } else {
+                                                        orphan_anchors.insert(orphan.num, orphan);
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
-                                            println!("⏳ Anchor for epoch {} missing previous anchor, updating sync state", a.num);
+                                            println!("⏳ Buffering orphan anchor for epoch {}", a.num);
+                                            orphan_anchors.insert(a.num, a.clone());
+                                            
                                             let mut state = sync_state.lock().unwrap();
                                             if a.num > state.highest_seen_epoch {
                                                 state.highest_seen_epoch = a.num;

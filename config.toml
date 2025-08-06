@@ -8,9 +8,9 @@ iroh_key_path = "iroh.key"
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 10000
 # Connection timeout in seconds
-connection_timeout_secs = 30
+connection_timeout_secs = 300
 # Timeout for initial network sync in seconds
-sync_timeout_secs = 180
+sync_timeout_secs = 1800
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
@@ -23,10 +23,10 @@ bootstrap = ["/ip4/34.51.215.84/udp/31000/quic-v1/p2p/12D3KooWMPtzmPYGLq58SeCMv5
 
 [p2p]
 # Peer scoring and rate limiting constants
-max_validation_failures_per_peer = 10
+max_validation_failures_per_peer = 10000
 peer_ban_duration_secs = 3600 # 1 hour
-rate_limit_window_secs = 60
-max_messages_per_window = 100
+rate_limit_window_secs = 600
+max_messages_per_window = 1000
 
 [storage]
 # Path where blockchain data will be stored (outside src-tauri to avoid rebuild loops)
@@ -37,7 +37,7 @@ path = "../blockchain_data"
 
 [epoch]
 # Duration of each epoch in seconds 
-seconds = 22
+seconds = 222
 # Target number of leading zeros for proof-of-work difficulty (start with 1 for public mining)
 target_leading_zeros = 1
 # Retargeting parameters
