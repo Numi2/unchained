@@ -48,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
+
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
         cfg.epoch.clone(),
@@ -57,9 +59,7 @@ async fn main() -> anyhow::Result<()> {
         coin_rx,
         shutdown_tx.subscribe(),
     );
-    epoch_mgr.start().await;
-
-    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
+    epoch_mgr.spawn_loop();
 
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
     if mining_enabled {

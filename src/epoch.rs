@@ -176,44 +176,35 @@ impl Manager {
         Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx }
     }
 
-    pub async fn start( self) {
-        let mut current_epoch = match self.db.get::<Anchor>("epoch", b"latest") {
-            Ok(Some(anchor)) => anchor.num + 1,
-            Ok(None) => 0,
-            Err(_) => 0,
-        };
+    pub fn spawn_loop(mut self) {
+        tokio::spawn(async move {
+            let mut current_epoch = match self.db.get::<Anchor>("epoch", b"latest") {
+                Ok(Some(anchor)) => anchor.num + 1,
+                Ok(None) => 0,
+                Err(_) => 0,
+            };
 
-        if current_epoch == 0 {
-            println!("🔄 Initial network synchronization phase...");
-            println!("   Waiting for peers to share current blockchain state...");
-            println!("   Timeout: {} seconds", self.net_cfg.sync_timeout_secs);
-            
-            println!("📡 Sending initial sync request...");
-            self.net.request_latest_epoch().await;
-            
-            let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
-            let sync_start = tokio::time::Instant::now();
-            let mut synced = false;
-            
-            while !synced && sync_start.elapsed() < sync_timeout {
-                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                    current_epoch = latest_anchor.num + 1;
-                    println!("✅ Network synchronization complete! Starting from epoch {}", current_epoch);
-                    synced = true;
-                } else {
+            if current_epoch == 0 {
+                println!("🔄 Initial network synchronization phase...");
+                let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
+                let sync_start = tokio::time::Instant::now();
+                
+                while sync_start.elapsed() < sync_timeout {
+                    if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                       if latest_anchor.num > 0 {
+                           current_epoch = latest_anchor.num + 1;
+                           println!("✅ Network synchronization complete! Starting from epoch {}", current_epoch);
+                           break;
+                       }
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                 }
+                
+                if current_epoch == 0 {
+                    println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis.");
+                }
             }
-            
-            if !synced {
-                println!("⚠️  Network synchronization timeout.");
-            }
-        }
-        self.spawn_loop(current_epoch);
-    }
 
-    fn spawn_loop(mut self, mut current_epoch: u64) {
-        tokio::spawn(async move {
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
             let mut ticker = time::interval(time::Duration::from_secs(self.cfg.seconds));
 
@@ -228,6 +219,16 @@ impl Manager {
                         buffer.insert(id);
                     },
                     _ = ticker.tick() => {
+                        if current_epoch > 0 {
+                            if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                                if latest_anchor.num >= current_epoch {
+                                    println!("⏭️  Chain has advanced. Skipping epoch creation and fast-forwarding from {} to {}.", current_epoch, latest_anchor.num + 1);
+                                    current_epoch = latest_anchor.num + 1;
+                                    continue;
+                                }
+                            }
+                        }
+
                         if current_epoch == 0 && buffer.is_empty() {
                             println!("🌱 No existing epochs found. Creating genesis anchor...");
                         }
@@ -267,10 +268,9 @@ impl Manager {
                             batch.put_cf(anchor_cf, &hash, &serialized_anchor);
                         }
                         
-                        if let Err(e) = self.db.write_batch(batch) {
+                        if let Err(e) = self.db.db.write(batch) {
                             eprintln!("🔥 Failed to write new epoch to DB: {e}");
                         } else {
-                            self.db.flush().ok();
                             self.net.gossip_anchor(&anchor).await;
                             let _ = self.anchor_tx.send(anchor);
                             buffer.clear();
