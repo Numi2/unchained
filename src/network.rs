@@ -183,8 +183,8 @@ pub async fn spawn(
 ) -> anyhow::Result<NetHandle> {
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
-    println!("📡 Local peer-ID: {peer_id}");
-
+    println!("🆔 Local peer ID: {}", peer_id);
+    
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -224,7 +224,11 @@ pub async fn spawn(
     }
 
     for addr in &net_cfg.bootstrap {
-        swarm.dial(addr.parse::<Multiaddr>()?)?;
+        println!("🔗 Dialing bootstrap node: {}", addr);
+        match swarm.dial(addr.parse::<Multiaddr>()?) {
+            Ok(_) => println!("✅ Bootstrap dial initiated"),
+            Err(e) => println!("❌ Failed to dial bootstrap node: {}", e),
+        }
     }
 
     let (anchor_tx, _) = broadcast::channel(256);
@@ -241,6 +245,7 @@ pub async fn spawn(
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            println!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
@@ -259,6 +264,9 @@ pub async fn spawn(
                             }
                             pending_commands = still_pending;
                         },
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            println!("👋 Disconnected from peer: {}", peer_id);
+                        },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
@@ -266,9 +274,11 @@ pub async fn spawn(
                             
                             match message.topic.as_str() {
                                 TOP_ANCHOR => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
+                                    println!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
                                             if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
+                                                println!("✅ Anchor validated and is better chain, storing epoch {}", a.num);
                                                 db.put("epoch", &a.num.to_le_bytes(), &a).ok();
                                                 db.put("anchor", &a.hash, &a).ok();
                                                 db.put("epoch", b"latest", &a).ok();
@@ -276,12 +286,16 @@ pub async fn spawn(
                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
+                                            println!("⏳ Anchor for epoch {} missing previous anchor, updating sync state", a.num);
                                             let mut state = sync_state.lock().unwrap();
                                             if a.num > state.highest_seen_epoch {
                                                 state.highest_seen_epoch = a.num;
                                             }
                                         },
-                                        Err(_) => score.record_validation_failure(),
+                                        Err(e) => {
+                                            println!("❌ Anchor validation failed: {}", e);
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 },
                                 TOP_COIN => if let Ok(c) = bincode::deserialize::<Coin>(&message.data) {
@@ -299,17 +313,25 @@ pub async fn spawn(
                                     }
                                 },
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
+                                    println!("📨 Received latest epoch request from peer: {}", peer_id);
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", b"latest") {
+                                        println!("📤 Sending latest epoch {} to peer", anchor.num);
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
+                                    } else {
+                                        println!("⚠️  No latest epoch found to send");
                                     }
                                 },
                                 TOP_EPOCH_REQUEST => if let Ok(n) = bincode::deserialize::<u64>(&message.data) {
+                                    println!("📨 Received request for epoch {} from peer: {}", n, peer_id);
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                                        println!("📤 Sending epoch {} to peer", n);
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
+                                    } else {
+                                        println!("⚠️  Epoch {} not found", n);
                                     }
                                 },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {

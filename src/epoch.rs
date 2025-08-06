@@ -188,6 +188,7 @@ impl Manager {
             println!("   Waiting for peers to share current blockchain state...");
             println!("   Timeout: {} seconds", self.net_cfg.sync_timeout_secs);
             
+            println!("📡 Sending initial sync request...");
             self.net.request_latest_epoch().await;
             
             let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
