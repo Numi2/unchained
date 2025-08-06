@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
 
@@ -10,6 +10,7 @@ pub mod sync;      pub mod metrics;  pub mod wallet;
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
 struct Cli {
+    /// Path to the TOML config file
     #[arg(short, long, default_value = "config.toml")]
     config: String,
 
@@ -19,6 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Enable the local miner even if `mining.enabled = false`
     Mine,
 }
 
@@ -31,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg_dir = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     let mut cfg = config::load(&cli.config)?;
 
+    // Resolve storage path relative to the config file location so that
+    // running the binary from any working directory uses the **same** DB.
     if std::path::Path::new(&cfg.storage.path).is_relative() {
         let abs = cfg_dir.join(&cfg.storage.path);
         cfg.storage.path = abs.to_string_lossy().into_owned();
@@ -39,12 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let db = storage::open(&cfg.storage);
     println!("🗄️  Database opened at '{}'", cfg.storage.path);
 
+    // Create shutdown broadcast channel for coordinated shutdown
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
-    
-    let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
-    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
+    let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
+
+    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone()).await?;
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -59,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     );
     epoch_mgr.start().await;
 
-    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
+    sync::spawn(db.clone(), net.clone(), shutdown_tx.subscribe());
 
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
     if mining_enabled {
@@ -78,17 +82,26 @@ async fn main() -> anyhow::Result<()> {
     println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");
 
+    // Wait for shutdown signal and perform clean shutdown
     match signal::ctrl_c().await {
         Ok(()) => {
             println!("\n🛑 Shutdown signal received, cleaning up...");
+            
+            // Signal all background tasks to shutdown
+            println!("📡 Signaling background tasks to shutdown...");
             let _ = shutdown_tx.send(());
+            
+            // Give tasks a reasonable time to shutdown gracefully
             println!("⏳ Waiting for tasks to shutdown gracefully...");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            
+            // Properly close database to prevent file conflicts
             if let Err(e) = db.close() {
                 eprintln!("Warning: Database cleanup failed: {e}");
             } else {
                 println!("✅ Database closed cleanly");
             }
+            
             println!("👋 unchained node stopped");
             Ok(())
         }

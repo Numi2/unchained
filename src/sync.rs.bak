@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 
 const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
-const SYNC_CHECK_INTERVAL_SECS: u64 = 5;
+const SYNC_CHECK_INTERVAL_SECS: u64 = 5; // Check for sync state every 5 seconds
 
 #[derive(Default, Debug)]
 pub struct SyncState {
@@ -31,49 +31,82 @@ pub fn spawn(
                 }
 
                 _ = sync_check_timer.tick() => {
-                    let highest_seen = { sync_state.lock().unwrap().highest_seen_epoch };
+                    let highest_seen = {
+                        let state = sync_state.lock().unwrap();
+                        state.highest_seen_epoch
+                    };
+
                     if highest_seen > local_epoch {
                         println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
                         request_missing_epochs(local_epoch, highest_seen, &net, &semaphore).await;
+                        // Update local_epoch after trying to sync
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
                         }
                     }
                 }
 
-                Ok(anchor) = anchor_rx.recv() => {
-                    if anchor.num > local_epoch {
-                        if anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or_default()) {
-                            if anchor.num > local_epoch + 1 {
-                                request_missing_epochs(local_epoch, anchor.num, &net, &semaphore).await;
+                anchor_result = anchor_rx.recv() => {
+                    match anchor_result {
+                        Ok(anchor) => {
+                            if anchor.num > local_epoch {
+                                let current_best = db.get::<Anchor>("epoch", b"latest").unwrap_or_default();
+                                let should_accept = match current_best {
+                                    Some(best) => anchor.is_better_chain(&Some(best)),
+                                    None => true,
+                                };
+
+                                if should_accept {
+                                    if anchor.num > local_epoch + 1 {
+                                        request_missing_epochs(local_epoch, anchor.num, &net, &semaphore).await;
+                                    }
+                                    local_epoch = anchor.num;
+                                }
                             }
-                            local_epoch = anchor.num;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("⚠️  Sync lagged {n} anchors behind; re-checking latest from DB.");
+                            local_epoch = db.get::<Anchor>("epoch", b"latest").unwrap_or_default().map_or(0, |a| a.num);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            println!("📡 Anchor broadcast channel closed");
+                            break;
                         }
                     }
                 }
             }
         }
+        
         println!("✅ Sync task shutdown complete");
     });
 }
 
 async fn request_missing_epochs(
-    local_epoch: u64,
+    mut local_epoch: u64,
     target_epoch: u64,
     net: &NetHandle,
     semaphore: &Arc<Semaphore>,
 ) {
+    let missing_count = target_epoch.saturating_sub(local_epoch);
+    println!("- Requesting {} missing epochs from {} to {}.", missing_count, local_epoch + 1, target_epoch);
+
     let mut request_tasks = Vec::new();
+    
     for missing in (local_epoch + 1)..=target_epoch {
         let net_clone = net.clone();
         let sem_clone = semaphore.clone();
+        
         let task = tokio::spawn(async move {
             let _permit = sem_clone.acquire().await.unwrap();
             net_clone.request_epoch(missing).await;
         });
+        
         request_tasks.push(task);
     }
+    
     for task in request_tasks {
-        task.await.ok();
+        if let Err(e) = task.await {
+            eprintln!("⚠️  Epoch request task failed: {e}");
+        }
     }
 }

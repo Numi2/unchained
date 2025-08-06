@@ -24,6 +24,8 @@ pub struct Net {
     pub connection_timeout_secs: u64,    // connection timeout
     #[serde(default)]
     pub public_ip: Option<String>,
+    #[serde(default = "default_sync_timeout")]
+    pub sync_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -104,6 +106,7 @@ fn default_max_mining_attempts() -> u64 { 1_000_000 }
 // Network defaults for production deployment
 fn default_max_peers() -> u32 { 100 }
 fn default_connection_timeout() -> u64 { 30 }
+fn default_sync_timeout() -> u64 { 180 }
 
 // P2P defaults
 fn default_max_validation_failures_per_peer() -> u32 { 10 }
