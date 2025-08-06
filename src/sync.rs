@@ -37,6 +37,7 @@ pub fn spawn(
                         request_missing_epochs(local_epoch, highest_seen, &net, &semaphore).await;
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
+                            println!("📊 Local epoch updated to: {}", local_epoch);
                         }
                     }
                 }
@@ -63,6 +64,7 @@ async fn request_missing_epochs(
     net: &NetHandle,
     semaphore: &Arc<Semaphore>,
 ) {
+    println!("📥 Requesting epochs {} to {}", local_epoch + 1, target_epoch);
     let mut request_tasks = Vec::new();
     for missing in (local_epoch + 1)..=target_epoch {
         let net_clone = net.clone();
