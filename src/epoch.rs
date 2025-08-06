@@ -186,6 +186,8 @@ impl Manager {
 
             if current_epoch == 0 {
                 println!("🔄 Initial network synchronization phase...");
+                self.net.request_latest_epoch().await;
+
                 let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
                 let sync_start = tokio::time::Instant::now();
                 

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 
 const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
-const SYNC_CHECK_INTERVAL_SECS: u64 = 5;
+const SYNC_CHECK_INTERVAL_SECS: u64 = 1;
 
 #[derive(Default, Debug)]
 pub struct SyncState {
@@ -31,10 +31,11 @@ pub fn spawn(
                 }
 
                 _ = sync_check_timer.tick() => {
+                    net.request_latest_epoch().await;
                     let highest_seen = { sync_state.lock().unwrap().highest_seen_epoch };
                     if highest_seen > local_epoch {
                         println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
-                        request_missing_epochs(local_epoch, highest_seen, &net, &semaphore).await;
+                        request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
                             println!("📊 Local epoch updated to: {}", local_epoch);
@@ -46,7 +47,7 @@ pub fn spawn(
                     if anchor.num > local_epoch {
                         if anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or_default()) {
                             if anchor.num > local_epoch + 1 {
-                                request_missing_epochs(local_epoch, anchor.num, &net, &semaphore).await;
+                                request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await;
                             }
                             local_epoch = anchor.num;
                         }
@@ -63,10 +64,21 @@ async fn request_missing_epochs(
     target_epoch: u64,
     net: &NetHandle,
     semaphore: &Arc<Semaphore>,
+    db: &Arc<Store>,
 ) {
-    println!("📥 Requesting epochs {} to {}", local_epoch + 1, target_epoch);
+    let start_epoch = if db.get::<Anchor>("epoch", b"latest").unwrap_or_default().is_none() {
+        0
+    } else {
+        local_epoch + 1
+    };
+
+    if start_epoch > target_epoch {
+        return;
+    }
+
+    println!("📥 Requesting epochs {} to {}", start_epoch, target_epoch);
     let mut request_tasks = Vec::new();
-    for missing in (local_epoch + 1)..=target_epoch {
+    for missing in start_epoch..=target_epoch {
         let net_clone = net.clone();
         let sem_clone = semaphore.clone();
         let task = tokio::spawn(async move {

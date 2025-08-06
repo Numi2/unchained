@@ -194,6 +194,7 @@ pub async fn spawn(
         .validation_mode(gossipsub::ValidationMode::Permissive)
         .mesh_n_low(0)
         .mesh_outbound_min(0)
+        .flood_publish(true) // Force publish to all peers, bypassing mesh warmup
         .build()?;
         
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
@@ -204,7 +205,13 @@ pub async fn spawn(
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
-    let mut swarm = Swarm::new(transport, gs, peer_id, libp2p::swarm::Config::with_tokio_executor());
+    let mut swarm = Swarm::new(
+        transport,
+        gs,
+        peer_id,
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(std::time::Duration::from_secs(20))
+    );
     
     let mut port = net_cfg.listen_port;
     loop {
@@ -264,8 +271,8 @@ pub async fn spawn(
                             }
                             pending_commands = still_pending;
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            println!("👋 Disconnected from peer: {}", peer_id);
+                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            println!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);

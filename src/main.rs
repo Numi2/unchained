@@ -61,6 +61,27 @@ async fn main() -> anyhow::Result<()> {
     );
     epoch_mgr.spawn_loop();
 
+    // --- Active Synchronization Before Mining ---
+    // A new node must sync with the network before it can mine. We explicitly
+    // request the latest state and then enter a loop, checking the database
+    // until we see that we have at least one epoch from the network.
+    println!("🔄 Initiating synchronization with the network...");
+    net.request_latest_epoch().await;
+    
+    let mut synced = false;
+    for _ in 0..30 { // Up to 15 seconds to sync (30 * 500ms)
+        if let Ok(Some(_)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+            println!("✅ Initial synchronization complete.");
+            synced = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    if !synced {
+        println!("⚠️  Could not sync with network after 15s. Starting as a new chain.");
+    }
+    
     let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
     if mining_enabled {
         miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe());
