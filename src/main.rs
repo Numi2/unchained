@@ -100,14 +100,24 @@ async fn main() -> anyhow::Result<()> {
     println!("🔄 Initiating synchronization with the network...");
     net.request_latest_epoch().await;
     
+    let poll_interval_ms: u64 = 500;
+    let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
     let mut synced = false;
-    for attempt in 0..260 { // Up to 130 seconds to sync (260 * 500ms = 130 seconds)
+    for attempt in 0..max_attempts {
         let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
-        let local_epoch = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
+        let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
+        let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
 
-        // Wait until we've heard from the network and our local chain matches the height.
+        // Case 1: We have a network view and our local chain has caught up
         if highest_seen > 0 && local_epoch >= highest_seen {
             println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
+            synced = true;
+            break;
+        }
+
+        // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
+        if highest_seen == 0 && latest_opt.is_some() {
+            println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
             synced = true;
             break;
         }
@@ -118,11 +128,14 @@ async fn main() -> anyhow::Result<()> {
             println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
     }
 
     if !synced {
-        println!("⚠️  Could not sync with network after 130s. Starting as a new chain.");
+        println!(
+            "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+            cfg.net.sync_timeout_secs
+        );
     }
     
     // Handle CLI commands
