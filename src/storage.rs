@@ -5,7 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use anyhow::{Result, Context};
 use hex;
 use std::sync::Arc;
-use std::process;
+// use std::process; // removed unused
 
 // Using bincode for fast, compact binary serialization instead of JSON.
 // Using zstd for a better compression ratio and speed than lz4.
@@ -72,24 +72,29 @@ impl Store {
         // Use base path directly for production, but ensure clean state
         let db_path = base_path.to_string();
         
-        // Clean up any existing lock files that might cause conflicts
-        let lock_file = format!("{}/LOCK", &db_path);
-        if std::path::Path::new(&lock_file).exists() {
-            let _ = std::fs::remove_file(&lock_file); // Remove stale lock
-        }
+        // Do not delete RocksDB LOCK file; if present and DB open fails, surface error to caller
         
-        let cf_names = ["default", "epoch", "coin", "head", "wallet", "anchor", "transfer"];
+        let cf_names = [
+            "default",
+            "epoch",
+            "coin",
+            "coin_candidate",
+            "epoch_selected", // per-epoch selected coin IDs
+            "epoch_leaves",   // per-epoch sorted leaf hashes for proofs
+            "head",
+            "wallet",
+            "anchor",
+            "transfer",
+        ];
         
-        // Configure column family options for stability and uniqueness
+        // Configure column family options with sane production defaults
         let mut cf_opts = Options::default();
-        cf_opts.set_write_buffer_size(256 * 1024); // 256KB buffer (very small)
-        cf_opts.set_max_write_buffer_number(1); // Only 1 write buffer
-        cf_opts.set_target_file_size_base(512 * 1024); // 512KB SST files (very small)
-        cf_opts.set_level_zero_file_num_compaction_trigger(1); // Compact immediately with 1 file
-        cf_opts.set_max_bytes_for_level_base(1024 * 1024); // 1MB base level
-        cf_opts.set_level_zero_slowdown_writes_trigger(1); // Slowdown at 1 file
-        cf_opts.set_level_zero_stop_writes_trigger(2); // Stop at 2 files
-        // (removed duplicate settings that conflict with extreme single-file config)
+        // Larger memtable for throughput; multiple write buffers
+        cf_opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        cf_opts.set_max_write_buffer_number(2);
+        // Target file size for compaction levels
+        cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
+        // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
         
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
@@ -109,38 +114,30 @@ impl Store {
         // Custom file organization
         db_opts.set_wal_dir(&wal_dir); // Put WAL files in /logs subdirectory
         
-        // Balanced durability settings - prioritize stability over extreme speed
-        db_opts.set_use_fsync(true); // Force fsync for durability
-        db_opts.set_bytes_per_sync(1024 * 1024); // Sync every 1MB (more stable)
-        db_opts.set_wal_bytes_per_sync(1024 * 1024); // Sync WAL every 1MB
-        db_opts.set_writable_file_max_buffer_size(0); // No OS buffering
-        db_opts.set_db_write_buffer_size(16 * 1024 * 1024); // 16MB total (more stable)
-        db_opts.set_max_background_jobs(4); // Reasonable background jobs
+        // Production-leaning durability settings: rely on WAL + periodic fsync
+        db_opts.set_use_fsync(false);
+        db_opts.set_bytes_per_sync(8 * 1024 * 1024);
+        db_opts.set_wal_bytes_per_sync(8 * 1024 * 1024);
+        db_opts.set_db_write_buffer_size(256 * 1024 * 1024);
+        db_opts.set_max_background_jobs(8);
         
-        // Prevent file naming conflicts with stable settings
-        db_opts.set_level_zero_slowdown_writes_trigger(8); // More stable thresholds
-        db_opts.set_level_zero_stop_writes_trigger(12);
-        db_opts.set_max_open_files(100); // Strict limit on open files
+        // More forgiving compaction thresholds
+        db_opts.set_level_zero_slowdown_writes_trigger(20);
+        db_opts.set_level_zero_stop_writes_trigger(36);
+        db_opts.set_max_open_files(512);
         
         // Additional file management settings
-        db_opts.set_recycle_log_file_num(0); // Don't recycle log files - delete them
+        db_opts.set_recycle_log_file_num(4);
         
-        // EXTREME single-file configuration
-        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::AbsoluteConsistency);
+        // WAL and cleanup tuned for throughput
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
         db_opts.set_manual_wal_flush(false);
-        
-        // Force absolute minimum files
-        db_opts.set_wal_size_limit_mb(1); // Smallest possible WAL
-        db_opts.set_max_total_wal_size(512 * 1024); // 512KB max total WAL
-        db_opts.set_keep_log_file_num(1); // Minimum allowed (can't be 0)
-        
-        // Instant cleanup - delete files immediately
-        db_opts.set_wal_ttl_seconds(1); // Delete after 1 second
-        db_opts.set_delete_obsolete_files_period_micros(100 * 1000); // Check every 100ms
-        
-        // Minimize compaction files  
-        db_opts.set_max_background_jobs(1); // Single background job
-        db_opts.set_max_subcompactions(1); // Single subcompaction
+        db_opts.set_wal_size_limit_mb(64);
+        db_opts.set_max_total_wal_size(512 * 1024 * 1024);
+        db_opts.set_keep_log_file_num(10);
+        db_opts.set_wal_ttl_seconds(24 * 60 * 60);
+        db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
+        db_opts.set_max_subcompactions(4);
         
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors)
             .with_context(|| format!("Failed to open database at '{db_path}'"))?;
@@ -195,19 +192,18 @@ impl Store {
         let handle = self.db.cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
 
-        // Use sync write options for critical data persistence
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true); // Force sync to disk immediately
+        // Use default write options; rely on WAL fsync policy
+        let write_opts = WriteOptions::default();
 
         // Write to RocksDB first (primary store)
         self.db
             .put_cf_opt(handle, key, &data_to_store, &write_opts)
             .with_context(|| format!("Failed to PUT to database for key '{key:?}' in CF '{cf}'"))?;
 
-        // Queue numicoin mirroring in background thread
+        // Queue coin mirroring in background thread (feature-guarded via env); off by default
         if cf == "coin" {
             if let Some(tx) = &self.mirror_tx {
-                let mirror_path = format!("{}/coins/numicoin{}.dat", self.path, hex::encode(key));
+                let mirror_path = format!("{}/coins/coin-{}.bin", self.path, hex::encode(key));
                 let _ = tx.send((mirror_path, data_to_store.clone()));
             }
         }
@@ -232,27 +228,21 @@ impl Store {
                 // Fallback: treat data as uncompressed bincode
                 match bincode::deserialize(&value[..]) {
                     Ok(deser) => Ok(Some(deser)),
-                    Err(_) => {
-                        // Special case: caller expects Vec<u8> but value is raw bytes
-                        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Vec<u8>>() {
-                            // Safe conversion for Vec<u8> case
-                            let vec_bytes: Vec<u8> = value.to_vec();
-                            // SAFETY: We've verified T is Vec<u8> via TypeId comparison
-                            let result = unsafe {
-                                let ptr = Box::into_raw(Box::new(vec_bytes)) as *mut T;
-                                *Box::from_raw(ptr)
-                            };
-                            Ok(Some(result))
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "Failed to deserialize value for key '{:?}' in CF '{}'", key, cf
-                            ))
-                        }
-                    }
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Failed to deserialize value for key '{:?}' in CF '{}'",
+                        key, cf
+                    )),
                 }
             }
             None => Ok(None),
         }
+    }
+
+    /// Fetch raw bytes without attempting to deserialize
+    pub fn get_raw_bytes(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let handle = self.db.cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
+        Ok(self.db.get_cf(handle, key)? .map(|v| v.to_vec()))
     }
 
     /// Atomically applies a set of writes.
@@ -304,7 +294,7 @@ impl Store {
         
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+            if let Ok(coin) = crate::coin::decode_coin(&value) {
                 if coin.creator_address == *owner_address {
                     coins.push(coin);
                 }
@@ -339,12 +329,125 @@ impl Store {
         
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+            if let Ok(coin) = crate::coin::decode_coin(&value) {
                 coins.push(coin);
             }
         }
         
         Ok(coins)
+    }
+
+    /// Iterates over all coin candidates in the database
+    pub fn iterate_coin_candidates(&self) -> Result<Vec<crate::coin::CoinCandidate>> {
+        let cf = self.db.cf_handle("coin_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut coins = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(coin) = bincode::deserialize::<crate::coin::CoinCandidate>(&value) {
+                coins.push(coin);
+            }
+        }
+        Ok(coins)
+    }
+
+    /// Build the composite key for coin candidates: epoch_hash || coin_id
+    pub fn candidate_key(epoch_hash: &[u8;32], coin_id: &[u8;32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(epoch_hash);
+        key.extend_from_slice(coin_id);
+        key
+    }
+
+    /// Iterate coin candidates by epoch hash using prefix iteration
+    pub fn get_coin_candidates_by_epoch_hash(&self, epoch_hash: &[u8; 32]) -> Result<Vec<crate::coin::CoinCandidate>> {
+        let cf = self.db.cf_handle("coin_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+        let mut coins = Vec::new();
+        let prefix = epoch_hash;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, v) = item?;
+            if k.len() < 64 { continue; }
+            if &k[0..32] != prefix { break; }
+            if let Ok(coin) = bincode::deserialize::<crate::coin::CoinCandidate>(&v) {
+                coins.push(coin);
+            }
+        }
+        Ok(coins)
+    }
+
+    /// Backward-compatible fetch of a confirmed coin by id
+    pub fn get_coin(&self, coin_id: &[u8; 32]) -> Result<Option<crate::coin::Coin>> {
+        let cf = self.db.cf_handle("coin")
+            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+        match self.db.get_cf(cf, coin_id)? {
+            Some(value) => match crate::coin::decode_coin(&value) {
+                Ok(c) => Ok(Some(c)),
+                Err(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Deletes coin candidates older than or equal to a specific epoch hash (best-effort GC)
+    pub fn prune_old_candidates(&self, keep_epoch_hash: &[u8; 32]) -> Result<()> {
+        let cf = self.db.cf_handle("coin_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut pruned: u64 = 0;
+        for item in iter {
+            let (key, _) = item?;
+            if key.len() >= 32 && &key[0..32] != keep_epoch_hash {
+                batch.delete_cf(cf, key);
+                pruned += 1;
+            }
+        }
+        self.write_batch(batch)?;
+        if pruned > 0 { crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64); }
+        Ok(())
+    }
+
+    /// Store sorted leaf hashes for an epoch for faster proof construction
+    pub fn store_epoch_leaves(&self, epoch_num: u64, leaves: &Vec<[u8;32]>) -> Result<()> {
+        let cf = self.db.cf_handle("epoch_leaves")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
+        let key = epoch_num.to_le_bytes();
+        let data = bincode::serialize(leaves)?;
+        self.db.put_cf(cf, &key, &data)?;
+        Ok(())
+    }
+
+    /// Load sorted leaf hashes for an epoch if present
+    pub fn get_epoch_leaves(&self, epoch_num: u64) -> Result<Option<Vec<[u8;32]>>> {
+        let cf = self.db.cf_handle("epoch_leaves")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
+        let key = epoch_num.to_le_bytes();
+        match self.db.get_cf(cf, &key)? {
+            Some(v) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Gets selected coin IDs for an epoch
+    pub fn get_selected_coin_ids_for_epoch(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+        let sel_cf = self.db.cf_handle("epoch_selected")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
+        let mut ids = Vec::new();
+        let start_key = epoch_num.to_le_bytes();
+        let iter = self.db.iterator_cf(sel_cf, rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
+        for item in iter {
+            let (k, _v) = item?;
+            if k.len() < 8 + 32 { continue; }
+            if &k[0..8] != start_key { break; }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&k[8..8+32]);
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Gets the total number of coins in the database
@@ -430,12 +533,16 @@ fn copy_dir_all(src: &str, dst: &str) -> Result<()> {
 }
 
 pub fn open(cfg: &crate::config::Storage) -> Arc<Store> {
-    Arc::new(Store::open(&cfg.path).unwrap_or_else(|e| {
-        eprintln!("❌ Critical: Database failed to open at '{}': {}", cfg.path, e);
-        eprintln!("💡 Possible solutions:");
-        eprintln!("   - Check if directory exists and is writable");
-        eprintln!("   - Verify no other instances are running");
-        eprintln!("   - Try removing lock files: rm {}/LOCK", cfg.path);
-        process::exit(1);
-    }))
+    match Store::open(&cfg.path) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("❌ Critical: Database failed to open at '{}': {}", cfg.path, e);
+            eprintln!("💡 Possible solutions:");
+            eprintln!("   - Check if directory exists and is writable");
+            eprintln!("   - Verify no other instances are running");
+            eprintln!("   - If previous crash, try removing stale lock: rm {}/LOCK", cfg.path);
+            // For genesis deployment, propagate error instead of exiting in library
+            panic!("Database open failed: {}", e);
+        }
+    }
 }

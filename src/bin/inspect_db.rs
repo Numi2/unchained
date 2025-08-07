@@ -10,7 +10,8 @@ fn main() -> anyhow::Result<()> {
         println!("📊 Latest Epoch: #{}", latest_epoch.num);
         println!("   Difficulty: {}", latest_epoch.difficulty);
         println!("   Memory: {} KiB", latest_epoch.mem_kib);
-        println!("   Coins in epoch: {}", latest_epoch.coin_count);
+        println!("   Coins in epoch (selected): {}", latest_epoch.coin_count);
+        println!("   Merkle root: {}", hex::encode(latest_epoch.merkle_root));
         println!("   Hash: {}", hex::encode(latest_epoch.hash));
     } else {
         println!("❌ No epochs found in database");

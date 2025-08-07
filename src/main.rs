@@ -25,6 +25,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Mine,
+        /// Request a coin proof and verify it locally
+        Proof {
+            #[arg(long)]
+            coin_id: String,
+        },
+        /// Serve a simple HTTP endpoint to fetch proofs by coin_id
+        ProofServer {
+            #[arg(long, default_value = "127.0.0.1:9090")]
+            bind: String,
+        },
     Send {
         #[arg(long)]
         to: String,
@@ -51,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.storage.path = abs.to_string_lossy().into_owned();
     }
 
-    let db = storage::open(&cfg.storage);
+    let db = match std::panic::catch_unwind(|| storage::open(&cfg.storage)) {
+        Ok(db) => db,
+        Err(_) => return Err(anyhow::anyhow!("failed to open database")),
+    };
     println!("🗄️  Database opened at '{}'", cfg.storage.path);
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -112,6 +125,123 @@ async fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Some(Cmd::Mine) => {
             miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+        }
+        Some(Cmd::Proof { coin_id }) => {
+            // Parse coin id
+            let id_vec = hex::decode(coin_id).map_err(|e| anyhow::anyhow!("Invalid coin_id hex: {}", e))?;
+            if id_vec.len() != 32 { return Err(anyhow::anyhow!("coin_id must be 32 bytes")); }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&id_vec);
+
+            // Subscribe to proof responses and wait for matching coin_id
+            let mut rx = net.proof_subscribe();
+            net.request_coin_proof(id).await;
+            println!("📨 Requested proof for coin {} (waiting up to 30s)", hex::encode(id));
+            let _start = std::time::Instant::now();
+            loop {
+                tokio::select! {
+                    Ok(resp) = rx.recv() => {
+                        if resp.coin.id == id {
+                            let leaf = crate::coin::Coin::id_to_leaf_hash(&resp.coin.id);
+                            let ok = crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root);
+                            println!("🔎 Proof verification for coin {}: {}", hex::encode(id), if ok {"OK"} else {"FAIL"});
+                            return if ok { Ok(()) } else { Err(anyhow::anyhow!("invalid proof")) };
+                        }
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err(anyhow::anyhow!("timeout waiting for proof"));
+                    }
+                }
+            }
+        }
+        Some(Cmd::ProofServer { bind }) => {
+            // Async Hyper server with simple auth and rate limit
+            use hyper::{Body, Request as HRequest, Response as HResponse, Server, Method, StatusCode};
+            use hyper::service::{make_service_fn, service_fn};
+            use std::net::SocketAddr;
+            let addr: SocketAddr = bind.parse().map_err(|e| anyhow::anyhow!("invalid bind {}: {}", bind, e))?;
+            let net_clone = net.clone();
+            let auth_token = std::env::var("PROOF_SERVER_TOKEN").ok();
+            let rate = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, (std::time::Instant, u32)>::new()));
+
+            let make_svc = make_service_fn(move |_| {
+                let net = net_clone.clone();
+                let auth = auth_token.clone();
+                let rate = rate.clone();
+                async move {
+                    Ok::<_, anyhow::Error>(service_fn(move |req: HRequest<Body>| {
+                        let net = net.clone();
+                        let auth = auth.clone();
+                        let rate = rate.clone();
+                        async move {
+                            // Auth
+                            if let Some(token) = &auth {
+                                let ok = req.headers().get("x-auth-token").and_then(|v| v.to_str().ok()) == Some(token.as_str());
+                                if !ok {
+                                    return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::UNAUTHORIZED).body(Body::from("unauthorized"))?);
+                                }
+                            }
+                            // Simple per-IP rate limit: 5 req / 10s window. Prefer socket addr over XFF unless explicitly trusted.
+                            let ip = req
+                                .extensions()
+                                .get::<SocketAddr>()
+                                .map(|a| a.ip().to_string())
+                                .or_else(|| req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            {
+                                let mut map = rate.lock().await;
+                                let now = std::time::Instant::now();
+                                let entry = map.entry(ip.clone()).or_insert((now, 0));
+                                if now.duration_since(entry.0) > std::time::Duration::from_secs(10) { *entry = (now, 0); }
+                                entry.1 += 1;
+                                if entry.1 > 5 { return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::TOO_MANY_REQUESTS).body(Body::from("rate limit"))?); }
+                            }
+
+                            if req.method() == Method::GET && req.uri().path().starts_with("/proof/") {
+                                let coin_hex = req.uri().path().trim_start_matches("/proof/");
+                                let bytes = match hex::decode(coin_hex) { Ok(b) => b, Err(_) => vec![] };
+                                if bytes.len() != 32 {
+                                    return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("bad coin id"))?);
+                                }
+                                let mut id = [0u8; 32]; id.copy_from_slice(&bytes);
+
+                                let mut sub = net.proof_subscribe();
+                                let start = std::time::Instant::now();
+                                net.request_coin_proof(id).await;
+                                // Await response or timeout
+                                let resp = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv()).await;
+                                match resp {
+                                    Ok(Ok(r)) if r.coin.id == id => {
+                                        let leaf = crate::coin::Coin::id_to_leaf_hash(&r.coin.id);
+                                        let ok = crate::epoch::MerkleTree::verify_proof(&leaf, &r.proof, &r.anchor.merkle_root);
+                                        let ms = start.elapsed().as_millis() as f64;
+                                        crate::metrics::PROOF_LATENCY_MS.observe(ms);
+                                        let body = serde_json::to_vec(&serde_json::json!({
+                                            "ok": ok, "response": {
+                                                "coin": hex::encode(r.coin.id),
+                                                "epoch": r.anchor.num,
+                                                "merkle_root": hex::encode(r.anchor.merkle_root),
+                                                "proof_len": r.proof.len()
+                                            }
+                                        }))?;
+                                        Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::OK).header("Content-Type", "application/json").body(Body::from(body))?)
+                                    }
+                                    Ok(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("mismatch"))?),
+                                    Err(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::GATEWAY_TIMEOUT).body(Body::from("timeout"))?),
+                                }
+                            } else {
+                                Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found"))?)
+                            }
+                        }
+                    }))
+                }
+            });
+            println!("🌐 Proof server listening on http://{}", bind);
+            // Run server in foreground and await shutdown via Ctrl+C
+            if let Err(e) = Server::bind(&addr).serve(make_svc).await {
+                eprintln!("proof server error: {}", e);
+            }
+            return Ok(());
         }
         Some(Cmd::Send { to, amount }) => {
             // Parse recipient address
@@ -197,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
+    println!("   🎯 Epoch coin cap (max selected): {}", cfg.epoch.max_coins_per_epoch);
     println!("   Press Ctrl+C to stop");
 
     match signal::ctrl_c().await {

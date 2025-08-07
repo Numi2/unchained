@@ -32,16 +32,17 @@ pub fn address_from_pk(pk: &PublicKey) -> Address {
 
 
 
-/// Computes the Argon2id hash for Proof-of-Work, now returning a Result
-/// to gracefully handle invalid parameters instead of panicking.
-pub fn argon2id_pow(input: &[u8], mem_kib: u32, lanes: u32) -> Result<[u8; 32]> {
-    let params = Params::new(mem_kib, 1, lanes, None)
+/// Computes the Argon2id hash for Proof-of-Work.
+/// Consensus parameters: lanes must be 1. Salt = BLAKE3(header)[0..16].
+pub fn argon2id_pow(input: &[u8], mem_kib: u32) -> Result<[u8; 32]> {
+    // lanes fixed to 1 as per consensus rules
+    let params = Params::new(mem_kib, 1, 1, None)
         .map_err(|e| anyhow!("Invalid Argon2id parameters: {}", e))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut hash = [0u8; 32];
-    // Derive a unique 16-byte salt from the input (header) to tie PoW to this specific challenge.
-    let full_salt = blake3_hash(input);
-    let salt = &full_salt[..16]; // 16-byte salt is sufficient and Argon2-compliant
+    // Unkeyed BLAKE3 over header bytes; first 16 bytes as salt
+    let full_salt = blake3::hash(input);
+    let salt = &full_salt.as_bytes()[..16];
 
     a2.hash_password_into(input, salt, &mut hash)
         .map_err(|e| anyhow!("Argon2id hashing failed: {}", e))?;

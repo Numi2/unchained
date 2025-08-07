@@ -6,15 +6,15 @@ listen_port = 31000
 # Path to the Iroh secret key
 iroh_key_path = "iroh.key"
 # Maximum number of peer connections (prevents resource exhaustion)
-max_peers = 10000
+max_peers = 133337
 # Connection timeout in seconds
 connection_timeout_secs = 300
 # Timeout for initial network sync in seconds
 sync_timeout_secs = 1800
 
 # The public IP address of this node, to be announced to other peers.
-# This is essential for nodes running behind a NAT.
-public_ip = "193.90.190.20"
+# This is essential for nodes running behind a NAT. 193.71.140.215
+public_ip = "34.51.215.84"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 bootstrap = ["/ip4/34.51.215.84/udp/31000/quic-v1/p2p/12D3KooWMPtzmPYGLq58SeCMv5x2YAEqb8ggc3htDYEjG7XZvy1z"]
@@ -38,7 +38,7 @@ path = "../blockchain_data"
 [epoch]
 # Duration of each epoch in seconds 
 seconds = 222
-# Target number of leading zeros for proof-of-work difficulty (start with 1 for public mining)
+# Target number of leading zeros for proof-of-work difficulty (start with 2 for public mining)
 target_leading_zeros = 1
 # Retargeting parameters
 # Target number of coins per epoch for difficulty adjustment (reduced for public mining)

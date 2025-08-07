@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use crate::crypto::{Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SIG_BYTES};
 use anyhow::{Result, Context, anyhow};
 use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey, DetachedSignature};
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
+use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
 
 use serde_big_array::BigArray;
 
@@ -84,24 +84,25 @@ impl Transfer {
     /// Validates a transfer against the current blockchain state.
     /// Returns Ok(()) if valid, Err with reason if invalid.
     pub fn validate(&self, db: &crate::storage::Store) -> Result<()> {
-        // Check if the coin exists and is unspent
+        // Check coin exists
         let coin: crate::coin::Coin = db.get("coin", &self.coin_id)
             .context("Failed to query coin from database")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // Check if coin is already spent
-        if let Some(_existing_transfer) = db.get::<Transfer>("transfer", &self.coin_id)
-            .context("Failed to query transfer from database")? {
-            return Err(anyhow!("Coin is already spent (double-spend detected)"));
-        }
+        // Determine last owner and expected prev_tx_hash
+        let last_tx: Option<Transfer> = db.get("transfer", &self.coin_id)
+            .context("Failed to query transfer from database")?;
+        let (expected_owner_addr, expected_prev_hash) = match last_tx {
+            Some(ref t) => (t.recipient(), t.hash()),
+            None => (coin.creator_address, self.coin_id),
+        };
 
-        // Validate sender is the coin creator
+        // Validate sender is last owner
         let sender_pk = PublicKey::from_bytes(&self.sender_pk)
             .context("Invalid sender public key")?;
         let sender_addr = crate::crypto::address_from_pk(&sender_pk);
-        
-        if sender_addr != coin.creator_address {
-            return Err(anyhow!("Sender is not the coin creator"));
+        if sender_addr != expected_owner_addr {
+            return Err(anyhow!("Sender is not current owner"));
         }
 
         // Validate recipient address
@@ -112,13 +113,17 @@ impl Transfer {
         // Validate signature
         let signature = DetachedSignature::from_bytes(&self.sig)
             .context("Invalid signature format")?;
-        
         if pqcrypto_dilithium::dilithium3::verify_detached_signature(
-            &signature, 
-            &self.signing_bytes(), 
-            &sender_pk
+            &signature,
+            &self.signing_bytes(),
+            &sender_pk,
         ).is_err() {
             return Err(anyhow!("Invalid signature"));
+        }
+
+        // Anti-replay: prev_tx_hash must match current chain tip for this coin
+        if self.prev_tx_hash != expected_prev_hash {
+            return Err(anyhow!("Invalid prev_tx_hash"));
         }
 
         Ok(())
@@ -200,11 +205,13 @@ impl TransferManager {
         Ok(transfer)
     }
 
-    /// Gets the previous transaction hash for a coin
+    /// Gets the previous transaction hash for a coin (coin_id if first spend)
     fn get_previous_tx_hash(&self, coin_id: &[u8; 32]) -> Result<[u8; 32]> {
-        // For now, use the coin ID as the previous transaction hash
-        // In a more sophisticated implementation, this would track the transaction chain
-        Ok(*coin_id)
+        if let Some(last) = self.get_transfer_for_coin(coin_id)? {
+            Ok(last.hash())
+        } else {
+            Ok(*coin_id)
+        }
     }
 
     /// Gets all transfers for a specific address (as sender or recipient)

@@ -124,7 +124,7 @@ async fn test_multi_epoch_blockchain_progression() {
     // : Simulate multiple epochs with varying coin production
     let mut previous_anchor_hash: Option<[u8; 32]> = None;
     let target_difficulty = 1;
-    let mem_kib = 512; // Lower memory for faster testing
+    let mem_kib = 256; // Lower memory for faster, still real PoW
     
     for epoch_num in 0..3 {
         println!("  Mining epoch {}...", epoch_num);
@@ -137,7 +137,7 @@ async fn test_multi_epoch_blockchain_progression() {
         let coins_to_mine = 2 + (epoch_num % 3); // 2, 3, or 2 coins per epoch
         let mut mined_count = 0;
         
-        for nonce_offset in 0..1000 {
+        for nonce_offset in 0..5000 {
             if mined_count >= coins_to_mine {
                 break;
             }

@@ -6,7 +6,7 @@ use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey};
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
-use argon2::Argon2;
+use argon2::{Argon2, Params};
 use chacha20poly1305::{aead::{Aead, NewAead}, XChaCha20Poly1305, Key, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -17,6 +17,9 @@ const WALLET_KEY: &[u8] = b"default_keypair";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const WALLET_VERSION_ENCRYPTED: u8 = 1;
+// Tunable KDF parameters for wallet encryption
+const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
+const WALLET_KDF_TIME_COST: u32 = 3; // iterations
 
 pub struct Wallet {
     _db: std::sync::Weak<Store>,
@@ -39,8 +42,8 @@ impl Wallet {
                     .context("Failed to read pass-phrase")?;
                 Ok(pw)
             } else {
-                // Non-interactive (tests / CI) – use deterministic placeholder
-                Ok("test_passphrase".to_string())
+                // Non-interactive (prod/CI): require env var, fail fast if missing
+                std::env::var("WALLET_PASSPHRASE").map_err(|_| anyhow!("WALLET_PASSPHRASE is required in non-interactive mode"))
             }
         }
 
@@ -59,7 +62,9 @@ impl Wallet {
                 OsRng.fill_bytes(&mut salt);
 
                 let mut key = [0u8; 32];
-                Argon2::default()
+                let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+                    .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
+                Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
                     .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
                     .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
@@ -69,6 +74,8 @@ impl Wallet {
                 let ciphertext = cipher
                     .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
                     .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
+                // best-effort zeroize
+                key.iter_mut().for_each(|b| *b = 0);
 
                 let mut new_encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
                 new_encoded.extend_from_slice(pk.as_bytes());
@@ -100,7 +107,9 @@ impl Wallet {
 
             let passphrase = obtain_passphrase("Enter wallet pass-phrase: ")?;
             let mut key = [0u8; 32];
-            Argon2::default()
+            let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+                .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
+            Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
                 .hash_password_into(passphrase.as_bytes(), salt, &mut key)
                 .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
@@ -113,9 +122,12 @@ impl Wallet {
                 .with_context(|| "Failed to decode public key")?;
             let sk = SecretKey::from_bytes(&sk_bytes)
                 .with_context(|| "Failed to decode secret key bytes")?;
+            // zeroize key and decrypted buffer
+            let mut key_zero = key;
+            key_zero.iter_mut().for_each(|b| *b = 0);
 
             let address = crypto::address_from_pk(&pk);
-            println!("🔑 Wallet unlocked. Address: {}", hex::encode(address));
+            // Avoid printing address unless explicitly requested via logs
             return Ok(Wallet { _db: Arc::downgrade(&db), pk, sk, address })
 
         }
@@ -130,7 +142,9 @@ impl Wallet {
         OsRng.fill_bytes(&mut salt);
 
         let mut key = [0u8; 32];
-        Argon2::default()
+        let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+            .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
             .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
@@ -140,6 +154,8 @@ impl Wallet {
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
             .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
+        // best-effort zeroize
+        key.iter_mut().for_each(|b| *b = 0);
 
         let mut encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
         encoded.extend_from_slice(pk.as_bytes());
@@ -149,7 +165,7 @@ impl Wallet {
         encoded.extend_from_slice(&ciphertext);
 
         db.put("wallet", WALLET_KEY, &encoded)?;
-        println!("✅ New wallet created and saved. Address: {}", hex::encode(address));
+        println!("✅ New wallet created and saved");
         Ok(Wallet { _db: Arc::downgrade(&db), pk, sk, address })
     }
 
@@ -164,10 +180,7 @@ impl Wallet {
         &self.pk
     }
 
-    /// Gets the secret key (use with caution)
-    pub fn secret_key(&self) -> &SecretKey {
-        &self.sk
-    }
+    // Removed direct secret key accessor; use sign() instead
 
     /// Signs a message using the wallet's secret key, returning the detached signature.
     pub fn sign(&self, message: &[u8]) -> pqcrypto_dilithium::dilithium3::DetachedSignature {
@@ -201,7 +214,7 @@ impl Wallet {
         let mut utxos = Vec::new();
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+            if let Ok(coin) = crate::coin::decode_coin(&value) {
                 if coin.creator_address == self.address {
                     let spent: Option<crate::transfer::Transfer> =
                         store.get("transfer", &coin.id)?;

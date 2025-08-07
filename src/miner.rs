@@ -1,4 +1,4 @@
-use crate::{storage::Store, crypto, epoch::Anchor, coin::Coin, network::NetHandle, wallet::Wallet};
+use crate::{storage::Store, crypto, epoch::Anchor, coin::{Coin, CoinCandidate}, network::NetHandle, wallet::Wallet};
 use rand::Rng;
 use std::sync::Arc;
 use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
@@ -22,6 +22,7 @@ pub fn spawn(
 }
 
 struct Miner {
+    #[allow(dead_code)]
     cfg: crate::config::Mining,
     db: Arc<Store>,
     net: NetHandle,
@@ -56,7 +57,7 @@ impl Miner {
             current_epoch: None,
             last_heartbeat: time::Instant::now(),
             consecutive_failures: 0,
-            max_consecutive_failures: cfg.max_consecutive_failures,
+            max_consecutive_failures: crate::config::default_max_consecutive_failures(),
         }
     }
 
@@ -115,7 +116,7 @@ impl Miner {
 
     async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { /* actual code continues */
         let mut anchor_rx = self.net.anchor_subscribe();
-        let mut heartbeat_interval = time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
+        let mut heartbeat_interval = time::interval(Duration::from_secs(crate::config::default_heartbeat_interval()));
         
         println!("🔗 Connected to anchor broadcast channel");
         
@@ -130,41 +131,9 @@ impl Miner {
                 }
             },
             Ok(None) => {
-                // GENESIS: No anchors exist, create the first one.
-                println!("🌱 No existing epochs found. Creating genesis anchor...");
-                let genesis_anchor = Anchor {
-                    num: 0,
-                    hash: [0; 32], // Genesis has no previous hash
-                    difficulty: 1, // Start with minimal difficulty
-                    coin_count: 0,
-                    cumulative_work: Anchor::expected_work_for_difficulty(1),
-                    mem_kib: self.cfg.mem_kib,
-                    spent_set_root: [0u8; 32], // Genesis has no spent coins
-                };
-
-                // Store the genesis anchor in the database
-                if let Err(e) = self.db.put("epoch", &0u64.to_le_bytes(), &genesis_anchor) {
-                    eprintln!("🔥 Failed to store genesis anchor: {}", e);
-                } else {
-                    if let Err(e) = self.db.put("epoch", b"latest", &genesis_anchor) {
-                        eprintln!("🔥 Failed to store genesis anchor as latest: {}", e);
-                    } else {
-                        println!("✅ Genesis anchor stored in database");
-                    }
-                }
-
-                // Use the internal anchor broadcaster provided by the network module
-                // to ensure the epoch manager and other components receive it.
-                let anchor_tx = self.net.anchor_sender();
-                if anchor_tx.send(genesis_anchor.clone()).is_ok() {
-                    println!("✅ Genesis anchor broadcasted internally");
-                    // Now mine this epoch
-                    if let Err(e) = self.mine_epoch(genesis_anchor).await {
-                        eprintln!("⚠️  Genesis mining attempt failed: {e}");
-                    }
-                } else {
-                    eprintln!("🔥 Failed to broadcast genesis anchor internally");
-                }
+                // No local epochs yet; request latest from network and wait for broadcasts.
+                println!("🌱 No existing epochs found locally. Requesting latest from network and waiting for anchors…");
+                self.net.request_latest_epoch().await;
             },
             Err(e) => {
                 eprintln!("🔥 Failed to read latest epoch from DB: {e}");
@@ -185,6 +154,15 @@ impl Miner {
                         Ok(anchor) => {
                             self.last_heartbeat = time::Instant::now();
                             self.consecutive_failures = 0;
+                            
+                            // Update sync state to reflect the new epoch
+                            {
+                                let mut st = self.sync_state.lock().unwrap();
+                                if anchor.num > st.highest_seen_epoch {
+                                    st.highest_seen_epoch = anchor.num;
+                                    println!("📊 Updated sync state: highest_seen_epoch = {}", st.highest_seen_epoch);
+                                }
+                            }
                             
                             println!(
                                 "⛏️  New epoch #{}: difficulty={}, mem_kib={}. Mining...",
@@ -229,7 +207,7 @@ impl Miner {
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
                     // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
-                    let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
+                    let timeout_secs = crate::config::default_heartbeat_interval() * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());
@@ -267,10 +245,10 @@ impl Miner {
         let mem_kib = anchor.mem_kib;
         let difficulty = anchor.difficulty;
         let mut attempts = 0u64;
-        let max_attempts = self.cfg.max_mining_attempts;
+        let max_attempts = crate::config::default_max_mining_attempts();
 
-        println!("🎯 Starting mining for epoch #{} with {} lanes", anchor.num, self.cfg.lanes);
-        println!("⚙️  Mining parameters: difficulty={}, mem_kib={}", difficulty, mem_kib);
+        println!("🎯 Starting mining for epoch #{}", anchor.num);
+        println!("⚙️  Mining parameters: difficulty={}, mem_kib={}, lanes=1 (consensus)", difficulty, mem_kib);
 
         loop {
             attempts += 1;
@@ -282,16 +260,19 @@ impl Miner {
             let nonce: u64 = rand::thread_rng().gen();
             let header = Coin::header_bytes(&anchor.hash, nonce, &creator_address);
             
-            if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib, self.cfg.lanes) {
+            // Consensus requires Argon2 parameters to be deterministic (lanes=1 enforced in function).
+            if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib) {
                                     if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
                     // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
                     // Finding a coin proves the current epoch is still active.
                     self.last_heartbeat = time::Instant::now();
 
-                    let coin = Coin::new(anchor.hash, nonce, creator_address, pow_hash);
-                    println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(coin.id), attempts);
+                    let candidate = CoinCandidate::new(anchor.hash, nonce, creator_address, pow_hash);
+                    println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(candidate.id), attempts);
 
-                    if let Err(e) = self.db.put("coin", &coin.id, &coin) {
+                    // Candidate key: epoch_hash || coin_id for efficient prefix scans
+                    let key = crate::storage::Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                    if let Err(e) = self.db.put("coin_candidate", &key, &candidate) {
                         eprintln!("🔥 Failed to save coin to DB: {e}");
                     } else {
                         // Force immediate flush to ensure coin is persisted
@@ -300,19 +281,19 @@ impl Miner {
                         }
                     }
                     
-                    match self.coin_tx.send(coin.id) {
-                        Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(coin.id)),
+                    match self.coin_tx.send(candidate.id) {
+                        Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(candidate.id)),
                         Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {e}"),
                     }
                     
-                    self.net.gossip_coin(&coin).await;
+                    self.net.gossip_coin(&candidate).await;
                     return Ok(());
                 }
             }
             
             // Every 1 000 attempts yield to the scheduler and check if a newer epoch exists.
-            if attempts % 1_000 == 0 {
-                // Progress indicator
+            if attempts % 10_000 == 0 {
+                // Less noisy progress indicator
                 println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
 
                 // NEW: abort early if the chain has already advanced.
