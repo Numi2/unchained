@@ -142,6 +142,14 @@ async fn main() -> anyhow::Result<()> {
             "⚠️  Could not sync with network after {}s. Starting as a new chain.",
             cfg.net.sync_timeout_secs
         );
+        // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
+        // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
+        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+            let mut st = sync_state.lock().unwrap();
+            st.synced = true;
+            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+        }
     }
     
     // Handle CLI commands

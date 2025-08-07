@@ -70,9 +70,19 @@ pub fn spawn(
                             }
                         } // Drop the mutex guard here
                         net.request_latest_epoch().await;
-                    } else if highest_seen == 0 && local_epoch == 0 {
-                        // We haven't heard from the network yet, keep requesting
-                        net.request_latest_epoch().await;
+                    } else if highest_seen == 0 {
+                        if local_epoch > 0 {
+                            // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
+                            let mut st = sync_state.lock().unwrap();
+                            if !st.synced {
+                                st.synced = true;
+                                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                                println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                            }
+                        } else {
+                            // We haven't heard from the network yet and have no local chain; keep requesting
+                            net.request_latest_epoch().await;
+                        }
                     }
                 }
 
