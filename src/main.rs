@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         // Case 1: We have a network view and our local chain has caught up
         if highest_seen > 0 && local_epoch >= highest_seen {
             println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
+            { let mut st = sync_state.lock().unwrap(); st.synced = true; }
             synced = true;
             break;
         }
@@ -118,6 +119,11 @@ async fn main() -> anyhow::Result<()> {
         // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
         if highest_seen == 0 && latest_opt.is_some() {
             println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
+            {
+                let mut st = sync_state.lock().unwrap();
+                st.synced = true;
+                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+            }
             synced = true;
             break;
         }
