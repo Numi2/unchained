@@ -235,13 +235,14 @@ impl Store {
                     Err(_) => {
                         // Special case: caller expects Vec<u8> but value is raw bytes
                         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Vec<u8>>() {
-                            // Safety: We just checked that T is Vec<u8>
-                                                        let vec_bytes: Vec<u8> = value.to_vec();
-                            // SAFETY: We ensured T is Vec<u8>; we convert via raw pointer round-trip to avoid size checks.
-                            let boxed = Box::new(vec_bytes);
-                            let raw = Box::into_raw(boxed) as *mut T;
-                            let coerced: Box<T> = unsafe { Box::from_raw(raw) };
-                            Ok(Some(*coerced))
+                            // Safe conversion for Vec<u8> case
+                            let vec_bytes: Vec<u8> = value.to_vec();
+                            // SAFETY: We've verified T is Vec<u8> via TypeId comparison
+                            let result = unsafe {
+                                let ptr = Box::into_raw(Box::new(vec_bytes)) as *mut T;
+                                *Box::from_raw(ptr)
+                            };
+                            Ok(Some(result))
                         } else {
                             Err(anyhow::anyhow!(
                                 "Failed to deserialize value for key '{:?}' in CF '{}'", key, cf
@@ -292,6 +293,112 @@ impl Store {
     pub fn coins_dir(&self) -> String {
         format!("{}/coins", self.path)
     }
+
+    /// Gets all coins owned by a specific address
+    pub fn get_coins_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::coin::Coin>> {
+        let cf = self.db.cf_handle("coin")
+            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut coins = Vec::new();
+        
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+                if coin.creator_address == *owner_address {
+                    coins.push(coin);
+                }
+            }
+        }
+        
+        Ok(coins)
+    }
+
+    /// Gets all unspent coins owned by a specific address
+    pub fn get_unspent_coins_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::coin::Coin>> {
+        let coins = self.get_coins_by_owner(owner_address)?;
+        let mut unspent_coins = Vec::new();
+        
+        for coin in coins {
+            // Check if coin is spent
+            if let Ok(None) = self.get::<crate::transfer::Transfer>("transfer", &coin.id) {
+                unspent_coins.push(coin);
+            }
+        }
+        
+        Ok(unspent_coins)
+    }
+
+    /// Iterates over all coins in the database
+    pub fn iterate_coins(&self) -> Result<Vec<crate::coin::Coin>> {
+        let cf = self.db.cf_handle("coin")
+            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut coins = Vec::new();
+        
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(coin) = bincode::deserialize::<crate::coin::Coin>(&value) {
+                coins.push(coin);
+            }
+        }
+        
+        Ok(coins)
+    }
+
+    /// Gets the total number of coins in the database
+    pub fn coin_count(&self) -> Result<u64> {
+        let cf = self.db.cf_handle("coin")
+            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let count = iter.count() as u64;
+        Ok(count)
+    }
+
+    /// Gets statistics about the database
+    pub fn get_stats(&self) -> Result<DatabaseStats> {
+        let coin_count = self.coin_count()?;
+        let transfer_count = self.transfer_count()?;
+        let epoch_count = self.epoch_count()?;
+        
+        Ok(DatabaseStats {
+            coin_count,
+            transfer_count,
+            epoch_count,
+        })
+    }
+
+    /// Gets the total number of transfers in the database
+    pub fn transfer_count(&self) -> Result<u64> {
+        let cf = self.db.cf_handle("transfer")
+            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let count = iter.count() as u64;
+        Ok(count)
+    }
+
+    /// Gets the total number of epochs in the database
+    pub fn epoch_count(&self) -> Result<u64> {
+        let cf = self.db.cf_handle("epoch")
+            .ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
+
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let count = iter.count() as u64;
+        Ok(count)
+    }
+}
+
+
+
+/// Database statistics
+#[derive(Debug, Clone)]
+pub struct DatabaseStats {
+    pub coin_count: u64,
+    pub transfer_count: u64,
+    pub epoch_count: u64,
 }
 
 /// Cross-platform directory copy function for backups

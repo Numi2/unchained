@@ -13,12 +13,29 @@ use libp2p::gossipsub::{
     AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent,
 };
 use bincode;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use hex;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static QUIET_NET: AtomicBool = AtomicBool::new(false);
+/// Toggle routine network message logging. Errors/warnings still log.
+pub fn set_quiet_logging(quiet: bool) {
+    QUIET_NET.store(quiet, Ordering::Relaxed);
+}
+
+macro_rules! net_log {
+    ($($arg:tt)*) => {
+        if !QUIET_NET.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+#[allow(unused_imports)]
+use net_log;
 
 #[allow(dead_code)]
 fn try_publish_gossip(
@@ -159,6 +176,7 @@ pub struct Network {
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(Coin),
+    GossipTransfer(Transfer),
     RequestEpoch(u64),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
@@ -183,7 +201,7 @@ pub async fn spawn(
 ) -> anyhow::Result<NetHandle> {
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
-    println!("🆔 Local peer ID: {}", peer_id);
+            net_log!("🆔 Local peer ID: {}", peer_id);
     
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
@@ -231,9 +249,9 @@ pub async fn spawn(
     }
 
     for addr in &net_cfg.bootstrap {
-        println!("🔗 Dialing bootstrap node: {}", addr);
+        net_log!("🔗 Dialing bootstrap node: {}", addr);
         match swarm.dial(addr.parse::<Multiaddr>()?) {
-            Ok(_) => println!("✅ Bootstrap dial initiated"),
+            Ok(_) => net_log!("✅ Bootstrap dial initiated"),
             Err(e) => println!("❌ Failed to dial bootstrap node: {}", e),
         }
     }
@@ -246,24 +264,27 @@ pub async fn spawn(
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
     let mut orphan_anchors: HashMap<u64, Anchor> = HashMap::new();
+    let mut connected_peers: HashSet<PeerId> = HashSet::new();
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
                     match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            println!("🤝 Connected to peer: {}", peer_id);
+                                                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            net_log!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
+                            connected_peers.insert(peer_id);
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
-                                    NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                                    NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                    NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
-                                    NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
-                                    NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                                };
+                                NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
+                                NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                                NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                                NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
+                                NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
+                                NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
+                            };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
                                         still_pending.push_back(cmd);
@@ -273,7 +294,8 @@ pub async fn spawn(
                             pending_commands = still_pending;
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                            println!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
+                            net_log!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
+                            connected_peers.remove(&peer_id);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
@@ -281,25 +303,37 @@ pub async fn spawn(
                             if score.is_banned() || !score.check_rate_limit() { continue; }
                             
                             match message.topic.as_str() {
-                                TOP_ANCHOR => if let Ok(mut a) = bincode::deserialize::<Anchor>(&message.data) {
-                                    println!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
-                                    
+                                TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
+                                    // Ignore duplicate anchors we have already stored to reduce log and CPU spam
+                                    if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
+                                        if a.num == latest.num && a.hash == latest.hash {
+                                            // Silently drop duplicate
+                                            continue;
+                                        }
+                                    }
+                                    if score.check_rate_limit() {
+                                        net_log!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
+                                    }
                                     // Attempt to process the received anchor.
                                     // If it fails because the parent is missing, buffer it.
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
                                             if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
-                                                println!("✅ Storing anchor for epoch {}", a.num);
+                                                net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 db.put("epoch", &a.num.to_le_bytes(), &a).ok();
                                                 db.put("anchor", &a.hash, &a).ok();
                                                 db.put("epoch", b"latest", &a).ok();
+                                                {
+                                                    let mut st = sync_state.lock().unwrap();
+                                                    st.highest_seen_epoch = a.num;
+                                                }
                                                 let _ = anchor_tx.send(a.clone());
 
                                                 // Now, try to process any orphans that were waiting for this anchor.
                                                 let mut next_num = a.num + 1;
                                                 while let Some(orphan) = orphan_anchors.remove(&next_num) {
                                                     if validate_anchor(&orphan, &db).is_ok() {
-                                                        println!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
+                                                        net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
                                                         db.put("epoch", &orphan.num.to_le_bytes(), &orphan).ok();
                                                         db.put("anchor", &orphan.hash, &orphan).ok();
                                                         db.put("epoch", b"latest", &orphan).ok();
@@ -313,7 +347,7 @@ pub async fn spawn(
                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
-                                            println!("⏳ Buffering orphan anchor for epoch {}", a.num);
+                                            net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
                                             orphan_anchors.insert(a.num, a.clone());
                                             
                                             let mut state = sync_state.lock().unwrap();
@@ -342,25 +376,31 @@ pub async fn spawn(
                                     }
                                 },
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
-                                    println!("📨 Received latest epoch request from peer: {}", peer_id);
+                                    // Only log once every 5 seconds per peer to avoid spam
+                                    let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
+                                    if score.check_rate_limit() {
+                                        net_log!("📨 Received latest epoch request from peer: {}", peer_id);
+                                    }
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", b"latest") {
-                                        println!("📤 Sending latest epoch {} to peer", anchor.num);
+                                        if score.check_rate_limit() {
+                                            net_log!("📤 Sending latest epoch {} to peer", anchor.num);
+                                        }
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
                                     } else {
-                                        println!("⚠️  No latest epoch found to send");
+                                        net_log!("⚠️  No latest epoch found to send");
                                     }
                                 },
                                 TOP_EPOCH_REQUEST => if let Ok(n) = bincode::deserialize::<u64>(&message.data) {
-                                    println!("📨 Received request for epoch {} from peer: {}", n, peer_id);
+                                    net_log!("📨 Received request for epoch {} from peer: {}", n, peer_id);
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                        println!("📤 Sending epoch {} to peer", n);
+                                        net_log!("📤 Sending epoch {} to peer", n);
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
                                     } else {
-                                        println!("⚠️  Epoch {} not found", n);
+                                        net_log!("⚠️  Epoch {} not found", n);
                                     }
                                 },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
@@ -380,6 +420,7 @@ pub async fn spawn(
                     let (topic, data) = match &command {
                         NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                         NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
+                        NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
                         NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                         NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                         NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
@@ -399,9 +440,17 @@ pub async fn spawn(
 impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &Coin) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
+    pub async fn gossip_transfer(&self, tx: &Transfer) { let _ = self.command_tx.send(NetworkCommand::GossipTransfer(tx.clone())); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }
+    
+    /// Gets the current number of connected peers
+    pub fn peer_count(&self) -> usize {
+        // This would need to be implemented with a shared state between the network thread and this struct
+        // For now, return a placeholder - in a full implementation, this would use Arc<Mutex<HashSet<PeerId>>>
+        0 // TODO: Implement actual peer counting
+    }
 }

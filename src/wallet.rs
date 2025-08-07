@@ -159,6 +159,16 @@ impl Wallet {
         self.address
     }
 
+    /// Gets the public key
+    pub fn public_key(&self) -> &PublicKey {
+        &self.pk
+    }
+
+    /// Gets the secret key (use with caution)
+    pub fn secret_key(&self) -> &SecretKey {
+        &self.sk
+    }
+
     /// Signs a message using the wallet's secret key, returning the detached signature.
     pub fn sign(&self, message: &[u8]) -> pqcrypto_dilithium::dilithium3::DetachedSignature {
         pqcrypto_dilithium::dilithium3::detached_sign(message, &self.sk)
@@ -176,10 +186,6 @@ impl Wallet {
     /// A coin is considered unspent if:
     ///   1. It belongs to `self.address`, **and**
     ///   2. There is no transfer recorded with the same `coin_id`.
-    ///
-    /// Currently transfers are not yet persisted, so condition (2) is a stub.
-    /// The function is implemented defensively so once `transfer` persistence
-    /// exists the spent-coin filter can be filled in without changing callers.
     pub fn list_unspent(&self) -> Result<Vec<crate::coin::Coin>> {
         let store = self
             ._db
@@ -234,4 +240,86 @@ impl Wallet {
             Ok(selected)
         }
     }
+
+    /// Sends a transfer to a recipient address.
+    /// This is the main entry point for sending coins.
+    pub async fn send_transfer(
+        &self,
+        to: crate::crypto::Address,
+        amount: u64,
+        network: &crate::network::NetHandle,
+    ) -> Result<Vec<crate::transfer::Transfer>> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+
+        // Select coins to spend
+        let coins_to_spend = self.select_inputs(amount)?;
+        
+        // Create transfer manager
+        let transfer_mgr = crate::transfer::TransferManager::new(store);
+        
+        // Create transfers for each coin
+        let mut transfers = Vec::new();
+        for coin in coins_to_spend {
+            let transfer = transfer_mgr.send_transfer(
+                coin.id,
+                self.pk.clone(),
+                &self.sk,
+                to,
+                network,
+            ).await?;
+            transfers.push(transfer);
+        }
+        
+        Ok(transfers)
+    }
+
+    /// Gets all transfers involving this wallet (as sender or recipient)
+    pub fn get_transfers(&self) -> Result<Vec<crate::transfer::Transfer>> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+
+        let transfer_mgr = crate::transfer::TransferManager::new(store);
+        transfer_mgr.get_transfers_for_address(&self.address)
+    }
+
+    /// Gets the transaction history for this wallet
+    pub fn get_transaction_history(&self) -> Result<Vec<TransactionRecord>> {
+        let transfers = self.get_transfers()?;
+        let mut history = Vec::new();
+        
+        for transfer in transfers {
+            let is_sender = transfer.is_from(&self.address)?;
+            let record = TransactionRecord {
+                coin_id: transfer.coin_id,
+                transfer_hash: transfer.hash(),
+                timestamp: std::time::SystemTime::now(), // TODO: Get actual timestamp from epoch
+                is_sender,
+                amount: 1, // All coins have value 1 in current implementation
+                counterparty: if is_sender { 
+                    transfer.recipient() 
+                } else { 
+                    transfer.sender()? 
+                },
+            };
+            history.push(record);
+        }
+        
+        Ok(history)
+    }
+}
+
+/// Represents a transaction record for wallet history
+#[derive(Debug, Clone)]
+pub struct TransactionRecord {
+    pub coin_id: [u8; 32],
+    pub transfer_hash: [u8; 32],
+    pub timestamp: std::time::SystemTime,
+    pub is_sender: bool,
+    pub amount: u64,
+    pub counterparty: crate::crypto::Address,
 }

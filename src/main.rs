@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
+use anyhow;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
@@ -13,6 +14,10 @@ struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: String,
 
+    /// Suppress routine network gossip logs
+    #[arg(long, default_value_t = false)]
+    quiet_net: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -20,6 +25,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Mine,
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+    },
+    Balance,
+    History,
 }
 
 #[tokio::main]
@@ -27,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
     println!("--- unchained Node ---");
 
     let cli = Cli::parse();
+    if cli.quiet_net { network::set_quiet_logging(true); }
+
     let cfg_path = std::path::Path::new(&cli.config);
     let cfg_dir = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     let mut cfg = config::load(&cli.config)?;
@@ -91,9 +106,83 @@ async fn main() -> anyhow::Result<()> {
         println!("⚠️  Could not sync with network after 160s. Starting as a new chain.");
     }
     
-    let mining_enabled = matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled;
-    if mining_enabled {
-        miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe());
+    // Handle CLI commands
+    match &cli.cmd {
+        Some(Cmd::Mine) => {
+            miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+        }
+        Some(Cmd::Send { to, amount }) => {
+            // Parse recipient address
+            let recipient = hex::decode(to)
+                .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
+            if recipient.len() != 32 {
+                return Err(anyhow::anyhow!("Recipient address must be 32 bytes"));
+            }
+            let mut recipient_addr = [0u8; 32];
+            recipient_addr.copy_from_slice(&recipient);
+
+            // Send transfer
+            println!("💰 Sending {} coins to {}", amount, hex::encode(recipient_addr));
+            match wallet.send_transfer(recipient_addr, *amount, &net).await {
+                Ok(transfers) => {
+                    println!("✅ Transfer successful! Sent {} transfers", transfers.len());
+                    for (i, transfer) in transfers.iter().enumerate() {
+                        println!("  Transfer {}: coin {} -> {}", i + 1, hex::encode(transfer.coin_id), hex::encode(transfer.recipient()));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Transfer failed: {}", e);
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
+        Some(Cmd::Balance) => {
+            match wallet.balance() {
+                Ok(balance) => {
+                    println!("💰 Wallet balance: {} coins", balance);
+                    println!("📍 Address: {}", hex::encode(wallet.address()));
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to get balance: {}", e);
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
+        Some(Cmd::History) => {
+            match wallet.get_transaction_history() {
+                Ok(history) => {
+                    println!("📜 Transaction history:");
+                    if history.is_empty() {
+                        println!("  No transactions found");
+                    } else {
+                        for (i, record) in history.iter().enumerate() {
+                            let direction = if record.is_sender { "→" } else { "←" };
+                            println!("  {} {} {} {} (coin: {})", 
+                                i + 1, 
+                                direction, 
+                                hex::encode(record.counterparty),
+                                record.amount,
+                                hex::encode(record.coin_id)
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to get history: {}", e);
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
+        None => {
+            // No command specified, start mining if enabled
+            let mining_enabled = cfg.mining.enabled;
+            if mining_enabled {
+                miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+            }
+        }
     }
 
     let metrics_bind = cfg.metrics.bind.clone();
@@ -105,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
         println!("   📢 Public IP announced as: {public_ip}");
     }
     println!("   📊 Metrics available on http://{metrics_bind}");
-    println!("   ⛏️  Mining: {}", if mining_enabled { "enabled" } else { "disabled" });
+    println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
     println!("   Press Ctrl+C to stop");
 
     match signal::ctrl_c().await {

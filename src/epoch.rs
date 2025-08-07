@@ -3,6 +3,7 @@ use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use rocksdb::WriteBatch;
+use anyhow::{Result, anyhow};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
@@ -12,6 +13,7 @@ pub struct Anchor {
     pub coin_count:   u32,
     pub cumulative_work: u128,
     pub mem_kib:      u32,
+    pub spent_set_root: [u8; 32], // Global unspent-set accumulator
 }
 
 impl Anchor {
@@ -29,12 +31,39 @@ impl Anchor {
             }
         }
     }
-    
-    pub fn calculate_retarget(
-        recent_anchors: &[Anchor], 
-        cfg: &crate::config::Epoch,
-        mining_cfg: &crate::config::Mining
-    ) -> (usize, u32) {
+
+    /// Calculates the spent set root for this anchor
+    pub fn calculate_spent_set_root(&self, db: &crate::storage::Store) -> Result<[u8; 32]> {
+        // Get all transfers up to this epoch
+        let cf = db.db.cf_handle("transfer")
+            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+
+        let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut spent_coin_ids = std::collections::HashSet::new();
+        
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(transfer) = bincode::deserialize::<crate::transfer::Transfer>(&value) {
+                spent_coin_ids.insert(transfer.coin_id);
+            }
+        }
+
+        // Build Merkle tree of spent coin IDs
+        Ok(MerkleTree::build_root(&spent_coin_ids))
+    }
+
+    /// Updates the spent set root for this anchor
+    pub fn update_spent_set_root(&mut self, db: &crate::storage::Store) -> Result<()> {
+        self.spent_set_root = self.calculate_spent_set_root(db)?;
+        Ok(())
+    }
+}
+
+pub fn calculate_retarget(
+    recent_anchors: &[Anchor], 
+    cfg: &crate::config::Epoch,
+    mining_cfg: &crate::config::Mining
+) -> (usize, u32) {
         if recent_anchors.is_empty() {
             return (cfg.target_leading_zeros, mining_cfg.mem_kib);
         }
@@ -76,7 +105,6 @@ impl Anchor {
         
         (new_difficulty, new_mem.clamp(mining_cfg.min_mem_kib, mining_cfg.max_mem_kib))
     }
-}
 
 pub struct MerkleTree;
 impl MerkleTree {
@@ -251,7 +279,7 @@ impl Manager {
                                     recent_anchors.push(anchor);
                                 }
                             }
-                            Anchor::calculate_retarget(&recent_anchors, &self.cfg, &self.mining_cfg)
+                            calculate_retarget(&recent_anchors, &self.cfg, &self.mining_cfg)
                         } else {
                             prev_anchor.as_ref().map_or((self.cfg.target_leading_zeros, self.mining_cfg.mem_kib), |p| (p.difficulty, p.mem_kib))
                         };
@@ -259,22 +287,54 @@ impl Manager {
                         let current_work = Anchor::expected_work_for_difficulty(difficulty);
                         let cumulative_work = prev_anchor.as_ref().map_or(current_work, |p| p.cumulative_work.saturating_add(current_work));
                         
-                        let anchor = Anchor { num: current_epoch, hash, difficulty, coin_count: buffer.len() as u32, cumulative_work, mem_kib };
+                        let mut anchor = Anchor { 
+                            num: current_epoch, 
+                            hash, 
+                            difficulty, 
+                            coin_count: buffer.len() as u32, 
+                            cumulative_work, 
+                            mem_kib,
+                            spent_set_root: [0u8; 32], // Will be updated below
+                        };
+                        
+                        // Calculate and set the spent set root
+                        if let Err(e) = anchor.update_spent_set_root(&self.db) {
+                            eprintln!("⚠️  Failed to calculate spent set root: {}", e);
+                            // Continue anyway, don't fail the epoch creation
+                        }
                         
                         let mut batch = WriteBatch::default();
-                        let serialized_anchor = bincode::serialize(&anchor).unwrap();
-                        let epoch_cf = self.db.db.cf_handle("epoch").unwrap();
+                        let serialized_anchor = match bincode::serialize(&anchor) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!("🔥 Failed to serialize anchor: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        let epoch_cf = match self.db.db.cf_handle("epoch") {
+                            Some(cf) => cf,
+                            None => {
+                                eprintln!("🔥 'epoch' column family missing");
+                                continue;
+                            }
+                        };
+                        
                         batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
                         batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                        
                         if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
                             batch.put_cf(anchor_cf, &hash, &serialized_anchor);
                         }
                         
                         if let Err(e) = self.db.db.write(batch) {
                             eprintln!("🔥 Failed to write new epoch to DB: {e}");
+                            continue;
                         } else {
                             self.net.gossip_anchor(&anchor).await;
-                            let _ = self.anchor_tx.send(anchor);
+                            if let Err(e) = self.anchor_tx.send(anchor) {
+                                eprintln!("⚠️  Failed to broadcast anchor: {}", e);
+                            }
                             buffer.clear();
                             current_epoch += 1;
                         }

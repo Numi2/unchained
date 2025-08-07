@@ -4,6 +4,8 @@ use std::sync::Arc;
 use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::sync::SyncState;
+
 pub fn spawn(
     cfg: crate::config::Mining,
     db: Arc<Store>,
@@ -11,9 +13,10 @@ pub fn spawn(
     wallet: Arc<Wallet>, // The miner needs a persistent identity
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     shutdown_rx: Receiver<()>,
+    sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>, // new
 ) {
     task::spawn(async move {
-        let mut miner = Miner::new(cfg, db, net, wallet, coin_tx, shutdown_rx);
+        let mut miner = Miner::new(cfg, db, net, wallet, coin_tx, shutdown_rx, sync_state);
         miner.run().await;
     });
 }
@@ -25,6 +28,7 @@ struct Miner {
     wallet: Arc<Wallet>,
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     shutdown_rx: Receiver<()>,
+    sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>, // new
     current_epoch: Option<u64>,
     last_heartbeat: time::Instant,
     consecutive_failures: u32,
@@ -39,6 +43,7 @@ impl Miner {
         wallet: Arc<Wallet>,
         coin_tx: mpsc::UnboundedSender<[u8; 32]>,
         shutdown_rx: Receiver<()>,
+        sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
     ) -> Self {
         Self {
             cfg: cfg.clone(),
@@ -47,6 +52,7 @@ impl Miner {
             wallet,
             coin_tx,
             shutdown_rx,
+            sync_state,
             current_epoch: None,
             last_heartbeat: time::Instant::now(),
             consecutive_failures: 0,
@@ -55,6 +61,24 @@ impl Miner {
     }
 
     async fn run(&mut self) {
+        // Wait until node is synced
+        loop {
+            {
+                let st = self.sync_state.lock().unwrap();
+                if st.synced {
+                    println!("🚀 Node is synced – starting mining");
+                    break;
+                }
+                let highest = st.highest_seen_epoch;
+                let local = self.db.get::<Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
+                println!("⌛ Waiting to reach network tip… local {local} / net {highest}");
+            }
+            tokio::select! {
+                _ = self.shutdown_rx.recv() => { println!("🛑 Miner received shutdown while waiting for sync"); return; }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+
         println!("⛏️  Starting miner with reconnection and fallback capabilities");
         
         loop {
@@ -115,7 +139,19 @@ impl Miner {
                     coin_count: 0,
                     cumulative_work: Anchor::expected_work_for_difficulty(1),
                     mem_kib: self.cfg.mem_kib,
+                    spent_set_root: [0u8; 32], // Genesis has no spent coins
                 };
+
+                // Store the genesis anchor in the database
+                if let Err(e) = self.db.put("epoch", &0u64.to_le_bytes(), &genesis_anchor) {
+                    eprintln!("🔥 Failed to store genesis anchor: {}", e);
+                } else {
+                    if let Err(e) = self.db.put("epoch", b"latest", &genesis_anchor) {
+                        eprintln!("🔥 Failed to store genesis anchor as latest: {}", e);
+                    } else {
+                        println!("✅ Genesis anchor stored in database");
+                    }
+                }
 
                 // Use the internal anchor broadcaster provided by the network module
                 // to ensure the epoch manager and other components receive it.
@@ -274,8 +310,8 @@ impl Miner {
                 }
             }
             
-            // Every 10 000 attempts yield to the scheduler and check if a newer epoch exists.
-            if attempts % 10_000 == 0 {
+            // Every 1 000 attempts yield to the scheduler and check if a newer epoch exists.
+            if attempts % 1_000 == 0 {
                 // Progress indicator
                 println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
 
