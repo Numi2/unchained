@@ -105,9 +105,10 @@ impl Store {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         
-        // Organize files into meaningful subdirectories
+        // Organize files into meaningful subdirectories under the chosen db_path
         let wal_dir = format!("{db_path}/logs");
         let backup_dir = format!("{db_path}/backups");
+        std::fs::create_dir_all(&db_path).ok();
         std::fs::create_dir_all(&wal_dir).ok();
         std::fs::create_dir_all(&backup_dir).ok();
         

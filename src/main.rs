@@ -52,12 +52,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.quiet_net { network::set_quiet_logging(true); }
 
-    let cfg_path = std::path::Path::new(&cli.config);
-    let cfg_dir = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     let mut cfg = config::load(&cli.config)?;
 
+    // Resolve storage path: if relative, place under user's home at ~/.unchained/unchained_data
     if std::path::Path::new(&cfg.storage.path).is_relative() {
-        let abs = cfg_dir.join(&cfg.storage.path);
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let abs = std::path::Path::new(&home)
+            .join(".unchained")
+            .join("unchained_data");
         cfg.storage.path = abs.to_string_lossy().into_owned();
     }
 
