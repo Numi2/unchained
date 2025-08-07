@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     net.request_latest_epoch().await;
     
     let mut synced = false;
-    for _ in 0..260 { // Up to 30 seconds to sync (160 * 500ms)
+    for attempt in 0..260 { // Up to 130 seconds to sync (260 * 500ms = 130 seconds)
         let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
         let local_epoch = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
 
@@ -97,13 +97,15 @@ async fn main() -> anyhow::Result<()> {
 
         if highest_seen > 0 {
             println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+        } else {
+            println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     if !synced {
-        println!("⚠️  Could not sync with network after 160s. Starting as a new chain.");
+        println!("⚠️  Could not sync with network after 130s. Starting as a new chain.");
     }
     
     // Handle CLI commands

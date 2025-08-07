@@ -60,8 +60,8 @@ pub fn spawn(
                 _ = idle_poll_timer.tick() => {
                     // Slower polling when fully synced to avoid spamming the network/logs
                     let highest_seen = { sync_state.lock().unwrap().highest_seen_epoch };
-                    if highest_seen == local_epoch {
-                        // we are at tip → mark synced once
+                    if highest_seen == local_epoch && highest_seen > 0 {
+                        // we are at tip and have actually synced with network → mark synced once
                         {
                             let mut st = sync_state.lock().unwrap();
                             if !st.synced {
@@ -69,6 +69,9 @@ pub fn spawn(
                                 println!("✅ Node is fully synced at epoch {}", local_epoch);
                             }
                         } // Drop the mutex guard here
+                        net.request_latest_epoch().await;
+                    } else if highest_seen == 0 && local_epoch == 0 {
+                        // We haven't heard from the network yet, keep requesting
                         net.request_latest_epoch().await;
                     }
                 }
