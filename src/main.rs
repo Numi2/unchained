@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
-        if highest_seen == 0 && latest_opt.is_some() {
+        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
             println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
             {
                 let mut st = sync_state.lock().unwrap();

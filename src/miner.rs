@@ -62,18 +62,20 @@ impl Miner {
     }
 
     async fn run(&mut self) {
-        // Wait until node is synced
+        // Wait until node is marked synced by main/sync services
         loop {
-            {
+            let (synced, highest, local) = {
                 let st = self.sync_state.lock().unwrap();
-                if st.synced {
-                    println!("🚀 Node is synced – starting mining");
-                    break;
-                }
-                let highest = st.highest_seen_epoch;
                 let local = self.db.get::<Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
-                println!("⌛ Waiting to reach network tip… local {local} / net {highest}");
+                (st.synced, st.highest_seen_epoch, local)
+            };
+
+            if synced {
+                println!("🚀 Node is synced – starting mining");
+                break;
             }
+
+            println!("⌛ Waiting to reach network tip… local {local} / net {highest}");
             tokio::select! {
                 _ = self.shutdown_rx.recv() => { println!("🛑 Miner received shutdown while waiting for sync"); return; }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -132,8 +134,8 @@ impl Miner {
             },
             Ok(None) => {
                 // No local epochs yet; request latest from network and wait for broadcasts.
-                println!("🌱 No existing epochs found locally. Requesting latest from network and waiting for anchors…");
-                self.net.request_latest_epoch().await;
+                // In single-node genesis, proceed with anchor stream; epoch manager will create genesis immediately due to immediate ticker.
+                println!("🌱 No existing epochs found locally. Waiting for epoch manager to create genesis…");
             },
             Err(e) => {
                 eprintln!("🔥 Failed to read latest epoch from DB: {e}");

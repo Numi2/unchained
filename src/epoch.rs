@@ -219,7 +219,8 @@ impl Manager {
             }
 
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
-            let mut ticker = time::interval(time::Duration::from_secs(self.cfg.seconds));
+            // Tick immediately on startup so genesis or the first epoch can be processed without waiting a full period
+            let mut ticker = time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds));
 
             loop {
                 tokio::select! {
