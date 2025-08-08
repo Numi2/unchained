@@ -25,6 +25,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Mine,
+    /// Print the local libp2p peer ID and exit
+    PeerId,
         /// Request a coin proof and verify it locally
         Proof {
             #[arg(long)]
@@ -156,6 +158,14 @@ async fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Some(Cmd::Mine) => {
             miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+        }
+        Some(Cmd::PeerId) => {
+            let id = network::peer_id_string()?;
+            println!("🆔 Peer ID: {}", id);
+            if let Some(ip) = &cfg.net.public_ip {
+                println!("📫 Multiaddr: /ip4/{}/udp/{}/quic-v1/p2p/{}", ip, cfg.net.listen_port, id);
+            }
+            return Ok(());
         }
         Some(Cmd::Proof { coin_id }) => {
             // Parse coin id

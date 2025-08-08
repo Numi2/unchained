@@ -234,6 +234,14 @@ fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
     Ok(keypair)
 }
 
+/// Returns the local libp2p PeerId as a string, creating a persistent
+/// identity file `peer_identity.key` on first use if it does not exist.
+pub fn peer_id_string() -> anyhow::Result<String> {
+    let id_keys = load_or_create_peer_identity()?;
+    let peer_id = PeerId::from(id_keys.public());
+    Ok(peer_id.to_string())
+}
+
 pub async fn spawn(
     net_cfg: config::Net,
     p2p_cfg: config::P2p,
@@ -347,10 +355,13 @@ pub async fn spawn(
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
+                            let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            if score.is_banned() || !score.check_rate_limit() { continue; }
+                            // Do not rate-limit inbound anchors – they are essential for fast catch-up.
+                            let rate_limit_exempt = topic_str == TOP_ANCHOR;
+                            if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
-                            match message.topic.as_str() {
+                            match topic_str {
                                 TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
                                     // Ignore duplicate anchors we have already stored to reduce log and CPU spam
                                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
@@ -409,11 +420,39 @@ pub async fn spawn(
                                             if a.num > state.highest_seen_epoch {
                                                 state.highest_seen_epoch = a.num;
                                             }
+                                            // Proactively request the missing predecessor to accelerate linking the chain
+                                            if a.num > 0 {
+                                                let prev_epoch = a.num - 1;
+                                                if let Ok(bytes) = bincode::serialize(&prev_epoch) {
+                                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                }
+                                            }
                                         },
                                         Err(e) => {
-                                            println!("❌ Anchor validation failed: {}", e);
-                                            crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
-                                            score.record_validation_failure();
+                                            // Treat hash-mismatch as an alternate fork block at the same height.
+                                            // This can legitimately occur if different miners produced different merkle roots.
+                                            // We ignore it (not better chain) but do not penalize the peer, and we still
+                                            // advance the highest_seen_epoch so heartbeat logic doesn’t flap.
+                                            if e.contains("hash mismatch") {
+                                                net_log!("🔀 Alternate fork anchor at height {} (hash mismatch) – ignoring", a.num);
+                                                {
+                                                    let mut st = sync_state.lock().unwrap();
+                                                    if a.num > st.highest_seen_epoch {
+                                                        st.highest_seen_epoch = a.num;
+                                                    }
+                                                }
+                                                // Try to retrieve the predecessor to this fork height to see the competing chain
+                                                if a.num > 0 {
+                                                    let prev_epoch = a.num - 1;
+                                                    if let Ok(bytes) = bincode::serialize(&prev_epoch) {
+                                                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                    }
+                                                }
+                                            } else {
+                                                println!("❌ Anchor validation failed: {}", e);
+                                                crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                score.record_validation_failure();
+                                            }
                                         }
                                     }
                                 },

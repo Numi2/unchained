@@ -14,10 +14,10 @@ sync_timeout_secs = 1800
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT. 193.71.140.215
-public_ip = "193.71.140.215"
+public_ip = "34.51.215.84"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = ["/ip4/34.51.215.84/udp/31000/quic-v1/p2p/12D3KooWMPtzmPYGLq58SeCMv5x2YAEqb8ggc3htDYEjG7XZvy1z"]
+bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
 
 
 
@@ -45,8 +45,7 @@ target_leading_zeros = 1
 target_coins_per_epoch = 3
 # How often to retarget (every N epochs - more frequent for dynamic adjustment)
 retarget_interval = 2000
-# Maximum difficulty adjustment factor 
-max_difficulty_adjustment = 1.05
+
 
 [mining]
 # Enable mining by default
