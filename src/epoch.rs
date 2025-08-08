@@ -214,7 +214,11 @@ impl Manager {
                 }
                 
                 if current_epoch == 0 {
-                    println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis.");
+                    if self.net_cfg.bootstrap.is_empty() {
+                        println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis (no bootstrap configured).");
+                    } else {
+                        println!("⚠️  Network sync timed out but bootstrap peers are configured; not creating local genesis. Waiting for network.");
+                    }
                 }
             }
 
@@ -245,7 +249,13 @@ impl Manager {
                         }
 
                         if current_epoch == 0 && buffer.is_empty() {
-                            println!("🌱 No existing epochs found. Creating genesis anchor...");
+                            if self.net_cfg.bootstrap.is_empty() {
+                                println!("🌱 No existing epochs found. Creating genesis anchor (no bootstrap configured)...");
+                            } else {
+                                // Avoid creating a forked genesis when we expect a network
+                                println!("⏳ Waiting for network genesis (bootstrap configured), not creating local genesis.");
+                                continue;
+                            }
                         }
 
                         // Determine previous anchor (for epoch linkage and candidate filtering)
