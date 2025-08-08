@@ -62,7 +62,13 @@ const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
 
-#[derive(Debug, Clone)]
+// PQ v2 topics (dual-publish during transition)
+const TOP_ANCHOR_V2: &str = "unchained/anchor/v2";
+const TOP_COIN_V2: &str = "unchained/coin/v2";
+const TOP_TX_V2: &str = "unchained/tx/v2";
+const TOP_HELLO_PQ: &str = "unchained/hello_pq/v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerScore {
     validation_failures: u32,
     banned_until: Option<Instant>,
@@ -161,8 +167,7 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 { return Err("Merkle root cannot be zero when coins are present".into()); }
     if anchor.num == 0 {
         if anchor.cumulative_work != Anchor::expected_work_for_difficulty(anchor.difficulty) {
-            return Err("Genesis cumulative work incorrect".into());
-        }
+            return Err("Genesis cumulative work incorrect".into()); }
         // For genesis, hash should be BLAKE3(merkle_root)
         let mut h = blake3::Hasher::new();
         h.update(&anchor.merkle_root);
@@ -185,8 +190,6 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     Ok(())
 }
 
-pub type NetHandle = Arc<Network>;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoinProofRequest { pub coin_id: [u8; 32] }
 
@@ -196,6 +199,16 @@ pub struct CoinProofResponse {
     pub anchor: Anchor,
     pub proof: Vec<([u8; 32], bool)>,
 }
+
+// PQ-signed wrapper for v2 topics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqSigned<T> {
+    pub msg: T,
+    pub pq_pk: [u8; crypto::DILITHIUM3_PK_BYTES],
+    pub pq_sig: [u8; crypto::DILITHIUM3_SIG_BYTES],
+}
+
+pub type NetHandle = Arc<Network>;
 
 #[derive(Clone)]
 pub struct Network {
@@ -243,7 +256,7 @@ pub async fn spawn(
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
             net_log!("🆔 Local peer ID: {}", peer_id);
-    
+
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -260,7 +273,7 @@ pub async fn spawn(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!(e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE] {
+    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE, TOP_ANCHOR_V2, TOP_COIN_V2, TOP_TX_V2, TOP_HELLO_PQ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -308,6 +321,32 @@ pub async fn spawn(
     let mut orphan_anchors: HashMap<u64, Anchor> = HashMap::new();
     let mut connected_peers: HashSet<PeerId> = HashSet::new();
 
+    // PQ peer identity
+    let (pq_pk, pq_sk) = crypto::load_or_create_pq_peer_identity("peer_identity_pq.key")?;
+
+    // Cache: peer_id -> PQ pk
+    static PEER_PQ_KEYS: Lazy<Mutex<HashMap<PeerId, Vec<u8>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    // Helper: wrap and sign a message into v2 container
+    fn wrap_pq<T: Serialize + Clone>(msg: &T, pq_pk: &[u8], pq_sk: &pqcrypto_dilithium::dilithium3::SecretKey) -> Option<Vec<u8>> {
+        let payload = bincode::serialize(msg).ok()?;
+        let sig = crypto::pq_sign_payload(&payload, pq_sk);
+        let mut pk_arr = [0u8; crypto::DILITHIUM3_PK_BYTES];
+        pk_arr.copy_from_slice(pq_pk);
+        let mut sig_arr = [0u8; crypto::DILITHIUM3_SIG_BYTES];
+        sig_arr.copy_from_slice(&sig);
+        let wrapper = PqSigned { msg: msg.clone(), pq_pk: pk_arr, pq_sig: sig_arr };
+        bincode::serialize(&wrapper).ok()
+    }
+
+    // Helper: verify a v2 message container
+    fn verify_pq<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> Option<T> {
+        let wrapper: PqSigned<T> = bincode::deserialize(bytes).ok()?;
+        let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&wrapper.pq_pk).ok()?;
+        let payload = bincode::serialize(&wrapper.msg).ok()?;
+        if crypto::pq_verify_payload(&payload, &wrapper.pq_sig, &pk) { Some(wrapper.msg) } else { None }
+    }
+
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -321,21 +360,41 @@ pub async fn spawn(
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             connected_peers.insert(peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
+                            // Send HELLO_PQ attestation once per connection
+                            if let Ok(data) = bincode::serialize(&PqSigned { msg: (), pq_pk: *pq_pk.as_bytes(), pq_sig: crypto::pq_sign_payload(&[], &pq_sk) }) {
+                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_HELLO_PQ), data);
+                            }
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
-                                let (t, data) = match &cmd {
-                                NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                                 NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
-                                NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
-                                NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
-                                NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                                NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
-                            };
+                                let (t, data, data_v2): (&str, Option<Vec<u8>>, Option<(&str, Vec<u8>)>) = match &cmd {
+                                    NetworkCommand::GossipAnchor(a) => {
+                                        let v1 = bincode::serialize(&a).ok();
+                                        let v2 = wrap_pq(a, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_ANCHOR_V2, d));
+                                        (TOP_ANCHOR, v1, v2)
+                                    },
+                                     NetworkCommand::GossipCoin(c)   => {
+                                        let v1 = bincode::serialize(&c).ok();
+                                        let v2 = wrap_pq(c, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_COIN_V2, d));
+                                        (TOP_COIN, v1, v2)
+                                    },
+                                    NetworkCommand::GossipTransfer(tx) => {
+                                        let v1 = bincode::serialize(&tx).ok();
+                                        let v2 = wrap_pq(tx, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_TX_V2, d));
+                                        (TOP_TX, v1, v2)
+                                    },
+                                    NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok(), None),
+                                    NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok(), None),
+                                    NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok(), None),
+                                    NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok(), None),
+                                };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
-                                        still_pending.push_back(cmd);
+                                        still_pending.push_back(cmd.clone());
+                                        continue;
                                     }
+                                }
+                                if let Some((t2, d2)) = data_v2 {
+                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(t2), d2);
                                 }
                             }
                             pending_commands = still_pending;
@@ -349,75 +408,23 @@ pub async fn spawn(
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             if score.is_banned() || !score.check_rate_limit() { continue; }
-                            
+                            let require_pq = p2p_cfg.require_pq_signatures;
                             match message.topic.as_str() {
-                                TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
-                                    // Ignore duplicate anchors we have already stored to reduce log and CPU spam
-                                    if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
-                                        if a.num == latest.num && a.hash == latest.hash {
-                                            // Silently drop duplicate
-                                            continue;
-                                        }
-                                    }
-                                    if score.check_rate_limit() {
-                                        net_log!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
-                                    }
-                                    // Attempt to process the received anchor.
-                                    // If it fails because the parent is missing, buffer it.
-                                    match validate_anchor(&a, &db) {
-                                        Ok(()) => {
-                                            if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
-                                                net_log!("✅ Storing anchor for epoch {}", a.num);
-                                                if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                {
-                                                    let mut st = sync_state.lock().unwrap();
-                                                    st.highest_seen_epoch = a.num;
-                                                }
-                                                let _ = anchor_tx.send(a.clone());
-
-                                                // Now, try to process any orphans that were waiting for this anchor.
-                                                let mut next_num = a.num + 1;
-                                                while let Some(orphan) = orphan_anchors.remove(&next_num) {
-                                                    if validate_anchor(&orphan, &db).is_ok() {
-                                                        net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
-                                                        if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                        if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                        if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                        let _ = anchor_tx.send(orphan);
-                                                        next_num += 1;
-                                                    } else {
-                                                        orphan_anchors.insert(orphan.num, orphan);
-                                                        break;
-                                                    }
-                                                }
-                                                // Enforce orphan cap
-                                                crate::metrics::ORPHAN_BUFFER_LEN.set(orphan_anchors.len() as i64);
-                                                if orphan_anchors.len() > MAX_ORPHAN_ANCHORS {
-                                                    let oldest = *orphan_anchors.keys().min().unwrap();
-                                                    orphan_anchors.remove(&oldest);
-                                                    eprintln!("⚠️ Orphan buffer cap exceeded, dropping oldest epoch {}", oldest);
-                                                }
+                                TOP_HELLO_PQ => {
+                                    if let Ok(wrapper): Result<PqSigned<()>, _> = bincode::deserialize(&message.data) {
+                                        // Cache peer's PQ pk if signature verifies
+                                        let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&wrapper.pq_pk);
+                                        if let Ok(pk) = pk {
+                                            if crypto::pq_verify_payload(&[], &wrapper.pq_sig, &pk) {
+                                                PEER_PQ_KEYS.lock().unwrap().insert(peer_id, wrapper.pq_pk.to_vec());
                                             }
                                         }
-                                        Err(e) if e.starts_with("Previous anchor") => {
-                                            net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
-                                            orphan_anchors.insert(a.num, a.clone());
-                                            
-                                            let mut state = sync_state.lock().unwrap();
-                                            if a.num > state.highest_seen_epoch {
-                                                state.highest_seen_epoch = a.num;
-                                            }
-                                        },
-                                        Err(e) => {
-                                            println!("❌ Anchor validation failed: {}", e);
-                                            crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
-                                            score.record_validation_failure();
-                                        }
                                     }
+                                }
+                                TOP_ANCHOR_V2 => if let Some(a) = verify_pq::<Anchor>(&message.data) {
+                                    process_anchor(a, &db, &anchor_tx, &mut orphan_anchors, &sync_state, &mut *score);
                                 },
-                                TOP_COIN => if let Ok(c) = bincode::deserialize::<CoinCandidate>(&message.data) {
+                                TOP_COIN_V2 => if let Some(c) = verify_pq::<CoinCandidate>(&message.data) {
                                     if validate_coin_candidate(&c, &db).is_ok() {
                                         let key = Store::candidate_key(&c.epoch_hash, &c.id);
                                         db.put("coin_candidate", &key, &c).ok();
@@ -426,7 +433,7 @@ pub async fn spawn(
                                         score.record_validation_failure();
                                     }
                                 },
-                                TOP_TX => if let Ok(tx) = bincode::deserialize::<Transfer>(&message.data) {
+                                TOP_TX_V2 => if let Some(tx) = verify_pq::<Transfer>(&message.data) {
                                     if validate_transfer(&tx, &db).is_ok() {
                                         db.put("transfer", &tx.coin_id, &tx).ok();
                                     } else {
@@ -434,8 +441,27 @@ pub async fn spawn(
                                         score.record_validation_failure();
                                     }
                                 },
+                                TOP_ANCHOR => if !require_pq { if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
+                                    process_anchor(a, &db, &anchor_tx, &mut orphan_anchors, &sync_state, &mut *score);
+                                }},
+                                TOP_COIN => if !require_pq { if let Ok(c) = bincode::deserialize::<CoinCandidate>(&message.data) {
+                                    if validate_coin_candidate(&c, &db).is_ok() {
+                                        let key = Store::candidate_key(&c.epoch_hash, &c.id);
+                                        db.put("coin_candidate", &key, &c).ok();
+                                    } else {
+                                        crate::metrics::VALIDATION_FAIL_COIN.inc();
+                                        score.record_validation_failure();
+                                    }
+                                }},
+                                TOP_TX => if !require_pq { if let Ok(tx) = bincode::deserialize::<Transfer>(&message.data) {
+                                    if validate_transfer(&tx, &db).is_ok() {
+                                        db.put("transfer", &tx.coin_id, &tx).ok();
+                                    } else {
+                                        crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
+                                        score.record_validation_failure();
+                                    }
+                                }},
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
-                                    // Only log once every 5 seconds per peer to avoid spam
                                     let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                                     if score.check_rate_limit() {
                                         net_log!("📨 Received latest epoch request from peer: {}", peer_id);
@@ -446,6 +472,9 @@ pub async fn spawn(
                                         }
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
+                                            if let Some((t2, d2)) = wrap_pq(&anchor, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_ANCHOR_V2, d)) {
+                                                swarm.behaviour_mut().publish(IdentTopic::new(t2), d2).ok();
+                                            }
                                         }
                                     } else {
                                         net_log!("⚠️  No latest epoch found to send");
@@ -457,6 +486,9 @@ pub async fn spawn(
                                         net_log!("📤 Sending epoch {} to peer", n);
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
+                                            if let Some((t2, d2)) = wrap_pq(&anchor, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_ANCHOR_V2, d)) {
+                                                swarm.behaviour_mut().publish(IdentTopic::new(t2), d2).ok();
+                                            }
                                         }
                                     } else {
                                         net_log!("⚠️  Epoch {} not found", n);
@@ -465,7 +497,10 @@ pub async fn spawn(
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                         if let Ok(data) = bincode::serialize(&coin) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), data).ok();
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), data.clone()).ok();
+                                            if let Some((t2, d2)) = wrap_pq(&coin, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_COIN_V2, d)) {
+                                                swarm.behaviour_mut().publish(IdentTopic::new(t2), d2).ok();
+                                            }
                                         }
                                     }
                                 },
@@ -507,25 +542,91 @@ pub async fn spawn(
                     }
                 },
                 Some(command) = command_rx.recv() => {
-                    let (topic, data) = match &command {
-                        NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                        NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
-                        NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
-                        NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
-                        NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
-                        NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                        NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                    let (topic, data, data_v2) = match &command {
+                        NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok(), wrap_pq(a, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_ANCHOR_V2, d))),
+                        NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok(), wrap_pq(c, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_COIN_V2, d))),
+                        NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok(), wrap_pq(tx, pq_pk.as_bytes(), &pq_sk).map(|d| (TOP_TX_V2, d))),
+                        NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok(), None),
+                        NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok(), None),
+                        NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok(), None),
+                        NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok(), None),
                     };
                     if let Some(d) = data {
                         if swarm.behaviour_mut().publish(IdentTopic::new(topic), d.clone()).is_err() {
-                            pending_commands.push_back(command);
+                            pending_commands.push_back(command.clone());
                         }
+                    }
+                    if let Some((t2, d2)) = data_v2 {
+                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(t2), d2);
                     }
                 }
             }
         }
     });
     Ok(net)
+}
+
+fn process_anchor(
+    a: Anchor,
+    db: &Arc<Store>,
+    anchor_tx: &broadcast::Sender<Anchor>,
+    orphan_anchors: &mut HashMap<u64, Anchor>,
+    sync_state: &Arc<Mutex<SyncState>>,
+    score: &mut PeerScore,
+) {
+    // Ignore duplicate anchors we have already stored to reduce log and CPU spam
+    if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
+        if a.num == latest.num && a.hash == latest.hash { return; }
+    }
+    net_log!("⚓ Received anchor for epoch {}", a.num);
+    match validate_anchor(&a, db) {
+        Ok(()) => {
+            if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
+                net_log!("✅ Storing anchor for epoch {}", a.num);
+                if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                {
+                    let mut st = sync_state.lock().unwrap();
+                    st.highest_seen_epoch = a.num;
+                }
+                let _ = anchor_tx.send(a.clone());
+
+                // Process orphans following this anchor
+                let mut next_num = a.num + 1;
+                while let Some(orphan) = orphan_anchors.remove(&next_num) {
+                    if validate_anchor(&orphan, db).is_ok() {
+                        net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
+                        if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                        if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                        if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                        let _ = anchor_tx.send(orphan);
+                        next_num += 1;
+                    } else {
+                        orphan_anchors.insert(orphan.num, orphan);
+                        break;
+                    }
+                }
+                crate::metrics::ORPHAN_BUFFER_LEN.set(orphan_anchors.len() as i64);
+                if orphan_anchors.len() > MAX_ORPHAN_ANCHORS {
+                    let oldest = *orphan_anchors.keys().min().unwrap();
+                    orphan_anchors.remove(&oldest);
+                    eprintln!("⚠️ Orphan buffer cap exceeded, dropping oldest epoch {}", oldest);
+                }
+            }
+        }
+        Err(e) if e.starts_with("Previous anchor") => {
+            net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
+            orphan_anchors.insert(a.num, a.clone());
+            let mut state = sync_state.lock().unwrap();
+            if a.num > state.highest_seen_epoch { state.highest_seen_epoch = a.num; }
+        },
+        Err(e) => {
+            println!("❌ Anchor validation failed: {}", e);
+            crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+            score.record_validation_failure();
+        }
+    }
 }
 
 impl Network {
@@ -542,8 +643,6 @@ impl Network {
     
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {
-        // This would need to be implemented with a shared state between the network thread and this struct
-        // For now, return a placeholder - in a full implementation, this would use Arc<Mutex<HashSet<PeerId>>>
         0 // TODO: Implement actual peer counting
     }
 }

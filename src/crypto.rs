@@ -58,6 +58,60 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
     keypair()
 }
 
+/// Load or create the node's PQ peer identity keypair for networking (Dilithium3)
+pub fn load_or_create_pq_peer_identity(path: &str) -> Result<(PublicKey, SecretKey)> {
+    use std::fs;
+    use std::path::Path;
+    let pk_path = format!("{}", path);
+    if Path::new(&pk_path).exists() {
+        let bytes = fs::read(&pk_path)?;
+        // Format: pk_len(2 bytes LE) || pk || sk
+        if bytes.len() < 2 { return Err(anyhow!("invalid pq key file")); }
+        let pk_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if bytes.len() < 2 + pk_len { return Err(anyhow!("invalid pq key file")); }
+        let pk = PublicKey::from_bytes(&bytes[2..2+pk_len]).map_err(|_| anyhow!("bad pq pk"))?;
+        let sk = SecretKey::from_bytes(&bytes[2+pk_len..]).map_err(|_| anyhow!("bad pq sk"))?;
+        return Ok((pk, sk));
+    }
+    let (pk, sk) = dilithium3_keypair();
+    // Store as simple concatenation with length prefix for future-proofing
+    let mut out = Vec::with_capacity(2 + DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES);
+    out.extend_from_slice(&(DILITHIUM3_PK_BYTES as u16).to_le_bytes());
+    out.extend_from_slice(pk.as_bytes());
+    out.extend_from_slice(sk.as_bytes());
+    std::fs::write(&pk_path, out)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&pk_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&pk_path, perms);
+        }
+    }
+    Ok((pk, sk))
+}
+
+/// Sign arbitrary payload bytes with Dilithium3
+pub fn pq_sign_payload(payload: &[u8], sk: &SecretKey) -> [u8; DILITHIUM3_SIG_BYTES] {
+    let sig = pqcrypto_dilithium::dilithium3::detached_sign(payload, sk);
+    let mut out = [0u8; DILITHIUM3_SIG_BYTES];
+    out.copy_from_slice(sig.as_bytes());
+    out
+}
+
+/// Verify Dilithium3 signature over raw payload bytes
+pub fn pq_verify_payload(payload: &[u8], sig: &[u8; DILITHIUM3_SIG_BYTES], pk: &PublicKey) -> bool {
+    match pqcrypto_dilithium::dilithium3::verify_detached_signature(
+        &pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(sig),
+        payload,
+        pk,
+    ) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
 /// Generate a self-signed X.509 certificate from a libp2p Ed25519 keypair
 /// This cert is used for QUIC's TLS stack authentication
 pub fn generate_self_signed_cert(_id_keys: &identity::Keypair) -> Result<(Vec<u8>, Vec<u8>)> {

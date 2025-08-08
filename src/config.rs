@@ -39,6 +39,12 @@ pub struct P2p {
     pub rate_limit_window_secs: u64,
     #[serde(default = "default_max_messages_per_window")]
     pub max_messages_per_window: u32,
+    /// Require PQ signatures (Dilithium) on gossip messages (v2 topics). When true, v1 messages are rejected.
+    #[serde(default)]
+    pub require_pq_signatures: bool,
+    /// Attempt to use PQ-hybrid KEMs for QUIC/TLS if available in the stack. Currently advisory.
+    #[serde(default)]
+    pub prefer_pq_quic: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -144,7 +150,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     "listen_port","bootstrap","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
                 ]),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window"
+                    "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window","require_pq_signatures","prefer_pq_quic"
                 ]),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
                 ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[

@@ -114,7 +114,7 @@ impl Wallet {
                 .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-            let sk_bytes = cipher
+            let mut sk_bytes = cipher
                 .decrypt(XNonce::from_slice(nonce), ciphertext)
                 .map_err(|_| anyhow!("Invalid pass-phrase"))?;
 
@@ -125,6 +125,7 @@ impl Wallet {
             // zeroize key and decrypted buffer
             let mut key_zero = key;
             key_zero.iter_mut().for_each(|b| *b = 0);
+            sk_bytes.iter_mut().for_each(|b| *b = 0);
 
             let address = crypto::address_from_pk(&pk);
             // Avoid printing address unless explicitly requested via logs
