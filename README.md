@@ -63,15 +63,6 @@ additional commands:
 - wallet encryption with xchacha20-poly1305
 - production tuning: wal durability, batch writes, compaction
 
-## configuration
-
-modify config.toml for:
-- network settings and bootstrap peers
-- mining parameters (difficulty, memory, target coins)
-- epoch timing and retargeting intervals
-- storage location and database tuning
-- metrics endpoint and rate limiting
-- proof server authentication
 
 ## security
 
@@ -80,11 +71,3 @@ modify config.toml for:
 - rate limiting and peer failure scoring
 - encrypted wallet storage with passphrase derivation
 - proof request deduplication and ip rate limiting
-
-## deployment
-
-- set WALLET_PASSPHRASE for headless operation
-- expose quic port for p2p networking
-- optionally expose proof API with PROOF_SERVER_TOKEN
-- monitor prometheus metrics for health
-- use durable storage for rocksdb data
