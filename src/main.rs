@@ -141,16 +141,23 @@ async fn main() -> anyhow::Result<()> {
 
     if !synced {
         println!(
-            "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+            "⚠️  Could not fully sync within {}s.",
             cfg.net.sync_timeout_secs
         );
-        // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
-        // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
-        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-            let mut st = sync_state.lock().unwrap();
-            st.synced = true;
-            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+        // Only allow standalone operation when no bootstrap peers are configured.
+        // If bootstrap peers exist, keep the node in unsynced state and let the background
+        // sync task continue fetching epochs to converge with the network.
+        if cfg.net.bootstrap.is_empty() {
+            if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                let mut st = sync_state.lock().unwrap();
+                st.synced = true;
+                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                println!("✅ Proceeding in standalone mode with local chain at epoch {}.", latest.num);
+            } else {
+                println!("⚠️  No peers and no local chain found. Waiting for network…");
+            }
+        } else {
+            println!("⏳ Bootstrap peers configured; staying in sync mode until caught up.");
         }
     }
     
@@ -350,10 +357,10 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         None => {
-            // No command specified, start mining if enabled
-            let mining_enabled = cfg.mining.enabled;
-            if mining_enabled {
-                miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+            // No command specified: run as a syncing node only (no mining) by default.
+            // To mine explicitly, use: `-- Mine` or set mining.enabled=true and `unchnained Mine`.
+            if cfg.mining.enabled {
+                println!("ℹ️  Mining is enabled in config, but default mode without subcommand does not start mining. Use 'Mine' subcommand to mine.");
             }
         }
     }

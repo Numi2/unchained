@@ -31,6 +31,7 @@ pub fn spawn(
         let mut local_epoch = db.get::<Anchor>("epoch", b"latest").unwrap_or_default().map_or(0, |a| a.num);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_REQUESTS));
         let mut sync_check_timer = interval(Duration::from_secs(SYNC_CHECK_INTERVAL_SECS));
+        let mut last_request_range: Option<(u64, u64)> = None;
         let mut idle_poll_timer = interval(Duration::from_secs(SYNC_IDLE_POLL_INTERVAL_SECS));
 
         loop {
@@ -48,11 +49,21 @@ pub fn spawn(
                         { let mut st = sync_state.lock().unwrap(); st.synced = false; }
                         // Ask peers for the latest epoch so we can catch up quickly
                         net.request_latest_epoch().await;
-                        println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
-                        request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                        // Avoid repeatedly spamming identical request ranges every tick
+                        // Compute the actual start_epoch exactly as request_missing_epochs will use
+                        let start_epoch = if db.get::<Anchor>("epoch", b"latest").unwrap_or_default().is_none() { 0 } else { local_epoch + 1 };
+                        if last_request_range != Some((start_epoch, highest_seen)) {
+                            println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
+                            request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                            last_request_range = Some((start_epoch, highest_seen));
+                        }
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
-                            local_epoch = latest_anchor.num;
-                            println!("📊 Local epoch updated to: {}", local_epoch);
+                            if latest_anchor.num != local_epoch {
+                                local_epoch = latest_anchor.num;
+                                println!("📊 Local epoch updated to: {}", local_epoch);
+                                // Reset last_request_range so next gap requests are re-evaluated
+                                last_request_range = None;
+                            }
                         }
                     }
                 }
@@ -93,6 +104,7 @@ pub fn spawn(
                                 request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await;
                             }
                             local_epoch = anchor.num;
+                            last_request_range = None; // new tip observed; clear dedupe so we can request next gaps
                         }
                     }
                 }

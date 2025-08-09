@@ -318,6 +318,9 @@ pub async fn spawn(
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    const EPOCH_REQ_DEDUP_TTL_SECS: u64 = 30;
+    const ORPHAN_BACKFILL_WINDOW: u64 = 16;
 
     tokio::spawn(async move {
         loop {
@@ -382,6 +385,9 @@ pub async fn spawn(
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                // Reflect network-learned height and selection in Prometheus metrics
+                                                crate::metrics::EPOCH_HEIGHT.set(a.num as i64);
+                                                crate::metrics::SELECTED_COINS.set(a.coin_count as i64);
                                                 {
                                                     let mut st = sync_state.lock().unwrap();
                                                     st.highest_seen_epoch = a.num;
@@ -396,6 +402,9 @@ pub async fn spawn(
                                                         if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                         if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                         if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                        // Update metrics for each linked orphan we finalize
+                                                        crate::metrics::EPOCH_HEIGHT.set(orphan.num as i64);
+                                                        crate::metrics::SELECTED_COINS.set(orphan.coin_count as i64);
                                                         let _ = anchor_tx.send(orphan);
                                                         next_num += 1;
                                                     } else {
@@ -413,18 +422,66 @@ pub async fn spawn(
                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
-                                            net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
-                                            orphan_anchors.insert(a.num, a.clone());
-                                            
-                                            let mut state = sync_state.lock().unwrap();
-                                            if a.num > state.highest_seen_epoch {
-                                                state.highest_seen_epoch = a.num;
-                                            }
-                                            // Proactively request the missing predecessor to accelerate linking the chain
-                                            if a.num > 0 {
-                                                let prev_epoch = a.num - 1;
-                                                if let Ok(bytes) = bincode::serialize(&prev_epoch) {
-                                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                            // Bootstrap: if we have no local chain yet, or only genesis, adopt the first seen anchor as a checkpoint.
+                                            let latest_opt = db.get::<Anchor>("epoch", b"latest").unwrap_or(None);
+                                            let should_checkpoint = latest_opt.as_ref().map_or(true, |anc| anc.num == 0);
+                                            if should_checkpoint {
+                                                net_log!("🧭 Adopting checkpoint anchor #{} (no local chain)", a.num);
+                                                if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                crate::metrics::EPOCH_HEIGHT.set(a.num as i64);
+                                                crate::metrics::SELECTED_COINS.set(a.coin_count as i64);
+                                                {
+                                                    let mut st = sync_state.lock().unwrap();
+                                                    st.highest_seen_epoch = a.num;
+                                                }
+                                                let _ = anchor_tx.send(a.clone());
+
+                                                // After adopting, immediately try to link any buffered orphans above it
+                                                let mut next_num = a.num + 1;
+                                                while let Some(orphan) = orphan_anchors.remove(&next_num) {
+                                                    if validate_anchor(&orphan, &db).is_ok() {
+                                                        net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
+                                                        if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                        if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                        if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                        crate::metrics::EPOCH_HEIGHT.set(orphan.num as i64);
+                                                        crate::metrics::SELECTED_COINS.set(orphan.coin_count as i64);
+                                                        let _ = anchor_tx.send(orphan);
+                                                        next_num += 1;
+                                                    } else {
+                                                        orphan_anchors.insert(orphan.num, orphan);
+                                                        break;
+                                                    }
+                                                }
+                                            } else {
+                                                net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
+                                                orphan_anchors.insert(a.num, a.clone());
+                                                
+                                                let mut state = sync_state.lock().unwrap();
+                                                if a.num > state.highest_seen_epoch {
+                                                    state.highest_seen_epoch = a.num;
+                                                }
+                                                // Proactively request the missing predecessor and a small backfill window
+                                                let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                let now = std::time::Instant::now();
+                                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_TTL_SECS));
+                                                let mut request_epoch_once = |epoch: u64| {
+                                                    if !map.contains_key(&epoch) {
+                                                        if let Ok(bytes) = bincode::serialize(&epoch) {
+                                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                            map.insert(epoch, std::time::Instant::now());
+                                                            net_log!("🔎 Requested epoch {} (backfill)", epoch);
+                                                        }
+                                                    }
+                                                };
+                                                if a.num > 0 { request_epoch_once(a.num - 1); }
+                                                if db.get::<Anchor>("epoch", b"latest").unwrap_or(None).is_none() {
+                                                    let start = a.num.saturating_sub(ORPHAN_BACKFILL_WINDOW);
+                                                    for e in (start..a.num).rev() {
+                                                        request_epoch_once(e);
+                                                    }
                                                 }
                                             }
                                         },
