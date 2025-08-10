@@ -279,6 +279,8 @@ pub async fn spawn(
     tokio::spawn(async move {
         // Periodic redial timer with exponential backoff when we have no peers
         let mut redial_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        // Periodically (re)send PQ auth hello until peers are authenticated to avoid race with gossipsub mesh setup
+        let mut auth_retry_timer = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut redial_backoff_secs: u64 = 1;
         let mut last_redial_instant = std::time::Instant::now() - std::time::Duration::from_secs(60);
         loop {
@@ -298,6 +300,52 @@ pub async fn spawn(
                     } else {
                         // Reset backoff once we have at least one peer
                         redial_backoff_secs = 1;
+                    }
+                },
+                _ = auth_retry_timer.tick() => {
+                    // Re-advertise PQ auth hello to any connected peer that hasn't been marked authenticated yet.
+                    // This mitigates timing where the initial publish happens before gossipsub mesh is ready.
+                    if !connected_peers.is_empty() {
+                        // Prepare hello once per tick
+                        #[derive(Debug, Clone, Serialize, Deserialize)]
+                        struct NetHelloUnsigned {
+                            handshake_version: u8,
+                            local_peer_id: String,
+                            #[serde(with = "serde_big_array::BigArray")]
+                            dilithium_pk: [u8; crate::crypto::DILITHIUM3_PK_BYTES],
+                            ed25519_pk: Vec<u8>,
+                            kyber_pk: Vec<u8>,
+                            expiry_unix_secs: u64,
+                        }
+                        #[derive(Debug, Clone, Serialize, Deserialize)]
+                        struct NetHello {
+                            unsigned: NetHelloUnsigned,
+                            sig_ed25519: Vec<u8>,
+                            #[serde(with = "serde_big_array::BigArray")]
+                            sig_dilithium: [u8; crate::crypto::DILITHIUM3_SIG_BYTES],
+                        }
+                        let ed_pk_bytes: Vec<u8> = id_keys.public().try_into_ed25519().map(|p| p.to_bytes().to_vec()).unwrap_or_default();
+                        let mut pq_pk_arr = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+                        pq_pk_arr.copy_from_slice(pq_pk.as_bytes());
+                        let unsigned = NetHelloUnsigned {
+                            handshake_version: 1,
+                            local_peer_id: peer_id.to_string(),
+                            dilithium_pk: pq_pk_arr,
+                            ed25519_pk: ed_pk_bytes.clone(),
+                            kyber_pk: crate::crypto::load_or_create_node_kyber().map(|(pk,_sk)| pk.as_bytes().to_vec()).unwrap_or_default(),
+                            expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 300,
+                        };
+                        let unsigned_ser = bincode::serialize(&unsigned).unwrap_or_default();
+                        let sig_ed25519 = id_keys.sign(&unsigned_ser).unwrap_or_default();
+                        let sig_dilithium = crate::crypto::pq_sign_detached(&unsigned_ser, &pq_sk);
+                        let hello = NetHello { unsigned, sig_ed25519, sig_dilithium };
+                        if let Ok(bytes) = bincode::serialize(&hello) {
+                            // Only resend if there exists at least one not-yet-authed peer
+                            let need_resend = connected_peers.iter().any(|p| !pq_authed.contains(p));
+                            if need_resend {
+                                let _ = swarm.behaviour_mut().gs.publish(IdentTopic::new(TOP_AUTH), bytes);
+                            }
+                        }
                     }
                 },
                 event = swarm.select_next_some() => {
@@ -435,6 +483,7 @@ pub async fn spawn(
                                         let pk_pq = match pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&hello.unsigned.dilithium_pk) { Ok(p)=>p, Err(_)=>{continue;} };
                                         if !crate::crypto::pq_verify_detached(&bincode::serialize(&hello.unsigned).unwrap_or_default(), &hello.sig_dilithium, &pk_pq) { continue; }
                                         pq_authed.insert(peer_id);
+                                        net_log!("✅ PQ auth completed for peer: {}", peer_id);
                                         peer_keys.insert(peer_id, PeerStaticKeys { kyber_pk: hello.unsigned.kyber_pk.clone(), ed25519_pk: hello.unsigned.ed25519_pk.clone(), dilithium_pk: hello.unsigned.dilithium_pk });
                                     }
                                 },
