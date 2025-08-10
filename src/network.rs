@@ -219,7 +219,7 @@ pub async fn spawn(
         behaviour,
         peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(std::time::Duration::from_secs(20))
+            .with_idle_connection_timeout(std::time::Duration::from_secs(120))
     );
     
     let mut port = net_cfg.listen_port;
@@ -274,17 +274,40 @@ pub async fn spawn(
     }
     let mut pending_rpcs: HashMap<u64, PendingRpc> = HashMap::new();
 
+    // For redial/backoff, keep a local copy of net config
+    let net_cfg_clone = net_cfg.clone();
     tokio::spawn(async move {
+        // Periodic redial timer with exponential backoff when we have no peers
+        let mut redial_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut redial_backoff_secs: u64 = 1;
+        let mut last_redial_instant = std::time::Instant::now() - std::time::Duration::from_secs(60);
         loop {
             tokio::select! {
+                _ = redial_timer.tick() => {
+                    if connected_peers.is_empty() {
+                        if last_redial_instant.elapsed() >= std::time::Duration::from_secs(redial_backoff_secs) {
+                            for addr in &net_cfg_clone.bootstrap {
+                                net_log!("🔁 Redial attempt (backoff {}s) to {}", redial_backoff_secs, addr);
+                                if let Err(e) = swarm.dial(addr.parse::<Multiaddr>().unwrap_or_else(|_| "/ip4/127.0.0.1/udp/31000/quic-v1".parse().unwrap())) {
+                                    println!("❌ Redial failed: {}", e);
+                                }
+                            }
+                            last_redial_instant = std::time::Instant::now();
+                            redial_backoff_secs = (redial_backoff_secs.saturating_mul(2)).min(60);
+                        }
+                    } else {
+                        // Reset backoff once we have at least one peer
+                        redial_backoff_secs = 1;
+                    }
+                },
                 event = swarm.select_next_some() => {
                     match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            net_log!("🤝 Connected to peer: {}", peer_id);
+                        SwarmEvent::ConnectionEstablished { peer_id: remote_peer_id, .. } => {
+                            net_log!("🤝 Connected to peer: {}", remote_peer_id);
                             // Diagnostic: indicate PQ TLS preference is active (aws-lc-rs installed)
                             net_log!("🔐 Transport: rustls prefer-post-quantum active (aws-lc-rs provider installed)");
-                            peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            connected_peers.insert(peer_id);
+                            peer_scores.entry(remote_peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
+                            connected_peers.insert(remote_peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
                             CONNECTED_PEER_COUNT.store(connected_peers.len(), Ordering::Relaxed);
                             // Send PQ auth hello
@@ -310,6 +333,7 @@ pub async fn spawn(
                             pq_pk_arr.copy_from_slice(pq_pk.as_bytes());
                             let unsigned = NetHelloUnsigned {
                                 handshake_version: 1,
+                                // Use our own local peer ID, not the remote peer ID from the event
                                 local_peer_id: peer_id.to_string(),
                                 dilithium_pk: pq_pk_arr,
                                 ed25519_pk: ed_pk_bytes.clone(),
@@ -362,6 +386,8 @@ pub async fn spawn(
                             connected_peers.remove(&peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
                             CONNECTED_PEER_COUNT.store(connected_peers.len(), Ordering::Relaxed);
+                            // Trigger immediate redial cycle by resetting last_redial_instant
+                            last_redial_instant = std::time::Instant::now() - std::time::Duration::from_secs(redial_backoff_secs);
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Gs(GossipsubEvent::Message { message, .. })) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);

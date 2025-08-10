@@ -524,6 +524,7 @@ impl Manager {
                             // Genesis: no prev anchor, use only buffered coins (should be empty)
                             Vec::new()
                         };
+                        let total_candidates = candidates.len();
 
                         // Threshold-only winners with DoS hardening:
                         // Recompute Argon2id for each candidate under prev anchor params and filter by target.
@@ -596,6 +597,17 @@ impl Manager {
                         }
                         // Ensure canonical compact encoding
                         target_nbits = crate::crypto::normalize_compact_target(target_nbits).unwrap_or(target_nbits);
+                        // Log epoch planning summary prior to persistence
+                        println!(
+                            "🕒 Epoch #{}: candidates={}, selected={}, txs={}, target_nbits=0x{:08x}, mem_kib={}, t_cost={}",
+                            current_epoch,
+                            total_candidates,
+                            selected_with_pow.len(),
+                            applied_tx_ids.len(),
+                            target_nbits,
+                            mem_kib,
+                            t_cost
+                        );
                         // Epoch work = sum over selected coins of work_from_pow_hash
                         let mut epoch_work = U256::zero();
                         let mut work_leaves: Vec<[u8;32]> = Vec::with_capacity(selected_with_pow.len());
@@ -708,6 +720,15 @@ impl Manager {
                         } else {
                             crate::metrics::EPOCH_HEIGHT.set(current_epoch as i64);
                             crate::metrics::SELECTED_COINS.set(selected_ids.len() as i64);
+                            println!(
+                                "✅ Finalized epoch #{}: selected={}, txs={}, target_nbits=0x{:08x}, mem_kib={}, t_cost={}",
+                                current_epoch,
+                                selected_ids.len(),
+                                applied_tx_ids.len(),
+                                target_nbits,
+                                mem_kib,
+                                t_cost
+                            );
                             self.net.gossip_anchor(&anchor).await;
                             if let Err(e) = self.anchor_tx.send(anchor) {
                                 eprintln!("⚠️  Failed to broadcast anchor: {}", e);
