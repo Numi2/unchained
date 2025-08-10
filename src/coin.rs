@@ -35,11 +35,12 @@ pub struct CoinV1Compat {
 }
 
 impl Coin {
-    /// Creates the raw input to hash with Argon2id.
+    /// Creates the raw input to hash with Argon2id (unsalted; salt comes from prev anchor hash).
     pub fn header_bytes(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32 + 8 + 32);
         bytes.extend_from_slice(epoch_hash);
-        bytes.extend_from_slice(&nonce.to_le_bytes());
+        // Use big-endian for nonce to match target big-endian interpretation preference
+        bytes.extend_from_slice(&nonce.to_be_bytes());
         bytes.extend_from_slice(creator_address);
         bytes
     }
@@ -48,7 +49,7 @@ impl Coin {
     pub fn calculate_id(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
         let mut id_hasher = blake3::Hasher::new();
         id_hasher.update(epoch_hash);
-        id_hasher.update(&nonce.to_le_bytes());
+        id_hasher.update(&nonce.to_be_bytes());
         id_hasher.update(creator_address);
         *id_hasher.finalize().as_bytes()
     }

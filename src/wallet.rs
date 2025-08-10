@@ -12,14 +12,16 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rpassword;
 use atty;
+use zeroize::Zeroize;
 
 const WALLET_KEY: &[u8] = b"default_keypair";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const WALLET_VERSION_ENCRYPTED: u8 = 1;
-// Tunable KDF parameters for wallet encryption
-const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
-const WALLET_KDF_TIME_COST: u32 = 3; // iterations
+// Tunable KDF parameters for wallet encryption (defaults strengthened)
+// Defaults: 1 GiB, time cost 4. Can be overridden via env WALLET_KDF_MEM_MIB, WALLET_KDF_TIME
+const WALLET_KDF_MEM_KIB: u32 = 1024 * 1024; // 1 GiB
+const WALLET_KDF_TIME_COST: u32 = 4; // iterations
 
 pub struct Wallet {
     _db: std::sync::Weak<Store>,
@@ -62,7 +64,9 @@ impl Wallet {
                 OsRng.fill_bytes(&mut salt);
 
                 let mut key = [0u8; 32];
-                let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+                let mem_kib = std::env::var("WALLET_KDF_MEM_MIB").ok().and_then(|s| s.parse::<u32>().ok()).map(|mib| mib.saturating_mul(1024)).unwrap_or(WALLET_KDF_MEM_KIB);
+                let time_cost = std::env::var("WALLET_KDF_TIME").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(WALLET_KDF_TIME_COST);
+                let params = Params::new(mem_kib, time_cost, 1, None)
                     .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
                 Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
                     .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
@@ -74,8 +78,8 @@ impl Wallet {
                 let ciphertext = cipher
                     .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
                     .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
-                // best-effort zeroize
-                key.iter_mut().for_each(|b| *b = 0);
+                // Zeroize key material and sensitive buffers
+                key.zeroize();
 
                 let mut new_encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
                 new_encoded.extend_from_slice(pk.as_bytes());
@@ -107,14 +111,16 @@ impl Wallet {
 
             let passphrase = obtain_passphrase("Enter wallet pass-phrase: ")?;
             let mut key = [0u8; 32];
-            let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+            let mem_kib = std::env::var("WALLET_KDF_MEM_MIB").ok().and_then(|s| s.parse::<u32>().ok()).map(|mib| mib.saturating_mul(1024)).unwrap_or(WALLET_KDF_MEM_KIB);
+            let time_cost = std::env::var("WALLET_KDF_TIME").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(WALLET_KDF_TIME_COST);
+            let params = Params::new(mem_kib, time_cost, 1, None)
                 .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
             Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
                 .hash_password_into(passphrase.as_bytes(), salt, &mut key)
                 .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-            let sk_bytes = cipher
+            let mut sk_bytes = cipher
                 .decrypt(XNonce::from_slice(nonce), ciphertext)
                 .map_err(|_| anyhow!("Invalid pass-phrase"))?;
 
@@ -122,9 +128,9 @@ impl Wallet {
                 .with_context(|| "Failed to decode public key")?;
             let sk = SecretKey::from_bytes(&sk_bytes)
                 .with_context(|| "Failed to decode secret key bytes")?;
-            // zeroize key and decrypted buffer
-            let mut key_zero = key;
-            key_zero.iter_mut().for_each(|b| *b = 0);
+            // zeroize key material and decrypted buffer (the original, not a clone)
+            let mut key_zero = key; key_zero.zeroize();
+            sk_bytes.zeroize();
 
             let address = crypto::address_from_pk(&pk);
             // Avoid printing address unless explicitly requested via logs
@@ -142,7 +148,9 @@ impl Wallet {
         OsRng.fill_bytes(&mut salt);
 
         let mut key = [0u8; 32];
-        let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+        let mem_kib = std::env::var("WALLET_KDF_MEM_MIB").ok().and_then(|s| s.parse::<u32>().ok()).map(|mib| mib.saturating_mul(1024)).unwrap_or(WALLET_KDF_MEM_KIB);
+        let time_cost = std::env::var("WALLET_KDF_TIME").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(WALLET_KDF_TIME_COST);
+        let params = Params::new(mem_kib, time_cost, 1, None)
             .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
         Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
@@ -154,8 +162,7 @@ impl Wallet {
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
             .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
-        // best-effort zeroize
-        key.iter_mut().for_each(|b| *b = 0);
+        key.zeroize();
 
         let mut encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
         encoded.extend_from_slice(pk.as_bytes());

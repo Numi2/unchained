@@ -1,5 +1,5 @@
 use crate::{storage::Store, crypto, epoch::Anchor, coin::{Coin, CoinCandidate}, network::NetHandle, wallet::Wallet};
-use rand::Rng;
+// use rand::Rng; // no longer needed with sequential nonce
 use std::sync::Arc;
 use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
 use tokio::sync::broadcast::error::RecvError;
@@ -167,8 +167,8 @@ impl Miner {
                             }
                             
                             println!(
-                                "⛏️  New epoch #{}: difficulty={}, mem_kib={}. Mining...",
-                                anchor.num, anchor.difficulty, anchor.mem_kib
+                                "⛏️  New epoch #{}: target_nbits=0x{:08x}, mem_kib={}, t_cost={}. Mining...",
+                                anchor.num, anchor.target_nbits, anchor.mem_kib, anchor.t_cost
                             );
                             
                             self.current_epoch = Some(anchor.num);
@@ -245,12 +245,14 @@ impl Miner {
 
         let creator_address = self.wallet.address();
         let mem_kib = anchor.mem_kib;
-        let difficulty = anchor.difficulty;
+        // Consensus guidance: t_cost=1 for PoW; keep from anchor for compatibility if >1 but miner uses anchor value
+        let t_cost = 1u32; // mining uses 1; validation will enforce whatever anchor encodes
+        let target = crate::crypto::decode_compact_target(anchor.target_nbits).unwrap_or_else(|_| primitive_types::U256::MAX);
         let mut attempts = 0u64;
         let max_attempts = crate::config::default_max_mining_attempts();
 
         println!("🎯 Starting mining for epoch #{}", anchor.num);
-        println!("⚙️  Mining parameters: difficulty={}, mem_kib={}, lanes=1 (consensus)", difficulty, mem_kib);
+        println!("⚙️  Mining parameters: target_nbits=0x{:08x}, mem_kib={}, t_cost={}, lanes=1 (consensus)", anchor.target_nbits, mem_kib, t_cost);
 
         loop {
             attempts += 1;
@@ -259,12 +261,13 @@ impl Miner {
                 return Ok(()); // Continue to next epoch
             }
 
-            let nonce: u64 = rand::thread_rng().gen();
+            // Use sequential nonces for efficient coverage of the search space
+            let nonce: u64 = attempts;
             let header = Coin::header_bytes(&anchor.hash, nonce, &creator_address);
             
-            // Consensus requires Argon2 parameters to be deterministic (lanes=1 enforced in function).
-            if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib) {
-                                    if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+            // Salt is bound to prev anchor hash (challenge); here header already includes epoch binding (prev hash), salt is prev hash
+            if let Ok(pow_hash) = crypto::argon2id_pow(&header, &anchor.hash, mem_kib, t_cost) {
+                if crate::crypto::leq_hash_to_target(&pow_hash, &target) {
                     // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
                     // Finding a coin proves the current epoch is still active.
                     self.last_heartbeat = time::Instant::now();

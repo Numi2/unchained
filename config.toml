@@ -3,23 +3,19 @@
 [net]
 # Port to listen on for P2P connections
 listen_port = 31000
-# Path to the Iroh secret key
-iroh_key_path = "iroh.key"
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 133337
 # Connection timeout in seconds
-connection_timeout_secs = 300
+connection_timeout_secs = 10
 # Timeout for initial network sync in seconds
-sync_timeout_secs = 1800
+sync_timeout_secs = 10
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
 
 
-public_ip = "193.71.140.215"
-
-# Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
+# Bootstrap nodes to connect to - add your seed nodes here - ip + peerid
+bootstrap = []
 
 
 
@@ -40,13 +36,12 @@ path = "../blockchain_data"
 [epoch]
 # Duration of each epoch in seconds 
 seconds = 222
-# Target number of leading zeros for proof-of-work difficulty (start with 2 for public mining)
-target_leading_zeros = 1
 # Retargeting parameters
-# Target number of coins per epoch for difficulty adjustment (reduced for public mining)
-target_coins_per_epoch = 3
-# How often to retarget (every N epochs - more frequent for dynamic adjustment)
-retarget_interval = 2000
+# Compact-target model: difficulty encoded via target_nbits in anchors; poe validation uses target(prev)
+# Target number of coins per epoch for difficulty adjustment
+target_coins_per_epoch = 100
+# How often to retarget (every N epochs)
+retarget_interval = 10
 
 
 [mining]
@@ -54,8 +49,6 @@ retarget_interval = 2000
 enabled = true
 # Memory usage for Argon2 hashing in KiB (32 MiB, optimized for mining speed)
 mem_kib = 16192
-# Number of parallel lanes for Argon2 (2 lanes for better parallelization)
-lanes = 2
 
 # Memory retargeting parameters
 # Minimum memory in KiB
@@ -69,11 +62,7 @@ max_memory_adjustment = 1.02
 
 # Miner stability settings for multi-node environments
 # Heartbeat interval in seconds (more frequent for network stability)
-heartbeat_interval_secs = 140
-# Maximum consecutive failures before restarting miner (more forgiving for network issues)
-max_consecutive_failures = 3
-# Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
-max_mining_attempts = 50000
+# (no additional miner stability keys)
 
 [metrics]
 # Optional – leave out to use the default "0.0.0.0:9100"

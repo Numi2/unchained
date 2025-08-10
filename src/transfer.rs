@@ -10,6 +10,10 @@ use serde_big_array::BigArray;
 /// verification, and a signature over the content. This forms a spendable UTXO.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transfer {
+    /// Version 0: legacy (no ts/seq in signature);
+    /// Version 1: includes ts_unix and seq in signature bytes
+    #[serde(default = "default_transfer_version")]
+    pub version: u8,
     pub coin_id: [u8; 32],
     // The sender's full public key is required for stateless signature verification.
     #[serde(with = "BigArray")]
@@ -18,22 +22,46 @@ pub struct Transfer {
     pub to: Address,
     // The hash of the previous transaction, forming a per-coin chain.
     pub prev_tx_hash: [u8; 32],
+    /// Wall-clock timestamp (Unix seconds) for replay protection and UX
+    #[serde(default)]
+    pub ts_unix: u64,
+    /// Per-sender monotonically increasing sequence number for replay protection
+    #[serde(default)]
+    pub seq: u64,
     // A Dilithium3 signature from the sender.
     #[serde(with = "BigArray")]
     pub sig: [u8; DILITHIUM3_SIG_BYTES],
 }
 
 impl Transfer {
-    /// Canonical bytes-to-sign: coin_id ‖ sender_pk ‖ to ‖ prev_tx_hash.
-    /// This deterministic serialization prevents replay/tamper attacks and is
-    /// independent of any serde/bincode representation.
-    pub fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes_v0(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(32 + DILITHIUM3_PK_BYTES + 32 + 32);
         v.extend_from_slice(&self.coin_id);
         v.extend_from_slice(&self.sender_pk);
         v.extend_from_slice(&self.to);
         v.extend_from_slice(&self.prev_tx_hash);
         v
+    }
+
+    /// Canonical bytes-to-sign: coin_id ‖ sender_pk ‖ to ‖ prev_tx_hash.
+    /// For version 1, also includes ts_unix ‖ seq.
+    /// This deterministic serialization prevents replay/tamper attacks and is
+    /// independent of any serde/bincode representation.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        match self.version {
+            0 => self.signing_bytes_v0(),
+            _ => {
+                let mut v = Vec::with_capacity(32 + DILITHIUM3_PK_BYTES + 32 + 32 + 8 + 8 + 1);
+                v.push(1u8); // version marker inside signing bytes for domain separation
+                v.extend_from_slice(&self.coin_id);
+                v.extend_from_slice(&self.sender_pk);
+                v.extend_from_slice(&self.to);
+                v.extend_from_slice(&self.prev_tx_hash);
+                v.extend_from_slice(&self.ts_unix.to_le_bytes());
+                v.extend_from_slice(&self.seq.to_le_bytes());
+                v
+            }
+        }
     }
 
     /// Backwards-compat alias used by old code paths – now forwards to signing_bytes().
@@ -49,12 +77,15 @@ impl Transfer {
 
     /// Creates a new transfer from a coin to a recipient address.
     /// This is the main entry point for creating transfers.
+    /// For replay protection, caller must provide current unix time and next sequence number.
     pub fn create(
         coin_id: [u8; 32],
         sender_pk: PublicKey,
         sender_sk: &SecretKey,
         to: Address,
         prev_tx_hash: [u8; 32],
+        ts_unix: u64,
+        seq: u64,
     ) -> Result<Self> {
         // Validate inputs
         if to == [0u8; 32] {
@@ -63,10 +94,13 @@ impl Transfer {
 
         let sender_pk_bytes = sender_pk.as_bytes();
         let mut transfer = Transfer {
+            version: 1,
             coin_id,
             sender_pk: [0u8; DILITHIUM3_PK_BYTES],
             to,
             prev_tx_hash,
+            ts_unix,
+            seq,
             sig: [0u8; DILITHIUM3_SIG_BYTES],
         };
         
@@ -126,6 +160,27 @@ impl Transfer {
             return Err(anyhow!("Invalid prev_tx_hash"));
         }
 
+        // Replay protection (version >= 1): enforce timestamp window and monotonic (ts, seq)
+        if self.version >= 1 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Allow at most 24h clock skew into the future
+            let max_future_skew = 24 * 60 * 60;
+            if self.ts_unix > now + max_future_skew {
+                return Err(anyhow!("Transfer timestamp too far in the future"));
+            }
+            // Lookup last seen (ts, seq) for this sender
+            let last = db.get_replay_state(&self.sender_pk)?;
+            if let Some((last_ts, last_seq)) = last {
+                let newer = self.ts_unix > last_ts || (self.ts_unix == last_ts && self.seq > last_seq);
+                if !newer {
+                    return Err(anyhow!("Non-monotonic (ts,seq) for sender; possible replay"));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -135,6 +190,11 @@ impl Transfer {
         // Store the transfer to mark the coin as spent
         db.put("transfer", &self.coin_id, self)
             .context("Failed to store transfer in database")?;
+        // Update replay state for the sender (idempotent on same (ts,seq))
+        if self.version >= 1 {
+            db.put_replay_state(&self.sender_pk, self.ts_unix, self.seq)
+                .context("Failed to update replay state")?;
+        }
         
         Ok(())
     }
@@ -162,6 +222,8 @@ impl Transfer {
     }
 }
 
+fn default_transfer_version() -> u8 { 0 }
+
 /// Transfer manager for handling transfer operations
 pub struct TransferManager {
     db: std::sync::Arc<crate::storage::Store>,
@@ -184,6 +246,15 @@ impl TransferManager {
         // Get the previous transaction hash for this coin
         let prev_tx_hash = self.get_previous_tx_hash(&coin_id)?;
 
+        // Derive timestamp and next sequence for replay protection
+        let ts_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let sender_pk_bytes = sender_pk.as_bytes();
+        let last = self.db.get_replay_state(sender_pk_bytes)?;
+        let next_seq = match last { Some((_ts, seq)) => seq.saturating_add(1), None => 0 };
+
         // Create the transfer
         let transfer = Transfer::create(
             coin_id,
@@ -191,6 +262,8 @@ impl TransferManager {
             sender_sk,
             to,
             prev_tx_hash,
+            ts_unix,
+            next_seq,
         )?;
 
         // Validate the transfer

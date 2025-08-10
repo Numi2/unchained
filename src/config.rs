@@ -49,15 +49,18 @@ pub struct Storage {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Epoch {
     pub seconds: u64,
-    pub target_leading_zeros: usize,
     #[serde(default = "default_target_coins")]
     pub target_coins_per_epoch: u32,
-    /// Hard cap of selected coins per epoch (consensus). If not specified,
-    /// defaults to the same as target_coins_per_epoch.
-    #[serde(default = "default_target_coins")]
-    pub max_coins_per_epoch: u32,
+    // Removed max_coins_per_epoch under threshold-only winners
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
+    // Selection rules
+    #[serde(default = "default_max_selected")] 
+    pub max_selected_per_epoch: u32, // N_max
+    #[serde(default = "default_selected_min")] 
+    pub selected_min_per_epoch: u32, // λ_min
+    #[serde(default = "default_selected_max")] 
+    pub selected_max_per_epoch: u32, // λ_max
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,6 +89,9 @@ fn default_bind() -> String { "127.0.0.1:9100".into() }
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
 fn default_retarget_interval() -> u64 { 10 }
+fn default_max_selected() -> u32 { 64 }
+fn default_selected_min() -> u32 { 8 }
+fn default_selected_max() -> u32 { 32 }
 
 
 // Mining memory retargeting defaults
@@ -148,7 +154,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ]),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
                 ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval"
+                    "seconds","target_coins_per_epoch","retarget_interval","max_selected_per_epoch","selected_min_per_epoch","selected_max_per_epoch"
                 ]),
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment"

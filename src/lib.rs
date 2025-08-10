@@ -9,6 +9,7 @@ pub mod coin;
 pub mod transfer;
 pub mod miner;
 pub mod network;
+pub mod rpc;
 pub mod sync;
 pub mod metrics;
 pub mod wallet;

@@ -8,10 +8,11 @@ fn main() -> anyhow::Result<()> {
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {
         println!("📊 Latest Epoch: #{}", latest_epoch.num);
-        println!("   Difficulty: {}", latest_epoch.difficulty);
-        println!("   Memory: {} KiB", latest_epoch.mem_kib);
+        println!("   Target nBits: 0x{:08x}", latest_epoch.target_nbits);
+        println!("   Memory: {} KiB, t_cost: {}", latest_epoch.mem_kib, latest_epoch.t_cost);
         println!("   Coins in epoch (selected): {}", latest_epoch.coin_count);
         println!("   Merkle root: {}", hex::encode(latest_epoch.merkle_root));
+        println!("   Transfers root: {}", hex::encode(latest_epoch.transfers_root));
         println!("   Hash: {}", hex::encode(latest_epoch.hash));
     } else {
         println!("❌ No epochs found in database");

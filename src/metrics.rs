@@ -17,6 +17,32 @@ pub static VALIDATION_FAIL_TRANSFER: Lazy<IntCounter> = Lazy::new(|| IntCounter:
 pub static DB_WRITE_FAILS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_db_write_failures_total", "Database write failures").unwrap());
 pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_pruned_candidates_total", "Total candidate entries pruned").unwrap());
 pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_selection_threshold_u64", "Threshold (first 8 bytes of pow_hash) for last selected coin").unwrap());
+pub static RATE_LIMIT_DROPS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_rate_limited_messages_total", "Inbound messages dropped due to per-peer rate limiting").unwrap());
+pub static BANNED_DROPS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_banned_messages_total", "Inbound messages dropped due to peer being banned").unwrap());
+pub static PENDING_CMD_DROPS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_pending_command_drops_total", "Commands dropped due to pending queue capacity").unwrap());
+pub static PENDING_CMD_QUEUE_LEN: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_pending_command_queue_len", "Length of the pending network command queue").unwrap());
+pub static PROOF_DEDUP_SIZE: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_proof_dedup_size", "Number of entries in recent proof request dedup map").unwrap());
+pub static EPOCH_REQ_DEDUP_SIZE: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_epoch_req_dedup_size", "Number of entries in recent epoch request dedup map").unwrap());
+
+// Inbound message counters per topic
+pub static MSGS_IN_ANCHOR: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_anchor_total", "Inbound anchor messages").unwrap());
+pub static MSGS_IN_COIN: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_coin_total", "Inbound coin candidate messages").unwrap());
+pub static MSGS_IN_TX: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_tx_total", "Inbound transfer messages").unwrap());
+pub static MSGS_IN_EPOCH_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_epoch_req_total", "Inbound epoch request messages").unwrap());
+pub static MSGS_IN_COIN_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_coin_req_total", "Inbound coin request messages").unwrap());
+pub static MSGS_IN_LATEST_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_latest_req_total", "Inbound latest epoch request messages").unwrap());
+pub static MSGS_IN_PROOF_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_proof_req_total", "Inbound coin proof request messages").unwrap());
+pub static MSGS_IN_PROOF_RESP: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_in_proof_resp_total", "Inbound coin proof response messages").unwrap());
+
+// Outbound message counters per topic
+pub static MSGS_OUT_ANCHOR: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_anchor_total", "Outbound anchor messages").unwrap());
+pub static MSGS_OUT_COIN: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_coin_total", "Outbound coin candidate messages").unwrap());
+pub static MSGS_OUT_TX: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_tx_total", "Outbound transfer messages").unwrap());
+pub static MSGS_OUT_EPOCH_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_epoch_req_total", "Outbound epoch request messages").unwrap());
+pub static MSGS_OUT_COIN_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_coin_req_total", "Outbound coin request messages").unwrap());
+pub static MSGS_OUT_LATEST_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_latest_req_total", "Outbound latest epoch request messages").unwrap());
+pub static MSGS_OUT_PROOF_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_proof_req_total", "Outbound coin proof request messages").unwrap());
+pub static MSGS_OUT_PROOF_RESP: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_proof_resp_total", "Outbound coin proof response messages").unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     REGISTRY.register(Box::new(PEERS.clone()))?;
@@ -32,6 +58,31 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     REGISTRY.register(Box::new(DB_WRITE_FAILS.clone()))?;
     REGISTRY.register(Box::new(PRUNED_CANDIDATES.clone()))?;
     REGISTRY.register(Box::new(SELECTION_THRESHOLD_U64.clone()))?;
+    REGISTRY.register(Box::new(RATE_LIMIT_DROPS.clone()))?;
+    REGISTRY.register(Box::new(BANNED_DROPS.clone()))?;
+    REGISTRY.register(Box::new(PENDING_CMD_DROPS.clone()))?;
+    REGISTRY.register(Box::new(PENDING_CMD_QUEUE_LEN.clone()))?;
+    REGISTRY.register(Box::new(PROOF_DEDUP_SIZE.clone()))?;
+    REGISTRY.register(Box::new(EPOCH_REQ_DEDUP_SIZE.clone()))?;
+
+    // Register per-topic message counters
+    REGISTRY.register(Box::new(MSGS_IN_ANCHOR.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_COIN.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_TX.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_EPOCH_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_COIN_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_LATEST_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_PROOF_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_IN_PROOF_RESP.clone()))?;
+
+    REGISTRY.register(Box::new(MSGS_OUT_ANCHOR.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_COIN.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_TX.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_EPOCH_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_COIN_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_LATEST_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_PROOF_REQ.clone()))?;
+    REGISTRY.register(Box::new(MSGS_OUT_PROOF_RESP.clone()))?;
     PEERS.set(0);
 
     // Start metrics server, retrying on port conflicts by incrementing port number.

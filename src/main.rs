@@ -6,7 +6,7 @@ use anyhow;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
-pub mod sync;      pub mod metrics;  pub mod wallet;
+pub mod rpc;       pub mod sync;     pub mod metrics;  pub mod wallet;
 
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
@@ -54,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.quiet_net { network::set_quiet_logging(true); }
 
+    // Install aws-lc-rs as rustls's default crypto provider so QUIC (via quinn) uses it.
+    // This enables PQ hybrid KEM negotiation when supported by the peer.
+    crate::crypto::ensure_aws_lc_rs_provider_installed();
+
     let mut cfg = config::load(&cli.config)?;
 
     // Resolve storage path: if relative, place under user's home at ~/.unchained/unchained_data
@@ -78,7 +82,14 @@ async fn main() -> anyhow::Result<()> {
     
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
-    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
+    let net = network::spawn(
+        cfg.net.clone(),
+        cfg.p2p.clone(),
+        db.clone(),
+        sync_state.clone(),
+        cfg.epoch.clone(),
+        cfg.mining.clone(),
+    ).await?;
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -284,6 +295,11 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             });
+            // If binding to non-loopback without TLS, refuse to start. Use a TLS reverse proxy in front.
+            if !addr.ip().is_loopback() {
+                eprintln!("Refusing to serve plaintext HTTP on non-loopback. Front this endpoint with a TLS reverse proxy (e.g., Caddy/Nginx) or run on loopback.");
+                return Err(anyhow::anyhow!("plaintext over non-loopback is forbidden"));
+            }
             println!("🌐 Proof server listening on http://{}", bind);
             // Run server in foreground and await shutdown via Ctrl+C
             if let Err(e) = Server::bind(&addr).serve(make_svc).await {
@@ -375,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
-    println!("   🎯 Epoch coin cap (max selected): {}", cfg.epoch.max_coins_per_epoch);
+    println!("   🎯 Target coins per epoch: {}", cfg.epoch.target_coins_per_epoch);
     println!("   Press Ctrl+C to stop");
 
     match signal::ctrl_c().await {
