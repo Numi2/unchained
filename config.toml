@@ -6,16 +6,16 @@ listen_port = 31000
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 133337
 # Connection timeout in seconds
-connection_timeout_secs = 10
+connection_timeout_secs = 333
 # Timeout for initial network sync in seconds
-sync_timeout_secs = 10
+sync_timeout_secs = 333
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
 
 
 # Bootstrap nodes to connect to - add your seed nodes here - ip + peerid
-bootstrap = []
+bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
 
 
 
