@@ -28,6 +28,45 @@ use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use ed25519_dalek::{Verifier as _, Signature as DalekSig};
 use rand_chacha;
+use std::time::Duration;
+
+/// Best-effort public IPv4 discovery using a set of HTTPS endpoints.
+/// Returns None if detection fails within the provided timeout per endpoint.
+pub async fn detect_public_ipv4(timeout_ms: u64) -> Option<String> {
+    let urls: [&str; 4] = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://ipv4.icanhazip.com",
+        "https://checkip.amazonaws.com",
+    ];
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .user_agent("unchained-node/1.0")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    for u in urls {        
+        if let Ok(resp) = client.get(u).send().await {            
+            if let Ok(body) = resp.text().await {
+                let s = body.trim();
+                if let Ok(std::net::IpAddr::V4(ipv4)) = s.parse() {
+                    // Accept globally routable ranges; ignore RFC1918/CGNAT/loopback/link-local
+                    let o = ipv4.octets();
+                    let is_private = o[0] == 10
+                        || (o[0] == 172 && (16..=31).contains(&o[1]))
+                        || (o[0] == 192 && o[1] == 168)
+                        || (o[0] == 100 && (64..=127).contains(&o[1]))
+                        || o[0] == 127
+                        || (o[0] == 169 && o[1] == 254);
+                    if !is_private { return Some(ipv4.to_string()); }
+                }
+            }
+        }
+    }
+    None
+}
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 static CONNECTED_PEER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -138,6 +177,7 @@ enum NetworkCommand {
     GossipCoin(CoinCandidate),
     GossipTransfer(Transfer),
     RequestEpoch(u64),
+    RequestEpochSummary(u64),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
     RequestCoinProof([u8; 32]),
@@ -271,14 +311,16 @@ pub async fn spawn(
     struct PendingRpc {
         client_sk: KyberSk,
         client_u: crate::rpc::ClientHelloUnsigned,
+        requested_method: crate::rpc::RpcMethod,
     }
     let mut pending_rpcs: HashMap<u64, PendingRpc> = HashMap::new();
 
     // For redial/backoff, keep a local copy of net config
     let net_cfg_clone = net_cfg.clone();
+    let target_min_peers = net_cfg_clone.min_peers.max(1) as usize;
     tokio::spawn(async move {
         // Periodic redial timer with exponential backoff when we have no peers
-        let mut redial_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut redial_timer = tokio::time::interval(std::time::Duration::from_millis(800));
         // Periodically (re)send PQ auth hello until peers are authenticated to avoid race with gossipsub mesh setup
         let mut auth_retry_timer = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut redial_backoff_secs: u64 = 1;
@@ -286,7 +328,8 @@ pub async fn spawn(
         loop {
             tokio::select! {
                 _ = redial_timer.tick() => {
-                    if connected_peers.is_empty() {
+                    // If we are below target, probe dials with adaptive backoff
+                    if connected_peers.len() < target_min_peers {
                         if last_redial_instant.elapsed() >= std::time::Duration::from_secs(redial_backoff_secs) {
                             for addr in &net_cfg_clone.bootstrap {
                                 net_log!("🔁 Redial attempt (backoff {}s) to {}", redial_backoff_secs, addr);
@@ -295,7 +338,12 @@ pub async fn spawn(
                                 }
                             }
                             last_redial_instant = std::time::Instant::now();
-                            redial_backoff_secs = (redial_backoff_secs.saturating_mul(2)).min(60);
+                            // Increase backoff only if we have zero peers; otherwise keep it modest to fill to min_peers faster
+                            if connected_peers.is_empty() {
+                                redial_backoff_secs = (redial_backoff_secs.saturating_mul(2)).min(30);
+                            } else {
+                                redial_backoff_secs = (redial_backoff_secs + 1).min(10);
+                            }
                         }
                     } else {
                         // Reset backoff once we have at least one peer
@@ -351,11 +399,14 @@ pub async fn spawn(
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::ConnectionEstablished { peer_id: remote_peer_id, .. } => {
-                            net_log!("🤝 Connected to peer: {}", remote_peer_id);
-                            // Diagnostic: indicate PQ TLS preference is active (aws-lc-rs installed)
-                            net_log!("🔐 Transport: rustls prefer-post-quantum active (aws-lc-rs provider installed)");
+                            // Only log the first time we see a connection for this peer to avoid duplicate logs
+                            let is_new_peer = connected_peers.insert(remote_peer_id);
+                            if is_new_peer {
+                                net_log!("🤝 Connected to peer: {}", remote_peer_id);
+                                // Diagnostic: indicate PQ TLS preference is active (aws-lc-rs installed)
+                                net_log!("🔐 Transport: rustls prefer-post-quantum active (aws-lc-rs provider installed)");
+                            }
                             peer_scores.entry(remote_peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            connected_peers.insert(remote_peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
                             CONNECTED_PEER_COUNT.store(connected_peers.len(), Ordering::Relaxed);
                             // Send PQ auth hello
@@ -402,6 +453,7 @@ pub async fn spawn(
                                  NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                                 NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
                                 NetworkCommand::RequestEpoch(_n) => ("", None),
+                                NetworkCommand::RequestEpochSummary(_n) => ("", None),
                                 NetworkCommand::RequestCoin(_id) => ("", None),
                                 NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                                 NetworkCommand::RequestCoinProof(_id) => ("", None),
@@ -436,11 +488,19 @@ pub async fn spawn(
                             CONNECTED_PEER_COUNT.store(connected_peers.len(), Ordering::Relaxed);
                             // Trigger immediate redial cycle by resetting last_redial_instant
                             last_redial_instant = std::time::Instant::now() - std::time::Duration::from_secs(redial_backoff_secs);
+                            // If we dropped below target, proactively dial without waiting for timer
+                            if connected_peers.len() < target_min_peers {
+                                for addr in &net_cfg_clone.bootstrap {
+                                    let _ = swarm.dial(addr.parse::<Multiaddr>().unwrap_or_else(|_| "/ip4/127.0.0.1/udp/31000/quic-v1".parse().unwrap()));
+                                }
+                            }
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Gs(GossipsubEvent::Message { message, .. })) => {
-                            let peer_id = message.source.unwrap_or_else(PeerId::random);
+                            let source_opt = message.source;
                             let topic_str = message.topic.as_str();
-                            let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
+                            // Use the actual source peer for accounting/gating when available; fall back to local only if unknown
+                            let src_peer = source_opt.unwrap_or(peer_id);
+                            let score = peer_scores.entry(src_peer).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             // Do not rate-limit inbound anchors – they are essential for fast catch-up.
                             let rate_limit_exempt = topic_str == TOP_ANCHOR || topic_str == TOP_AUTH;
                             if score.is_banned() {
@@ -452,7 +512,7 @@ pub async fn spawn(
                                 continue;
                             }
                             // Gate non-auth topics behind PQ handshake
-                            if topic_str != TOP_AUTH && !pq_authed.contains(&peer_id) {
+                            if topic_str != TOP_AUTH && !pq_authed.contains(&src_peer) {
                                 // silently ignore pre-auth non-auth topics
                                 continue;
                             }
@@ -464,27 +524,36 @@ pub async fn spawn(
                                     #[derive(Debug, Clone, Serialize, Deserialize)]
                                     struct NetHello { unsigned: NetHelloUnsigned, sig_ed25519: Vec<u8>, #[serde(with = "serde_big_array::BigArray")] sig_dilithium: [u8; crate::crypto::DILITHIUM3_SIG_BYTES] }
                                     if let Ok(hello) = bincode::deserialize::<NetHello>(&message.data) {
+                                        // Derive claimed peer id from the signed ed25519 key
+                                        let derived_peer = match libp2p::identity::ed25519::PublicKey::try_from_bytes(&hello.unsigned.ed25519_pk) {
+                                            Ok(lp) => PeerId::from(libp2p::identity::PublicKey::from(lp)),
+                                            Err(e) => { eprintln!("TOP_AUTH: bad ed25519 pk from peer {:?}: {}", source_opt, e); continue; }
+                                        };
+                                        // Prefer libp2p-reported source when available, otherwise fall back to derived
+                                        let auth_peer = source_opt.unwrap_or_else(|| derived_peer.clone());
+                                        // If already authenticated, ignore repeated hellos to avoid log spam
+                                        if pq_authed.contains(&auth_peer) { continue; }
                                         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                        if hello.unsigned.expiry_unix_secs < now { continue; }
-                                        // Verify ed25519 peer id binding
-                                        let ed_ok = if !hello.unsigned.ed25519_pk.is_empty() {
-                                            if let Ok(lp) = libp2p::identity::ed25519::PublicKey::try_from_bytes(&hello.unsigned.ed25519_pk) {
-                                                let derived = PeerId::from(libp2p::identity::PublicKey::from(lp));
-                                                derived == peer_id
-                                            } else { false }
-                                        } else { false };
-                                        if !ed_ok { continue; }
-                                        if hello.unsigned.local_peer_id != peer_id.to_string() { continue; }
+                                        if hello.unsigned.expiry_unix_secs < now { eprintln!("TOP_AUTH: hello expired from {}", auth_peer); continue; }
+                                        // Verify the message binds to the claimed peer id
+                                        if derived_peer != auth_peer { eprintln!("TOP_AUTH: derived peer {:?} != source {:?}", derived_peer, auth_peer); continue; }
+                                        if hello.unsigned.local_peer_id != derived_peer.to_string() { eprintln!("TOP_AUTH: local_peer_id mismatch for {}", auth_peer); continue; }
                                         // Verify ed25519 signature (dalek)
-                                        let dalek_pk = match ed25519_dalek::PublicKey::from_bytes(&hello.unsigned.ed25519_pk) { Ok(p)=>p, Err(_)=>{continue;} };
-                                        let dalek_sig = match DalekSig::from_bytes(&hello.sig_ed25519) { Ok(s)=>s, Err(_)=>{continue;} };
-                                        if dalek_pk.verify(&bincode::serialize(&hello.unsigned).unwrap_or_default(), &dalek_sig).is_err() { continue; }
+                                        let dalek_pk = match ed25519_dalek::PublicKey::from_bytes(&hello.unsigned.ed25519_pk) { Ok(p)=>p, Err(e)=>{ eprintln!("TOP_AUTH: bad ed25519 pk bytes from {}: {}", auth_peer, e); continue; } };
+                                        let dalek_sig = match DalekSig::from_bytes(&hello.sig_ed25519) { Ok(s)=>s, Err(e)=>{ eprintln!("TOP_AUTH: bad ed25519 sig from {}: {}", auth_peer, e); continue; } };
+                                        if dalek_pk.verify(&bincode::serialize(&hello.unsigned).unwrap_or_default(), &dalek_sig).is_err() { eprintln!("TOP_AUTH: ed25519 verify failed for {}", auth_peer); continue; }
                                         // Verify dilithium signature
-                                        let pk_pq = match pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&hello.unsigned.dilithium_pk) { Ok(p)=>p, Err(_)=>{continue;} };
-                                        if !crate::crypto::pq_verify_detached(&bincode::serialize(&hello.unsigned).unwrap_or_default(), &hello.sig_dilithium, &pk_pq) { continue; }
-                                        pq_authed.insert(peer_id);
-                                        net_log!("✅ PQ auth completed for peer: {}", peer_id);
-                                        peer_keys.insert(peer_id, PeerStaticKeys { kyber_pk: hello.unsigned.kyber_pk.clone(), ed25519_pk: hello.unsigned.ed25519_pk.clone(), dilithium_pk: hello.unsigned.dilithium_pk });
+                                        let pk_pq = match pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&hello.unsigned.dilithium_pk) { Ok(p)=>p, Err(_)=>{ eprintln!("TOP_AUTH: bad dilithium pk from {}", auth_peer); continue; } };
+                                        if !crate::crypto::pq_verify_detached(&bincode::serialize(&hello.unsigned).unwrap_or_default(), &hello.sig_dilithium, &pk_pq) { eprintln!("TOP_AUTH: dilithium verify failed for {}", auth_peer); continue; }
+                                        let first_time = pq_authed.insert(auth_peer);
+                                        peer_keys.insert(auth_peer, PeerStaticKeys { kyber_pk: hello.unsigned.kyber_pk.clone(), ed25519_pk: hello.unsigned.ed25519_pk.clone(), dilithium_pk: hello.unsigned.dilithium_pk });
+                                        if first_time {
+                                            net_log!("✅ PQ auth completed for peer: {}", src_peer);
+                                            // Kick off sync immediately after auth by requesting latest anchor
+                                            let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
+                                        }
+                                    } else {
+                                        eprintln!("TOP_AUTH: failed to deserialize hello from {:?}", source_opt);
                                     }
                                 },
                                 // Gossip only announces anchor id and height; bodies via RPC
@@ -492,13 +561,19 @@ pub async fn spawn(
                                     crate::metrics::MSGS_IN_ANCHOR.inc();
                                     // Always request full anchor by number over RPC
                                     net_log!("📣 Announced anchor #{} (hash {}) — requesting payload via RPC", ann.num, hex::encode(ann.hash));
+                                    // Update highest seen epoch for sync state
+                                    {
+                                        let mut st = _sync_state.lock().unwrap();
+                                        if ann.num > st.highest_seen_epoch { st.highest_seen_epoch = ann.num; }
+                                    }
                                     let _ = command_tx.send(NetworkCommand::RequestEpoch(ann.num));
                                 },
                                 // Gossip coin: announce only epoch_hash + coin_id
                                 TOP_COIN => if let Ok(ann) = bincode::deserialize::<CoinAnnounce>(&message.data) {
                                     crate::metrics::MSGS_IN_COIN.inc();
                                     // Enforce per-peer candidate quota
-                                    let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
+                                    // Use the actual source peer for accounting, not the local peer id
+                                    let score = peer_scores.entry(src_peer).or_insert_with(|| PeerScore::new(&p2p_cfg));
                                     if !score.allow_candidate() { continue; }
                                     // Actively fetch candidate and validate early to mitigate DoS
                                     let _ = command_tx.send(NetworkCommand::RequestCoin(ann.coin_id));
@@ -687,7 +762,8 @@ pub async fn spawn(
                                     let _ = swarm.behaviour_mut().rpc.send_response(channel, resp);
                                 }
                                 ReqRespMessage::Response { response, .. } => {
-                                    if let Some(p) = pending_rpcs.remove(&response.request_id) {
+                                    // Do not remove the pending RPC until we verify and process the response
+                                    if let Some(p) = pending_rpcs.get(&response.request_id).cloned() {
                                         // Verify server authenticity and binding before any decryption/use
                                         // 1) Ensure we have pinned keys for this peer
                                         let Some(keys) = peer_keys.get(&peer) else { continue; };
@@ -719,12 +795,12 @@ pub async fn spawn(
                                                 } else { false }
                                             } else { false }
                                         } else { false };
-                                        if !ed_ok { continue; }
+                                         if !ed_ok { continue; }
                                         // dilithium
                                         let pq_ok = if let Ok(pqpk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&keys.dilithium_pk) {
                                             crate::crypto::pq_verify_detached(&ser_u, &server_hello.sig_dilithium, &pqpk)
                                         } else { false };
-                                        if !pq_ok { continue; }
+                                         if !pq_ok { continue; }
 
                                         // Passed authenticity checks → proceed to decapsulation and payload open
                                         if let Ok(ct) = KyberCt::from_bytes(&response.kyber_ct) {
@@ -880,15 +956,40 @@ pub async fn spawn(
                                                                 }
                                                             });
                                                         }
+                                                        crate::rpc::RpcResponsePayload::EpochSelectedIds(None) => {
+                                                            // No selection set materialized on server for this epoch; request full summary instead
+                                                            if let crate::rpc::RpcMethod::EpochSelectedIds(epoch_num) = p.requested_method {
+                                                                let _ = command_tx.send(NetworkCommand::RequestEpochSummary(epoch_num));
+                                                            }
+                                                        }
                                                         crate::rpc::RpcResponsePayload::CoinProof(Some((coin, anchor, proof))) => {
                                                             let resp = CoinProofResponse { coin, anchor, proof };
                                                             let _ = proof_tx.send(resp);
+                                                        }
+                                                        crate::rpc::RpcResponsePayload::Error(err) => {
+                                                            // If the server rejected due to unauthenticated (race: server hasn't seen our TOP_AUTH yet), retry the original method.
+                                                            if err == "unauthenticated" {
+                                                                match p.requested_method {
+                                                                    crate::rpc::RpcMethod::LatestAnchor => { let _ = command_tx.send(NetworkCommand::RequestLatestEpoch); },
+                                                                    crate::rpc::RpcMethod::Epoch(n) => { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); },
+                                                                    crate::rpc::RpcMethod::EpochSelectedIds(n) => { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); },
+                                                                    crate::rpc::RpcMethod::EpochSummary(n) => { let _ = command_tx.send(NetworkCommand::RequestEpochSummary(n)); },
+                                                                    crate::rpc::RpcMethod::Coin(id) => { let _ = command_tx.send(NetworkCommand::RequestCoin(id)); },
+                                                                    crate::rpc::RpcMethod::CoinProof(id) => { let _ = command_tx.send(NetworkCommand::RequestCoinProof(id)); },
+                                                                    crate::rpc::RpcMethod::CoinCandidate { .. } => { /* not issued via NetworkCommand in this path */ }
+                                                                    crate::rpc::RpcMethod::TransferById(_)=> { /* not issued here */ }
+                                                                }
+                                                            } else {
+                                                                eprintln!("RPC error payload from {}: {}", peer, err);
+                                                            }
                                                         }
                                                         _ => {}
                                                     }
                                                 }
                                             }
                                         }
+                                        // Response processed; remove pending entry now
+                                        let _ = pending_rpcs.remove(&response.request_id);
                                     }
                                 }
                             }
@@ -953,7 +1054,7 @@ pub async fn spawn(
                             let c2s = crate::rpc::derive_c2s_master(&client_ss, &unsigned, &server_ed, &keys.dilithium_pk);
                             let method_enc = crate::rpc::aead_encrypt_c2s(&c2s, &client_ct, request_id, &aad_extra, &method_pt);
                             let req = crate::rpc::RpcRequest { request_id, stream_id, client_hello, client_kyber_ct: client_ct, method_enc };
-                            pending_rpcs.insert(request_id, PendingRpc { client_sk, client_u: unsigned });
+                            pending_rpcs.insert(request_id, PendingRpc { client_sk, client_u: unsigned, requested_method: method.clone() });
                             let _ = swarm.behaviour_mut().rpc.send_request(&peer, req);
                         } else {
                             if pending_commands.len() >= MAX_PENDING_COMMANDS {
@@ -982,6 +1083,7 @@ pub async fn spawn(
                         }
                         NetworkCommand::RequestLatestEpoch => send_rpc(crate::rpc::RpcMethod::LatestAnchor),
                         NetworkCommand::RequestEpoch(n) => send_rpc(crate::rpc::RpcMethod::EpochSelectedIds(*n)),
+                        NetworkCommand::RequestEpochSummary(n) => send_rpc(crate::rpc::RpcMethod::EpochSummary(*n)),
                         NetworkCommand::RequestCoin(id) => send_rpc(crate::rpc::RpcMethod::Coin(*id)),
                         NetworkCommand::RequestCoinProof(id) => send_rpc(crate::rpc::RpcMethod::CoinProof(*id)),
                     }

@@ -82,6 +82,13 @@ async fn main() -> anyhow::Result<()> {
     
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
+    // Auto-detect public IP if not provided or set to "auto"
+    if cfg.net.public_ip.as_deref() == Some("auto") || cfg.net.public_ip.is_none() {
+        if let Some(ip) = network::detect_public_ipv4(1500).await {
+            cfg.net.public_ip = Some(ip);
+        }
+    }
+
     let net = network::spawn(
         cfg.net.clone(),
         cfg.p2p.clone(),

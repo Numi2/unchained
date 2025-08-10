@@ -21,6 +21,8 @@ pub struct Net {
     pub bootstrap: Vec<String>,          // multiaddrs
     #[serde(default = "default_max_peers")]
     pub max_peers: u32,                  // maximum peer connections
+    #[serde(default = "default_min_peers")]
+    pub min_peers: u32,                  // maintain at least this many connections
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64,    // connection timeout
     #[serde(default)]
@@ -106,6 +108,7 @@ pub fn default_max_mining_attempts() -> u64 { 1_000_000 }
 
 // Network defaults for production deployment
 fn default_max_peers() -> u32 { 100 }
+fn default_min_peers() -> u32 { 4 }
 fn default_connection_timeout() -> u64 { 30 }
 fn default_sync_timeout() -> u64 { 180 }
 
@@ -147,7 +150,7 @@ fn warn_unknown_keys(val: &TomlValue) {
             }
             match (k.as_str(), v) {
                 ("net", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "listen_port","bootstrap","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
+                    "listen_port","bootstrap","max_peers","min_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
                 ]),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window"
