@@ -28,11 +28,11 @@ path = "unchained_data"
 
 [epoch]
 # Duration of each epoch in seconds
-seconds = 333
+seconds = 33
 
 # Retargeting parameters
 # Target number of selected coins per epoch (controller setpoint)
-target_coins_per_epoch = 22
+target_coins_per_epoch = 11
 # How often to retarget (every N epochs)
 retarget_interval = 10
 
@@ -44,7 +44,7 @@ selected_max_per_epoch = 32
 
 [mining]
 # Mining is started via the 'Mine' subcommand; keep disabled by default here
-enabled = false
+enabled = true
 
 # Initial Argon2 memory in KiB (consensus uses lanes=1, t_cost=1)
 mem_kib = 65536

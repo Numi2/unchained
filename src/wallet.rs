@@ -10,8 +10,7 @@ use argon2::{Argon2, Params};
 use chacha20poly1305::{aead::{Aead, NewAead}, XChaCha20Poly1305, Key, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use rpassword;
-use atty;
+// rpassword and atty are no longer required here; unified prompt lives in crypto
 use zeroize::Zeroize;
 
 const WALLET_KEY: &[u8] = b"default_keypair";
@@ -34,19 +33,9 @@ impl Wallet {
     /// Loads the default keypair from the store, or creates a new one if none exists.
     /// This ensures the miner's identity is persistent across restarts.
     pub fn load_or_create(db: Arc<Store>) -> Result<Self> {
-        // Helper to obtain a pass-phrase depending on environment
+        // Use unified passphrase across all key materials
         fn obtain_passphrase(prompt: &str) -> Result<String> {
-            if let Ok(p) = std::env::var("WALLET_PASSPHRASE") {
-                return Ok(p);
-            }
-            if atty::is(atty::Stream::Stdin) {
-                let pw = rpassword::prompt_password(prompt)
-                    .context("Failed to read pass-phrase")?;
-                Ok(pw)
-            } else {
-                // Non-interactive (prod/CI): require env var, fail fast if missing
-                std::env::var("WALLET_PASSPHRASE").map_err(|_| anyhow!("WALLET_PASSPHRASE is required in non-interactive mode"))
-            }
+            crate::crypto::unified_passphrase(Some(prompt))
         }
 
         if let Some(encoded) = db.get::<Vec<u8>>("wallet", WALLET_KEY)? {
@@ -59,7 +48,7 @@ impl Wallet {
                 let sk = SecretKey::from_bytes(sk_bytes)
                     .with_context(|| "Failed to decode secret key from wallet")?;
 
-                let passphrase = obtain_passphrase("Set a pass-phrase to encrypt your wallet: ")?;
+                let passphrase = obtain_passphrase("Set a quantum pass-phrase to encrypt your wallet: ")?;
                 let mut salt = [0u8; SALT_LEN];
                 OsRng.fill_bytes(&mut salt);
 
@@ -109,7 +98,7 @@ impl Wallet {
             let nonce = &encoded[nonce_start..nonce_start + NONCE_LEN];
             let ciphertext = &encoded[ct_start..];
 
-            let passphrase = obtain_passphrase("Enter wallet pass-phrase: ")?;
+            let passphrase = obtain_passphrase("Enter quantum pass-phrase: ")?;
             let mut key = [0u8; 32];
             let mem_kib = std::env::var("WALLET_KDF_MEM_MIB").ok().and_then(|s| s.parse::<u32>().ok()).map(|mib| mib.saturating_mul(1024)).unwrap_or(WALLET_KDF_MEM_KIB);
             let time_cost = std::env::var("WALLET_KDF_TIME").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(WALLET_KDF_TIME_COST);
@@ -143,7 +132,7 @@ impl Wallet {
         let (pk, sk) = crypto::dilithium3_keypair();
         let address = crypto::address_from_pk(&pk);
 
-        let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
+        let passphrase = obtain_passphrase("Set a quantum pass-phrase for your new wallet: ")?;
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
 

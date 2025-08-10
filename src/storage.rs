@@ -39,8 +39,11 @@ impl Store {
                 }
             }
         }
-        // Else derive from passphrase if provided
-        let pass = match std::env::var("DB_ENC_PASSPHRASE") { Ok(p)=>p, Err(_)=>return None };
+        // Else derive from unified passphrase only
+        let pass = match crate::crypto::unified_passphrase(Some("Enter quantum pass-phrase: ")) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
         let salt_path = format!("{}/db.keysalt", base_path);
         let mut salt: [u8;16] = [0u8;16];
         if std::path::Path::new(&salt_path).exists() {

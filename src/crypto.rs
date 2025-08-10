@@ -17,6 +17,7 @@ use webpki_roots;
 use serde::{Serialize, Deserialize};
 use pqcrypto_kyber::kyber768::{encapsulate, decapsulate, PublicKey as KyberPk, SecretKey as KyberSk, keypair as kyber_keypair, Ciphertext as KyberCt};
 use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _, PublicKey as _, SecretKey as _};
+use once_cell::sync::OnceCell;
 
 // Constants for post-quantum crypto primitives ensure type safety and clarity.
 pub const DILITHIUM3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
@@ -28,6 +29,38 @@ pub const DILITHIUM3_SIG_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHI
 pub type Address = [u8; 32];
 
 
+
+// -----------------------------------------------------------------------------
+// Unified passphrase handling
+// -----------------------------------------------------------------------------
+static UNIFIED_PASSPHRASE: OnceCell<String> = OnceCell::new();
+
+/// Obtain a single, unified pass-phrase for all sensitive at-rest keys.
+/// Source:
+///   - QUANTUM_PASSPHRASE
+/// If not set and interactive, prompt using the provided text (or a default).
+/// If non-interactive and not set, returns an error.
+pub fn unified_passphrase(prompt: Option<&str>) -> Result<String> {
+    if let Some(existing) = UNIFIED_PASSPHRASE.get() {
+        return Ok(existing.clone());
+    }
+
+    // Only QUANTUM_PASSPHRASE is supported
+    if let Ok(val) = std::env::var("QUANTUM_PASSPHRASE") {
+        let _ = UNIFIED_PASSPHRASE.set(val.clone());
+        return Ok(val);
+    }
+
+    // Prompt if interactive
+    if atty::is(atty::Stream::Stdin) {
+        let text = prompt.unwrap_or("Enter quantum pass-phrase: ");
+        let pw = rpassword::prompt_password(text)?;
+        let _ = UNIFIED_PASSPHRASE.set(pw.clone());
+        return Ok(pw);
+    }
+
+    bail!("QUANTUM_PASSPHRASE is required in non-interactive mode")
+}
 
 pub fn address_from_pk(pk: &PublicKey) -> Address {
     *Hasher::new_derive_key("unchained-address")
@@ -152,12 +185,7 @@ pub fn load_or_create_node_kyber() -> Result<(KyberPk, KyberSk)> {
     // Passphrase-protected node Kyber KEM keys
     const SALT_LEN: usize = 16; const NONCE_LEN: usize = 24; const VERSION: u8 = 1;
     let path = "node_kyber.enc";
-    fn obtain_passphrase() -> Result<String> {
-        if let Ok(p) = std::env::var("NODE_PASSPHRASE") { return Ok(p); }
-        if atty::is(atty::Stream::Stdin) {
-            let pw = rpassword::prompt_password("Enter node pass-phrase: ")?; Ok(pw)
-        } else { bail!("NODE_PASSPHRASE is required in non-interactive mode") }
-    }
+    fn obtain_passphrase() -> Result<String> { unified_passphrase(Some("Enter quantum pass-phrase: ")) }
     if std::path::Path::new(path).exists() {
         let enc = std::fs::read(path)?;
         if enc.len() < 1 + SALT_LEN + NONCE_LEN { bail!("corrupt node kyber file"); }
@@ -196,10 +224,7 @@ pub fn load_or_create_pq_identity() -> Result<(PublicKey, SecretKey)> {
     const SALT_LEN: usize = 16; const NONCE_LEN: usize = 24; const VERSION: u8 = 1;
     let legacy = "pq_identity.bin"; let path = "pq_identity.enc";
 
-    fn obtain_passphrase(prompt: &str) -> Result<String> {
-        if let Ok(p) = std::env::var("PQ_ID_PASSPHRASE") { return Ok(p); }
-        if atty::is(atty::Stream::Stdin) { Ok(rpassword::prompt_password(prompt)?) } else { bail!("PQ_ID_PASSPHRASE is required in non-interactive mode") }
-    }
+    fn obtain_passphrase(prompt: &str) -> Result<String> { unified_passphrase(Some(prompt)) }
 
     if std::path::Path::new(path).exists() {
         let enc = std::fs::read(path)?;
@@ -209,7 +234,7 @@ pub fn load_or_create_pq_identity() -> Result<(PublicKey, SecretKey)> {
         let salt = &enc[DILITHIUM3_PK_BYTES+1 .. DILITHIUM3_PK_BYTES+1+SALT_LEN];
         let nonce = &enc[DILITHIUM3_PK_BYTES+1+SALT_LEN .. DILITHIUM3_PK_BYTES+1+SALT_LEN+NONCE_LEN];
         let ct = &enc[DILITHIUM3_PK_BYTES+1+SALT_LEN+NONCE_LEN .. ];
-        let pass = obtain_passphrase("Enter PQ identity pass-phrase: ")?;
+        let pass = obtain_passphrase("Enter quantum pass-phrase: ")?;
         let mut key = [0u8;32];
         let params = Params::new(256*1024, 3, 1, None).map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
@@ -229,7 +254,7 @@ pub fn load_or_create_pq_identity() -> Result<(PublicKey, SecretKey)> {
         let id: PqIdentity = bincode::deserialize(&bytes)?;
         let pk = PublicKey::from_bytes(&id.pk)?; let sk = SecretKey::from_bytes(&id.sk)?;
         // Re-encrypt under passphrase
-        let pass = obtain_passphrase("Set a pass-phrase to encrypt your PQ identity: ")?;
+        let pass = obtain_passphrase("Set a quantum pass-phrase to encrypt your identity: ")?;
         let mut salt = [0u8;SALT_LEN]; OsRng.fill_bytes(&mut salt);
         let mut key = [0u8;32]; let params = Params::new(256*1024, 3, 1, None).map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params).hash_password_into(pass.as_bytes(), &salt, &mut key).map_err(|e| anyhow!("Argon2id failed: {}", e))?;
@@ -245,7 +270,7 @@ pub fn load_or_create_pq_identity() -> Result<(PublicKey, SecretKey)> {
 
     // Brand new PQ identity
     let (pk, sk) = dilithium3_keypair();
-    let pass = obtain_passphrase("Set a pass-phrase for your PQ identity: ")?;
+    let pass = obtain_passphrase("Set a quantum pass-phrase for your identity: ")?;
     let mut salt = [0u8;SALT_LEN]; OsRng.fill_bytes(&mut salt);
     let mut key = [0u8;32]; let params = Params::new(256*1024, 3, 1, None).map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params).hash_password_into(pass.as_bytes(), &salt, &mut key).map_err(|e| anyhow!("Argon2id failed: {}", e))?;

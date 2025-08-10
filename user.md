@@ -87,7 +87,7 @@ Networking and firewall
 - If you set `public_ip`, the node announces it so others can dial you.
 
 ### 5) Wallet and basic CLI
-On first run, the node creates an encrypted wallet and prompts for a passphrase.
+On first run, the node creates an encrypted wallet and prompts for a quantum passphrase. In headless mode, set `QUANTUM_PASSPHRASE`.
 
 Show balance
 ```
@@ -175,7 +175,7 @@ Common gauges/counters
   - Verify your peer is dialable via its multiaddr.
 
 ### 11) Security notes
-- Protect your wallet passphrase and `peer_identity.key`.
+- Protect your quantum passphrase and `peer_identity.key`.
 - Prefer binding the proof server to a private address and enable the token header if exposing externally.
 - Be cautious when exposing metrics publicly.
 

@@ -2,6 +2,8 @@
 
 Post-quantum, epoch-based blockchain with Argon2id PoW, Dilithium3 signatures, and Kyber768-secured RPC.
 
+every coin is its own object, and time is the chain.
+
 ## Key features
 
 - Epoch finality; fork choice = highest cumulative work (tie-break by height)
@@ -85,7 +87,7 @@ Column families:
 
 ## Ops
 
-- Headless env vars: `WALLET_PASSPHRASE`, `PQ_ID_PASSPHRASE`, `NODE_PASSPHRASE`
+- Headless env var: `QUANTUM_PASSPHRASE`.
 - Proof server is loopback-only by default; front with TLS reverse proxy for external access
 - Monitor Prometheus metrics for health and sync state
 

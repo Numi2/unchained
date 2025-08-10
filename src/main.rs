@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         sync_state.clone(),
         cfg.epoch.clone(),
         cfg.mining.clone(),
+        shutdown_tx.subscribe(),
     ).await?;
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -394,23 +395,32 @@ async fn main() -> anyhow::Result<()> {
     println!("   🎯 Target coins per epoch: {}", cfg.epoch.target_coins_per_epoch);
     println!("   Press Ctrl+C to stop");
 
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            println!("\n🛑 Shutdown signal received, cleaning up...");
-            let _ = shutdown_tx.send(());
-            println!("⏳ Waiting for tasks to shutdown gracefully...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            if let Err(e) = db.close() {
-                eprintln!("Warning: Database cleanup failed: {e}");
-            } else {
-                println!("✅ Database closed cleanly");
-            }
-            println!("👋 unchained node stopped");
-            Ok(())
-        }
-        Err(err) => {
-            eprintln!("Error waiting for shutdown signal: {err}");
-            Err(err.into())
+    // Graceful shutdown on Ctrl+C, SIGTERM or SIGQUIT (Unix)
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigquit = signal(SignalKind::quit())?;
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+            _ = sigquit.recv() => {},
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+
+    println!("\n🛑 Shutdown signal received, cleaning up...");
+    let _ = shutdown_tx.send(());
+    println!("⏳ Waiting for tasks to shutdown gracefully...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    if let Err(e) = db.close() {
+        eprintln!("Warning: Database cleanup failed: {e}");
+    } else {
+        println!("✅ Database closed cleanly");
+    }
+    println!("👋 unchained node stopped");
+    Ok(())
 }

@@ -177,6 +177,7 @@ pub async fn spawn(
     _sync_state: Arc<Mutex<SyncState>>,
     epoch_cfg: config::Epoch,
     mining_cfg: config::Mining,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<NetHandle> {
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
@@ -909,9 +910,14 @@ pub async fn spawn(
                         NetworkCommand::RequestCoin(id) => send_rpc(crate::rpc::RpcMethod::Coin(*id)),
                         NetworkCommand::RequestCoinProof(id) => send_rpc(crate::rpc::RpcMethod::CoinProof(*id)),
                     }
+                },
+                _ = shutdown_rx.recv() => {
+                    net_log!("🛑 Network received shutdown signal");
+                    break;
                 }
             }
         }
+        net_log!("✅ Network shutdown complete");
     });
     Ok(net)
 }

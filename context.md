@@ -85,7 +85,7 @@ Sync:
 ### Wallet and security
 - Wallet uses Dilithium3 keys; address = BLAKE3(public key) (domain-keyed) → 32-byte `Address`.
 - At-rest encryption: XChaCha20-Poly1305, key derived via Argon2id with strong parameters (default: 256 MiB, time_cost=3, lanes=1); keying material is wiped after use.
-- Non-interactive mode requires `WALLET_PASSPHRASE` (fails fast if missing). Interactive uses hidden prompt.
+- Non-interactive mode requires `QUANTUM_PASSPHRASE` (fails fast if missing). Interactive uses hidden prompt.
 - Peer identity is persisted in `peer_identity.key` and set to `0600` permissions on Unix.
 
 ### Configuration (selected keys)
@@ -155,7 +155,7 @@ Notes:
 - `src/metrics.rs` – Prometheus registry and gauges/counters
 
 ### Deployment notes
-- Provide `WALLET_PASSPHRASE` in the environment for headless nodes; secure file permissions.
+- Provide `QUANTUM_PASSPHRASE` in the environment for headless nodes; secure file permissions.
 - Expose QUIC port and optionally the proof API port; protect the proof API via `PROOF_SERVER_TOKEN` or reverse proxy auth.
 - Use durable disks for `storage.path` and monitor metrics for health. If `storage.path` is relative, state is stored at `${HOME}/.unchained/unchained_data`.
 
