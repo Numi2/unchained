@@ -3,67 +3,58 @@
 [net]
 # Port to listen on for P2P connections
 listen_port = 31000
-# Maximum number of peer connections (prevents resource exhaustion)
-max_peers = 133337
-# Connection timeout in seconds
-connection_timeout_secs = 333
-# Timeout for initial network sync in seconds
-sync_timeout_secs = 333
 
-# The public IP address of this node, to be announced to other peers.
-# This is essential for nodes running behind a NAT.
+# Timeout for initial network sync in seconds
+sync_timeout_secs = 180
+
+# Optional: announce a public IP (useful behind NAT)
+# public_ip = "203.0.113.10"
 
 
 # Bootstrap nodes to connect to - add your seed nodes here - ip + peerid
 bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
 
-
-
 [p2p]
-# Peer scoring and rate limiting constants
-max_validation_failures_per_peer = 10000
-peer_ban_duration_secs = 3600 # 1 hour
-rate_limit_window_secs = 600
-max_messages_per_window = 1000
+# Per-peer rate limiting window and allowance
+rate_limit_window_secs = 60
+max_messages_per_window = 100
+
 
 [storage]
-# Path where blockchain data will be stored (outside src-tauri to avoid rebuild loops)
-# Move runtime data one directory up so that it no longer lives inside
-# `src-tauri` – this prevents the Tauri development file-watcher from
-# rebuilding the app every time the node writes to its database.
-path = "../blockchain_data"
+# If this path is relative, the node will store data under
+# ~/.unchained/unchained_data automatically. Set an absolute path to override.
+path = "unchained_data"
+
 
 [epoch]
-# Duration of each epoch in seconds 
-seconds = 222
+# Duration of each epoch in seconds
+seconds = 333
+
 # Retargeting parameters
-# Compact-target model: difficulty encoded via target_nbits in anchors; poe validation uses target(prev)
-# Target number of coins per epoch for difficulty adjustment
-target_coins_per_epoch = 100
+# Target number of selected coins per epoch (controller setpoint)
+target_coins_per_epoch = 22
 # How often to retarget (every N epochs)
 retarget_interval = 10
 
+# Selection bounds and caps
+max_selected_per_epoch = 64
+selected_min_per_epoch = 8
+selected_max_per_epoch = 32
+
 
 [mining]
-# Enable mining by default
-enabled = true
-# Memory usage for Argon2 hashing in KiB (32 MiB, optimized for mining speed)
-mem_kib = 16192
+# Mining is started via the 'Mine' subcommand; keep disabled by default here
+enabled = false
 
-# Memory retargeting parameters
-# Minimum memory in KiB
-min_mem_kib = 16192
+# Initial Argon2 memory in KiB (consensus uses lanes=1, t_cost=1)
+mem_kib = 65536
 
-# Maximum memor in KiB 
-max_mem_kib = 512007
+# Memory retarget bounds in KiB
+min_mem_kib = 16384
+max_mem_kib = 262144
 
-# Memory adjustment factor 
-max_memory_adjustment = 1.02
-
-# Miner stability settings for multi-node environments
-# Heartbeat interval in seconds (more frequent for network stability)
-# (no additional miner stability keys)
 
 [metrics]
-# Optional – leave out to use the default "0.0.0.0:9100"
-bind = "0.0.0.0:9100"
+# Bind address for Prometheus metrics (plain HTTP)
+# Default is 127.0.0.1:9100 if omitted; expose only if you know what you're doing.
+bind = "127.0.0.1:9100"
