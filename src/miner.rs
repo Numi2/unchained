@@ -322,7 +322,9 @@ impl Miner {
                         Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(candidate.id)),
                         Err(e) => {
                             eprintln!("🔥 Failed to send coin ID to epoch manager: {e}");
-                            // Fallback: send via network broadcast channel dedicated to coin IDs so epoch manager can pick it up.
+                            // Robust fallback: publish directly to the internal coin_id broadcast channel,
+                            // which the epoch manager subscribes to, then also gossip to peers.
+                            let _ = self.net.coin_id_sender().send(candidate.id);
                             self.net.gossip_coin(&candidate).await;
                         },
                     }

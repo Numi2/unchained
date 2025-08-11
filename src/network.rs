@@ -1362,6 +1362,7 @@ impl Network {
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub fn coin_id_subscribe(&self) -> broadcast::Receiver<[u8; 32]> { self.coin_id_tx.subscribe() }
+    pub fn coin_id_sender(&self) -> broadcast::Sender<[u8; 32]> { self.coin_id_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }
