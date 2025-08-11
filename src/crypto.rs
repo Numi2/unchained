@@ -33,7 +33,7 @@ pub type Address = [u8; 32];
 // -----------------------------------------------------------------------------
 // Unified passphrase handling
 // -----------------------------------------------------------------------------
-static UNIFIED_PASSPHRASE: OnceCell<()> = OnceCell::new();
+static UNIFIED_PASSPHRASE: OnceCell<zeroize::Zeroizing<String>> = OnceCell::new();
 
 /// Obtain a single, unified pass-phrase for all sensitive at-rest keys.
 /// Source:
@@ -41,14 +41,23 @@ static UNIFIED_PASSPHRASE: OnceCell<()> = OnceCell::new();
 /// If not set and interactive, prompt using the provided text (or a default).
 /// If non-interactive and not set, returns an error.
 pub fn unified_passphrase(prompt: Option<&str>) -> Result<zeroize::Zeroizing<String>> {
-    // Do not cache passphrases in process memory. Use env or prompt each time.
+    // 1) Prefer environment variable
     if let Ok(val) = std::env::var("QUANTUM_PASSPHRASE") {
-        return Ok(zeroize::Zeroizing::new(val));
+        let z = zeroize::Zeroizing::new(val);
+        let _ = UNIFIED_PASSPHRASE.set(z.clone());
+        return Ok(z);
     }
+    // 2) Reuse cached passphrase if already provided during this process
+    if let Some(existing) = UNIFIED_PASSPHRASE.get() {
+        return Ok(existing.clone());
+    }
+    // 3) Interactive prompt exactly once per process
     if atty::is(atty::Stream::Stdin) {
         let text = prompt.unwrap_or("Enter quantum pass-phrase: ");
         let pw = rpassword::prompt_password(text)?;
-        return Ok(zeroize::Zeroizing::new(pw));
+        let z = zeroize::Zeroizing::new(pw);
+        let _ = UNIFIED_PASSPHRASE.set(z.clone());
+        return Ok(z);
     }
     bail!("QUANTUM_PASSPHRASE is required in non-interactive mode")
 }
