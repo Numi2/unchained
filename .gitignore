@@ -3,7 +3,8 @@ peer_identity.key
 
 # Blockchain data
 blockchain_data/
-
+node_kyber.enc
+pq_identity.enc
 # Build artifacts
 target/
 **/*.rs.bk
