@@ -34,6 +34,8 @@ struct Miner {
     last_heartbeat: time::Instant,
     consecutive_failures: u32,
     max_consecutive_failures: u32,
+    // Track if we've already found a coin for the current epoch to avoid re-mining it
+    found_for_epoch: Option<u64>,
 }
 
 impl Miner {
@@ -58,6 +60,7 @@ impl Miner {
             last_heartbeat: time::Instant::now(),
             consecutive_failures: 0,
             max_consecutive_failures: crate::config::default_max_consecutive_failures(),
+            found_for_epoch: None,
         }
     }
 
@@ -135,7 +138,9 @@ impl Miner {
                 );
                 self.current_epoch = Some(latest_anchor.num);
                 self.last_heartbeat = time::Instant::now();
-                if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
+                if self.found_for_epoch == Some(latest_anchor.num) {
+                    println!("🪙 Already found a coin for epoch #{}. Waiting for next anchor…", latest_anchor.num);
+                } else if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
                     eprintln!("⚠️  Initial mining attempt failed: {e}");
                 }
             },
@@ -183,6 +188,8 @@ impl Miner {
                             );
                             
                             self.current_epoch = Some(anchor.num);
+                            // New epoch: reset found flag and start mining
+                            self.found_for_epoch = None;
                             self.mine_epoch(anchor).await?;
                         }
                         Err(RecvError::Closed) => {
@@ -236,10 +243,20 @@ impl Miner {
                                 if latest_anchor.num >= next_epoch {
                                     println!("📥 Found missed epoch #{} in database", latest_anchor.num);
                                     self.current_epoch = Some(latest_anchor.num);
+                                    // Newer epoch discovered: reset found flag and start mining
+                                    self.found_for_epoch = None;
                                     self.mine_epoch(latest_anchor).await?;
                                     self.last_heartbeat = time::Instant::now();
                                     continue;
                                 }
+                            }
+
+                            // If we have already found a coin for the current epoch, keep waiting
+                            if self.found_for_epoch == Some(current_epoch) {
+                                println!("⏸️  Already submitted a coin for epoch #{}. Waiting for finalization…", current_epoch);
+                                // Reset heartbeat window to avoid repeated timeouts while waiting
+                                self.last_heartbeat = time::Instant::now();
+                                continue;
                             }
                         }
                         
@@ -261,6 +278,12 @@ impl Miner {
         let target = crate::crypto::decode_compact_target(anchor.target_nbits).unwrap_or_else(|_| primitive_types::U256::MAX);
         let mut attempts = 0u64;
         let max_attempts = crate::config::default_max_mining_attempts();
+
+        // If we already found a coin for this epoch, skip re-mining it
+        if self.found_for_epoch == Some(anchor.num) {
+            println!("🪙 Already found a coin for epoch #{}. Skipping re-mine.", anchor.num);
+            return Ok(());
+        }
 
         println!(
             "🎯 Starting mining against parent anchor #{} (target epoch #{})",
@@ -346,6 +369,9 @@ impl Miner {
                         },
                     }
                     
+                    // Remember that we've already found a coin for this epoch, so we don't re-mine it
+                    self.found_for_epoch = Some(anchor.num);
+
                     self.net.gossip_coin(&candidate).await;
                     return Ok(());
                 }

@@ -206,11 +206,15 @@ impl Store {
             match *name {
                 // Prefix: epoch_hash (32 bytes) || coin_id (32 bytes)
                 "coin_candidate" => {
-                    // Safe prefix extractor: only apply when key length >= 32
+                    // Safe prefix extractor: clamp to available length to avoid panics on short/internal keys.
+                    // RocksDB expects a stable prefix; for short keys we return the whole key (including empty).
                     let st = SliceTransform::create(
                         "coin_candidate_prefix",
-                        |key: &[u8]| &key[..32],
-                        Some(|key: &[u8]| key.len() >= 32),
+                        |key: &[u8]| {
+                            let n = 32.min(key.len());
+                            &key[..n]
+                        },
+                        None,
                     );
                     opts.set_prefix_extractor(st);
                     // Enable memtable prefix bloom to speed up prefix seeks
@@ -218,11 +222,14 @@ impl Store {
                 }
                 // Prefix: epoch number (8 bytes) || coin_id
                 "epoch_selected" => {
-                    // Safe prefix extractor: only apply when key length >= 8
+                    // Safe prefix extractor: clamp to available length to avoid panics on short/internal keys.
                     let st = SliceTransform::create(
                         "epoch_selected_prefix",
-                        |key: &[u8]| &key[..8],
-                        Some(|key: &[u8]| key.len() >= 8),
+                        |key: &[u8]| {
+                            let n = 8.min(key.len());
+                            &key[..n]
+                        },
+                        None,
                     );
                     opts.set_prefix_extractor(st);
                     opts.set_memtable_prefix_bloom_ratio(0.1);

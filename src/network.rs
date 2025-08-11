@@ -710,36 +710,7 @@ pub async fn spawn(
                         SwarmEvent::Behaviour(BehaviourEvent::Rpc(ReqRespEvent::Message { peer, message, .. })) => {
                             match message {
                                 ReqRespMessage::Request { request, channel, .. } => {
-                                    // Enforce RPC gating: require prior PQ auth on TOP_AUTH and verify ClientHello signatures before any decryption.
-                                    if !pq_authed.contains(&peer) {
-                                        net_log!("⛔ RPC from unauthenticated peer ({}); responding 'unauthenticated'", peer);
-                                        // Refuse processing requests from peers that haven't completed PQ auth
-                                        let server_ed_pk: [u8;32] = id_keys.public().try_into_ed25519().map(|p| p.to_bytes()).unwrap_or([0u8;32]);
-                                        let mut pq_pk_arr = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-                                        pq_pk_arr.copy_from_slice(pq_pk.as_bytes());
-                                        let _ = swarm.behaviour_mut().rpc.send_response(
-                                            channel,
-                                            crate::rpc::seal_response(
-                                                request.request_id,
-                                                request.stream_id,
-                                                request.client_hello.unsigned.clone(),
-                                                server_ed_pk,
-                                                pq_pk_arr,
-                                                |m| id_keys.sign(m).unwrap_or_default(),
-                                                |m| crate::crypto::pq_sign_detached(m, &pq_sk),
-                                                |client_pk_bytes| {
-                                                    let pk = KyberPk::from_bytes(client_pk_bytes).expect("kyber pk");
-                                                    crate::crypto::kyber_encapsulate(&pk)
-                                                },
-                                                node_ky_pk_bytes.clone(),
-                                                crate::rpc::PINNED_SUITES,
-                                                &peer_id.to_string(),
-                                                &peer.to_string(),
-                                                &crate::rpc::RpcResponsePayload::Error("unauthenticated".into())
-                                            )
-                                        );
-                                        continue;
-                                    }
+                                    // Defer RPC gating until after decrypting the method so we can allow AuthHello pre-auth.
 
                                     // Verify client hello signatures and binding (plaintext hello is part of request)
                                     let client_u = &request.client_hello.unsigned;
@@ -895,17 +866,38 @@ pub async fn spawn(
                                         let c2s = crate::rpc::derive_c2s_master(&ss, &request.client_hello.unsigned, &server_ed_pk, &pq_pk_arr);
                                         let aad_extra = bincode::serialize(&request.client_hello.unsigned).unwrap_or_default();
                                         if let Some(pt) = crate::rpc::aead_decrypt_c2s(&c2s, &request.client_kyber_ct, request.request_id, &aad_extra, &request.method_enc) {
-                                                if let Ok(method) = bincode::deserialize::<crate::rpc::RpcMethod>(&pt) {
+                                            if let Ok(method) = bincode::deserialize::<crate::rpc::RpcMethod>(&pt) {
+                                                if !pq_authed.contains(&peer) {
                                                     match method {
-                                                    crate::rpc::RpcMethod::AuthHello => {
-                                                        // Respond OK with no payload; client pins keys from ServerHello
-                                                        crate::rpc::RpcResponsePayload::Anchor(None)
+                                                        crate::rpc::RpcMethod::AuthHello => {
+                                                            // Treat a valid AuthHello RPC as completing PQ auth if gossip-based TOP_AUTH was missed.
+                                                            // Persist the client's static keys for this session and mark authenticated.
+                                                            let cu = &request.client_hello.unsigned;
+                                                            let _ = pq_authed.insert(peer);
+                                                            peer_keys.insert(peer, PeerStaticKeys {
+                                                                kyber_pk: cu.client_kyber_pk.clone(),
+                                                                ed25519_pk: cu.ed25519_pk.to_vec(),
+                                                                dilithium_pk: cu.dilithium_pk,
+                                                            });
+                                                            net_log!("✅ PQ auth completed via RPC for peer: {}", peer);
+                                                            // Respond OK with no payload; client pins keys from ServerHello
+                                                            crate::rpc::RpcResponsePayload::Anchor(None)
+                                                        }
+                                                        _ => {
+                                                            net_log!("⛔ RPC from unauthenticated peer ({}); responding 'unauthenticated'", peer);
+                                                            crate::rpc::RpcResponsePayload::Error("unauthenticated".into())
+                                                        }
                                                     }
-                                                    crate::rpc::RpcMethod::LatestAnchor => {
-                                                        net_log!("📨 RPC LatestAnchor from {}", peer);
-                                                        let a = db.get::<Anchor>("epoch", b"latest").unwrap_or(None);
-                                                        crate::rpc::RpcResponsePayload::Anchor(a)
-                                                    }
+                                                } else {
+                                                    match method {
+                                                        crate::rpc::RpcMethod::AuthHello => {
+                                                            crate::rpc::RpcResponsePayload::Anchor(None)
+                                                        }
+                                                        crate::rpc::RpcMethod::LatestAnchor => {
+                                                            net_log!("📨 RPC LatestAnchor from {}", peer);
+                                                            let a = db.get::<Anchor>("epoch", b"latest").unwrap_or(None);
+                                                            crate::rpc::RpcResponsePayload::Anchor(a)
+                                                        }
                                                         crate::rpc::RpcMethod::Epoch(n) => {
                                                             let a = db.get::<Anchor>("epoch", &n.to_le_bytes()).unwrap_or(None);
                                                             crate::rpc::RpcResponsePayload::Anchor(a)
@@ -928,33 +920,34 @@ pub async fn spawn(
                                                                 crate::rpc::RpcResponsePayload::EpochSummary(None)
                                                             }
                                                         }
-                                                    crate::rpc::RpcMethod::CoinProof(id) => {
-                                                        if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
-                                                            if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
-                                                                if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
-                                                                    let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
-                                                                    if set.contains(&coin.id) {
-                                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                                                                            crate::rpc::RpcResponsePayload::CoinProof(Some((coin, anchor, proof)))
+                                                        crate::rpc::RpcMethod::CoinProof(id) => {
+                                                            if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
+                                                                if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
+                                                                    if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
+                                                                        let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
+                                                                        if set.contains(&coin.id) {
+                                                                            if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                                                crate::rpc::RpcResponsePayload::CoinProof(Some((coin, anchor, proof)))
+                                                                            } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
                                                                         } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
                                                                     } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
                                                                 } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
                                                             } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
-                                                        } else { crate::rpc::RpcResponsePayload::CoinProof(None) }
-                                                    }
-                                                    crate::rpc::RpcMethod::Coin(id) => {
-                                                        let c = db.get::<Coin>("coin", &id).unwrap_or(None);
-                                                        crate::rpc::RpcResponsePayload::Coin(c)
-                                                    }
-                                                    crate::rpc::RpcMethod::CoinCandidate { epoch_hash, coin_id } => {
-                                                        let composite = crate::storage::Store::candidate_key(&epoch_hash, &coin_id);
-                                                        if let Ok(Some(c)) = db.get::<crate::coin::CoinCandidate>("coin_candidate", &composite) {
-                                                            crate::rpc::RpcResponsePayload::CoinCandidate(Some(c))
-                                                        } else { crate::rpc::RpcResponsePayload::CoinCandidate(None) }
-                                                    }
-                                                    crate::rpc::RpcMethod::TransferById(tx_id) => {
-                                                        let t = db.get::<crate::transfer::Transfer>("transfer", &tx_id).unwrap_or(None);
-                                                        crate::rpc::RpcResponsePayload::Transfer(t)
+                                                        }
+                                                        crate::rpc::RpcMethod::Coin(id) => {
+                                                            let c = db.get::<Coin>("coin", &id).unwrap_or(None);
+                                                            crate::rpc::RpcResponsePayload::Coin(c)
+                                                        }
+                                                        crate::rpc::RpcMethod::CoinCandidate { epoch_hash, coin_id } => {
+                                                            let composite = crate::storage::Store::candidate_key(&epoch_hash, &coin_id);
+                                                            if let Ok(Some(c)) = db.get::<crate::coin::CoinCandidate>("coin_candidate", &composite) {
+                                                                crate::rpc::RpcResponsePayload::CoinCandidate(Some(c))
+                                                            } else { crate::rpc::RpcResponsePayload::CoinCandidate(None) }
+                                                        }
+                                                        crate::rpc::RpcMethod::TransferById(tx_id) => {
+                                                            let t = db.get::<crate::transfer::Transfer>("transfer", &tx_id).unwrap_or(None);
+                                                            crate::rpc::RpcResponsePayload::Transfer(t)
+                                                        }
                                                     }
                                                 }
                                             } else { crate::rpc::RpcResponsePayload::Error("bad method".into()) }
