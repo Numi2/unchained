@@ -33,32 +33,23 @@ pub type Address = [u8; 32];
 // -----------------------------------------------------------------------------
 // Unified passphrase handling
 // -----------------------------------------------------------------------------
-static UNIFIED_PASSPHRASE: OnceCell<String> = OnceCell::new();
+static UNIFIED_PASSPHRASE: OnceCell<()> = OnceCell::new();
 
 /// Obtain a single, unified pass-phrase for all sensitive at-rest keys.
 /// Source:
 ///   - QUANTUM_PASSPHRASE
 /// If not set and interactive, prompt using the provided text (or a default).
 /// If non-interactive and not set, returns an error.
-pub fn unified_passphrase(prompt: Option<&str>) -> Result<String> {
-    if let Some(existing) = UNIFIED_PASSPHRASE.get() {
-        return Ok(existing.clone());
-    }
-
-    // Only QUANTUM_PASSPHRASE is supported
+pub fn unified_passphrase(prompt: Option<&str>) -> Result<zeroize::Zeroizing<String>> {
+    // Do not cache passphrases in process memory. Use env or prompt each time.
     if let Ok(val) = std::env::var("QUANTUM_PASSPHRASE") {
-        let _ = UNIFIED_PASSPHRASE.set(val.clone());
-        return Ok(val);
+        return Ok(zeroize::Zeroizing::new(val));
     }
-
-    // Prompt if interactive
     if atty::is(atty::Stream::Stdin) {
         let text = prompt.unwrap_or("Enter quantum pass-phrase: ");
         let pw = rpassword::prompt_password(text)?;
-        let _ = UNIFIED_PASSPHRASE.set(pw.clone());
-        return Ok(pw);
+        return Ok(zeroize::Zeroizing::new(pw));
     }
-
     bail!("QUANTUM_PASSPHRASE is required in non-interactive mode")
 }
 
@@ -185,7 +176,7 @@ pub fn load_or_create_node_kyber() -> Result<(KyberPk, KyberSk)> {
     // Passphrase-protected node Kyber KEM keys
     const SALT_LEN: usize = 16; const NONCE_LEN: usize = 24; const VERSION: u8 = 1;
     let path = "node_kyber.enc";
-    fn obtain_passphrase() -> Result<String> { unified_passphrase(Some("Enter quantum pass-phrase: ")) }
+    fn obtain_passphrase() -> Result<zeroize::Zeroizing<String>> { unified_passphrase(Some("Enter quantum pass-phrase: ")) }
     if std::path::Path::new(path).exists() {
         let enc = std::fs::read(path)?;
         if enc.len() < 1 + SALT_LEN + NONCE_LEN { bail!("corrupt node kyber file"); }
@@ -224,7 +215,7 @@ pub fn load_or_create_pq_identity() -> Result<(PublicKey, SecretKey)> {
     const SALT_LEN: usize = 16; const NONCE_LEN: usize = 24; const VERSION: u8 = 1;
     let legacy = "pq_identity.bin"; let path = "pq_identity.enc";
 
-    fn obtain_passphrase(prompt: &str) -> Result<String> { unified_passphrase(Some(prompt)) }
+    fn obtain_passphrase(prompt: &str) -> Result<zeroize::Zeroizing<String>> { unified_passphrase(Some(prompt)) }
 
     if std::path::Path::new(path).exists() {
         let enc = std::fs::read(path)?;

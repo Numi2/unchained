@@ -243,15 +243,18 @@ async fn main() -> anyhow::Result<()> {
             let auth_token = std::env::var("PROOF_SERVER_TOKEN").ok();
             let rate = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, (std::time::Instant, u32)>::new()));
 
-            let make_svc = make_service_fn(move |_| {
+            // Pass the remote socket address into request extensions to avoid relying on XFF
+            let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
                 let net = net_clone.clone();
                 let auth = auth_token.clone();
                 let rate = rate.clone();
+                let remote_addr = conn.remote_addr();
                 async move {
-                    Ok::<_, anyhow::Error>(service_fn(move |req: HRequest<Body>| {
+                    Ok::<_, anyhow::Error>(service_fn(move |mut req: HRequest<Body>| {
                         let net = net.clone();
                         let auth = auth.clone();
                         let rate = rate.clone();
+                        req.extensions_mut().insert(remote_addr);
                         async move {
                             // Auth
                             if let Some(token) = &auth {
@@ -265,7 +268,6 @@ async fn main() -> anyhow::Result<()> {
                                 .extensions()
                                 .get::<SocketAddr>()
                                 .map(|a| a.ip().to_string())
-                                .or_else(|| req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
                                 .unwrap_or_else(|| "unknown".to_string());
                             {
                                 let mut map = rate.lock().await;
@@ -303,7 +305,8 @@ async fn main() -> anyhow::Result<()> {
                                                 "proof_len": r.proof.len()
                                             }
                                         }))?;
-                                        Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::OK).header("Content-Type", "application/json").body(Body::from(body))?)
+                                    let status = if ok { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY };
+                                    Ok::<_, anyhow::Error>(HResponse::builder().status(status).header("Content-Type", "application/json").body(Body::from(body))?)
                                     }
                                     Ok(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("mismatch"))?),
                                     Err(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::GATEWAY_TIMEOUT).body(Body::from("timeout"))?),

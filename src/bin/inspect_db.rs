@@ -3,7 +3,7 @@ use unchained::{storage, epoch::Anchor};
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting unchained Database...");
     
-    let db = storage::open(&unchained::config::Storage { path: "./data".to_string() });
+    let db = storage::open(&unchained::config::Storage { path: "./data".to_string(), require_encryption: false });
     
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {

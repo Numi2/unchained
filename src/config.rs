@@ -46,6 +46,8 @@ pub struct P2p {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Storage {
     pub path: String,
+    #[serde(default)]
+    pub require_encryption: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

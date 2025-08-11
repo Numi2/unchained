@@ -124,8 +124,9 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<String> {
                 continue;
             }
             let mut response = tiny_http::Response::from_data(buffer);
+            // Prometheus text format content-type
             response.add_header(
-                "Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8"
+                "Content-Type: text/plain; version=0.0.4; charset=utf-8"
                     .parse::<tiny_http::Header>()
                     .unwrap(),
             );

@@ -17,10 +17,10 @@ const WALLET_KEY: &[u8] = b"default_keypair";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const WALLET_VERSION_ENCRYPTED: u8 = 1;
-// Tunable KDF parameters for wallet encryption (defaults strengthened)
-// Defaults: 1 GiB, time cost 4. Can be overridden via env WALLET_KDF_MEM_MIB, WALLET_KDF_TIME
-const WALLET_KDF_MEM_KIB: u32 = 1024 * 1024; // 1 GiB
-const WALLET_KDF_TIME_COST: u32 = 4; // iterations
+// Tunable KDF parameters for wallet encryption
+// Safer defaults for typical hardware; override via WALLET_KDF_MEM_MIB, WALLET_KDF_TIME
+const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
+const WALLET_KDF_TIME_COST: u32 = 2; // iterations
 
 pub struct Wallet {
     _db: std::sync::Weak<Store>,
@@ -34,7 +34,7 @@ impl Wallet {
     /// This ensures the miner's identity is persistent across restarts.
     pub fn load_or_create(db: Arc<Store>) -> Result<Self> {
         // Use unified passphrase across all key materials
-        fn obtain_passphrase(prompt: &str) -> Result<String> {
+        fn obtain_passphrase(prompt: &str) -> Result<zeroize::Zeroizing<String>> {
             crate::crypto::unified_passphrase(Some(prompt))
         }
 

@@ -4,6 +4,7 @@ use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use rocksdb::WriteBatch;
+type KV32 = ([u8;32], Vec<u8>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
@@ -570,19 +571,6 @@ impl Manager {
                         let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(leaf_hash_for_coin_id).collect();
                         leaves.sort();
                         let merkle_root = fold_merkle(leaves.clone(), b"node");
-                        // Build transfers_root from tx_pool (sorted blake3(tx_id))
-                        let (transfers_root, applied_tx_ids) = {
-                            if let Ok(txs) = self.db.iterate_tx_pool() {
-                                if txs.is_empty() {
-                                    ([0u8;32], Vec::new())
-                                } else {
-                                    let mut ids: Vec<[u8;32]> = Vec::with_capacity(txs.len());
-                                    for tx in &txs { ids.push(tx.hash()); }
-                                    ids.sort();
-                                    (compute_transfers_root(&ids), ids)
-                                }
-                            } else { ([0u8;32], Vec::new()) }
-                        };
                         // Retarget
                         let (mut target_nbits, mut mem_kib, t_cost) = if current_epoch > 0 && current_epoch % self.cfg.retarget_interval == 0 {
                             let mut recent_anchors = Vec::new();
@@ -610,7 +598,7 @@ impl Manager {
                             current_epoch,
                             total_candidates,
                             selected_with_pow.len(),
-                            applied_tx_ids.len(),
+                            0usize,
                             target_nbits,
                             mem_kib,
                             t_cost
@@ -628,6 +616,28 @@ impl Manager {
                         // Build work root and persist sorted leaves for proof serving
                         work_leaves.sort();
                         let work_root = fold_merkle(work_leaves.clone(), b"worknode");
+                        // Determine transfers to include: validate tx_pool entries and collect the subset that applies
+                        // Defer writes until after anchor is built so that the batch is atomic.
+                        let mut applied_ids: Vec<[u8;32]> = Vec::new();
+                        let mut applied_bytes: Vec<KV32> = Vec::new();
+                        if let Some(tx_pool_cf) = self.db.db.cf_handle("tx_pool") {
+                            if let Some(_tx_cf) = self.db.db.cf_handle("transfer") {
+                                let iter = self.db.db.iterator_cf(tx_pool_cf, rocksdb::IteratorMode::Start);
+                                for item in iter {
+                                    if let Ok((_k, v)) = item {
+                                        if let Ok(tx) = bincode::deserialize::<crate::transfer::Transfer>(&v) {
+                                            if tx.validate(&self.db).is_ok() {
+                                                applied_ids.push(tx.hash());
+                                                applied_bytes.push((tx.coin_id, v.to_vec()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        applied_ids.sort();
+                        let transfers_root = compute_transfers_root(&applied_ids);
+
                         // Anchor hash commits to all consensus-critical fields and previous hash
                         let prev_hash_ref = prev_anchor.as_ref().map(|p| &p.hash);
                         let hash = compute_anchor_hash(&merkle_root, &transfers_root, prev_hash_ref, &work_root, target_nbits, mem_kib, t_cost, coin_count, &cumulative_work);
@@ -651,7 +661,7 @@ impl Manager {
                             crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
                             continue;
                         }
-                        
+
                         let mut batch = WriteBatch::default();
                         let serialized_anchor = match bincode::serialize(&anchor) {
                             Ok(data) => data,
@@ -681,29 +691,19 @@ impl Manager {
                                 }
                             }
                         }
-                        // Apply transfers selected for this epoch: re-validate, move from tx_pool to transfer CF and index per-epoch ids
+                        // Apply validated transfers: move from tx_pool to transfer CF and index per-epoch ids
                         if let Some(tx_pool_cf) = self.db.db.cf_handle("tx_pool") {
-                            let mut applied: Vec<[u8;32]> = Vec::new();
-                            let iter = self.db.db.iterator_cf(tx_pool_cf, rocksdb::IteratorMode::Start);
                             if let Some(tx_cf) = self.db.db.cf_handle("transfer") {
-                                for item in iter {
-                                    if let Ok((_k, v)) = item {
-                                        if let Ok(tx) = bincode::deserialize::<crate::transfer::Transfer>(&v) {
-                                            if tx.validate(&self.db).is_ok() {
-                                                // apply
-                                                batch.put_cf(tx_cf, &tx.coin_id, &v);
-                                                applied.push(tx.hash());
-                                            }
-                                        }
-                                    }
+                                for (coin_id, bytes) in &applied_bytes {
+                                    batch.put_cf(tx_cf, coin_id, bytes);
                                 }
                             }
                             // Remove applied from pool
-                            for id in applied {
-                                batch.delete_cf(tx_pool_cf, &id);
+                            for id in &applied_ids {
+                                batch.delete_cf(tx_pool_cf, id);
                             }
-                            // Persist per-epoch transfer ids for validation and proofs
-                            if let Err(e) = self.db.store_epoch_transfers(current_epoch, &applied_tx_ids) { eprintln!("⚠️ Failed to store epoch transfers: {}", e); }
+                            // Persist per-epoch transfer ids for validation and proofs (exact applied set)
+                            if let Err(e) = self.db.store_epoch_transfers(current_epoch, &applied_ids) { eprintln!("⚠️ Failed to store epoch transfers: {}", e); }
                         }
                         if let Some(sel_cf) = self.db.db.cf_handle("epoch_selected") {
                             // Key: epoch number (little endian) || coin_id
@@ -731,7 +731,7 @@ impl Manager {
                                 "✅ Finalized epoch #{}: selected={}, txs={}, target_nbits=0x{:08x}, mem_kib={}, t_cost={}",
                                 current_epoch,
                                 selected_ids.len(),
-                                applied_tx_ids.len(),
+                                applied_ids.len(),
                                 target_nbits,
                                 mem_kib,
                                 t_cost

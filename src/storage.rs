@@ -765,15 +765,29 @@ fn copy_dir_all(src: &str, dst: &str) -> Result<()> {
 }
 
 pub fn open(cfg: &crate::config::Storage) -> Arc<Store> {
+    // Enforce fail-closed when encryption is required
+    if cfg.require_encryption {
+        // Probe whether a passphrase or key is available; if not, abort early
+        let have_key = std::env::var("DB_ENC_KEY_HEX").ok().map(|v| v.len() == 64).unwrap_or(false)
+            || crate::crypto::unified_passphrase(Some("Enter quantum pass-phrase: ")).is_ok();
+        if !have_key {
+            panic!("Database encryption is required but no passphrase or DB_ENC_KEY_HEX provided");
+        }
+    }
     match Store::open(&cfg.path) {
-        Ok(s) => Arc::new(s),
+        Ok(s) => {
+            // If encryption required but enc_key is None, fail closed
+            if cfg.require_encryption && s.enc_key.is_none() {
+                panic!("Database encryption is required but key derivation failed");
+            }
+            Arc::new(s)
+        }
         Err(e) => {
             eprintln!("❌ Critical: Database failed to open at '{}': {}", cfg.path, e);
             eprintln!("💡 Possible solutions:");
             eprintln!("   - Check if directory exists and is writable");
             eprintln!("   - Verify no other instances are running");
             eprintln!("   - If previous crash, try removing stale lock: rm {}/LOCK", cfg.path);
-            // For genesis deployment, propagate error instead of exiting in library
             panic!("Database open failed: {}", e);
         }
     }

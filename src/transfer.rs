@@ -234,7 +234,7 @@ impl TransferManager {
         Self { db }
     }
 
-    /// Creates and broadcasts a transfer
+    /// Creates and gossips a transfer; does not apply immediately.
     pub async fn send_transfer(
         &self,
         coin_id: [u8; 32],
@@ -266,11 +266,12 @@ impl TransferManager {
             next_seq,
         )?;
 
-        // Validate the transfer
+        // Validate the transfer (stateless + current DB view)
         transfer.validate(&self.db)?;
 
-        // Apply the transfer to our local database
-        transfer.apply(&self.db)?;
+        // Do NOT apply to final state here. Stage into tx_pool; epoch finalization applies atomically.
+        self.db.put("tx_pool", &transfer.hash(), &transfer)
+            .context("Failed to stage transfer in tx_pool")?;
 
         // Broadcast the transfer to the network
         network.gossip_transfer(&transfer).await;
