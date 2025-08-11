@@ -123,7 +123,7 @@ impl Miner {
         let mut anchor_rx = self.net.anchor_subscribe();
         // Jitter the heartbeat to avoid synchronized timeouts across many miners
         let base = crate::config::default_heartbeat_interval();
-        let jitter = (rand::random::<u64>() % 5).min(4);
+        let jitter = (rand::random::<u64>() % 9).min(8);
         let mut heartbeat_interval = time::interval(Duration::from_secs(base + jitter));
         
         println!("🔗 Connected to anchor broadcast channel");
@@ -227,7 +227,7 @@ impl Miner {
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
                     // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
-                    let timeout_secs = crate::config::default_heartbeat_interval() * 6;
+                    let timeout_secs = crate::config::default_heartbeat_interval() * 8;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());

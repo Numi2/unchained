@@ -117,6 +117,8 @@ pub struct EpochSummary {
     pub anchor: crate::epoch::Anchor,
     pub selected_coin_ids: Vec<[u8;32]>,
     pub coins: Vec<crate::coin::Coin>,
+    // Per-epoch applied transfer IDs to allow clients to recompute transfers_root
+    pub tx_ids: Vec<[u8;32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

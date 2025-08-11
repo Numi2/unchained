@@ -975,7 +975,9 @@ pub async fn spawn(
                                                                 for id in &ids {
                                                                     if let Ok(Some(c)) = db.get::<Coin>("coin", id) { coins.push(c); }
                                                                 }
-                                                                crate::rpc::RpcResponsePayload::EpochSummary(Some(crate::rpc::EpochSummary { anchor: a, selected_coin_ids: ids, coins }))
+                                                                // Include per-epoch transfer ids so client can recompute transfers_root
+                                                                let tx_ids = db.get_epoch_transfers(n).unwrap_or_default().unwrap_or_default();
+                                                                crate::rpc::RpcResponsePayload::EpochSummary(Some(crate::rpc::EpochSummary { anchor: a, selected_coin_ids: ids, coins, tx_ids }))
                                                             } else {
                                                                 crate::rpc::RpcResponsePayload::EpochSummary(None)
                                                             }
@@ -1106,6 +1108,8 @@ pub async fn spawn(
                                                                 let prev = if summary.anchor.num > 0 { db_clone.get::<Anchor>("epoch", &(summary.anchor.num-1).to_le_bytes()).unwrap_or(None) } else { None };
                                                                 // Validate; use provided coins and ids
                                                                 let ids: Vec<[u8;32]> = summary.selected_coin_ids.clone();
+                                                                // Persist transfer ids prior to validation so transfers_root can be recomputed
+                                                                let _ = db_clone.store_epoch_transfers(summary.anchor.num, &summary.tx_ids);
                                                                 match crate::epoch::validate_anchor(&db_clone, &epoch_cfg_clone, &mining_cfg_clone, &summary.anchor, prev.as_ref(), &ids, &summary.coins) {
                                                                     Ok(()) => {
                                                                         // Persist: anchor

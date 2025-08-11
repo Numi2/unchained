@@ -38,6 +38,18 @@ Peer ID:
 cargo run --release -- peer-id
 ```
 
+Wallet helpers and transfers:
+```bash
+# Show wallet balance and address
+cargo run --release -- balance
+
+# Send 1 or more coins to a 32-byte hex address
+cargo run --release -- send --to <hex32> --amount <u64>
+
+# List transfer history (sent/received)
+cargo run --release -- history
+```
+
 ## Networking
 
 - QUIC transport; PQ TLS negotiation preferred (rustls `prefer-post-quantum` with `aws-lc-rs` provider).
@@ -62,6 +74,10 @@ Column families:
 - `epoch_work_leaves` (sorted per-coin work leaf hashes), `epoch_transfers`
 - `wallet`, `replay`, `head`
 
+Data directory:
+- If `storage.path` in `config.toml` is relative, it is resolved to `~/.unchained/unchained_data` at runtime.
+- RocksDB logs and backups are organized under the chosen path; individual coin files may be mirrored to `coins/` when enabled (see env below).
+
 ## Security
 
 - Dilithium3 signatures for transfers and node auth; Kyber768 for RPC key exchange.
@@ -73,6 +89,10 @@ Column families:
 - Compact-target (nBits) normalization enforced: exponent in [1,32], mantissa high-bit cleared; anchors must be canonical; emission normalized at genesis/retarget.
 - Anchor pre-validation before persistence/broadcast; metrics on rejection.
 - Encrypted at-rest keys; wallet/node identities use Argon2id + XChaCha20-Poly1305.
+
+Deterministic genesis:
+- If no peers respond and no bootstrap peers are configured, the node will create a deterministic genesis anchor locally to allow single-node operation.
+- If bootstrap peers are configured, the node waits for the network and avoids creating a conflicting local genesis.
 
 ### Limits
 - Request cap: 128 KiB; Response cap: 4 MiB (anchors/proofs). Caps enforced in codec read/write.
@@ -91,6 +111,15 @@ Column families:
 - Proof server is loopback-only by default; front with TLS reverse proxy for external access
 - Monitor Prometheus metrics for health and sync state
 
+Environment variables (selected):
+- `QUANTUM_PASSPHRASE`: required in non-interactive mode to unlock wallet/node/db keys.
+- `DB_ENC_KEY_HEX`: 64-hex char key to encrypt DB values (except wallet) instead of prompting.
+- `DB_ENC_MEM_MIB`, `DB_ENC_TIME`: Argon2id parameters for DB key derivation when passphrase-based.
+- `WALLET_KDF_MEM_MIB`, `WALLET_KDF_TIME`: Argon2id parameters for wallet encryption.
+- `COIN_MIRRORING=1`: writes plaintext coin blobs under `<db>/coins` for debugging (do not use in prod).
+- `ROCKSDB_USE_FSYNC=0`: relax fsync if you accept durability tradeoffs.
+- `PROOF_SERVER_TOKEN`: static token required via `x-auth-token` header by the proof HTTP server.
+
 ## Quick commands
 
 ```bash
@@ -106,6 +135,7 @@ cargo run --release -- proof --coin-id <hex32>
 
 # Serve HTTP proof endpoint (loopback only)
 cargo run --release -- proof-server --bind 127.0.0.1:9090
+#   Optional: require token via env PROOF_SERVER_TOKEN, header x-auth-token: <token> (simple rate limit applies)
 
 # Metrics (default)
 curl -s http://127.0.0.1:9100/ | head

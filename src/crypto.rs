@@ -302,8 +302,7 @@ pub fn kyber_decapsulate(ct: &[u8], sk: &KyberSk) -> Option<Vec<u8>> {
 }
 
 /// Install the aws-lc-rs crypto provider as the default for rustls (if not already installed).
-/// This ensures downstream users that rely on rustls's default provider (e.g., libp2p-quic/quinn)
-/// will negotiate PQ-capable cipher suites/KEMs when available.
+
 pub fn ensure_aws_lc_rs_provider_installed() {
     // If the provider is already installed elsewhere, this returns an error we can ignore safely.
     #[allow(unused_must_use)]
