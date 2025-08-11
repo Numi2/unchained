@@ -128,7 +128,11 @@ impl Miner {
         // doesn’t have to wait for the next anchor broadcast (which can be several minutes away).
         match self.db.get::<Anchor>("epoch", b"latest") {
             Ok(Some(latest_anchor)) => {
-                println!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
+                println!(
+                    "📥 Loaded latest anchor #{} from database — targeting epoch #{}",
+                    latest_anchor.num,
+                    latest_anchor.num.saturating_add(1)
+                );
                 self.current_epoch = Some(latest_anchor.num);
                 self.last_heartbeat = time::Instant::now();
                 if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
@@ -170,8 +174,12 @@ impl Miner {
                             }
                             
                             println!(
-                                "⛏️  New epoch #{}: target_nbits=0x{:08x}, mem_kib={}, t_cost={}. Mining...",
-                                anchor.num, anchor.target_nbits, anchor.mem_kib, anchor.t_cost
+                                "⛏️  New anchor #{} received (target epoch #{}) — target_nbits=0x{:08x}, mem_kib={}, t_cost={}. Mining...",
+                                anchor.num,
+                                anchor.num.saturating_add(1),
+                                anchor.target_nbits,
+                                anchor.mem_kib,
+                                anchor.t_cost
                             );
                             
                             self.current_epoch = Some(anchor.num);
@@ -254,8 +262,17 @@ impl Miner {
         let mut attempts = 0u64;
         let max_attempts = crate::config::default_max_mining_attempts();
 
-        println!("🎯 Starting mining for epoch #{}", anchor.num);
-        println!("⚙️  Mining parameters: target_nbits=0x{:08x}, mem_kib={}, t_cost={}, lanes=1 (consensus)", anchor.target_nbits, mem_kib, t_cost);
+        println!(
+            "🎯 Starting mining against parent anchor #{} (target epoch #{})",
+            anchor.num,
+            anchor.num.saturating_add(1)
+        );
+        println!(
+            "⚙️  Mining parameters: target_nbits=0x{:08x}, mem_kib={}, t_cost={}, lanes=1 (consensus)",
+            anchor.target_nbits,
+            mem_kib,
+            t_cost
+        );
 
         let mut last_db_check = time::Instant::now();
         loop {
@@ -336,7 +353,14 @@ impl Miner {
             
             // Lightweight cooperative yield every 2 000 attempts; progress log every 20 000
             if attempts % 2_000 == 0 { tokio::task::yield_now().await; }
-            if attempts % 20_000 == 0 { println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num); }
+            if attempts % 20_000 == 0 {
+                println!(
+                    "⏳ Mining progress: {} attempts (parent #{}, target #{})",
+                    attempts,
+                    anchor.num,
+                    anchor.num.saturating_add(1)
+                );
+            }
         }
     }
 }

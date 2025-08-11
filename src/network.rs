@@ -431,7 +431,7 @@ pub async fn spawn(
                             dilithium_pk: pq_pk_arr,
                             ed25519_pk: ed_pk_bytes.clone(),
                             kyber_pk: node_ky_pk_bytes.clone(),
-                            expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 300,
+                            expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 3600,
                         };
                         let unsigned_ser = bincode::serialize(&unsigned).unwrap_or_default();
                         let sig_ed25519 = id_keys.sign(&unsigned_ser).unwrap_or_default();
@@ -495,7 +495,7 @@ pub async fn spawn(
                                 dilithium_pk: pq_pk_arr,
                                 ed25519_pk: ed_pk_bytes.clone(),
                                 kyber_pk: node_ky_pk_bytes.clone(),
-                                expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 300,
+                                expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 3600,
                             };
                             let unsigned_ser = bincode::serialize(&unsigned).unwrap_or_default();
                             let sig_ed25519 = id_keys.sign(&unsigned_ser).unwrap_or_default();
@@ -593,9 +593,11 @@ pub async fn spawn(
                                 crate::metrics::RATE_LIMIT_DROPS.inc();
                                 continue;
                             }
-                            // Gate non-auth topics behind PQ handshake
-                            if topic_str != TOP_AUTH && !pq_authed.contains(&src_peer) {
-                                // silently ignore pre-auth non-auth topics
+                            // Gate non-auth topics behind PQ handshake, but allow TOP_ANCHOR to pass pre-auth
+                            // so new nodes can learn the tip and enqueue RPC fetches which will be flushed
+                            // once PQ auth completes.
+                            if topic_str != TOP_AUTH && topic_str != TOP_ANCHOR && !pq_authed.contains(&src_peer) {
+                                // silently ignore pre-auth non-auth topics (except anchors)
                                 continue;
                             }
                             match topic_str {
@@ -710,6 +712,7 @@ pub async fn spawn(
                                 ReqRespMessage::Request { request, channel, .. } => {
                                     // Enforce RPC gating: require prior PQ auth on TOP_AUTH and verify ClientHello signatures before any decryption.
                                     if !pq_authed.contains(&peer) {
+                                        net_log!("⛔ RPC from unauthenticated peer ({}); responding 'unauthenticated'", peer);
                                         // Refuse processing requests from peers that haven't completed PQ auth
                                         let server_ed_pk: [u8;32] = id_keys.public().try_into_ed25519().map(|p| p.to_bytes()).unwrap_or([0u8;32]);
                                         let mut pq_pk_arr = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
@@ -899,6 +902,7 @@ pub async fn spawn(
                                                         crate::rpc::RpcResponsePayload::Anchor(None)
                                                     }
                                                     crate::rpc::RpcMethod::LatestAnchor => {
+                                                        net_log!("📨 RPC LatestAnchor from {}", peer);
                                                         let a = db.get::<Anchor>("epoch", b"latest").unwrap_or(None);
                                                         crate::rpc::RpcResponsePayload::Anchor(a)
                                                     }
@@ -1200,6 +1204,9 @@ pub async fn spawn(
                                                         crate::rpc::RpcResponsePayload::Error(err) => {
                                                             // If the server rejected due to unauthenticated (race: server hasn't seen our TOP_AUTH yet), retry the original method.
                                                             if err == "unauthenticated" {
+                                                                if let crate::rpc::RpcMethod::LatestAnchor = p.requested_method {
+                                                                    net_log!("⏳ LatestAnchor RPC unauthenticated by {}; waiting for server-side PQ auth", peer);
+                                                                }
                                                                 match p.requested_method {
                                                                     crate::rpc::RpcMethod::AuthHello => { let _ = command_tx.send(NetworkCommand::RequestLatestEpoch); },
                                                                     crate::rpc::RpcMethod::LatestAnchor => { let _ = command_tx.send(NetworkCommand::RequestLatestEpoch); },
@@ -1253,8 +1260,9 @@ pub async fn spawn(
                 },
                 Some(command) = command_rx.recv() => {
                     // Helper to send an RPC request via PQ AEAD with C2S request encryption
-                    let mut send_rpc = |method: crate::rpc::RpcMethod| {
-                        if let Some(peer) = connected_peers.iter().next().cloned() {
+                    let mut send_rpc = |swarm_mut: &mut libp2p::Swarm<Behaviour>, method: crate::rpc::RpcMethod| {
+                        // Prefer a connected peer that has completed PQ auth (i.e., keys are pinned)
+                        if let Some(peer) = connected_peers.iter().find(|p| peer_keys.contains_key(*p)).cloned() {
                             // Require peer static keys from PQ auth
                             let Some(keys) = peer_keys.get(&peer) else {
                                 // Requeue until we have peer keys
@@ -1275,7 +1283,7 @@ pub async fn spawn(
                                 remote_peer_id: peer.to_string(),
                                 ed25519_pk: ed_pk,
                                 dilithium_pk,
-                                expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 300,
+                                expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 3600,
                                 client_kyber_pk,
                                 nonce: {
                                     let mut n = [0u8;32];
@@ -1309,7 +1317,7 @@ pub async fn spawn(
                             let method_enc = crate::rpc::aead_encrypt_c2s(&c2s, &client_ct, request_id, &aad_extra, &method_pt);
                             let req = crate::rpc::RpcRequest { request_id, stream_id, client_hello, client_kyber_ct: client_ct, method_enc };
                             pending_rpcs.insert(request_id, PendingRpc { client_sk, client_u: unsigned, requested_method: method.clone() });
-                            let _ = swarm.behaviour_mut().rpc.send_request(&peer, req);
+                            let _ = swarm_mut.behaviour_mut().rpc.send_request(&peer, req);
                         } else {
                             if pending_commands.len() >= MAX_PENDING_COMMANDS {
                                 let _ = pending_commands.pop_front();
@@ -1335,12 +1343,17 @@ pub async fn spawn(
                             if let Ok(d) = bincode::serialize(&ann) { let _ = swarm.behaviour_mut().gs.publish(IdentTopic::new(TOP_TX), d); }
                             crate::metrics::MSGS_OUT_TX.inc();
                         }
-                        NetworkCommand::RequestAuthHello => send_rpc(crate::rpc::RpcMethod::AuthHello),
-                        NetworkCommand::RequestLatestEpoch => send_rpc(crate::rpc::RpcMethod::LatestAnchor),
-                        NetworkCommand::RequestEpoch(n) => send_rpc(crate::rpc::RpcMethod::Epoch(*n)),
-                        NetworkCommand::RequestEpochSummary(n) => send_rpc(crate::rpc::RpcMethod::EpochSummary(*n)),
-                        NetworkCommand::RequestCoin(id) => send_rpc(crate::rpc::RpcMethod::Coin(*id)),
-                        NetworkCommand::RequestCoinProof(id) => send_rpc(crate::rpc::RpcMethod::CoinProof(*id)),
+                        NetworkCommand::RequestAuthHello => send_rpc(&mut swarm, crate::rpc::RpcMethod::AuthHello),
+                        NetworkCommand::RequestLatestEpoch => {
+                            // Best-effort gossip marker for observability (not used for payload)
+                            if let Ok(d) = bincode::serialize(&()) { let _ = swarm.behaviour_mut().gs.publish(IdentTopic::new(TOP_LATEST_REQUEST), d); }
+                            crate::metrics::MSGS_OUT_LATEST_REQ.inc();
+                            send_rpc(&mut swarm, crate::rpc::RpcMethod::LatestAnchor)
+                        },
+                        NetworkCommand::RequestEpoch(n) => send_rpc(&mut swarm, crate::rpc::RpcMethod::Epoch(*n)),
+                        NetworkCommand::RequestEpochSummary(n) => send_rpc(&mut swarm, crate::rpc::RpcMethod::EpochSummary(*n)),
+                        NetworkCommand::RequestCoin(id) => send_rpc(&mut swarm, crate::rpc::RpcMethod::Coin(*id)),
+                        NetworkCommand::RequestCoinProof(id) => send_rpc(&mut swarm, crate::rpc::RpcMethod::CoinProof(*id)),
                     }
                 },
                 _ = shutdown_rx.recv() => {

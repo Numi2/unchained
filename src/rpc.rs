@@ -414,7 +414,8 @@ pub fn seal_response(
         remote_peer_id: remote_peer_id.to_string(),
         ed25519_pk: server_ed25519_pk,
         dilithium_pk: server_pq_pk,
-        expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 300,
+        // Extend expiry to tolerate larger clock skew between nodes
+        expiry_unix_secs: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) + 3600,
         kyber_ct: kyber_ct.clone(),
         server_kyber_pk,
     };

@@ -137,6 +137,12 @@ async fn main() -> anyhow::Result<()> {
         let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
         let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
         let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+        // Respect background sync task state to avoid deadlock when we have a local chain but no network view yet
+        if sync_state.lock().unwrap().synced {
+            println!("✅ Synchronization complete (background). Local epoch is {}.", local_epoch);
+            synced = true;
+            break;
+        }
 
         // Case 1: We have a network view and our local chain has caught up
         if highest_seen > 0 && local_epoch >= highest_seen {
@@ -147,7 +153,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
-        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
+        // Allow proceeding regardless of bootstrap peers to enable genesis/startup in isolated conditions.
+        if highest_seen == 0 && latest_opt.is_some() {
             println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
             {
                 let mut st = sync_state.lock().unwrap();
@@ -172,20 +179,16 @@ async fn main() -> anyhow::Result<()> {
             "⚠️  Could not fully sync within {}s.",
             cfg.net.sync_timeout_secs
         );
-        // Only allow standalone operation when no bootstrap peers are configured.
-        // If bootstrap peers exist, keep the node in unsynced state and let the background
-        // sync task continue fetching epochs to converge with the network.
-        if cfg.net.bootstrap.is_empty() {
-            if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                let mut st = sync_state.lock().unwrap();
-                st.synced = true;
-                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-                println!("✅ Proceeding in standalone mode with local chain at epoch {}.", latest.num);
-            } else {
-                println!("⚠️  No peers and no local chain found. Waiting for network…");
-            }
+        // As a safety valve, allow standalone operation if we already have a local chain,
+        // even if bootstrap peers are configured. Background sync will flip us back to
+        // unsynced if/when the network tip advances beyond our local epoch.
+        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+            let mut st = sync_state.lock().unwrap();
+            st.synced = true;
+            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+            println!("✅ Proceeding in standalone mode with local chain at epoch {}.", latest.num);
         } else {
-            println!("⏳ Bootstrap peers configured; staying in sync mode until caught up.");
+            println!("⚠️  No peers and no local chain found. Waiting for network…");
         }
     }
     

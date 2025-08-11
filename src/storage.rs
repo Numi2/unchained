@@ -206,13 +206,25 @@ impl Store {
             match *name {
                 // Prefix: epoch_hash (32 bytes) || coin_id (32 bytes)
                 "coin_candidate" => {
-                    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+                    // Safe prefix extractor: only apply when key length >= 32
+                    let st = SliceTransform::create(
+                        "coin_candidate_prefix",
+                        |key: &[u8]| &key[..32],
+                        Some(|key: &[u8]| key.len() >= 32),
+                    );
+                    opts.set_prefix_extractor(st);
                     // Enable memtable prefix bloom to speed up prefix seeks
                     opts.set_memtable_prefix_bloom_ratio(0.1);
                 }
                 // Prefix: epoch number (8 bytes) || coin_id
                 "epoch_selected" => {
-                    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
+                    // Safe prefix extractor: only apply when key length >= 8
+                    let st = SliceTransform::create(
+                        "epoch_selected_prefix",
+                        |key: &[u8]| &key[..8],
+                        Some(|key: &[u8]| key.len() >= 8),
+                    );
+                    opts.set_prefix_extractor(st);
                     opts.set_memtable_prefix_bloom_ratio(0.1);
                 }
                 _ => { /* default */ }
