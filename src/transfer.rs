@@ -23,6 +23,21 @@ pub struct Transfer {
     pub sig: [u8; DILITHIUM3_SIG_BYTES],
 }
 
+/// Tracks the current tip of a coin's transfer chain.
+/// last_seq == 0 and last_hash == coin_id means the coin has never been transferred.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tip {
+    pub last_hash: [u8; 32],
+    pub last_seq: u64,
+}
+
+/// A transfer plus its acceptance epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferInclusion {
+    pub transfer: Transfer,
+    pub epoch_num: u64,
+}
+
 impl Transfer {
     /// Canonical bytes-to-sign: coin_id ‖ sender_pk ‖ to ‖ prev_tx_hash.
     /// This deterministic serialization prevents replay/tamper attacks and is
@@ -89,12 +104,21 @@ impl Transfer {
             .context("Failed to query coin from database")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // Determine last owner and expected prev_tx_hash
-        let last_tx: Option<Transfer> = db.get("transfer", &self.coin_id)
-            .context("Failed to query transfer from database")?;
-        let (expected_owner_addr, expected_prev_hash) = match last_tx {
-            Some(ref t) => (t.recipient(), t.hash()),
-            None => (coin.creator_address, self.coin_id),
+        // Determine last owner and expected prev_tx_hash from the per-coin tip
+        let tip = db
+            .get_transfer_tip(&self.coin_id)
+            .context("Failed to read transfer tip")?;
+
+        let (expected_owner_addr, expected_prev_hash) = match tip {
+            Some(ref tip) if tip.last_seq > 0 => {
+                // Load the last transfer to get recipient/current owner
+                let last: Transfer = db
+                    .get_last_transfer_for_coin(&self.coin_id)
+                    .context("Failed to fetch last transfer")?
+                    .ok_or_else(|| anyhow!("Tip says last_seq>0 but no transfer found"))?;
+                (last.recipient(), tip.last_hash)
+            }
+            _ => (coin.creator_address, self.coin_id),
         };
 
         // Validate sender is last owner
@@ -132,11 +156,9 @@ impl Transfer {
     /// Applies a validated transfer to the database.
     /// This should only be called after validate() returns Ok.
     pub fn apply(&self, db: &crate::storage::Store) -> Result<()> {
-        // Store the transfer to mark the coin as spent
-        db.put("transfer", &self.coin_id, self)
-            .context("Failed to store transfer in database")?;
-        
-        Ok(())
+        // Append the transfer atomically to the coin's history, updating the tip
+        db.append_transfer_if_tip_matches(self)
+            .context("Failed to append transfer atomically")
     }
 
     /// Gets the recipient address of this transfer
@@ -196,10 +218,10 @@ impl TransferManager {
         // Validate the transfer
         transfer.validate(&self.db)?;
 
-        // Apply the transfer to our local database
-        transfer.apply(&self.db)?;
+        // Do not apply immediately; add to mempool locally (epoch finalization will include it)
+        self.db.put_mempool_tx(&transfer)?;
 
-        // Broadcast the transfer to the network
+        // Broadcast the transfer to the network (mempool)
         network.gossip_transfer(&transfer).await;
 
         Ok(transfer)
@@ -237,7 +259,7 @@ impl TransferManager {
 
     /// Gets the transfer for a specific coin (if it exists)
     pub fn get_transfer_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<Transfer>> {
-        self.db.get("transfer", coin_id)
+        self.db.get_last_transfer_for_coin(coin_id)
     }
 
     /// Checks if a coin is spent

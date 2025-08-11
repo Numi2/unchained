@@ -2,6 +2,8 @@ use crate::{
     storage::Store,
     crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES},
 };
+use crate::ringsig::{RingSignatureScheme, RingPublicKey};
+use crate::ring_transfer::{RingTransfer, RingOutput};
 use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey};
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
@@ -195,33 +197,30 @@ impl Wallet {
     // ---------------------------------------------------------------------
     // 🪙 UTXO helpers
     // ---------------------------------------------------------------------
-    /// Returns all coins created by this wallet that are currently **unspent**.
-    /// A coin is considered unspent if:
-    ///   1. It belongs to `self.address`, **and**
-    ///   2. There is no transfer recorded with the same `coin_id`.
+    /// Returns all coins currently owned by this wallet that are **unspent by this wallet**.
+    /// Ownership is determined by the latest transfer tip: if no transfers, creator is owner; else last recipient.
     pub fn list_unspent(&self) -> Result<Vec<crate::coin::Coin>> {
         let store = self
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
 
-        let cf = store
-            .db
-            .cf_handle("coin")
-            .ok_or_else(|| anyhow!("'coin' column family missing"))?;
-
+        let cf = store.db.cf_handle("coin").ok_or_else(|| anyhow!("'coin' column family missing"))?;
         let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut utxos = Vec::new();
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                if coin.creator_address == self.address {
-                    let spent: Option<crate::transfer::Transfer> =
-                        store.get("transfer", &coin.id)?;
-                    if spent.is_none() {
-                        utxos.push(coin);
+                // Determine current owner
+                let owner = match store.get_transfer_tip(&coin.id)? {
+                    Some(tip) if tip.last_seq > 0 => {
+                        if let Some(last) = store.get_last_transfer_for_coin(&coin.id)? {
+                            last.recipient()
+                        } else { coin.creator_address }
                     }
-                }
+                    _ => coin.creator_address,
+                };
+                if owner == self.address { utxos.push(coin); }
             }
         }
         Ok(utxos)
@@ -273,9 +272,15 @@ impl Wallet {
         // Create transfer manager
         let transfer_mgr = crate::transfer::TransferManager::new(store);
         
-        // Create transfers for each coin
+        // Create transfers for each coin currently owned by us
         let mut transfers = Vec::new();
         for coin in coins_to_spend {
+            // Ensure we still own this coin at send time
+            let current_owner = match transfer_mgr.get_transfer_for_coin(&coin.id)? {
+                Some(last) => last.recipient(),
+                None => coin.creator_address,
+            };
+            if current_owner != self.address { continue; }
             let transfer = transfer_mgr.send_transfer(
                 coin.id,
                 self.pk.clone(),
@@ -323,6 +328,85 @@ impl Wallet {
         }
         
         Ok(history)
+    }
+
+    // ------------------------- Ring outputs (private spends) -------------------------
+    /// Derive a one-time pubkey for receiving outputs; for now reuse the main key as placeholder.
+    fn derive_one_time_public(&self) -> RingPublicKey {
+        RingPublicKey(self.pk.as_bytes().to_vec())
+    }
+
+    /// List owned ring outputs by matching the one-time public key
+    pub fn list_owned_outputs(&self) -> Result<Vec<RingOutput>> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        // Use `addr_utxo` index for O(keys) lookup
+        let addr = crypto::address_from_pk(&self.pk);
+        let cf = store.db.cf_handle("addr_utxo").ok_or_else(|| anyhow!("'addr_utxo' CF missing"))?;
+        let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::From(&addr, rocksdb::Direction::Forward));
+        let mut outs = Vec::new();
+        for item in iter {
+            let (k, _v) = item?;
+            if k.len() < 64 || &k[..32] != &addr { break; }
+            let mut out_id = [0u8;32]; out_id.copy_from_slice(&k[32..64]);
+            if let Some(out) = store.get_output(&out_id)? { outs.push(out); }
+        }
+        Ok(outs)
+    }
+
+    /// Select decoys from outputs CF deterministically by epoch buckets.
+    fn select_decoy_pubkeys(&self, store: &Store, target_count: usize) -> Result<Vec<RingPublicKey>> {
+        let cf = store.db.cf_handle("outputs").ok_or_else(|| anyhow!("'outputs' CF missing"))?;
+        let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut picks: Vec<RingPublicKey> = Vec::new();
+        for item in iter {
+            let (_k, v) = item?;
+            if let Ok(out) = bincode::deserialize::<RingOutput>(&v) {
+                picks.push(out.pubkey.clone());
+                if picks.len() >= target_count { break; }
+            }
+        }
+        Ok(picks)
+    }
+
+    /// Build a ring transfer with 4 decoys (total ring size 5)
+    pub fn build_ring_transfer<S: RingSignatureScheme>(
+        &self,
+        store: &Store,
+        scheme: &S,
+        real_output: &RingOutput,
+        to: Address,
+    ) -> Result<RingTransfer> {
+        let mut ring = self.select_decoy_pubkeys(store, 4)?;
+        // Ensure decoys don't accidentally equal the real key
+        ring.retain(|pk| pk.0 != real_output.pubkey.0);
+        // Insert real at a deterministic position (e.g., 0)
+        ring.insert(0, real_output.pubkey.clone());
+
+        let recipient_one_time = self.derive_one_time_public();
+        let msg = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&to);
+            // Commit to ring members via a BLAKE3 root over concatenated pubkeys
+            let mut concat = Vec::new();
+            for m in &ring { concat.extend_from_slice(&m.0); }
+            let ring_root = crate::crypto::blake3_hash(&concat);
+            // Domain-separated binding message
+            v.extend_from_slice(b"ring_tx");
+            v.extend_from_slice(&ring_root);
+            v.extend_from_slice(&recipient_one_time.0);
+            v
+        };
+        let (sig, tag) = scheme.sign(&msg, &ring, self.sk.as_bytes())?;
+        Ok(RingTransfer {
+            ring_members: ring,
+            recipient_one_time,
+            to,
+            signature: sig,
+            link_tag: tag,
+        })
     }
 }
 

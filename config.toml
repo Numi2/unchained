@@ -47,6 +47,8 @@ target_leading_zeros = 1
 target_coins_per_epoch = 3
 # How often to retarget (every N epochs - more frequent for dynamic adjustment)
 retarget_interval = 2000
+# Legacy-compatible anchors: do NOT include transfers_root in anchor.hash
+include_transfers_root_in_hash = false
 
 
 [mining]

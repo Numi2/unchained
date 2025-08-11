@@ -5569,6 +5569,7 @@ dependencies = [
  "hyper 0.14.32",
  "iroh",
  "iroh-gossip",
+ "libc",
  "libp2p",
  "libp2p-core 0.43.1",
  "libp2p-noise",

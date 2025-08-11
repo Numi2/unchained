@@ -72,7 +72,39 @@ impl Store {
         // Use base path directly for production, but ensure clean state
         let db_path = base_path.to_string();
         
-        // Do not delete RocksDB LOCK file; if present and DB open fails, surface error to caller
+        // Single-instance advisory lock: create/open a lock file and try to lock
+        {
+            use std::io::Write as _;
+            use std::os::unix::prelude::AsRawFd;
+            let lock_dir = base_path.to_string();
+            std::fs::create_dir_all(&lock_dir).ok();
+            let lock_path = format!("{}/UNCHAINED_DB.LOCK", lock_dir);
+            let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&lock_path)
+                .with_context(|| format!("Failed to open lock file at {}", lock_path))?;
+            // best-effort write PID for diagnostics
+            let _ = file.set_len(0);
+            let _ = writeln!(&file, "pid:{}", std::process::id());
+            // Try to acquire exclusive non-blocking lock (Unix-specific)
+            #[cfg(target_family = "unix")]
+            {
+                let fd = file.as_raw_fd();
+                let flock = libc::flock {
+                    l_type: libc::F_WRLCK as i16,
+                    l_whence: libc::SEEK_SET as i16,
+                    l_start: 0,
+                    l_len: 0,
+                    l_pid: 0,
+                };
+                let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &flock) };
+                if rc == -1 {
+                    anyhow::bail!("Another unchained instance is using the database at {} (lock busy)", base_path);
+                }
+            }
+            #[cfg(not(target_family = "unix"))]
+            {
+                // On non-Unix, rely on RocksDB's internal LOCK file and surface open errors as single-instance enforcement
+            }
+        }
         
         let cf_names = [
             "default",
@@ -85,6 +117,16 @@ impl Store {
             "wallet",
             "anchor",
             "transfer",
+            "transfer_tip",
+            "transfer_epoch",
+            "tx_mempool",
+            "outputs",
+            "ring_tag",
+            "epoch_ring_transfers",
+            "ring_transfer_leaves",
+            "ring_tx",
+            "addr_utxo",
+            "addr_transfers",
         ];
         
         // Configure column family options with sane production defaults
@@ -254,6 +296,224 @@ impl Store {
         
         self.db.write_opt(batch, &write_opts).with_context(|| "Failed to write batch to database")
     }
+
+    // ------------------------- Mempool -------------------------
+    pub fn put_mempool_tx(&self, tx: &crate::transfer::Transfer) -> Result<()> {
+        let cf = self.db.cf_handle("tx_mempool")
+            .ok_or_else(|| anyhow::anyhow!("'tx_mempool' column family missing"))?;
+        let key = tx.hash();
+        let bytes = bincode::serialize(tx)?;
+        self.db.put_cf(cf, &key, &bytes)?;
+        Ok(())
+    }
+
+    pub fn delete_mempool_tx(&self, tx_hash: &[u8; 32]) -> Result<()> {
+        let cf = self.db.cf_handle("tx_mempool")
+            .ok_or_else(|| anyhow::anyhow!("'tx_mempool' column family missing"))?;
+        self.db.delete_cf(cf, tx_hash)?;
+        Ok(())
+    }
+
+    pub fn get_mempool_tx(&self, tx_hash: &[u8; 32]) -> Result<Option<crate::transfer::Transfer>> {
+        let cf = self.db.cf_handle("tx_mempool")
+            .ok_or_else(|| anyhow::anyhow!("'tx_mempool' column family missing"))?;
+        Ok(match self.db.get_cf(cf, tx_hash)? {
+            Some(v) => Some(bincode::deserialize(&v)?),
+            None => None,
+        })
+    }
+
+    pub fn iterate_mempool(&self) -> Result<Vec<crate::transfer::Transfer>> {
+        let cf = self.db.cf_handle("tx_mempool")
+            .ok_or_else(|| anyhow::anyhow!("'tx_mempool' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut out = Vec::new();
+        for item in iter {
+            let (_k, v) = item?;
+            if let Ok(tx) = bincode::deserialize::<crate::transfer::Transfer>(&v) {
+                out.push(tx);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Atomically append a transfer if the tip matches `prev_tx_hash`.
+    /// Keys used:
+    ///   - transfer history CF: key = coin_id || seq (u64 LE)
+    ///   - tip CF: key = coin_id, value = Tip { last_hash, last_seq }
+    pub fn append_transfer_if_tip_matches(&self, tx: &crate::transfer::Transfer) -> Result<()> {
+        // Fetch existing tip
+        let tip_cf = self.db.cf_handle("transfer_tip")
+            .ok_or_else(|| anyhow::anyhow!("'transfer_tip' column family missing"))?;
+        let tr_cf = self.db.cf_handle("transfer")
+            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+
+        let current_tip: Option<crate::transfer::Tip> = match self.db.get_cf(tip_cf, &tx.coin_id)? {
+            Some(v) => Some(bincode::deserialize(&v)?),
+            None => None,
+        };
+
+        let (expected_prev, next_seq) = match current_tip {
+            Some(t) => (t.last_hash, t.last_seq + 1),
+            None => (tx.coin_id, 1u64),
+        };
+
+        if expected_prev != tx.prev_tx_hash {
+            anyhow::bail!("Tip mismatch: prev_tx_hash does not match current tip");
+        }
+
+        // Build history key coin_id || seq
+        let mut hist_key = Vec::with_capacity(32 + 8);
+        hist_key.extend_from_slice(&tx.coin_id);
+        hist_key.extend_from_slice(&next_seq.to_le_bytes());
+
+        // Serialize once
+        let tx_bytes = bincode::serialize(tx)?;
+        let tip_bytes = bincode::serialize(&crate::transfer::Tip { last_hash: tx.hash(), last_seq: next_seq })?;
+
+        // Use write batch to ensure atomicity
+        let mut batch = WriteBatch::default();
+        batch.put_cf(tr_cf, &hist_key, &tx_bytes);
+        batch.put_cf(tip_cf, &tx.coin_id, &tip_bytes);
+        self.write_batch(batch)
+    }
+
+    /// Fetch the per-coin transfer tip
+    pub fn get_transfer_tip(&self, coin_id: &[u8; 32]) -> Result<Option<crate::transfer::Tip>> {
+        let cf = self.db.cf_handle("transfer_tip")
+            .ok_or_else(|| anyhow::anyhow!("'transfer_tip' column family missing"))?;
+        Ok(match self.db.get_cf(cf, coin_id)? {
+            Some(v) => Some(bincode::deserialize(&v)?),
+            None => None,
+        })
+    }
+
+    /// Fetch the last transfer for a coin using the tip
+    pub fn get_last_transfer_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<crate::transfer::Transfer>> {
+        let tip = match self.get_transfer_tip(coin_id)? { Some(t) => t, None => return Ok(None) };
+        if tip.last_seq == 0 { return Ok(None); }
+        let cf = self.db.cf_handle("transfer")
+            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+        let mut key = Vec::with_capacity(32+8);
+        key.extend_from_slice(coin_id);
+        key.extend_from_slice(&tip.last_seq.to_le_bytes());
+        Ok(match self.db.get_cf(cf, &key)? {
+            Some(v) => Some(bincode::deserialize(&v)?),
+            None => None,
+        })
+    }
+
+    /// Iterate all transfers for a coin in order (caller may early-break).
+    pub fn iterate_transfers_for_coin(&self, coin_id: &[u8; 32]) -> Result<Vec<crate::transfer::Transfer>> {
+        let cf = self.db.cf_handle("transfer")
+            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(coin_id, rocksdb::Direction::Forward));
+        let mut out = Vec::new();
+        for item in iter {
+            let (k, v) = item?;
+            if k.len() < 40 { continue; }
+            if &k[0..32] != coin_id { break; }
+            out.push(bincode::deserialize::<crate::transfer::Transfer>(&v)?);
+        }
+        Ok(out)
+    }
+
+    // ------------------------- Ring storage helpers -------------------------
+    pub fn put_output(&self, out: &crate::ring_transfer::RingOutput) -> Result<()> {
+        let cf = self.db.cf_handle("outputs").ok_or_else(|| anyhow::anyhow!("'outputs' CF missing"))?;
+        let bytes = bincode::serialize(out)?;
+        self.db.put_cf(cf, &out.id, &bytes)?;
+        Ok(())
+    }
+
+    pub fn get_output(&self, id: &[u8;32]) -> Result<Option<crate::ring_transfer::RingOutput>> {
+        let cf = self.db.cf_handle("outputs").ok_or_else(|| anyhow::anyhow!("'outputs' CF missing"))?;
+        Ok(match self.db.get_cf(cf, id)? { Some(v) => Some(bincode::deserialize(&v)?), None => None })
+    }
+
+    pub fn set_ring_tag(&self, tag: &[u8;32], epoch: u64) -> Result<()> {
+        let cf = self.db.cf_handle("ring_tag").ok_or_else(|| anyhow::anyhow!("'ring_tag' CF missing"))?;
+        self.db.put_cf(cf, tag, &epoch.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn has_ring_tag(&self, tag: &[u8;32]) -> Result<bool> {
+        Ok(self.get_raw_bytes("ring_tag", tag)?.is_some())
+    }
+
+    pub fn put_ring_mempool_tx(&self, rtx: &crate::ring_transfer::RingTransfer) -> Result<()> {
+        let cf = self.db.cf_handle("tx_mempool").ok_or_else(|| anyhow::anyhow!("'tx_mempool' CF missing"))?;
+        let bytes = bincode::serialize(rtx)?;
+        self.db.put_cf(cf, &rtx.hash(), &bytes)?;
+        Ok(())
+    }
+
+    pub fn get_epoch_ring_transfers(&self, epoch: u64) -> Result<Vec<[u8;32]>> {
+        let cf = self.db.cf_handle("epoch_ring_transfers").ok_or_else(|| anyhow::anyhow!("'epoch_ring_transfers' CF missing"))?;
+        Ok(match self.db.get_cf(cf, &epoch.to_le_bytes())? { Some(v) => bincode::deserialize(&v)?, None => Vec::new() })
+    }
+
+    pub fn put_ring_tx(&self, tx: &crate::ring_transfer::RingTransfer) -> Result<()> {
+        let cf = self.db.cf_handle("ring_tx").ok_or_else(|| anyhow::anyhow!("'ring_tx' CF missing"))?;
+        let bytes = bincode::serialize(tx)?;
+        self.db.put_cf(cf, &tx.hash(), &bytes)?;
+        Ok(())
+    }
+
+    pub fn get_ring_tx(&self, hash: &[u8;32]) -> Result<Option<crate::ring_transfer::RingTransfer>> {
+        let cf = self.db.cf_handle("ring_tx").ok_or_else(|| anyhow::anyhow!("'ring_tx' CF missing"))?;
+        Ok(match self.db.get_cf(cf, hash)? { Some(v) => Some(bincode::deserialize(&v)?), None => None })
+    }
+
+    /// Rebuild ring outputs and spent set from canonical chain
+    pub fn rebuild_ring_state(&self) -> Result<()> {
+        // Clear ring_tag and outputs CFs (best-effort)
+        for name in ["ring_tag", "outputs"] {
+            if let Some(cf) = self.db.cf_handle(name) {
+                let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+                let mut batch = WriteBatch::default();
+                for item in iter { let (k, _v) = item?; batch.delete_cf(cf, k); }
+                self.write_batch(batch)?;
+            }
+        }
+        // Iterate epochs ascending
+        let latest = self.get::<crate::epoch::Anchor>("epoch", b"latest")?;
+        let max_epoch = latest.as_ref().map_or(0, |a| a.num);
+        for e in 0..=max_epoch {
+            let list = self.get_epoch_ring_transfers(e)?;
+            for h in list {
+                if let Some(tx) = self.get_ring_tx(&h)? {
+                    // Record link tag as spent marker
+                    self.set_ring_tag(&tx.link_tag.0, e)?;
+                    // Create recipient output id and store
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"out"); hasher.update(&h); hasher.update(&tx.recipient_one_time.0);
+                    let id = *hasher.finalize().as_bytes();
+                    let out = crate::ring_transfer::RingOutput { id, pubkey: tx.recipient_one_time.clone(), epoch_num: e };
+                    self.put_output(&out)?;
+                    // Index by owner address for fast queries: address || output_id
+                    if let Some(cf) = self.db.cf_handle("addr_utxo") {
+                        // Owner address is hash of pubkey (same scheme as account addresses)
+                        let addr = crate::crypto::blake3_hash(&out.pubkey.0);
+                        let mut key = Vec::with_capacity(32+32);
+                        key.extend_from_slice(&addr);
+                        key.extend_from_slice(&out.id);
+                        self.db.put_cf(cf, &key, &[])?;
+                    }
+                    // Index transfer by recipient: address || epoch || tx_hash
+                    if let Some(cf) = self.db.cf_handle("addr_transfers") {
+                        let addr = crate::crypto::blake3_hash(&out.pubkey.0);
+                        let mut key = Vec::with_capacity(32+8+32);
+                        key.extend_from_slice(&addr);
+                        key.extend_from_slice(&e.to_le_bytes());
+                        key.extend_from_slice(&h);
+                        self.db.put_cf(cf, &key, &[])?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     
     /// Force flush all memtables to disk (useful for ensuring durability)
     pub fn flush(&self) -> Result<()> {
@@ -311,10 +571,9 @@ impl Store {
         let mut unspent_coins = Vec::new();
         
         for coin in coins {
-            // Check if coin is spent
-            if let Ok(None) = self.get::<crate::transfer::Transfer>("transfer", &coin.id) {
-                unspent_coins.push(coin);
-            }
+            // Unspent for creator means no transfers yet
+            let tip = self.get_transfer_tip(&coin.id)?;
+            if tip.is_none() || tip.as_ref().unwrap().last_seq == 0 { unspent_coins.push(coin); }
         }
         
         Ok(unspent_coins)

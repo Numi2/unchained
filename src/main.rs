@@ -6,7 +6,7 @@ use anyhow;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
-pub mod sync;      pub mod metrics;  pub mod wallet;
+pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod ringsig;  pub mod ring_transfer;
 
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
@@ -43,8 +43,18 @@ enum Cmd {
         #[arg(long)]
         amount: u64,
     },
+    /// Send a private ring transfer for a specific owned output (demo)
+    RingSend {
+        #[arg(long)]
+        to: String,
+        /// Hex-encoded 32-byte output id to spend
+        #[arg(long, value_name="output_id_hex")]
+        output_id: String,
+    },
     Balance,
     History,
+    /// Rebuild ring state (outputs and spent set) from canonical chain after a reorg
+    RebuildRing,
 }
 
 #[tokio::main]
@@ -82,75 +92,85 @@ async fn main() -> anyhow::Result<()> {
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
+    if matches!(cli.cmd, Some(Cmd::Mine)) || cli.cmd.is_none() {
+        sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
 
-    let epoch_mgr = epoch::Manager::new(
-        db.clone(),
-        cfg.epoch.clone(),
-        cfg.mining.clone(),
-        cfg.net.clone(),
-        net.clone(),
-        coin_rx,
-        shutdown_tx.subscribe(),
-    );
-    epoch_mgr.spawn_loop();
+        let epoch_mgr = epoch::Manager::new(
+            db.clone(),
+            cfg.epoch.clone(),
+            cfg.mining.clone(),
+            cfg.net.clone(),
+            net.clone(),
+            coin_rx,
+            shutdown_tx.subscribe(),
+        );
+        epoch_mgr.spawn_loop();
+    }
 
     // --- Active Synchronization Before Mining ---
     // A new node must sync with the network before it can mine. We explicitly
     // request the latest state and then enter a loop, waiting until our local
     // epoch number matches the highest epoch we've seen from the network.
-    println!("🔄 Initiating synchronization with the network...");
-    net.request_latest_epoch().await;
-    
-    let poll_interval_ms: u64 = 500;
-    let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
-    let mut synced = false;
-    for attempt in 0..max_attempts {
-        let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
-        let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
-        let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+    if matches!(cli.cmd, Some(Cmd::Mine)) || cli.cmd.is_none() {
+        println!("🔄 Initiating synchronization with the network...");
+        net.request_latest_epoch().await;
 
-        // Case 1: We have a network view and our local chain has caught up
-        if highest_seen > 0 && local_epoch >= highest_seen {
-            println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
-            { let mut st = sync_state.lock().unwrap(); st.synced = true; }
-            synced = true;
-            break;
+        let poll_interval_ms: u64 = 500;
+        let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
+        let mut synced = false;
+        for attempt in 0..max_attempts {
+            let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+            let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
+            let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+
+            // Case 1: We have a network view and our local chain has caught up
+            if highest_seen > 0 && local_epoch >= highest_seen {
+                println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
+                { let mut st = sync_state.lock().unwrap(); st.synced = true; }
+                synced = true;
+                break;
+            }
+
+            // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
+            if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
+                println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
+                {
+                    let mut st = sync_state.lock().unwrap();
+                    st.synced = true;
+                    if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                }
+                synced = true;
+                break;
+            }
+
+            if highest_seen > 0 {
+                println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+            } else {
+                println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
+            }
+
+            // Proactively request latest anchor each iteration to coax peers
+            net.request_latest_epoch().await;
+            // Optionally, every 10th attempt, try fetching epoch 0 as a seed if we still have nothing
+            if attempt % 10 == 0 && latest_opt.is_none() {
+                net.request_epoch(0).await;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
         }
 
-        // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
-        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
-            println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
-            {
+        if !synced {
+            println!(
+                "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+                cfg.net.sync_timeout_secs
+            );
+            // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
+            // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
+            if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
                 let mut st = sync_state.lock().unwrap();
                 st.synced = true;
-                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                println!("✅ Proceeding with local chain at epoch {}.", latest.num);
             }
-            synced = true;
-            break;
-        }
-
-        if highest_seen > 0 {
-            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
-        } else {
-            println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
-    }
-
-    if !synced {
-        println!(
-            "⚠️  Could not sync with network after {}s. Starting as a new chain.",
-            cfg.net.sync_timeout_secs
-        );
-        // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
-        // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
-        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-            let mut st = sync_state.lock().unwrap();
-            st.synced = true;
-            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
         }
     }
     
@@ -209,11 +229,13 @@ async fn main() -> anyhow::Result<()> {
                 let net = net_clone.clone();
                 let auth = auth_token.clone();
                 let rate = rate.clone();
+                let db_clone = db.clone();
                 async move {
                     Ok::<_, anyhow::Error>(service_fn(move |req: HRequest<Body>| {
                         let net = net.clone();
                         let auth = auth.clone();
                         let rate = rate.clone();
+                        let db = db_clone.clone();
                         async move {
                             // Auth
                             if let Some(token) = &auth {
@@ -270,6 +292,39 @@ async fn main() -> anyhow::Result<()> {
                                     Ok(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("mismatch"))?),
                                     Err(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::GATEWAY_TIMEOUT).body(Body::from("timeout"))?),
                                 }
+                            } else if req.method() == Method::GET && req.uri().path().starts_with("/ring/") {
+                                let tx_hex = req.uri().path().trim_start_matches("/ring/");
+                                let bytes = match hex::decode(tx_hex) { Ok(b) => b, Err(_) => vec![] };
+                                if bytes.len() != 32 {
+                                    return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("bad tx hash"))?);
+                                }
+                                let mut h = [0u8;32]; h.copy_from_slice(&bytes);
+                                // Serve proof locally from DB
+                                if let Ok(Some(latest)) = db.get::<crate::epoch::Anchor>("epoch", b"latest") {
+                                    for e in (0..=latest.num).rev() {
+                                        if let Ok(list) = db.get_epoch_ring_transfers(e) {
+                                            if list.contains(&h) {
+                                                if let Ok(Some(anchor)) = db.get::<crate::epoch::Anchor>("epoch", &e.to_le_bytes()) {
+                                                    let mut sorted = list.clone();
+                                                    sorted.sort();
+                                                    if let Some(proof) = crate::epoch::build_hash_list_proof(&sorted, &h) {
+                                                        let body = serde_json::to_vec(&serde_json::json!({
+                                                            "ok": true, "response": {
+                                                                "tx_hash": tx_hex,
+                                                                "epoch": e,
+                                                                "transfers_root": hex::encode(anchor.transfers_root),
+                                                                "proof_len": proof.len()
+                                                            }
+                                                        }))?;
+                                                        return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::OK).header("Content-Type", "application/json").body(Body::from(body))?);
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("ring tx not found"))?)
                             } else {
                                 Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found"))?)
                             }
@@ -310,6 +365,36 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::RingSend { to, output_id }) => {
+            // Parse recipient address and output id
+            let recipient = hex::decode(to).map_err(|e| anyhow::anyhow!("Invalid recipient: {}", e))?;
+            if recipient.len() != 32 { return Err(anyhow::anyhow!("Recipient must be 32 bytes")); }
+            let mut recipient_addr = [0u8;32]; recipient_addr.copy_from_slice(&recipient);
+            let out_bytes = hex::decode(output_id).map_err(|e| anyhow::anyhow!("Invalid output id: {}", e))?;
+            if out_bytes.len() != 32 { return Err(anyhow::anyhow!("Output id must be 32 bytes")); }
+            let mut out_id = [0u8;32]; out_id.copy_from_slice(&out_bytes);
+
+            // Load output
+            let store = db.clone();
+            let store_ref = store;
+            if let Some(out) = store_ref.get_output(&out_id)? {
+                // Build ring transfer (mock LLRS)
+                #[cfg(feature = "ring_mock")]
+                let scheme = crate::ringsig::MockLlrs{};
+                #[cfg(not(feature = "ring_mock"))]
+                let scheme = crate::ringsig::NoLlrs{};
+                let rtx = wallet.build_ring_transfer(&store_ref, &scheme, &out, recipient_addr)?;
+                // Add to mempool and gossip
+                store_ref.put_ring_mempool_tx(&rtx)?;
+                net.gossip_ring_transfer(&rtx).await;
+                // Save for inclusion-proof servicing and reorg rebuilds
+                store_ref.put_ring_tx(&rtx)?;
+                println!("✅ Ring transfer submitted: {}", hex::encode(rtx.hash()));
+                return Ok(());
+            } else {
+                return Err(anyhow::anyhow!("Output not found or not owned"));
+            }
+        }
         Some(Cmd::Balance) => {
             match wallet.balance() {
                 Ok(balance) => {
@@ -347,6 +432,11 @@ async fn main() -> anyhow::Result<()> {
                     return Err(e);
                 }
             }
+            return Ok(());
+        }
+        Some(Cmd::RebuildRing) => {
+            db.rebuild_ring_state()?;
+            println!("🔄 Rebuilt ring state from canonical chain");
             return Ok(());
         }
         None => {

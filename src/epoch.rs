@@ -3,6 +3,8 @@ use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use rocksdb::WriteBatch;
+use bincode;
+use crate::ring_transfer::RingTransfer;
 // anyhow not used in this module currently
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -10,6 +12,7 @@ pub struct Anchor {
     pub num:          u64,
     pub hash:         [u8; 32],
     pub merkle_root:  [u8; 32],
+    pub transfers_root: [u8; 32],
     pub difficulty:   usize,
     pub coin_count:   u32,
     pub cumulative_work: u128,
@@ -163,6 +166,50 @@ impl MerkleTree {
     }
 }
 
+/// Build a Merkle root from an ordered list of 32-byte hashes.
+pub fn build_hash_list_root(mut items: Vec<[u8;32]>) -> [u8;32] {
+    if items.is_empty() { return [0u8;32]; }
+    items.sort();
+    let mut level = items;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for chunk in level.chunks(2) {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&chunk[0]);
+            hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+            next.push(*hasher.finalize().as_bytes());
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Build a Merkle proof for a target hash within a sorted list of 32-byte hashes.
+pub fn build_hash_list_proof(items: &[ [u8;32] ], target: &[u8;32]) -> Option<Vec<([u8;32], bool)>> {
+    if items.is_empty() { return None; }
+    let mut level: Vec<[u8;32]> = items.to_vec();
+    let mut idx = level.iter().position(|h| h == target)?;
+    let mut proof = Vec::new();
+    while level.len() > 1 {
+        let (sib, sib_is_left) = if idx % 2 == 0 {
+            (*level.get(idx + 1).unwrap_or(&level[idx]), false)
+        } else {
+            (level[idx - 1], true)
+        };
+        proof.push((sib, sib_is_left));
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for chunk in level.chunks(2) {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&chunk[0]);
+            hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+            next.push(*hasher.finalize().as_bytes());
+        }
+        idx /= 2;
+        level = next;
+    }
+    Some(proof)
+}
+
 pub struct Manager {
     db:   Arc<Store>,
     cfg:  crate::config::Epoch,
@@ -195,6 +242,25 @@ impl Manager {
                 Err(_) => 0,
             };
 
+            // Read last anchor timestamp to align next tick and enforce minimum spacing across restarts
+            let mut initial_delay = time::Duration::from_secs(0);
+            if current_epoch > 0 {
+                if let Some(head_cf) = self.db.db.cf_handle("head") {
+                    if let Ok(Some(ts_bytes)) = self.db.db.get_cf(head_cf, b"last_anchor_ts") {
+                        if ts_bytes.len() == 8 {
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(&ts_bytes);
+                            let last_ts = u64::from_le_bytes(arr);
+                            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let target = last_ts.saturating_add(self.cfg.seconds);
+                            if now_secs < target {
+                                initial_delay = time::Duration::from_secs(target - now_secs);
+                            }
+                        }
+                    }
+                }
+            }
+
             if current_epoch == 0 {
                 println!("🔄 Initial network synchronization phase...");
                 self.net.request_latest_epoch().await;
@@ -223,8 +289,9 @@ impl Manager {
             }
 
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
-            // Tick immediately on startup so genesis or the first epoch can be processed without waiting a full period
-            let mut ticker = time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds));
+            // Align first tick to previous anchor timestamp + cfg.seconds if available
+            let start_instant = time::Instant::now() + initial_delay;
+            let mut ticker = time::interval_at(start_instant, time::Duration::from_secs(self.cfg.seconds));
 
             loop {
                 tokio::select! {
@@ -238,6 +305,22 @@ impl Manager {
                         crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
                     },
                     _ = ticker.tick() => {
+                        // Enforce minimum wall-clock spacing even if ticker fires early due to clock drift
+                        if let Some(head_cf) = self.db.db.cf_handle("head") {
+                            if let Ok(Some(ts_bytes)) = self.db.db.get_cf(head_cf, b"last_anchor_ts") {
+                                if ts_bytes.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&ts_bytes);
+                                    let last_ts = u64::from_le_bytes(arr);
+                                    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    let target = last_ts.saturating_add(self.cfg.seconds);
+                                    if now_secs < target {
+                                        let sleep_for = target - now_secs;
+                                        tokio::time::sleep(std::time::Duration::from_secs(sleep_for)).await;
+                                    }
+                                }
+                            }
+                        }
                         if current_epoch > 0 {
                             if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
                                 if latest_anchor.num >= current_epoch {
@@ -320,10 +403,12 @@ impl Manager {
                             tmp[0]
                         };
                         // Anchor hash commits to merkle_root and previous anchor hash (if any)
+                        // transfers_root will be computed later; for now, placeholder zero included for forward compat
                         let hash = {
                             let mut h = blake3::Hasher::new();
                             h.update(&merkle_root);
                             if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
+                            h.update(&[0u8;32]); // placeholder transfers_root
                             *h.finalize().as_bytes()
                         };
                         
@@ -347,6 +432,7 @@ impl Manager {
                             num: current_epoch, 
                             hash,
                             merkle_root,
+                            transfers_root: [0u8;32],
                             difficulty, 
                             coin_count: selected_ids.len() as u32, 
                             cumulative_work, 
@@ -382,6 +468,82 @@ impl Manager {
                                 }
                             }
                         }
+                        // Accept transfers from mempool into this epoch (deterministic filter)
+                        if let Some(mempool_cf) = self.db.db.cf_handle("tx_mempool") {
+                            // Iterate mempool (small expected volume). For production, index by coin_id prefix.
+                            let iter = self.db.db.iterator_cf(mempool_cf, rocksdb::IteratorMode::Start);
+                            let mut accepted_ring_txs: Vec<[u8;32]> = Vec::new();
+                            for item in iter {
+                                if let Ok((_k, v)) = item {
+                                    if let Ok(tx) = bincode::deserialize::<crate::transfer::Transfer>(&v) {
+                                        // Validate against current tip using shared logic
+                                        if tx.validate(&self.db).is_ok() {
+                                            // Append to history immediately (atomic with tip)
+                                            if let Ok(_) = self.db.append_transfer_if_tip_matches(&tx) {
+                                                // Mark inclusion epoch for auditing
+                                                let incl = crate::transfer::TransferInclusion { transfer: tx.clone(), epoch_num: current_epoch };
+                                                if let Some(te_cf) = self.db.db.cf_handle("transfer_epoch") {
+                                                    let key = tx.hash();
+                                                    if let Ok(incl_bytes) = bincode::serialize(&incl) {
+                                                        batch.put_cf(te_cf, &key, &incl_bytes);
+                                                    }
+                                                }
+                                                // Remove from mempool (best-effort)
+                                                batch.delete_cf(mempool_cf, &tx.hash());
+                                            }
+                                        }
+                                    } else if let Ok(rtx) = bincode::deserialize::<RingTransfer>(&v) {
+                                        // Verify double-spend and inclusion constraints
+                                        if self.db.get_raw_bytes("ring_tag", &rtx.link_tag.0).ok().flatten().is_none() {
+                                            accepted_ring_txs.push(rtx.hash());
+                                            // Stage write of link tag to prevent double-spend
+                                            if let Some(tag_cf) = self.db.db.cf_handle("ring_tag") {
+                                                batch.put_cf(tag_cf, &rtx.link_tag.0, &current_epoch.to_le_bytes());
+                                            }
+                                            // Persist accepted ring transfer list under epoch after loop
+                                            // Remove from mempool
+                                            batch.delete_cf(mempool_cf, &rtx.hash());
+                                        }
+                                    }
+                                }
+                            }
+                        // Persist accepted ring transfers list (sorted) and optional leaves cache, and update anchor.transfers_root
+                            accepted_ring_txs.sort();
+                            if let Ok(bytes) = bincode::serialize(&accepted_ring_txs) {
+                                if let Some(er_cf) = self.db.db.cf_handle("epoch_ring_transfers") {
+                                    batch.put_cf(er_cf, &current_epoch.to_le_bytes(), &bytes);
+                                }
+                            }
+                        // Compute transfers_root and update anchor (rewrite epoch/latest entries)
+                        let transfers_root = if accepted_ring_txs.is_empty() { [0u8;32] } else {
+                            let mut h = blake3::Hasher::new();
+                            for th in &accepted_ring_txs { h.update(th); }
+                            *h.finalize().as_bytes()
+                        };
+                        let mut anchor = anchor.clone();
+                        anchor.transfers_root = transfers_root;
+                        // Recompute hash including transfers_root
+                        let hash2 = if self.cfg.include_transfers_root_in_hash {
+                            let mut h = blake3::Hasher::new();
+                            h.update(&anchor.merkle_root);
+                            if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
+                            h.update(&anchor.transfers_root);
+                            *h.finalize().as_bytes()
+                        } else {
+                            let mut h = blake3::Hasher::new();
+                            h.update(&anchor.merkle_root);
+                            if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
+                            *h.finalize().as_bytes()
+                        };
+                        anchor.hash = hash2;
+                        let serialized_anchor2 = match bincode::serialize(&anchor) {
+                            Ok(d) => d,
+                            Err(e) => { eprintln!("Failed to serialize anchor2: {}", e); continue; }
+                        };
+                        batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor2);
+                        batch.put_cf(epoch_cf, b"latest", &serialized_anchor2);
+                        if let Some(anchor_cf) = self.db.db.cf_handle("anchor") { batch.put_cf(anchor_cf, &anchor.hash, &serialized_anchor2); }
+                        }
                         if let Some(sel_cf) = self.db.db.cf_handle("epoch_selected") {
                             // Key: epoch number (little endian) || coin_id
                             for coin in &selected_ids {
@@ -395,6 +557,11 @@ impl Manager {
                         
                         if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
                             batch.put_cf(anchor_cf, &hash, &serialized_anchor);
+                        }
+                        // Persist last anchor timestamp for tick alignment across restarts
+                        if let Some(head_cf) = self.db.db.cf_handle("head") {
+                            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            batch.put_cf(head_cf, b"last_anchor_ts", &now_secs.to_le_bytes());
                         }
                         
                         if let Err(e) = self.db.write_batch(batch) {

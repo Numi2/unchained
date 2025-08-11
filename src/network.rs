@@ -22,6 +22,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
+use blake3;
+use rand::RngCore;
+use serde_big_array::BigArray;
+#[cfg(feature = "ring_mock")]
+use crate::ringsig::MockLlrs as Llrs;
+#[cfg(not(feature = "ring_mock"))]
+use crate::ringsig::NoLlrs as Llrs;
+use crate::ringsig::RingSignatureScheme;
+use crate::ring_transfer::RingTransfer;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -57,10 +66,16 @@ const TOP_ANCHOR: &str = "unchained/anchor/v1";
 const TOP_COIN: &str = "unchained/coin/v1";
 const TOP_COIN_PROOF_REQUEST: &str = "unchained/coin_proof_request/v1";
 const TOP_COIN_PROOF_RESPONSE: &str = "unchained/coin_proof_response/v1";
+const TOP_RING_PROOF_REQUEST: &str = "unchained/ring_proof_request/v1";
+const TOP_RING_PROOF_RESPONSE: &str = "unchained/ring_proof_response/v1";
 const TOP_TX: &str = "unchained/tx/v1";
+const TOP_RING_TX: &str = "unchained/ring_tx/v1";
+const TOP_TX_ACCEPTED: &str = "unchained/tx_accepted/v1"; // transfer included in epoch
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
+const TOP_PQ_ID_REQ: &str = "unchained/pq_id_req/v1";
+const TOP_PQ_ID_RESP: &str = "unchained/pq_id_resp/v1";
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -144,10 +159,22 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
 fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
     use pqcrypto_dilithium::dilithium3::{PublicKey, DetachedSignature, verify_detached_signature};
     let coin: Coin = db.get("coin", &tx.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
-    if db.get::<Transfer>("transfer", &tx.coin_id).unwrap().is_some() { return Err("Double-spend detected".into()); }
     let sender_pk = PublicKey::from_bytes(&tx.sender_pk).map_err(|_| "Invalid sender PK")?;
     let sender_addr = crypto::address_from_pk(&sender_pk);
-    if sender_addr != coin.creator_address { return Err("Sender is not coin creator".into()); }
+
+    // Determine expected owner and prev hash from tip (multi-hop)
+    let (expected_owner_addr, expected_prev_hash) = match db.get_transfer_tip(&tx.coin_id).map_err(|e| e.to_string())? {
+        Some(tip) if tip.last_seq > 0 => {
+            let last = db.get_last_transfer_for_coin(&tx.coin_id).map_err(|e| e.to_string())?
+                .ok_or_else(|| "Inconsistent tip".to_string())?;
+            (last.recipient(), tip.last_hash)
+        }
+        _ => (coin.creator_address, tx.coin_id),
+    };
+
+    if sender_addr != expected_owner_addr { return Err("Sender is not current owner".into()); }
+    if tx.prev_tx_hash != expected_prev_hash { return Err("Invalid prev_tx_hash".into()); }
+
     let sig = DetachedSignature::from_bytes(&tx.sig).map_err(|_| "Invalid signature")?;
     if verify_detached_signature(&sig, &tx.signing_bytes(), &sender_pk).is_err() { return Err("Invalid signature".into()); }
     if tx.to == [0u8; 32] { return Err("Invalid recipient".into()); }
@@ -197,6 +224,17 @@ pub struct CoinProofResponse {
     pub proof: Vec<([u8; 32], bool)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqIdRequest { pub nonce: [u8;32] }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqIdResponse {
+    pub peer_id: String,
+    #[serde(with = "BigArray")] pub pk: [u8; crate::crypto::DILITHIUM3_PK_BYTES],
+    #[serde(with = "BigArray")] pub sig: [u8; crate::crypto::DILITHIUM3_SIG_BYTES],
+    pub nonce: [u8;32],
+}
+
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
@@ -205,14 +243,18 @@ pub struct Network {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipTransfer(Transfer),
+        GossipRingTransfer(RingTransfer),
     RequestEpoch(u64),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
     RequestCoinProof([u8; 32]),
+    /// Internal: request PQ identity proof handshake from remote
+    RequestPqIdentity(PeerId),
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -268,7 +310,7 @@ pub async fn spawn(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!(e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE] {
+    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_RING_TX, TOP_TX_ACCEPTED, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE, TOP_RING_PROOF_REQUEST, TOP_RING_PROOF_RESPONSE, TOP_PQ_ID_REQ, TOP_PQ_ID_RESP] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -315,6 +357,9 @@ pub async fn spawn(
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
     let mut orphan_anchors: HashMap<u64, Anchor> = HashMap::new();
     let mut connected_peers: HashSet<PeerId> = HashSet::new();
+    let mut pq_verified: HashMap<PeerId, bool> = HashMap::new();
+    let mut pq_nonces: HashMap<PeerId, [u8;32]> = HashMap::new();
+    let (pq_pk, pq_sk) = crate::crypto::dilithium3_keypair();
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -329,16 +374,24 @@ pub async fn spawn(
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             connected_peers.insert(peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
+                            // Send PQ identity request
+                            let mut nonce = [0u8;32]; rand::thread_rng().fill_bytes(&mut nonce);
+                            pq_nonces.insert(peer_id, nonce);
+                            if let Ok(bytes) = bincode::serialize(&PqIdRequest{ nonce }) {
+                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_PQ_ID_REQ), bytes);
+                            }
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
                                 NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                  NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                                 NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                                 NetworkCommand::GossipRingTransfer(tx) => (TOP_RING_TX, bincode::serialize(&tx).ok()),
                                 NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                 NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                 NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                                 NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                                NetworkCommand::RequestPqIdentity(_p) => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                             };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
@@ -353,7 +406,7 @@ pub async fn spawn(
                             connected_peers.remove(&peer_id);
                             crate::metrics::PEERS.set(connected_peers.len() as i64);
                         },
-                        SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
+                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let peer_id = message.source.unwrap_or_else(PeerId::random);
                             let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
@@ -361,7 +414,7 @@ pub async fn spawn(
                             let rate_limit_exempt = topic_str == TOP_ANCHOR;
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
-                            match topic_str {
+                             match topic_str {
                                 TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
                                     // Ignore duplicate anchors we have already stored to reduce log and CPU spam
                                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
@@ -377,6 +430,15 @@ pub async fn spawn(
                                     // If it fails because the parent is missing, buffer it.
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
+                                             // Verify transfers_root commitment if available (optional, forward-compatible)
+                                             if let Ok(Some(list_bytes)) = db.get_raw_bytes("epoch_ring_transfers", &a.num.to_le_bytes()) {
+                                                 if let Ok(hashes) = bincode::deserialize::<Vec<[u8;32]>>(&list_bytes) {
+                                                     let mut h = blake3::Hasher::new();
+                                                     for th in &hashes { h.update(th); }
+                                                     let tr = *h.finalize().as_bytes();
+                                                     if tr != a.transfers_root { continue; }
+                                                 }
+                                             }
                                             if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
                                                 net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
@@ -467,10 +529,43 @@ pub async fn spawn(
                                 },
                                 TOP_TX => if let Ok(tx) = bincode::deserialize::<Transfer>(&message.data) {
                                     if validate_transfer(&tx, &db).is_ok() {
-                                        db.put("transfer", &tx.coin_id, &tx).ok();
+                                        // Do not append immediately; add to mempool, finalization will include it in an epoch
+                                        if db.put_mempool_tx(&tx).is_err() {
+                                            crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
+                                        }
                                     } else {
                                         crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
                                         score.record_validation_failure();
+                                    }
+                                },
+                                TOP_RING_TX => if let Ok(rtx) = bincode::deserialize::<RingTransfer>(&message.data) {
+                                    let scheme = Llrs{};
+                                    let msg = {
+                                        // Rebuild binding message: to || "ring_tx" || BLAKE3(concat(ring_pubkeys)) || recipient_one_time
+                                        let mut v = Vec::new();
+                                        v.extend_from_slice(&rtx.to);
+                                        let mut concat = Vec::new();
+                                        for m in &rtx.ring_members { concat.extend_from_slice(&m.0); }
+                                        let ring_root = crate::crypto::blake3_hash(&concat);
+                                        v.extend_from_slice(b"ring_tx");
+                                        v.extend_from_slice(&ring_root);
+                                        v.extend_from_slice(&rtx.recipient_one_time.0);
+                                        v
+                                    };
+                                    // Verify ring sig and ensure link_tag not seen
+                                    match scheme.verify(&msg, &rtx.ring_members, &rtx.signature, &rtx.link_tag) {
+                                        Ok(true) => {
+                                            // Check double-spend by link tag
+                                            if db.get_raw_bytes("ring_tag", &rtx.link_tag.0).ok().flatten().is_none() {
+                                                let _ = db.put_ring_mempool_tx(&rtx);
+                                                // Save full tx for future reorg rebuild
+                                                let _ = db.put_ring_tx(&rtx);
+                                            }
+                                        },
+                                        _ => {
+                                            crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 },
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
@@ -536,9 +631,42 @@ pub async fn spawn(
                                         }
                                     }
                                 },
-                                TOP_COIN_PROOF_RESPONSE => if let Ok(resp) = bincode::deserialize::<CoinProofResponse>(&message.data) {
+                                 TOP_COIN_PROOF_RESPONSE => if let Ok(resp) = bincode::deserialize::<CoinProofResponse>(&message.data) {
                                     let _ = proof_tx.send(resp);
                                 },
+                                 TOP_PQ_ID_REQ => if let Ok(req) = bincode::deserialize::<PqIdRequest>(&message.data) {
+                                     let my_peer_id = swarm.local_peer_id().to_string();
+                                     let mut msg = Vec::new();
+                                     msg.extend_from_slice(b"pq_id");
+                                     msg.extend_from_slice(my_peer_id.as_bytes());
+                                     msg.extend_from_slice(&req.nonce);
+                                     let sig = pqcrypto_dilithium::dilithium3::detached_sign(&msg, &pq_sk);
+                                     let mut pk_arr = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+                                     pk_arr.copy_from_slice(pq_pk.as_bytes());
+                                     let mut sig_arr = [0u8; crate::crypto::DILITHIUM3_SIG_BYTES];
+                                     sig_arr.copy_from_slice(sig.as_bytes());
+                                     let resp = PqIdResponse { peer_id: my_peer_id, pk: pk_arr, sig: sig_arr, nonce: req.nonce };
+                                     if let Ok(bytes) = bincode::serialize(&resp) {
+                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_PQ_ID_RESP), bytes);
+                                     }
+                                 },
+                                 TOP_PQ_ID_RESP => if let Ok(resp) = bincode::deserialize::<PqIdResponse>(&message.data) {
+                                     if let Some(nonce) = pq_nonces.get(&peer_id) {
+                                         if &resp.nonce == nonce {
+                                             if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&resp.pk) {
+                                                 if let Ok(sig) = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&resp.sig) {
+                                                     let mut msg = Vec::new();
+                                                     msg.extend_from_slice(b"pq_id");
+                                                     msg.extend_from_slice(resp.peer_id.as_bytes());
+                                                     msg.extend_from_slice(&resp.nonce);
+                                                     if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &msg, &pk).is_ok() {
+                                                         pq_verified.insert(peer_id, true);
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 },
                                 _ => {}
                             }
                         },
@@ -550,10 +678,12 @@ pub async fn spawn(
                         NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                         NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
                         NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                        NetworkCommand::GossipRingTransfer(tx) => (TOP_RING_TX, bincode::serialize(&tx).ok()),
                         NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                         NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                         NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                         NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                        NetworkCommand::RequestPqIdentity(_p) => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                     };
                     if let Some(d) = data {
                         if swarm.behaviour_mut().publish(IdentTopic::new(topic), d.clone()).is_err() {
@@ -571,6 +701,7 @@ impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &CoinCandidate) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
     pub async fn gossip_transfer(&self, tx: &Transfer) { let _ = self.command_tx.send(NetworkCommand::GossipTransfer(tx.clone())); }
+    pub async fn gossip_ring_transfer(&self, tx: &RingTransfer) { let _ = self.command_tx.send(NetworkCommand::GossipRingTransfer(tx.clone())); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }

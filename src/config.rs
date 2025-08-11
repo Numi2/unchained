@@ -27,6 +27,9 @@ pub struct Net {
     pub public_ip: Option<String>,
     #[serde(default = "default_sync_timeout")]
     pub sync_timeout_secs: u64,
+    /// Enforce application-layer PQ identity proof (Dilithium3) on connections
+    #[serde(default)]
+    pub require_pq_identity: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -58,6 +61,10 @@ pub struct Epoch {
     pub max_coins_per_epoch: u32,
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
+    /// If true, anchor.hash commits to transfers_root as well as merkle_root and prev.hash.
+    /// Default is false for legacy compatibility.
+    #[serde(default)]
+    pub include_transfers_root_in_hash: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -123,9 +130,30 @@ pub fn load<P: AsRef<Path>>(p: P) -> Result<Config> {
         .with_context(|| "📝  invalid TOML in config file".to_string())?;
     warn_unknown_keys(&val);
     let mut cfg: Config = val.try_into().with_context(|| "📝  invalid config schema".to_string())?;
-    // Sanity clamps
+    // Strict validation with safe bounds
+    if cfg.epoch.seconds < 222 {
+        anyhow::bail!("epoch.seconds must be at least 222 seconds");
+    }
+    if !(1..=12).contains(&cfg.epoch.target_leading_zeros) {
+        anyhow::bail!("epoch.target_leading_zeros must be between 1 and 12");
+    }
+    if cfg.epoch.max_coins_per_epoch == 0 {
+        anyhow::bail!("epoch.max_coins_per_epoch must be > 0");
+    }
+    if cfg.epoch.target_coins_per_epoch == 0 {
+        anyhow::bail!("epoch.target_coins_per_epoch must be > 0");
+    }
+    if cfg.epoch.max_coins_per_epoch < cfg.epoch.target_coins_per_epoch {
+        eprintln!("⚠️  epoch.max_coins_per_epoch < target_coins_per_epoch; using target as cap");
+        cfg.epoch.max_coins_per_epoch = cfg.epoch.target_coins_per_epoch;
+    }
+    if cfg.mining.min_mem_kib == 0 || cfg.mining.max_mem_kib == 0 || cfg.mining.min_mem_kib > cfg.mining.max_mem_kib {
+        anyhow::bail!("mining min_mem_kib and max_mem_kib must be positive and min <= max");
+    }
     if cfg.mining.mem_kib < cfg.mining.min_mem_kib { cfg.mining.mem_kib = cfg.mining.min_mem_kib; }
     if cfg.mining.mem_kib > cfg.mining.max_mem_kib { cfg.mining.mem_kib = cfg.mining.max_mem_kib; }
+    if cfg.net.listen_port == 0 { anyhow::bail!("net.listen_port must be > 0"); }
+    if cfg.p2p.max_messages_per_window == 0 { anyhow::bail!("p2p.max_messages_per_window must be > 0"); }
     Ok(cfg)
 }
 
@@ -148,7 +176,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ]),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
                 ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval"
+                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval","include_transfers_root_in_hash"
                 ]),
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment"

@@ -7,11 +7,13 @@ pub mod storage;
 pub mod epoch;
 pub mod coin;
 pub mod transfer;
+pub mod ring_transfer;
 pub mod miner;
 pub mod network;
 pub mod sync;
 pub mod metrics;
 pub mod wallet;
+pub mod ringsig;
 
 // Re-export commonly used types for convenience
 pub use coin::Coin;
