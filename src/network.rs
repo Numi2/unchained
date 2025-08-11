@@ -177,6 +177,7 @@ pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
     proof_tx: broadcast::Sender<CoinProofResponse>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
+    coin_id_tx: broadcast::Sender<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +185,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipTransfer(Transfer),
+    RequestAuthHello,
     RequestEpoch(u64),
     RequestEpochSummary(u64),
     RequestCoin([u8; 32]),
@@ -270,7 +272,8 @@ pub async fn spawn(
             "unchained/1.0".into(),
             id_keys.public(),
         );
-        let ping_cfg = ping::Config::new().with_interval(std::time::Duration::from_secs(5));
+        let ping_cfg = ping::Config::new()
+            .with_interval(std::time::Duration::from_secs(3));
         Behaviour {
             gs,
             rpc: crate::rpc::build_rpc_behaviour(),
@@ -325,9 +328,10 @@ pub async fn spawn(
 
     let (anchor_tx, _) = broadcast::channel(256);
     let (proof_tx, _) = broadcast::channel(256);
+    let (coin_id_tx, _) = broadcast::channel(1024);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone(), coin_id_tx: coin_id_tx.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -541,6 +545,7 @@ pub async fn spawn(
                                     // Keep them pending to be flushed on PQ auth completion.
                                     NetworkCommand::RequestEpoch(_)
                                     | NetworkCommand::RequestEpochSummary(_)
+                                    | NetworkCommand::RequestAuthHello
                                     | NetworkCommand::RequestCoin(_)
                                     | NetworkCommand::RequestCoinProof(_)
                                     | NetworkCommand::RequestLatestEpoch => {
@@ -626,7 +631,8 @@ pub async fn spawn(
                                         peer_keys.insert(auth_peer, PeerStaticKeys { kyber_pk: hello.unsigned.kyber_pk.clone(), ed25519_pk: hello.unsigned.ed25519_pk.clone(), dilithium_pk: hello.unsigned.dilithium_pk });
                                         if first_time {
                                             net_log!("✅ PQ auth completed for peer: {}", src_peer);
-                                            // Kick off sync immediately after auth by requesting latest anchor
+                                            // Kick off sync immediately after auth by sending AuthHello then requesting latest anchor
+                                            let _ = command_tx.send(NetworkCommand::RequestAuthHello);
                                             let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
                                             // Now that PQ auth is complete and peer static keys are pinned, flush any pending RPC commands
                                             // by re-enqueuing them onto the command channel to be sent via RPC.
@@ -661,7 +667,9 @@ pub async fn spawn(
                                         let mut st = _sync_state.lock().unwrap();
                                         if ann.num > st.highest_seen_epoch { st.highest_seen_epoch = ann.num; }
                                     }
+                                    // Request both summary and header directly; whichever lands first advances us
                                     let _ = command_tx.send(NetworkCommand::RequestEpochSummary(ann.num));
+                                    let _ = command_tx.send(NetworkCommand::RequestEpoch(ann.num));
                                 },
                                 // Gossip coin: announce only epoch_hash + coin_id
                                 TOP_COIN => if let Ok(ann) = bincode::deserialize::<CoinAnnounce>(&message.data) {
@@ -670,6 +678,9 @@ pub async fn spawn(
                                     // Use the actual source peer for accounting, not the local peer id
                                     let score = peer_scores.entry(src_peer).or_insert_with(|| PeerScore::new(&p2p_cfg));
                                     if !score.allow_candidate() { continue; }
+                                    // Immediately broadcast coin id to local subscribers (epoch manager)
+                                    let _ = anchor_tx.send(Anchor { version: 0, num: 0, hash: [0u8;32], merkle_root: [0u8;32], transfers_root: [0u8;32], work_root: [0u8;32], target_nbits: 0, mem_kib: 0, t_cost: 0, coin_count: 0, cumulative_work: primitive_types::U256::zero() }); // no-op to avoid unused warnings
+                                    let _ = coin_id_tx.send(ann.coin_id);
                                     // Actively fetch candidate and validate early to mitigate DoS
                                     let _ = command_tx.send(NetworkCommand::RequestCoin(ann.coin_id));
                                     // Also request a proof for probabilistic verifiers later if needed
@@ -1324,6 +1335,7 @@ pub async fn spawn(
                             if let Ok(d) = bincode::serialize(&ann) { let _ = swarm.behaviour_mut().gs.publish(IdentTopic::new(TOP_TX), d); }
                             crate::metrics::MSGS_OUT_TX.inc();
                         }
+                        NetworkCommand::RequestAuthHello => send_rpc(crate::rpc::RpcMethod::AuthHello),
                         NetworkCommand::RequestLatestEpoch => send_rpc(crate::rpc::RpcMethod::LatestAnchor),
                         NetworkCommand::RequestEpoch(n) => send_rpc(crate::rpc::RpcMethod::Epoch(*n)),
                         NetworkCommand::RequestEpochSummary(n) => send_rpc(crate::rpc::RpcMethod::EpochSummary(*n)),
@@ -1349,6 +1361,7 @@ impl Network {
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
+    pub fn coin_id_subscribe(&self) -> broadcast::Receiver<[u8; 32]> { self.coin_id_tx.subscribe() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }

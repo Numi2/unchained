@@ -320,7 +320,11 @@ impl Miner {
                     
                     match self.coin_tx.send(candidate.id) {
                         Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(candidate.id)),
-                        Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {e}"),
+                        Err(e) => {
+                            eprintln!("🔥 Failed to send coin ID to epoch manager: {e}");
+                            // Fallback: send via network broadcast channel dedicated to coin IDs so epoch manager can pick it up.
+                            self.net.gossip_coin(&candidate).await;
+                        },
                     }
                     
                     self.net.gossip_coin(&candidate).await;

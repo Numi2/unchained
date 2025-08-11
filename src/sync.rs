@@ -4,12 +4,12 @@ use std::{collections::HashMap, sync::{Arc, Mutex}};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 use std::time::Instant;
 
-const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
+const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 24;
 const SYNC_CHECK_INTERVAL_SECS: u64 = 1;
 // When fully synced, only poll peers for the latest epoch every this many seconds
-const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
+const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 10;
 // Dedupe repeated requests for the same epoch within this TTL window to avoid network spam
-const EPOCH_REQ_DEDUP_TTL_SECS: u64 = 10;
+const EPOCH_REQ_DEDUP_TTL_SECS: u64 = 3;
 
 #[derive(Debug)]
 pub struct SyncState {
@@ -39,10 +39,9 @@ pub fn spawn(
         let mut idle_poll_timer = interval(Duration::from_secs(SYNC_IDLE_POLL_INTERVAL_SECS));
         let recent_epoch_reqs: Arc<Mutex<HashMap<u64, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        // On startup, proactively reconcile our current tip with the network to detect any divergence early.
-        if local_epoch > 0 {
-            net.request_epoch(local_epoch).await;
-        }
+        // On startup, immediately ask the network for the latest anchor and the next few epochs
+        net.request_latest_epoch().await;
+        if local_epoch > 0 { net.request_epoch(local_epoch + 1).await; }
 
         loop {
             tokio::select! {
@@ -71,6 +70,9 @@ pub fn spawn(
                             // Even if the range is unchanged, re-request only truly missing epochs (respecting dedupe TTL)
                             request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db, &recent_epoch_reqs).await;
                         }
+                        // Proactively request a small lookahead to absorb races
+                        let lookahead = highest_seen.saturating_add(2);
+                        request_missing_epochs(local_epoch, lookahead, &net, &semaphore, &db, &recent_epoch_reqs).await;
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             if latest_anchor.num != local_epoch {
                                 local_epoch = latest_anchor.num;

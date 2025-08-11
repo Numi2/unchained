@@ -374,6 +374,7 @@ pub struct Manager {
     anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     shutdown_rx: broadcast::Receiver<()>,
+    net_coin_rx: tokio::sync::broadcast::Receiver<[u8;32]>,
 }
 impl Manager {
     pub fn new(
@@ -386,7 +387,8 @@ impl Manager {
         shutdown_rx: broadcast::Receiver<()>
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx }
+        let net_coin_rx = net.coin_id_subscribe();
+        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, net_coin_rx }
     }
 
     
@@ -475,6 +477,10 @@ impl Manager {
                         break;
                     }
                     Some(id) = self.coin_rx.recv() => { 
+                        buffer.insert(id);
+                        crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
+                    },
+                    Ok(id) = self.net_coin_rx.recv() => {
                         buffer.insert(id);
                         crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
                     },
