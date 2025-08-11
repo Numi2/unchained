@@ -30,10 +30,16 @@ tiny_http = "0.12"
 serde-big-array = "0.5"
 # Using QUIC with post-quantum preference; remove unused libp2p subcrates to avoid version conflicts
 ml-kem = "0.2.1"
+# Post-quantum KEM (Kyber768) for stealth outputs
+pqcrypto-kyber = "0.8"
+# AEAD for encrypting one-time secret keys in stealth outputs
+aes-gcm-siv = "0.11"
+base64 = "0.22"
 # Dependencies for TLS certificate generation and post-quantum cryptography
 rcgen = "0.13"
 rustls = { version = "0.23.22", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 webpki-roots = "0.26"
+tokio-rustls = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 postcard = "1.1.3"
 bytes = "1.10.1"

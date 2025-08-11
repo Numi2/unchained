@@ -58,6 +58,16 @@ pub struct Epoch {
     pub max_coins_per_epoch: u32,
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
+    /// Minimum/maximum difficulty clamp for retargeting
+    #[serde(default = "default_difficulty_min")]
+    pub difficulty_min: usize,
+    #[serde(default = "default_difficulty_max")]
+    pub difficulty_max: usize,
+    /// Percent thresholds for retargeting windows (e.g., 110 = 110%)
+    #[serde(default = "default_retarget_upper_pct")]
+    pub retarget_upper_pct: u64,
+    #[serde(default = "default_retarget_lower_pct")]
+    pub retarget_lower_pct: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -72,6 +82,21 @@ pub struct Mining {
     pub max_mem_kib: u32,
     #[serde(default = "default_max_memory_adjustment")]
     pub max_memory_adjustment: f64,
+    /// Miner heartbeat timeout interval (seconds)
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Maximum attempts per epoch before giving up
+    #[serde(default = "default_max_mining_attempts")]
+    pub max_attempts: u64,
+    /// Attempts between runtime yield/anchor checks
+    #[serde(default = "default_check_interval_attempts")]
+    pub check_interval_attempts: u64,
+    /// Number of parallel mining workers (logical threads)
+    #[serde(default = "default_workers")]
+    pub workers: u32,
+    /// Offload Argon2 hashing to blocking threads
+    #[serde(default = "default_offload_blocking")]
+    pub offload_blocking: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,6 +111,10 @@ fn default_bind() -> String { "127.0.0.1:9100".into() }
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
 fn default_retarget_interval() -> u64 { 10 }
+fn default_difficulty_min() -> usize { 1 }
+fn default_difficulty_max() -> usize { 12 }
+fn default_retarget_upper_pct() -> u64 { 110 }
+fn default_retarget_lower_pct() -> u64 { 90 }
 
 
 // Mining memory retargeting defaults
@@ -97,6 +126,9 @@ pub fn default_max_memory_adjustment() -> f64 { 1.5 }
 pub fn default_heartbeat_interval() -> u64 { 30 }  // 30 seconds
 pub fn default_max_consecutive_failures() -> u32 { 5 }
 pub fn default_max_mining_attempts() -> u64 { 1_000_000 }
+fn default_check_interval_attempts() -> u64 { 1_000 }
+fn default_workers() -> u32 { 1 }
+fn default_offload_blocking() -> bool { true }
 
 // Network defaults for production deployment
 fn default_max_peers() -> u32 { 100 }
@@ -148,10 +180,10 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ]),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
                 ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval"
+                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval","difficulty_min","difficulty_max","retarget_upper_pct","retarget_lower_pct"
                 ]),
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment"
+                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","check_interval_attempts","workers","offload_blocking"
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind"]),
                 _ => {}

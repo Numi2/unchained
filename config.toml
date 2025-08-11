@@ -3,12 +3,14 @@
 [net]
 # Port to listen on for P2P connections
 listen_port = 31000
-# Path to the Iroh secret key
-iroh_key_path = "iroh.key"
+
+
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 133337
+
 # Connection timeout in seconds
 connection_timeout_secs = 300
+
 # Timeout for initial network sync in seconds
 sync_timeout_secs = 1800
 

@@ -22,6 +22,11 @@ pub const DILITHIUM3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIU
 pub const DILITHIUM3_SK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
 pub const DILITHIUM3_SIG_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES;
 
+// Kyber768 sizes for ciphertext and public key
+pub const KYBER768_CT_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
+pub const KYBER768_PK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_PUBLICKEYBYTES;
+pub const KYBER768_SK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_SECRETKEYBYTES;
+
 /// A 32-byte address, derived from a BLAKE3 hash of a public key.
 /// This provides a fixed-size, user-friendly identifier.
 pub type Address = [u8; 32];
@@ -92,6 +97,20 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
     keypair()
 }
 
+/// Compute a PQ-safe nullifier bound to a secret spend key and coin id.
+/// N = BLAKE3("nullifier_v2" || sk_bytes || coin_id)
+pub fn compute_nullifier_v2(sk_bytes: &[u8], coin_id: &[u8; 32]) -> [u8; 32] {
+    let mut h = Hasher::new_derive_key("nullifier_v2");
+    h.update(sk_bytes);
+    h.update(coin_id);
+    *h.finalize().as_bytes()
+}
+
+/// Commitment of a stealth output used in spend authorization
+pub fn commitment_of_stealth_output(to_bytes: &[u8]) -> [u8; 32] {
+    blake3_hash(to_bytes)
+}
+
 /// Generate a self-signed X.509 certificate from a libp2p Ed25519 keypair
 /// This cert is used for QUIC's TLS stack authentication
 pub fn generate_self_signed_cert(_id_keys: &identity::Keypair) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -136,10 +155,13 @@ pub fn create_pq_server_config(cert_der: Vec<u8>, private_key_der: Vec<u8>) -> R
         .map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
 
     // Build server config with post-quantum support
-    let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+    let mut config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)?;
+
+    // Prefer PQ/hybrid KEX via aws-lc provider. Set ALPN for HTTP/1.1.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }

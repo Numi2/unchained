@@ -38,8 +38,9 @@ enum Cmd {
             bind: String,
         },
     Send {
+        /// Recipient stealth address (base64-url, from `wallet export-stealth-address`)
         #[arg(long)]
-        to: String,
+        stealth: String,
         #[arg(long)]
         amount: u64,
     },
@@ -196,24 +197,44 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Cmd::ProofServer { bind }) => {
-            // Async Hyper server with simple auth and rate limit
-            use hyper::{Body, Request as HRequest, Response as HResponse, Server, Method, StatusCode};
-            use hyper::service::{make_service_fn, service_fn};
+            // HTTPS server over rustls (aws-lc provider, PQ/hybrid TLS1.3)
+            use hyper::{Body, Request as HRequest, Response as HResponse, Method, StatusCode};
+            use hyper::service::service_fn;
             use std::net::SocketAddr;
+            use tokio_rustls::TlsAcceptor;
+            use tokio::net::TcpListener;
+            use hyper::server::conn::Http;
             let addr: SocketAddr = bind.parse().map_err(|e| anyhow::anyhow!("invalid bind {}: {}", bind, e))?;
             let net_clone = net.clone();
             let auth_token = std::env::var("PROOF_SERVER_TOKEN").ok();
             let rate = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, (std::time::Instant, u32)>::new()));
 
-            let make_svc = make_service_fn(move |_| {
+            // Self-signed cert for local serving
+            let (_cert_der, _key_der) = crypto::generate_self_signed_cert(&libp2p::identity::Keypair::generate_ed25519())?;
+            let tls_cfg = crypto::create_pq_server_config(_cert_der, _key_der)?;
+            let acceptor = TlsAcceptor::from(tls_cfg.clone());
+            let listener = TcpListener::bind(addr).await?;
+            println!("🔐 Proof server (TLS) listening on https://{}", bind);
+
+            loop {
+                let (stream, peer_addr) = listener.accept().await?;
+                let acceptor = acceptor.clone();
                 let net = net_clone.clone();
                 let auth = auth_token.clone();
                 let rate = rate.clone();
-                async move {
-                    Ok::<_, anyhow::Error>(service_fn(move |req: HRequest<Body>| {
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TLS accept error: {}", e);
+                            return;
+                        }
+                    };
+                    let service = service_fn(move |req: HRequest<Body>| {
                         let net = net.clone();
                         let auth = auth.clone();
                         let rate = rate.clone();
+                        let remote_ip = peer_addr.ip().to_string();
                         async move {
                             // Auth
                             if let Some(token) = &auth {
@@ -222,17 +243,11 @@ async fn main() -> anyhow::Result<()> {
                                     return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::UNAUTHORIZED).body(Body::from("unauthorized"))?);
                                 }
                             }
-                            // Simple per-IP rate limit: 5 req / 10s window. Prefer socket addr over XFF unless explicitly trusted.
-                            let ip = req
-                                .extensions()
-                                .get::<SocketAddr>()
-                                .map(|a| a.ip().to_string())
-                                .or_else(|| req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.to_string()))
-                                .unwrap_or_else(|| "unknown".to_string());
+                            // Simple per-IP rate limit: 5 req / 10s window.
                             {
                                 let mut map = rate.lock().await;
                                 let now = std::time::Instant::now();
-                                let entry = map.entry(ip.clone()).or_insert((now, 0));
+                                let entry = map.entry(remote_ip.clone()).or_insert((now, 0));
                                 if now.duration_since(entry.0) > std::time::Duration::from_secs(10) { *entry = (now, 0); }
                                 entry.1 += 1;
                                 if entry.1 > 5 { return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::TOO_MANY_REQUESTS).body(Body::from("rate limit"))?); }
@@ -274,37 +289,28 @@ async fn main() -> anyhow::Result<()> {
                                 Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found"))?)
                             }
                         }
-                    }))
-                }
-            });
-            println!("🌐 Proof server listening on http://{}", bind);
-            // Run server in foreground and await shutdown via Ctrl+C
-            if let Err(e) = Server::bind(&addr).serve(make_svc).await {
-                eprintln!("proof server error: {}", e);
+                    });
+                    if let Err(e) = Http::new().serve_connection(tls_stream, service).await {
+                        eprintln!("HTTP serve error: {}", e);
+                    }
+                });
             }
-            return Ok(());
         }
-        Some(Cmd::Send { to, amount }) => {
-            // Parse recipient address
-            let recipient = hex::decode(to)
-                .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
-            if recipient.len() != 32 {
-                return Err(anyhow::anyhow!("Recipient address must be 32 bytes"));
-            }
-            let mut recipient_addr = [0u8; 32];
-            recipient_addr.copy_from_slice(&recipient);
-
-            // Send transfer
-            println!("💰 Sending {} coins to {}", amount, hex::encode(recipient_addr));
-            match wallet.send_transfer(recipient_addr, *amount, &net).await {
-                Ok(transfers) => {
-                    println!("✅ Transfer successful! Sent {} transfers", transfers.len());
-                    for (i, transfer) in transfers.iter().enumerate() {
-                        println!("  Transfer {}: coin {} -> {}", i + 1, hex::encode(transfer.coin_id), hex::encode(transfer.recipient()));
+        Some(Cmd::Send { stealth, amount }) => {
+            println!("💰 Sending {} coins to stealth recipient", amount);
+            match wallet.send_to_stealth_address(stealth, *amount, &net).await {
+                Ok(outcome) => {
+                    let total = outcome.transfers.len() + outcome.spends.len();
+                    println!("✅ Sent {} records ({} legacy transfers, {} spends)", total, outcome.transfers.len(), outcome.spends.len());
+                    for (i, t) in outcome.transfers.iter().enumerate() {
+                        println!("  V1 transfer {}: coin {} -> {}", i + 1, hex::encode(t.coin_id), hex::encode(t.recipient()));
+                    }
+                    for (i, s) in outcome.spends.iter().enumerate() {
+                        println!("  V2 spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
                     }
                 }
                 Err(e) => {
-                    eprintln!("❌ Transfer failed: {}", e);
+                    eprintln!("❌ Send failed: {}", e);
                     return Err(e);
                 }
             }

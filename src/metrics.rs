@@ -17,6 +17,12 @@ pub static VALIDATION_FAIL_TRANSFER: Lazy<IntCounter> = Lazy::new(|| IntCounter:
 pub static DB_WRITE_FAILS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_db_write_failures_total", "Database write failures").unwrap());
 pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_pruned_candidates_total", "Total candidate entries pruned").unwrap());
 pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_selection_threshold_u64", "Threshold (first 8 bytes of pow_hash) for last selected coin").unwrap());
+pub static MINING_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_attempts_total", "Total mining attempts (nonces tried)").unwrap());
+pub static MINING_FOUND: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_solutions_total", "Total found PoW solutions").unwrap());
+pub static MINING_HASH_TIME_MS: Lazy<prometheus::Histogram> = Lazy::new(|| prometheus::Histogram::with_opts(
+    prometheus::HistogramOpts::new("unchained_mining_hash_time_ms", "Argon2 PoW hashing time per attempt (ms)")
+        .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0])
+).unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     REGISTRY.register(Box::new(PEERS.clone()))?;
@@ -32,6 +38,9 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     REGISTRY.register(Box::new(DB_WRITE_FAILS.clone()))?;
     REGISTRY.register(Box::new(PRUNED_CANDIDATES.clone()))?;
     REGISTRY.register(Box::new(SELECTION_THRESHOLD_U64.clone()))?;
+    REGISTRY.register(Box::new(MINING_ATTEMPTS.clone()))?;
+    REGISTRY.register(Box::new(MINING_FOUND.clone()))?;
+    REGISTRY.register(Box::new(MINING_HASH_TIME_MS.clone()))?;
     PEERS.set(0);
 
     // Start metrics server, retrying on port conflicts by incrementing port number.

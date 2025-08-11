@@ -1,5 +1,5 @@
 use crate::{
-    storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Transfer, crypto, config, sync::SyncState,
+    storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::{Transfer, Spend}, crypto, config, sync::SyncState,
 };
 use std::sync::{Arc, Mutex};
 use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
@@ -62,6 +62,7 @@ const TOP_COIN: &str = "unchained/coin/v1";
 const TOP_COIN_PROOF_REQUEST: &str = "unchained/coin_proof_request/v1";
 const TOP_COIN_PROOF_RESPONSE: &str = "unchained/coin_proof_response/v1";
 const TOP_TX: &str = "unchained/tx/v1";
+const TOP_SPEND: &str = "unchained/spend/v2";
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
@@ -148,14 +149,53 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
 fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
     use pqcrypto_dilithium::dilithium3::{PublicKey, DetachedSignature, verify_detached_signature};
     let coin: Coin = db.get("coin", &tx.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
-    if db.get::<Transfer>("transfer", &tx.coin_id).unwrap().is_some() { return Err("Double-spend detected".into()); }
+    // Nullifier unseen check for uniqueness
+    if db.get::<[u8; 1]>("nullifier", &tx.nullifier).unwrap().is_some() {
+        return Err("Nullifier already seen (possible double spend)".into());
+    }
     let sender_pk = PublicKey::from_bytes(&tx.sender_pk).map_err(|_| "Invalid sender PK")?;
     let sender_addr = crypto::address_from_pk(&sender_pk);
     if sender_addr != coin.creator_address { return Err("Sender is not coin creator".into()); }
     let sig = DetachedSignature::from_bytes(&tx.sig).map_err(|_| "Invalid signature")?;
     if verify_detached_signature(&sig, &tx.signing_bytes(), &sender_pk).is_err() { return Err("Invalid signature".into()); }
-    if tx.to == [0u8; 32] { return Err("Invalid recipient".into()); }
+    // Basic stealth output sanity: ensure one-time pk decodes
+    if pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&tx.to.one_time_pk).is_err() {
+        return Err("Invalid one-time recipient public key".into());
+    }
     Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
+    // no-op
+    // Mirror Spend::validate but return String errors for network context
+    let coin: Coin = db.get("coin", &sp.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
+    let anchor: Anchor = db.get("anchor", &coin.epoch_hash).unwrap().ok_or("Anchor not found for coin's epoch")?;
+    if anchor.merkle_root != sp.root { return Err("Merkle root mismatch".into()); }
+    let leaf = crate::coin::Coin::id_to_leaf_hash(&sp.coin_id);
+    if !crate::epoch::MerkleTree::verify_proof(&leaf, &sp.proof, &sp.root) { return Err("Invalid Merkle proof".into()); }
+    if db.get::<[u8;1]>("nullifier", &sp.nullifier).unwrap().is_some() { return Err("Nullifier already seen (double spend)".into()); }
+    // Determine expected owner address
+    let last_transfer: Option<Transfer> = db.get("transfer", &sp.coin_id).unwrap_or(None);
+    let expected_owner_addr = match last_transfer {
+        Some(ref t) => t.recipient(),
+        None => coin.creator_address,
+    };
+    // Verify signature under last recipient one-time pk
+    if let Some(t) = last_transfer {
+        if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&t.to.one_time_pk) {
+            if crate::crypto::address_from_pk(&pk) == expected_owner_addr {
+                if let Ok(sig) = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&sp.sig) {
+                    if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
+                        return Ok(())
+                    }
+                }
+            }
+        }
+        return Err("Invalid spend signature".into());
+    } else {
+        return Err("Cannot validate spend without previous owner pk (genesis spend requires legacy transfer)".into());
+    }
 }
 
 fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
@@ -213,6 +253,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipTransfer(Transfer),
+    GossipSpend(Spend),
     RequestEpoch(u64),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
@@ -272,7 +313,7 @@ pub async fn spawn(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!(e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE] {
+    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_SPEND, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -339,6 +380,7 @@ pub async fn spawn(
                                 NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                  NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                                 NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                                NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                 NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                 NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                 NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
@@ -472,6 +514,16 @@ pub async fn spawn(
                                 TOP_TX => if let Ok(tx) = bincode::deserialize::<Transfer>(&message.data) {
                                     if validate_transfer(&tx, &db).is_ok() {
                                         db.put("transfer", &tx.coin_id, &tx).ok();
+                                        let _ = db.put("nullifier", &tx.nullifier, &[1u8;1]);
+                                    } else {
+                                        crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
+                                        score.record_validation_failure();
+                                    }
+                                },
+                                TOP_SPEND => if let Ok(sp) = bincode::deserialize::<Spend>(&message.data) {
+                                    if validate_spend(&sp, &db).is_ok() {
+                                        db.put("spend", &sp.coin_id, &sp).ok();
+                                        let _ = db.put("nullifier", &sp.nullifier, &[1u8;1]);
                                     } else {
                                         crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
                                         score.record_validation_failure();
@@ -554,6 +606,7 @@ pub async fn spawn(
                         NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                         NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
                         NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
+                        NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                         NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                         NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                         NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
@@ -575,6 +628,7 @@ impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &CoinCandidate) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
     pub async fn gossip_transfer(&self, tx: &Transfer) { let _ = self.command_tx.send(NetworkCommand::GossipTransfer(tx.clone())); }
+    pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }

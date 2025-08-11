@@ -85,6 +85,8 @@ impl Store {
             "wallet",
             "anchor",
             "transfer",
+            "spend",
+            "nullifier",
         ];
         
         // Configure column family options with sane production defaults
@@ -312,9 +314,9 @@ impl Store {
         
         for coin in coins {
             // Check if coin is spent
-            if let Ok(None) = self.get::<crate::transfer::Transfer>("transfer", &coin.id) {
-                unspent_coins.push(coin);
-            }
+            let legacy_spent: Option<crate::transfer::Transfer> = self.get("transfer", &coin.id)?;
+            let v2_spent: Option<crate::transfer::Spend> = self.get("spend", &coin.id)?;
+            if legacy_spent.is_none() && v2_spent.is_none() { unspent_coins.push(coin); }
         }
         
         Ok(unspent_coins)

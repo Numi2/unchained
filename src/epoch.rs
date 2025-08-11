@@ -3,7 +3,7 @@ use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use rocksdb::WriteBatch;
-// anyhow not used in this module currently
+
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
@@ -60,15 +60,18 @@ pub fn calculate_retarget(
         let avg_coins_x_precision = (total_coins * PRECISION) / num_anchors;
         let target_coins_x_precision = cfg.target_coins_per_epoch as u64 * PRECISION;
 
-        let new_difficulty = {
+         let new_difficulty = {
             let current_difficulty = last_anchor.difficulty as u64;
-            if avg_coins_x_precision > target_coins_x_precision * 11 / 10 {
-                (current_difficulty + 1).min(12) as usize
-            } else if avg_coins_x_precision < target_coins_x_precision * 9 / 10 {
-                current_difficulty.saturating_sub(1).max(1) as usize
+             let upper = (target_coins_x_precision * cfg.retarget_upper_pct / 100) as u64;
+             let lower = (target_coins_x_precision * cfg.retarget_lower_pct / 100) as u64;
+             let next = if avg_coins_x_precision > upper {
+                 current_difficulty + 1
+             } else if avg_coins_x_precision < lower {
+                 current_difficulty.saturating_sub(1)
             } else {
-                last_anchor.difficulty
-            }
+                 current_difficulty
+             } as usize;
+             next.clamp(cfg.difficulty_min, cfg.difficulty_max)
         };
         
         let new_mem = {
@@ -285,15 +288,41 @@ impl Manager {
                             Vec::new()
                         };
 
+                        // Enforce PoW difficulty from the previous anchor before selection
+                        let mut selected: Vec<CoinCandidate> = if let Some(prev) = &prev_anchor {
+                            let required_difficulty = prev.difficulty;
+                            candidates
+                                .into_iter()
+                                .filter(|c| c.pow_hash.iter().take(required_difficulty).all(|b| *b == 0))
+                                .collect()
+                        } else {
+                            // Genesis: nothing to filter
+                            candidates
+                        };
+
                         // Select up to max_coins_per_epoch by smallest pow_hash, tie-break by coin_id for determinism
-                        let mut selected: Vec<CoinCandidate> = candidates;
-                        selected.sort_by(|a, b| a
-                            .pow_hash
-                            .cmp(&b.pow_hash)
-                            .then_with(|| a.id.cmp(&b.id))
-                        );
                         let cap = self.cfg.max_coins_per_epoch as usize;
-                        if selected.len() > cap { selected.truncate(cap); }
+                        if selected.len() > cap {
+                            if cap == 0 {
+                                selected.clear();
+                            } else {
+                                // Partial select the k smallest to avoid full sort on large candidate sets
+                                let _ = selected.select_nth_unstable_by(cap - 1, |a, b| a
+                                    .pow_hash
+                                    .cmp(&b.pow_hash)
+                                    .then_with(|| a.id.cmp(&b.id))
+                                );
+                                selected.truncate(cap);
+                                // Now stable-sort the top-k deterministically for reproducibility across nodes
+                                selected.sort_by(|a, b| a
+                                    .pow_hash
+                                    .cmp(&b.pow_hash)
+                                    .then_with(|| a.id.cmp(&b.id))
+                                );
+                            }
+                        } else {
+                            selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+                        }
                         if let Some(last) = selected.last() {
                             // approximate selection threshold: interpret first 8 bytes of pow_hash as u64
                             let mut eight = [0u8;8];

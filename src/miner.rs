@@ -118,7 +118,7 @@ impl Miner {
 
     async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { /* actual code continues */
         let mut anchor_rx = self.net.anchor_subscribe();
-        let mut heartbeat_interval = time::interval(Duration::from_secs(crate::config::default_heartbeat_interval()));
+        let mut heartbeat_interval = time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
         
         println!("🔗 Connected to anchor broadcast channel");
         
@@ -209,7 +209,7 @@ impl Miner {
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
                     // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
-                    let timeout_secs = crate::config::default_heartbeat_interval() * 6;
+                    let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());
@@ -247,7 +247,7 @@ impl Miner {
         let mem_kib = anchor.mem_kib;
         let difficulty = anchor.difficulty;
         let mut attempts = 0u64;
-        let max_attempts = crate::config::default_max_mining_attempts();
+        let max_attempts = self.cfg.max_attempts;
 
         println!("🎯 Starting mining for epoch #{}", anchor.num);
         println!("⚙️  Mining parameters: difficulty={}, mem_kib={}, lanes=1 (consensus)", difficulty, mem_kib);
@@ -261,9 +261,23 @@ impl Miner {
 
             let nonce: u64 = rand::thread_rng().gen();
             let header = Coin::header_bytes(&anchor.hash, nonce, &creator_address);
-            
+
+            // Measure hashing time and offload to blocking thread to avoid starving async runtime.
+            let start = std::time::Instant::now();
+            let pow_hash = if self.cfg.offload_blocking {
+                tokio::task::spawn_blocking({
+                    let header = header.clone();
+                    move || crypto::argon2id_pow(&header, mem_kib)
+                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!(format!("join error: {}", e))))?
+            } else {
+                crypto::argon2id_pow(&header, mem_kib)?
+            };
+            crate::metrics::MINING_ATTEMPTS.inc();
+            let elapsed = start.elapsed();
+            crate::metrics::MINING_HASH_TIME_MS.observe(elapsed.as_secs_f64() * 1000.0);
+
             // Consensus requires Argon2 parameters to be deterministic (lanes=1 enforced in function).
-            if let Ok(pow_hash) = crypto::argon2id_pow(&header, mem_kib) {
+            {
                                     if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
                     // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
                     // Finding a coin proves the current epoch is still active.
@@ -271,6 +285,7 @@ impl Miner {
 
                     let candidate = CoinCandidate::new(anchor.hash, nonce, creator_address, pow_hash);
                     println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(candidate.id), attempts);
+                    crate::metrics::MINING_FOUND.inc();
 
                     // Candidate key: epoch_hash || coin_id for efficient prefix scans
                     let key = crate::storage::Store::candidate_key(&candidate.epoch_hash, &candidate.id);
@@ -293,8 +308,8 @@ impl Miner {
                 }
             }
             
-            // Every 1 000 attempts yield to the scheduler and check if a newer epoch exists.
-            if attempts % 10_000 == 0 {
+            // Periodically yield to the scheduler and check if a newer epoch exists.
+            if attempts % self.cfg.check_interval_attempts == 0 {
                 // Less noisy progress indicator
                 println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
 

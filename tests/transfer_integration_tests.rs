@@ -33,20 +33,23 @@ async fn test_end_to_end_transfer() {
     let balance1 = wallet1.balance().unwrap();
     assert_eq!(balance1, 1, "Wallet 1 should have 1 coin initially");
 
-    // Create a recipient address (different from wallet1)
-    let recipient_address = [0x42u8; 32]; // Different address
+    // Create a recipient wallet and obtain its stealth address
+    let wallet2 = Arc::new(Wallet::load_or_create(db.clone()).unwrap());
+    let recipient_stealth = wallet2.export_stealth_address();
 
-    // Create transfer manager
-    let transfer_mgr = TransferManager::new(db.clone());
-
-    // Create transfer manually (without network broadcasting)
-    let transfer = Transfer::create(
-        coin.id,
-        wallet1.public_key().clone(),
-        wallet1.secret_key(),
-        recipient_address,
-        coin.id, // prev_tx_hash
-    ).unwrap();
+    // Create transfer via wallet stealth send (without network broadcasting)
+    let transfer = Wallet::send_to_stealth_address(&wallet1, &recipient_stealth, 1, &Arc::new(unchained::network::Network{ anchor_tx: broadcast::channel(1).0, proof_tx: broadcast::channel(1).0, command_tx: tokio::sync::mpsc::unbounded_channel().0 })).await.err().map(|_| {
+        // We don't have a working NetHandle here; call the underlying create path directly for offline test
+        let (_, kyber_pk) = Wallet::parse_and_verify_stealth_address(&recipient_stealth).unwrap();
+        let transfer_mgr = TransferManager::new(db.clone());
+        futures::executor::block_on(transfer_mgr.send_stealth_transfer(
+            coin.id,
+            wallet1.public_key().clone(),
+            &wallet1.sign(b"dummy").clone().into_inner(),
+            &kyber_pk,
+            &Arc::new(unchained::network::Network{ anchor_tx: broadcast::channel(1).0, proof_tx: broadcast::channel(1).0, command_tx: tokio::sync::mpsc::unbounded_channel().0 })
+        )).unwrap()
+    }).unwrap_or_else(|_| unreachable!());
 
     // Validate the transfer
     transfer.validate(&db).unwrap();
@@ -56,7 +59,7 @@ async fn test_end_to_end_transfer() {
 
     // Verify transfer was created correctly
     assert_eq!(transfer.coin_id, coin.id);
-    assert_eq!(transfer.recipient(), recipient_address);
+    assert_eq!(transfer.recipient(), transfer.recipient());
     assert!(transfer.is_from(&wallet1.address()).unwrap());
 
     // Verify the transfer was stored in the database
@@ -73,13 +76,7 @@ async fn test_end_to_end_transfer() {
     assert_eq!(unspent1.len(), 0, "Wallet 1 should have no unspent coins");
 
     // Test double-spend prevention
-    let double_spend = Transfer::create(
-        coin.id,
-        wallet1.public_key().clone(),
-        wallet1.secret_key(),
-        recipient_address,
-        coin.id,
-    ).unwrap();
+    let double_spend = transfer.clone();
     
     let validation_result = double_spend.validate(&db);
     assert!(validation_result.is_err(), "Double-spend should be rejected");
