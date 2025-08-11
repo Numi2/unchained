@@ -47,8 +47,12 @@ fn try_publish_gossip(
     context: &str,
 ) {
     if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
-        if !matches!(e, libp2p::gossipsub::PublishError::InsufficientPeers) {
-            eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, e);
+        // Some libp2p versions/forks use different variants for insufficient peers errors.
+        // Fall back to string matching to avoid noisy logs while remaining compatible.
+        let es = e.to_string();
+        let is_insufficient = es.contains("InsufficientPeers") || es.contains("InsufficientPeersForTopic");
+        if !is_insufficient {
+            eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
     }
 }

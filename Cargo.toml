@@ -17,7 +17,7 @@ atty = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 pqcrypto-dilithium = "0.5.0"
 pqcrypto-traits = "0.3"
-libp2p = { version = "0.53", features = ["quic", "tokio", "gossipsub", "mdns", "macros"] }
+libp2p = { git = "https://github.com/guorong009/rust-libp2p", branch = "prefer-post-quantum", default-features = false, features = ["quic", "tokio", "gossipsub", "macros"] }
 rocksdb = "0.21"
 prometheus = "0.13"
 futures = "0.3"
@@ -28,18 +28,13 @@ zstd = "0.13"
 hex = "0.4"
 tiny_http = "0.12"
 serde-big-array = "0.5"
-libp2p-noise = "0.46.1"
+# Using QUIC with post-quantum preference; remove unused libp2p subcrates to avoid version conflicts
 ml-kem = "0.2.1"
-libp2p-yamux = "0.47.0"
-libp2p-tcp = "0.44.0"
-libp2p-core = "0.43.1"
 # Dependencies for TLS certificate generation and post-quantum cryptography
 rcgen = "0.13"
 rustls = { version = "0.23.22", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 webpki-roots = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
-iroh = "0.91.1"
-iroh-gossip = "0.91.0"
 postcard = "1.1.3"
 bytes = "1.10.1"
 log = "0.4.27"
@@ -47,6 +42,10 @@ serde_bytes = "0.11.17"
 once_cell = "1.19"
 serde_json = "1.0"
 hyper = { version = "0.14", features = ["full"] }
+hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, features = ["tokio-runtime"] }
+hickory-proto = "=0.25.0-alpha.4"
+hickory-client = "=0.25.0-alpha.4"
+zeroize = "1.8.1"
 
 [[bin]]
 name = "inspect_db"

@@ -10,6 +10,11 @@ use rcgen::{CertificateParams, KeyPair, SanType};
 use rustls::{ClientConfig, ServerConfig, RootCertStore};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
+use once_cell::sync::OnceCell;
+use zeroize::Zeroizing;
+use anyhow::bail;
+use atty;
+use rpassword;
 use webpki_roots;
 
 // Constants for post-quantum crypto primitives ensure type safety and clarity.
@@ -22,6 +27,35 @@ pub const DILITHIUM3_SIG_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHI
 pub type Address = [u8; 32];
 
 
+
+// -----------------------------------------------------------------------------
+// Unified passphrase handling (cached once per process)
+// -----------------------------------------------------------------------------
+static UNIFIED_PASSPHRASE: OnceCell<Zeroizing<String>> = OnceCell::new();
+
+/// Obtain a single, unified pass-phrase for all sensitive at-rest keys.
+/// Source order:
+///   1) QUANTUM_PASSPHRASE env var
+///   2) Interactive prompt (only once per process)
+/// Non-interactive without env returns an error.
+pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<String>> {
+    if let Some(existing) = UNIFIED_PASSPHRASE.get() {
+        return Ok(existing.clone());
+    }
+    if let Ok(val) = std::env::var("QUANTUM_PASSPHRASE") {
+        let z = Zeroizing::new(val);
+        let _ = UNIFIED_PASSPHRASE.set(z.clone());
+        return Ok(z);
+    }
+    if atty::is(atty::Stream::Stdin) {
+        let text = prompt.unwrap_or("Enter quantum pass-phrase: ");
+        let pw = rpassword::prompt_password(text)?;
+        let z = Zeroizing::new(pw);
+        let _ = UNIFIED_PASSPHRASE.set(z.clone());
+        return Ok(z);
+    }
+    bail!("QUANTUM_PASSPHRASE is required in non-interactive mode")
+}
 
 pub fn address_from_pk(pk: &PublicKey) -> Address {
     *Hasher::new_derive_key("unchained-address")
