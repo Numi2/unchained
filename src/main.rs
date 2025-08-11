@@ -49,6 +49,15 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize logging early. Use RUST_LOG or default to info. Also initialize tracing for richer diagnostics.
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().filter_or("RUST_LOG", "info")).try_init();
+    // Optional tracing subscriber; ignore errors if already set
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     println!("--- unchained Node ---");
 
     let cli = Cli::parse();
@@ -389,15 +398,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let metrics_bind = cfg.metrics.bind.clone();
-    metrics::serve(cfg.metrics)?;
+    let _metrics_bind = cfg.metrics.bind.clone();
+    let metrics_actual = metrics::serve(cfg.metrics)?;
 
     println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
     if let Some(public_ip) = cfg.net.public_ip {
         println!("   📢 Public IP announced as: {public_ip}");
     }
-    println!("   📊 Metrics available on http://{metrics_bind}");
+    println!("   📊 Metrics available on http://{metrics_actual}");
     println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
     println!("   🎯 Target coins per epoch: {}", cfg.epoch.target_coins_per_epoch);
     println!("   Press Ctrl+C to stop");

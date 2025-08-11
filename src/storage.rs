@@ -1,4 +1,5 @@
 use rocksdb::{Options, DB, ColumnFamilyDescriptor, WriteBatch, WriteOptions};
+use rocksdb::{SliceTransform, BlockBasedOptions, DBCompressionType};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
@@ -28,6 +29,9 @@ pub struct ReplayVal { pub ts: u64, pub seq: u64 }
 static DB_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Store {
+    // Compress values larger than this many bytes using zstd before optional encryption
+    const COMPRESS_THRESHOLD_BYTES: usize = 512;
+    const ZSTD_LEVEL: i32 = 3;
     fn load_or_derive_enc_key(base_path: &str) -> Option<[u8;32]> {
         // Prefer a raw key via DB_ENC_KEY_HEX (64 hex chars for 32 bytes)
         if let Ok(hexkey) = std::env::var("DB_ENC_KEY_HEX") {
@@ -182,24 +186,46 @@ impl Store {
             "tx_pool",
             "replay",
         ];
-        
-        // Configure column family options with sane production defaults
-        let mut cf_opts = Options::default();
-        // Larger memtable for throughput; multiple write buffers
-        cf_opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
-        cf_opts.set_max_write_buffer_number(2);
-        // Target file size for compaction levels
-        cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
-        // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
-        
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
-            .collect();
+
+        // Base CF options
+        let mut base_cf_opts = Options::default();
+        base_cf_opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        base_cf_opts.set_max_write_buffer_number(2);
+        base_cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
+
+        // Global block-based options with bloom filter
+        let mut blk_opts = BlockBasedOptions::default();
+        // Bloom filter: 10 bits per key, no block-based whole key filtering
+        blk_opts.set_bloom_filter(10.0, false);
+
+        // Build per-CF options, enabling prefix extractors for hot prefix scans
+        let mut cf_descriptors: Vec<ColumnFamilyDescriptor> = Vec::new();
+        for name in cf_names.iter() {
+            let mut opts = base_cf_opts.clone();
+            opts.set_block_based_table_factory(&blk_opts);
+            match *name {
+                // Prefix: epoch_hash (32 bytes) || coin_id (32 bytes)
+                "coin_candidate" => {
+                    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+                    // Enable memtable prefix bloom to speed up prefix seeks
+                    opts.set_memtable_prefix_bloom_ratio(0.1);
+                }
+                // Prefix: epoch number (8 bytes) || coin_id
+                "epoch_selected" => {
+                    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
+                    opts.set_memtable_prefix_bloom_ratio(0.1);
+                }
+                _ => { /* default */ }
+            }
+            cf_descriptors.push(ColumnFamilyDescriptor::new(*name, opts));
+        }
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // Prefer Zstd compression for better read amplification vs. size
+        db_opts.set_compression_type(DBCompressionType::Zstd);
+        db_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         
         // Organize files into meaningful subdirectories under the chosen db_path
         let wal_dir = format!("{db_path}/logs");
@@ -286,8 +312,14 @@ impl Store {
 
     pub fn put<T: Serialize>(&self, cf: &str, key: &[u8], value: &T) -> Result<()> {
         // Serialize value once
-        let data_to_store = bincode::serialize(value)
+        let mut data_to_store = bincode::serialize(value)
             .with_context(|| format!("Failed to serialize value for key '{key:?}' in CF '{cf}'"))?;
+        // Compress large values before optional encryption
+        if data_to_store.len() >= Self::COMPRESS_THRESHOLD_BYTES {
+            if let Ok(comp) = zstd::encode_all(&data_to_store[..], Self::ZSTD_LEVEL) {
+                data_to_store = comp;
+            }
+        }
         let data_to_store = self.maybe_encrypt(cf, data_to_store);
 
         let handle = self.db.cf_handle(cf)

@@ -118,7 +118,10 @@ impl Miner {
 
     async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { /* actual code continues */
         let mut anchor_rx = self.net.anchor_subscribe();
-        let mut heartbeat_interval = time::interval(Duration::from_secs(crate::config::default_heartbeat_interval()));
+        // Jitter the heartbeat to avoid synchronized timeouts across many miners
+        let base = crate::config::default_heartbeat_interval();
+        let jitter = (rand::random::<u64>() % 5).min(4);
+        let mut heartbeat_interval = time::interval(Duration::from_secs(base + jitter));
         
         println!("🔗 Connected to anchor broadcast channel");
         
@@ -254,7 +257,36 @@ impl Miner {
         println!("🎯 Starting mining for epoch #{}", anchor.num);
         println!("⚙️  Mining parameters: target_nbits=0x{:08x}, mem_kib={}, t_cost={}, lanes=1 (consensus)", anchor.target_nbits, mem_kib, t_cost);
 
+        let mut last_db_check = time::Instant::now();
         loop {
+            // Fast-path: if a newer epoch has been announced, abort immediately (drain any backlog).
+            loop {
+                match live_anchor_rx.try_recv() {
+                    Ok(new_anchor) => {
+                        if new_anchor.num > anchor.num {
+                            println!("🔄 Received newer epoch #{} while mining #{} – switching epochs", new_anchor.num, anchor.num);
+                            return Ok(());
+                        }
+                        // If it's the same epoch or older, keep draining to stay current and continue mining
+                        continue;
+                    },
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Err("Anchor broadcast channel closed".into()),
+                }
+            }
+
+            // Slow-path: time-based DB verification in case we missed a broadcast (multi-node safety)
+            if last_db_check.elapsed() >= Duration::from_millis(200) {
+                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                    if latest_anchor.num > anchor.num {
+                        println!("🔄 Detected newer epoch #{} in DB while mining #{}, stopping current mining", latest_anchor.num, anchor.num);
+                        return Ok(());
+                    }
+                }
+                last_db_check = time::Instant::now();
+            }
+
             attempts += 1;
             if attempts > max_attempts {
                 eprintln!("⚠️  Reached max attempts ({}) for epoch #{}, continuing to next epoch", max_attempts, anchor.num);
@@ -296,38 +328,9 @@ impl Miner {
                 }
             }
             
-            // Every 1 000 attempts yield to the scheduler and check if a newer epoch exists.
-            if attempts % 10_000 == 0 {
-                // Less noisy progress indicator
-                println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
-
-                // NEW: abort early if the chain has already advanced.
-                // First, non-blocking check of the live anchor broadcast channel (fast-path).
-                match live_anchor_rx.try_recv() {
-                    Ok(new_anchor) => {
-                        if new_anchor.num > anchor.num {
-                            println!("🔄 Received newer epoch #{} while mining #{} – switching epochs", new_anchor.num, anchor.num);
-                            return Ok(()); // Outer loop will handle the fresh anchor
-                        }
-                    },
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        // Channel closed: treat as abort signal
-                        return Err("Anchor broadcast channel closed".into());
-                    },
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                // Slow-path: also verify DB in case we missed the broadcast (unlikely but safe on multi-node).
-                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                    if latest_anchor.num > anchor.num {
-                        println!("🔄 Detected newer epoch #{} in DB while mining #{}, stopping current mining", latest_anchor.num, anchor.num);
-                        return Ok(());
-                    }
-                }
-
-                // Let other tasks run so we don’t starve the runtime.
-                tokio::task::yield_now().await;
-            }
+            // Lightweight cooperative yield every 2 000 attempts; progress log every 20 000
+            if attempts % 2_000 == 0 { tokio::task::yield_now().await; }
+            if attempts % 20_000 == 0 { println!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num); }
         }
     }
 }

@@ -173,6 +173,7 @@ pub fn validate_anchor(
     let prev_h = if let Some(h) = prev_h_opt { h } else { [0u8;32] };
     let id_set_check: HashSet<[u8;32]> = coins.iter().map(|c| c.id).collect();
     if !selected_coin_ids.iter().all(|id| id_set_check.contains(id)) { return Err("coins list missing entries".into()); }
+    // Pre-size collections to minimize reallocations in validation hot path
     let mut epoch_work = U256::zero();
     let mut work_leaves: Vec<[u8;32]> = Vec::with_capacity(coins.len());
     for coin in coins {
@@ -201,7 +202,7 @@ pub fn validate_anchor(
     if anchor.cumulative_work != expected_cw { return Err("cumulative_work mismatch".into()); }
     work_leaves.sort();
     let work_root = if work_leaves.is_empty() { [0u8;32] } else {
-        let mut level = work_leaves.clone();
+        let mut level = work_leaves; // reuse allocated buffer
         while level.len() > 1 {
             let mut next = Vec::with_capacity((level.len()+1)/2);
             for chunk in level.chunks(2) {

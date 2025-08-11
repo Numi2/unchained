@@ -21,7 +21,7 @@ pqcrypto-traits = "0.3"
 pqcrypto-kyber = "0.8"
 hkdf = "0.12"
 sha2 = "0.10"
-libp2p = { version = "0.56", features = ["quic", "tokio", "gossipsub", "macros", "request-response"] }
+libp2p = { version = "0.56", features = ["quic", "tokio", "gossipsub", "macros", "request-response", "identify", "ping"] }
 async-trait = "0.1"
 ed25519-dalek = "1.0"
 rocksdb = "0.21"
@@ -45,6 +45,12 @@ futures = "0.3"
 aes-gcm-siv = "0.11"
 zeroize = "1.6"
 tokio-rustls = "0.25"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# Logging/Tracing
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[bin]]
 name = "inspect_db"

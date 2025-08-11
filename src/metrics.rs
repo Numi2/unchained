@@ -44,7 +44,7 @@ pub static MSGS_OUT_LATEST_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new(
 pub static MSGS_OUT_PROOF_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_proof_req_total", "Outbound coin proof request messages").unwrap());
 pub static MSGS_OUT_PROOF_RESP: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_msgs_out_proof_resp_total", "Outbound coin proof response messages").unwrap());
 
-pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
+pub fn serve(cfg: crate::config::Metrics) -> Result<String> {
     REGISTRY.register(Box::new(PEERS.clone()))?;
     REGISTRY.register(Box::new(EPOCH_HEIGHT.clone()))?;
     REGISTRY.register(Box::new(CANDIDATE_COINS.clone()))?;
@@ -87,6 +87,7 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
 
     // Start metrics server, retrying on port conflicts by incrementing port number.
     let bind_addr = cfg.bind.clone();
+    let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel::<String>(1);
     thread::spawn(move || {
         let mut addr = bind_addr.clone();
         let server = loop {
@@ -109,23 +110,30 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
                 }
             }
         };
+        // Inform the caller which address we successfully bound to
+        let _ = addr_tx.send(addr.clone());
         eprintln!("📊 Prometheus metrics serving on http://{}", addr);
 
         for request in server.incoming_requests() {
-            let mut buffer = vec![];
+            // Pre-allocate a buffer proportional to current families to reduce reallocs
+            let mut buffer = Vec::with_capacity(32 * 1024);
             let encoder = TextEncoder::new();
             let metric_families = REGISTRY.gather();
             if encoder.encode(&metric_families, &mut buffer).is_err() {
                 eprintln!("🔥 Could not encode metrics");
                 continue;
             }
-
-            let response = tiny_http::Response::from_data(buffer)
-                .with_header("Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8".parse::<tiny_http::Header>().unwrap());
-            
+            let mut response = tiny_http::Response::from_data(buffer);
+            response.add_header(
+                "Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8"
+                    .parse::<tiny_http::Header>()
+                    .unwrap(),
+            );
             let _ = request.respond(response);
         }
     });
 
-    Ok(())
+    // Wait for the bound address so callers can display the correct endpoint
+    let bound = addr_rx.recv().map_err(|e| anyhow::anyhow!("metrics server failed to report bound address: {}", e))?;
+    Ok(bound)
 }

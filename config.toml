@@ -7,12 +7,15 @@ listen_port = 31000
 # Timeout for initial network sync in seconds
 sync_timeout_secs = 180
 
-# Optional: announce a public IP (useful behind NAT)
-# public_ip = "203.0.113.10"
+# Optional: announce a public IP (useful behind NAT). Use "auto" to detect.
+public_ip = "193.71.140.215"
 
+# Peer connection targets
+# Maintain at least this many peers; the node will keep dialing until it reaches this number.
+min_peers = 1
 
 # Bootstrap nodes to connect to - add your seed nodes here - ip + peerid
-bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
+bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWBPTfoRzkw2UJuipj7gn9MyoHfMWtSrQ6mxSpfZUoxepH" ]
 
 [p2p]
 # Per-peer rate limiting window and allowance
@@ -28,7 +31,7 @@ path = "unchained_data"
 
 [epoch]
 # Duration of each epoch in seconds
-seconds = 33
+seconds = 333
 
 # Retargeting parameters
 # Target number of selected coins per epoch (controller setpoint)
@@ -47,7 +50,7 @@ selected_max_per_epoch = 32
 enabled = true
 
 # Initial Argon2 memory in KiB (consensus uses lanes=1, t_cost=1)
-mem_kib = 65536
+mem_kib = 16536
 
 # Memory retarget bounds in KiB
 min_mem_kib = 16384
