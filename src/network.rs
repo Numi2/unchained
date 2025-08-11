@@ -25,9 +25,11 @@ use once_cell::sync::Lazy;
 use blake3;
 use rand::RngCore;
 use serde_big_array::BigArray;
-#[cfg(feature = "ring_mock")]
+#[cfg(feature = "llrs_ffi")]
+use crate::ringsig::FfiLlrs as Llrs;
+#[cfg(all(not(feature = "llrs_ffi"), feature = "ring_mock"))]
 use crate::ringsig::MockLlrs as Llrs;
-#[cfg(not(feature = "ring_mock"))]
+#[cfg(all(not(feature = "llrs_ffi"), not(feature = "ring_mock")))]
 use crate::ringsig::NoLlrs as Llrs;
 use crate::ringsig::RingSignatureScheme;
 use crate::ring_transfer::RingTransfer;
@@ -540,6 +542,12 @@ pub async fn spawn(
                                 },
                                 TOP_RING_TX => if let Ok(rtx) = bincode::deserialize::<RingTransfer>(&message.data) {
                                     let scheme = Llrs{};
+                                     // Enforce ring size bounds from config
+                                     let cfg = crate::config::load("config.toml").ok();
+                                     if let Some(cfg) = cfg.as_ref() {
+                                         let n = rtx.ring_members.len();
+                                         if n < cfg.epoch.min_ring_size || n > cfg.epoch.max_ring_size { continue; }
+                                     }
                                     let msg = {
                                         // Rebuild binding message: to || "ring_tx" || BLAKE3(concat(ring_pubkeys)) || recipient_one_time
                                         let mut v = Vec::new();

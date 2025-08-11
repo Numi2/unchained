@@ -378,10 +378,12 @@ async fn main() -> anyhow::Result<()> {
             let store = db.clone();
             let store_ref = store;
             if let Some(out) = store_ref.get_output(&out_id)? {
-                // Build ring transfer (mock LLRS)
-                #[cfg(feature = "ring_mock")]
+                // Build ring transfer with configured LLRS backend
+                #[cfg(feature = "llrs_ffi")]
+                let scheme = crate::ringsig::FfiLlrs{};
+                #[cfg(all(not(feature = "llrs_ffi"), feature = "ring_mock"))]
                 let scheme = crate::ringsig::MockLlrs{};
-                #[cfg(not(feature = "ring_mock"))]
+                #[cfg(all(not(feature = "llrs_ffi"), not(feature = "ring_mock")))]
                 let scheme = crate::ringsig::NoLlrs{};
                 let rtx = wallet.build_ring_transfer(&store_ref, &scheme, &out, recipient_addr)?;
                 // Add to mempool and gossip

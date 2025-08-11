@@ -50,7 +50,7 @@ hyper = { version = "0.14", features = ["full"] }
 libc = { version = "0.2", optional = true }
 
 [features]
-default = ["ring_mock"]
+default = []
 ring_mock = []
 llrs_ffi = []
 [target.'cfg(unix)'.dependencies]

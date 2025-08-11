@@ -3,14 +3,13 @@
 [net]
 # Port to listen on for P2P connections
 listen_port = 31000
-# Path to the Iroh secret key
-iroh_key_path = "iroh.key"
+
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 133337
 # Connection timeout in seconds
 connection_timeout_secs = 300
 # Timeout for initial network sync in seconds
-sync_timeout_secs = 1800
+sync_timeout_secs = 11
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
@@ -19,7 +18,7 @@ sync_timeout_secs = 1800
 public_ip = "193.71.140.215"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
+bootstrap = []
 
 
 
@@ -57,7 +56,7 @@ enabled = true
 # Memory usage for Argon2 hashing in KiB (32 MiB, optimized for mining speed)
 mem_kib = 16192
 # Number of parallel lanes for Argon2 (2 lanes for better parallelization)
-lanes = 2
+lanes = 1
 
 # Memory retargeting parameters
 # Minimum memory in KiB

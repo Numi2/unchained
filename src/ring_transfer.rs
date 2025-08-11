@@ -26,6 +26,13 @@ impl RingTransfer {
     }
 
     pub fn verify<S: RingSignatureScheme>(&self, scheme: &S) -> Result<()> {
+        // Enforce ring size bounds to avoid trivial rings and DoS
+        let cfg = crate::config::load("config.toml").ok();
+        if let Some(cfg) = cfg {
+            if self.ring_members.len() < cfg.epoch.min_ring_size || self.ring_members.len() > cfg.epoch.max_ring_size {
+                return Err(anyhow!("ring size out of bounds"));
+            }
+        }
         let msg = self.binding_message();
         if !scheme.verify(&msg, &self.ring_members, &self.signature, &self.link_tag)? {
             return Err(anyhow!("invalid ring signature"));

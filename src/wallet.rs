@@ -371,7 +371,7 @@ impl Wallet {
         Ok(picks)
     }
 
-    /// Build a ring transfer with 4 decoys (total ring size 5)
+    /// Build a ring transfer selecting decoys randomly and shuffling ring order
     pub fn build_ring_transfer<S: RingSignatureScheme>(
         &self,
         store: &Store,
@@ -379,11 +379,38 @@ impl Wallet {
         real_output: &RingOutput,
         to: Address,
     ) -> Result<RingTransfer> {
-        let mut ring = self.select_decoy_pubkeys(store, 4)?;
-        // Ensure decoys don't accidentally equal the real key
-        ring.retain(|pk| pk.0 != real_output.pubkey.0);
-        // Insert real at a deterministic position (e.g., 0)
-        ring.insert(0, real_output.pubkey.clone());
+        // Enforce ring size bounds from config
+        let cfg = crate::config::load("config.toml").unwrap_or_else(|_| crate::config::Config{
+            net: crate::config::Net{ listen_port: 0, bootstrap: vec![], max_peers: 8, connection_timeout_secs: 30, public_ip: None, sync_timeout_secs: 180, require_pq_identity: false },
+            p2p: crate::config::P2p{ max_validation_failures_per_peer: 10, peer_ban_duration_secs: 3600, rate_limit_window_secs: 60, max_messages_per_window: 100 },
+            storage: crate::config::Storage{ path: ".".into() },
+            epoch: crate::config::Epoch{ seconds: 222, target_leading_zeros: 1, target_coins_per_epoch: 1, max_coins_per_epoch: 1, retarget_interval: 10, include_transfers_root_in_hash: false, min_ring_size: 5, max_ring_size: 64 },
+            mining: crate::config::Mining{ enabled: false, mem_kib: 65_536, min_mem_kib: 16_384, max_mem_kib: 262_144, max_memory_adjustment: 1.5 },
+            metrics: crate::config::Metrics{ bind: "127.0.0.1:9100".into() },
+        });
+        let min_ring = cfg.epoch.min_ring_size;
+        let max_ring = cfg.epoch.max_ring_size;
+        let target_ring = min_ring.max(5).min(max_ring);
+
+        // Gather a pool of candidate decoys (over-sample to filter uniq and avoid real key)
+        let mut decoys = self.select_decoy_pubkeys(store, target_ring * 4)?;
+        decoys.retain(|pk| pk.0 != real_output.pubkey.0);
+        // Deduplicate
+        let mut seen = std::collections::HashSet::new();
+        decoys.retain(|pk| seen.insert(pk.0.clone()));
+
+        // Randomly sample decoys and insert real key then shuffle
+        let mut rng = rand::rngs::OsRng;
+        use rand::seq::SliceRandom;
+        decoys.shuffle(&mut rng);
+        let needed_decoys = target_ring.saturating_sub(1);
+        let mut ring: Vec<RingPublicKey> = decoys.into_iter().take(needed_decoys).collect();
+        // Ensure we have enough decoys
+        if ring.len() + 1 < min_ring {
+            return Err(anyhow::anyhow!("insufficient decoys to satisfy min_ring_size"));
+        }
+        ring.push(real_output.pubkey.clone());
+        ring.shuffle(&mut rng);
 
         let recipient_one_time = self.derive_one_time_public();
         let msg = {

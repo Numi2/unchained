@@ -5,6 +5,13 @@ use std::{collections::HashSet, sync::Arc};
 use rocksdb::WriteBatch;
 use bincode;
 use crate::ring_transfer::RingTransfer;
+use crate::ringsig::RingSignatureScheme;
+#[cfg(feature = "llrs_ffi")]
+use crate::ringsig::FfiLlrs as Llrs;
+#[cfg(all(not(feature = "llrs_ffi"), feature = "ring_mock"))]
+use crate::ringsig::MockLlrs as Llrs;
+#[cfg(all(not(feature = "llrs_ffi"), not(feature = "ring_mock")))]
+use crate::ringsig::NoLlrs as Llrs;
 // anyhow not used in this module currently
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -493,16 +500,27 @@ impl Manager {
                                             }
                                         }
                                     } else if let Ok(rtx) = bincode::deserialize::<RingTransfer>(&v) {
-                                        // Verify double-spend and inclusion constraints
-                                        if self.db.get_raw_bytes("ring_tag", &rtx.link_tag.0).ok().flatten().is_none() {
-                                            accepted_ring_txs.push(rtx.hash());
-                                            // Stage write of link tag to prevent double-spend
-                                            if let Some(tag_cf) = self.db.db.cf_handle("ring_tag") {
-                                                batch.put_cf(tag_cf, &rtx.link_tag.0, &current_epoch.to_le_bytes());
+                                        // Re-verify ring signature at inclusion time and double-spend by tag
+                                        let scheme = Llrs{};
+                                        let msg = {
+                                            let mut v = Vec::new();
+                                            v.extend_from_slice(&rtx.to);
+                                            let mut concat = Vec::new();
+                                            for m in &rtx.ring_members { concat.extend_from_slice(&m.0); }
+                                            let ring_root = crate::crypto::blake3_hash(&concat);
+                                            v.extend_from_slice(b"ring_tx");
+                                            v.extend_from_slice(&ring_root);
+                                            v.extend_from_slice(&rtx.recipient_one_time.0);
+                                            v
+                                        };
+                                        if scheme.verify(&msg, &rtx.ring_members, &rtx.signature, &rtx.link_tag).unwrap_or(false) {
+                                            if self.db.get_raw_bytes("ring_tag", &rtx.link_tag.0).ok().flatten().is_none() {
+                                                accepted_ring_txs.push(rtx.hash());
+                                                if let Some(tag_cf) = self.db.db.cf_handle("ring_tag") {
+                                                    batch.put_cf(tag_cf, &rtx.link_tag.0, &current_epoch.to_le_bytes());
+                                                }
+                                                batch.delete_cf(mempool_cf, &rtx.hash());
                                             }
-                                            // Persist accepted ring transfer list under epoch after loop
-                                            // Remove from mempool
-                                            batch.delete_cf(mempool_cf, &rtx.hash());
                                         }
                                     }
                                 }

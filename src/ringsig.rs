@@ -2,6 +2,9 @@ use anyhow::{Result, anyhow};
 use serde::{Serialize, Deserialize};
 use serde_bytes;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
+#[cfg(feature = "llrs_ffi")]
+use crate::crypto::DILITHIUM3_PK_BYTES;
+use blake3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkTag(pub [u8; 32]);
@@ -43,6 +46,7 @@ extern "C" {
         msg_len: usize,
         ring_ptr: *const u8,   // concatenated ring public keys
         ring_len: usize,       // number of public keys
+        pk_len: usize,         // length in bytes of each public key
         sk_ptr: *const u8,
         sk_len: usize,
         sig_out_ptr: *mut *mut u8,
@@ -58,6 +62,7 @@ extern "C" {
         msg_len: usize,
         ring_ptr: *const u8,
         ring_len: usize,
+        pk_len: usize,
         sig_ptr: *const u8,
         sig_len: usize,
         link_tag_ptr: *const u8, // 32 bytes
@@ -72,8 +77,14 @@ impl RingSignatureScheme for FfiLlrs {
         ring: &[RingPublicKey],
         secret_key_bytes: &[u8],
     ) -> Result<(RingSignatureBlob, LinkTag)> {
-        // Flatten ring public keys
-        let mut ring_bytes = Vec::with_capacity(ring.len() * DILITHIUM3_PK_BYTES);
+        // Validate and flatten ring public keys
+        if ring.is_empty() { return Err(anyhow!("ring must not be empty")); }
+        let pk_len = ring[0].0.len();
+        if pk_len == 0 { return Err(anyhow!("ring public key length must be > 0")); }
+        for pk in ring {
+            if pk.0.len() != pk_len { return Err(anyhow!("inconsistent ring public key lengths")); }
+        }
+        let mut ring_bytes = Vec::with_capacity(ring.len() * pk_len);
         for pk in ring { ring_bytes.extend_from_slice(&pk.0); }
 
         let mut sig_ptr: *mut u8 = std::ptr::null_mut();
@@ -82,7 +93,7 @@ impl RingSignatureScheme for FfiLlrs {
         let rc = unsafe {
             llrs_sign(
                 message.as_ptr(), message.len(),
-                ring_bytes.as_ptr(), ring.len(),
+                ring_bytes.as_ptr(), ring.len(), pk_len,
                 secret_key_bytes.as_ptr(), secret_key_bytes.len(),
                 &mut sig_ptr, &mut sig_len,
                 tag.as_mut_ptr(),
@@ -101,12 +112,18 @@ impl RingSignatureScheme for FfiLlrs {
         signature: &RingSignatureBlob,
         link_tag: &LinkTag,
     ) -> Result<bool> {
-        let mut ring_bytes = Vec::with_capacity(ring.len() * DILITHIUM3_PK_BYTES);
+        if ring.is_empty() { return Ok(false); }
+        let pk_len = ring[0].0.len();
+        if pk_len == 0 { return Ok(false); }
+        for pk in ring {
+            if pk.0.len() != pk_len { return Ok(false); }
+        }
+        let mut ring_bytes = Vec::with_capacity(ring.len() * pk_len);
         for pk in ring { ring_bytes.extend_from_slice(&pk.0); }
         let rc = unsafe {
             llrs_verify(
                 message.as_ptr(), message.len(),
-                ring_bytes.as_ptr(), ring.len(),
+                ring_bytes.as_ptr(), ring.len(), pk_len,
                 signature.0.as_ptr(), signature.0.len(),
                 link_tag.0.as_ptr(),
             )
@@ -132,7 +149,27 @@ impl RingSignatureScheme for MockLlrs {
             .map_err(|_| anyhow!("invalid secret key"))?;
         let sig = pqcrypto_dilithium::dilithium3::detached_sign(message, &sk);
         let sig_bytes = sig.as_bytes();
-        let tag = crate::crypto::blake3_hash(sig_bytes);
+        // Pseudo link tag for mock: bind to public key and domain separation so
+        // repeated spends by same signer are linkable within this mock regime.
+        // Derive public key by re-signing a fixed label and search the ring? Not available.
+        // Instead, require caller to include the true public key in the ring; we link against
+        // any ring member that verifies the signature.
+        // Compute tag as hash of first verifying public key and domain separation.
+        let sig_obj = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(sig_bytes)
+            .map_err(|_| anyhow!("invalid signature format"))?;
+        let mut tag = [0u8; 32];
+        for pk in _ring {
+            if let Ok(pk_obj) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&pk.0) {
+                if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig_obj, message, &pk_obj).is_ok() {
+                    let mut h = blake3::Hasher::new_derive_key("unchained-ring-link-mock");
+                    // Link tag derived solely from signer's public key so multiple signatures by the
+                    // same key are linkable across messages (mock behavior only).
+                    h.update(pk_obj.as_bytes());
+                    tag = *h.finalize().as_bytes();
+                    break;
+                }
+            }
+        }
         Ok((RingSignatureBlob(sig_bytes.to_vec()), LinkTag(tag)))
     }
 
@@ -141,7 +178,7 @@ impl RingSignatureScheme for MockLlrs {
         message: &[u8],
         ring: &[RingPublicKey],
         signature: &RingSignatureBlob,
-        _link_tag: &LinkTag,
+        link_tag: &LinkTag,
     ) -> Result<bool> {
         use pqcrypto_traits::sign::DetachedSignature as _;
         let sig = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&signature.0)
@@ -149,7 +186,11 @@ impl RingSignatureScheme for MockLlrs {
         for pk in ring {
             if let Ok(pk_obj) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&pk.0) {
                 if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, message, &pk_obj).is_ok() {
-                    return Ok(true);
+                    // Check link_tag matches the mock derivation rule
+                    let mut h = blake3::Hasher::new_derive_key("unchained-ring-link-mock");
+                    h.update(pk_obj.as_bytes());
+                    let expected = *h.finalize().as_bytes();
+                    return Ok(expected == link_tag.0);
                 }
             }
         }

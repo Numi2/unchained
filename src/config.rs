@@ -65,6 +65,13 @@ pub struct Epoch {
     /// Default is false for legacy compatibility.
     #[serde(default)]
     pub include_transfers_root_in_hash: bool,
+    /// Minimum allowed ring size for ring transfers (consensus). Small rings
+    /// harm anonymity. Defaults to 5.
+    #[serde(default = "default_min_ring_size")] 
+    pub min_ring_size: usize,
+    /// Maximum allowed ring size to bound verification cost. Defaults to 64.
+    #[serde(default = "default_max_ring_size")] 
+    pub max_ring_size: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -93,6 +100,8 @@ fn default_bind() -> String { "127.0.0.1:9100".into() }
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
 fn default_retarget_interval() -> u64 { 10 }
+fn default_min_ring_size() -> usize { 5 }
+fn default_max_ring_size() -> usize { 64 }
 
 
 // Mining memory retargeting defaults
@@ -136,6 +145,12 @@ pub fn load<P: AsRef<Path>>(p: P) -> Result<Config> {
     }
     if !(1..=12).contains(&cfg.epoch.target_leading_zeros) {
         anyhow::bail!("epoch.target_leading_zeros must be between 1 and 12");
+    }
+    if cfg.epoch.min_ring_size < 3 {
+        anyhow::bail!("epoch.min_ring_size must be >= 3");
+    }
+    if cfg.epoch.max_ring_size < cfg.epoch.min_ring_size {
+        anyhow::bail!("epoch.max_ring_size must be >= min_ring_size");
     }
     if cfg.epoch.max_coins_per_epoch == 0 {
         anyhow::bail!("epoch.max_coins_per_epoch must be > 0");
