@@ -21,7 +21,7 @@ sync_timeout_secs = 1800
 public_ip = "193.71.140.215"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
+bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWBPTfoRzkw2UJuipj7gn9MyoHfMWtSrQ6mxSpfZUoxepH" ]
 
 
 
