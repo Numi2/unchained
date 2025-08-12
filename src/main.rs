@@ -27,6 +27,8 @@ enum Cmd {
     Mine,
     /// Print the local libp2p peer ID and exit
     PeerId,
+    /// Export your stealth receiving address (base64-url)
+    StealthAddress,
         /// Request a coin proof and verify it locally
         Proof {
             #[arg(long)]
@@ -83,81 +85,72 @@ async fn main() -> anyhow::Result<()> {
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Spawn background sync task (safe for read-only commands; does not advance epochs itself)
     sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
-
-    let epoch_mgr = epoch::Manager::new(
-        db.clone(),
-        cfg.epoch.clone(),
-        cfg.mining.clone(),
-        cfg.net.clone(),
-        net.clone(),
-        coin_rx,
-        shutdown_tx.subscribe(),
-    );
-    epoch_mgr.spawn_loop();
-
-    // --- Active Synchronization Before Mining ---
-    // A new node must sync with the network before it can mine. We explicitly
-    // request the latest state and then enter a loop, waiting until our local
-    // epoch number matches the highest epoch we've seen from the network.
-    println!("🔄 Initiating synchronization with the network...");
-    net.request_latest_epoch().await;
-    
-    let poll_interval_ms: u64 = 500;
-    let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
-    let mut synced = false;
-    for attempt in 0..max_attempts {
-        let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
-        let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
-        let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
-
-        // Case 1: We have a network view and our local chain has caught up
-        if highest_seen > 0 && local_epoch >= highest_seen {
-            println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
-            { let mut st = sync_state.lock().unwrap(); st.synced = true; }
-            synced = true;
-            break;
-        }
-
-        // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
-        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
-            println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
-            {
-                let mut st = sync_state.lock().unwrap();
-                st.synced = true;
-                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
-            }
-            synced = true;
-            break;
-        }
-
-        if highest_seen > 0 {
-            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
-        } else {
-            println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
-    }
-
-    if !synced {
-        println!(
-            "⚠️  Could not sync with network after {}s. Starting as a new chain.",
-            cfg.net.sync_timeout_secs
-        );
-        // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
-        // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
-        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-            let mut st = sync_state.lock().unwrap();
-            st.synced = true;
-            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
-        }
-    }
     
     // Handle CLI commands
     match &cli.cmd {
         Some(Cmd::Mine) => {
+            // Start epoch manager only when actively mining or running as a block producer
+            let epoch_mgr = epoch::Manager::new(
+                db.clone(),
+                cfg.epoch.clone(),
+                cfg.mining.clone(),
+                cfg.net.clone(),
+                net.clone(),
+                coin_rx,
+                shutdown_tx.subscribe(),
+            );
+            epoch_mgr.spawn_loop();
+
+            // --- Active Synchronization Before Mining ---
+            println!("🔄 Initiating synchronization with the network...");
+            net.request_latest_epoch().await;
+
+            let poll_interval_ms: u64 = 500;
+            let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
+            let mut synced = false;
+            for attempt in 0..max_attempts {
+                let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+                let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
+                let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+
+                if highest_seen > 0 && local_epoch >= highest_seen {
+                    println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
+                    { let mut st = sync_state.lock().unwrap(); st.synced = true; }
+                    synced = true;
+                    break;
+                }
+                if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
+                    println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
+                    {
+                        let mut st = sync_state.lock().unwrap();
+                        st.synced = true;
+                        if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                    }
+                    synced = true;
+                    break;
+                }
+                if highest_seen > 0 {
+                    println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                } else {
+                    println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+            }
+            if !synced {
+                println!(
+                    "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+                    cfg.net.sync_timeout_secs
+                );
+                if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                    let mut st = sync_state.lock().unwrap();
+                    st.synced = true;
+                    if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                    println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+                }
+            }
+
             miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
         }
         Some(Cmd::PeerId) => {
@@ -166,6 +159,11 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ip) = &cfg.net.public_ip {
                 println!("📫 Multiaddr: /ip4/{}/udp/{}/quic-v1/p2p/{}", ip, cfg.net.listen_port, id);
             }
+            return Ok(());
+        }
+        Some(Cmd::StealthAddress) => {
+            let stealth = wallet.export_stealth_address();
+            println!("{}", stealth);
             return Ok(());
         }
         Some(Cmd::Proof { coin_id }) => {
@@ -357,8 +355,67 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             // No command specified, start mining if enabled
-            let mining_enabled = cfg.mining.enabled;
-            if mining_enabled {
+            if cfg.mining.enabled {
+                // Start epoch manager only when mining
+                let epoch_mgr = epoch::Manager::new(
+                    db.clone(),
+                    cfg.epoch.clone(),
+                    cfg.mining.clone(),
+                    cfg.net.clone(),
+                    net.clone(),
+                    coin_rx,
+                    shutdown_tx.subscribe(),
+                );
+                epoch_mgr.spawn_loop();
+
+                // --- Active Synchronization Before Mining ---
+                println!("🔄 Initiating synchronization with the network...");
+                net.request_latest_epoch().await;
+
+                let poll_interval_ms: u64 = 500;
+                let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
+                let mut synced = false;
+                for attempt in 0..max_attempts {
+                    let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+                    let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
+                    let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+
+                    if highest_seen > 0 && local_epoch >= highest_seen {
+                        println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
+                        { let mut st = sync_state.lock().unwrap(); st.synced = true; }
+                        synced = true;
+                        break;
+                    }
+                    if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
+                        println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
+                        {
+                            let mut st = sync_state.lock().unwrap();
+                            st.synced = true;
+                            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                        }
+                        synced = true;
+                        break;
+                    }
+                    if highest_seen > 0 {
+                        println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                    } else {
+                        println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+                }
+                if !synced {
+                    println!(
+                        "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+                        cfg.net.sync_timeout_secs
+                    );
+                    if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                        let mut st = sync_state.lock().unwrap();
+                        st.synced = true;
+                        if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                        println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+                    }
+                }
+
                 miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
             }
         }

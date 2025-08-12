@@ -157,8 +157,8 @@ impl Transfer {
         let ot_pk_bytes = ot_pk.as_bytes();
         let ot_sk_bytes = ot_sk.as_bytes();
 
-        // 2) Kyber encapsulation to recipient
-        let (ct, shared) = encapsulate(recipient_kyber_pk);
+        // 2) Kyber encapsulation to recipient (returns (shared_secret, ciphertext))
+        let (shared, ct) = encapsulate(recipient_kyber_pk);
 
         // 3) AEAD key from shared secret (BLAKE3 KDF)
         let aead_key = blake3::derive_key("unchained.stealth.aead.v1", shared.as_bytes());
@@ -402,7 +402,8 @@ impl Spend {
         let ot_pk_bytes = ot_pk.as_bytes();
         let ot_sk_bytes = ot_sk.as_bytes();
 
-        let (ct, shared) = encapsulate(recipient_kyber_pk);
+        // Kyber encapsulation returns (shared_secret, ciphertext)
+        let (shared, ct) = encapsulate(recipient_kyber_pk);
         let aead_key = blake3::derive_key("unchained.stealth.aead.v1", shared.as_bytes());
         let cipher = Aes256GcmSiv::new_from_slice(&aead_key).expect("key length is 32");
         let mut nonce = [0u8; 12];
