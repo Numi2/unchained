@@ -2,6 +2,7 @@ use crate::{storage::Store, network::NetHandle, coin::{Coin, CoinCandidate}};
 use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
+use crate::sync::SyncState;
 use rocksdb::WriteBatch;
 
 
@@ -175,6 +176,7 @@ pub struct Manager {
     anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     shutdown_rx: broadcast::Receiver<()>,
+    sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
 }
 impl Manager {
     pub fn new(
@@ -184,10 +186,11 @@ impl Manager {
         net_cfg: crate::config::Net,
         net: NetHandle, 
         coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
-        shutdown_rx: broadcast::Receiver<()>
+        shutdown_rx: broadcast::Receiver<()>,
+        sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx }
+        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state }
     }
 
     pub fn spawn_loop(mut self) {
@@ -226,8 +229,13 @@ impl Manager {
             }
 
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
-            // Tick immediately on startup so genesis or the first epoch can be processed without waiting a full period
-            let mut ticker = time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds));
+            // Only tick immediately for genesis. For existing chains, wait a full interval to avoid
+            // advancing the epoch immediately on node restarts, which can cause unnecessary height bumps.
+            let mut ticker = if current_epoch == 0 {
+                time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds))
+            } else {
+                time::interval(time::Duration::from_secs(self.cfg.seconds))
+            };
 
             loop {
                 tokio::select! {
@@ -241,6 +249,23 @@ impl Manager {
                         crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
                     },
                     _ = ticker.tick() => {
+                        // When bootstrap peers are configured, avoid producing epochs until we have a peer-confirmed tip.
+                        if !self.net_cfg.bootstrap.is_empty() {
+                            let peer_confirmed = { self.sync_state.lock().unwrap().peer_confirmed_tip };
+                            if !peer_confirmed {
+                                self.net.request_latest_epoch().await;
+                                // Also fast-forward our cursor to network-observed latest if we have it
+                                if current_epoch > 0 {
+                                    if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                                        if latest_anchor.num >= current_epoch {
+                                            current_epoch = latest_anchor.num + 1;
+                                        }
+                                    }
+                                }
+                                println!("⏳ Waiting for peer confirmation before producing epoch {}", current_epoch);
+                                continue;
+                            }
+                        }
                         if current_epoch > 0 {
                             if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
                                 if latest_anchor.num >= current_epoch {
@@ -334,6 +359,11 @@ impl Manager {
                         let selected_ids: HashSet<[u8; 32]> = selected.iter().map(|c| c.id).collect();
                         let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
                         leaves.sort();
+                        // Avoid emitting empty epochs on existing chains. This prevents height from
+                        // advancing without any economic activity and reduces potential fork surface.
+                        if prev_anchor.is_some() && selected_ids.is_empty() {
+                            continue;
+                        }
                         let merkle_root = if leaves.is_empty() { [0u8;32] } else {
                             let mut tmp = leaves.clone();
                             while tmp.len() > 1 {

@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Spawn background sync task (safe for read-only commands; does not advance epochs itself)
-    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe());
+    sync::spawn(db.clone(), net.clone(), sync_state.clone(), shutdown_tx.subscribe(), !cfg.net.bootstrap.is_empty());
     
     // Handle CLI commands
     match &cli.cmd {
@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
                 net.clone(),
                 coin_rx,
                 shutdown_tx.subscribe(),
+                sync_state.clone(),
             );
             epoch_mgr.spawn_loop();
 
@@ -112,10 +113,12 @@ async fn main() -> anyhow::Result<()> {
             let mut synced = false;
             for attempt in 0..max_attempts {
                 let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+                let peer_confirmed = sync_state.lock().unwrap().peer_confirmed_tip;
                 let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
                 let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
 
-                if highest_seen > 0 && local_epoch >= highest_seen {
+                // When bootstrap peers are configured, require a peer-confirmed tip before declaring sync
+                if highest_seen > 0 && local_epoch >= highest_seen && (cfg.net.bootstrap.is_empty() || peer_confirmed) {
                     println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
                     { let mut st = sync_state.lock().unwrap(); st.synced = true; }
                     synced = true;
@@ -132,7 +135,11 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 if highest_seen > 0 {
-                    println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                    if cfg.net.bootstrap.is_empty() {
+                        println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                    } else {
+                        println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                    }
                 } else {
                     println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
                 }
@@ -145,7 +152,10 @@ async fn main() -> anyhow::Result<()> {
                 );
                 if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
                     let mut st = sync_state.lock().unwrap();
-                    st.synced = true;
+                    // Only auto-proceed without peer confirmation if no bootstrap peers are configured
+                    if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
+                        st.synced = true;
+                    }
                     if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
                     println!("✅ Proceeding with local chain at epoch {}.", latest.num);
                 }
@@ -365,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
                     net.clone(),
                     coin_rx,
                     shutdown_tx.subscribe(),
+                    sync_state.clone(),
                 );
                 epoch_mgr.spawn_loop();
 
@@ -377,10 +388,11 @@ async fn main() -> anyhow::Result<()> {
                 let mut synced = false;
                 for attempt in 0..max_attempts {
                     let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
+                    let peer_confirmed = sync_state.lock().unwrap().peer_confirmed_tip;
                     let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
                     let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
 
-                    if highest_seen > 0 && local_epoch >= highest_seen {
+                    if highest_seen > 0 && local_epoch >= highest_seen && (cfg.net.bootstrap.is_empty() || peer_confirmed) {
                         println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
                         { let mut st = sync_state.lock().unwrap(); st.synced = true; }
                         synced = true;
@@ -397,7 +409,11 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     if highest_seen > 0 {
-                        println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                        if cfg.net.bootstrap.is_empty() {
+                            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                        } else {
+                            println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                        }
                     } else {
                         println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
                     }
@@ -410,7 +426,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                     if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
                         let mut st = sync_state.lock().unwrap();
-                        st.synced = true;
+                        if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
+                            st.synced = true;
+                        }
                         if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
                         println!("✅ Proceeding with local chain at epoch {}.", latest.num);
                     }

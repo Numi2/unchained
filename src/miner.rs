@@ -166,6 +166,41 @@ impl Miner {
                                 }
                             }
                             
+                             // Ignore historical or non-adopted alternate anchors during reorg replay.
+                             // Only mine the adopted tip or newer.
+                             let db_latest_num = self
+                                 .db
+                                 .get::<Anchor>("epoch", b"latest")
+                                 .unwrap_or(None)
+                                 .map_or(0, |a| a.num);
+                             if anchor.num < db_latest_num {
+                                 println!(
+                                     "⤴️  Ignoring historical anchor #{} (< latest #{}) during reorg replay",
+                                     anchor.num, db_latest_num
+                                 );
+                                 continue;
+                             }
+                             if let Ok(Some(existing_at_height)) =
+                                 self.db.get::<Anchor>("epoch", &anchor.num.to_le_bytes())
+                             {
+                                 if existing_at_height.hash != anchor.hash {
+                                     println!(
+                                         "⤴️  Ignoring alternate fork anchor at height {} (not adopted)",
+                                         anchor.num
+                                     );
+                                     continue;
+                                 }
+                             }
+                             if let Some(curr) = self.current_epoch {
+                                 if anchor.num < curr {
+                                     println!(
+                                         "⤴️  Ignoring out-of-order anchor #{} (< current #{})",
+                                         anchor.num, curr
+                                     );
+                                     continue;
+                                 }
+                             }
+                             
                             println!(
                                 "⛏️  New epoch #{}: difficulty={}, mem_kib={}. Mining...",
                                 anchor.num, anchor.difficulty, anchor.mem_kib

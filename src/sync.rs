@@ -3,6 +3,9 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 
 const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
+// Back-off parameters to avoid spamming the same missing tip repeatedly when reorg
+// cannot proceed due to unavailable fork parents.
+const TIP_REQUEST_BACKOFF_MS: u64 = 1500;
 const SYNC_CHECK_INTERVAL_SECS: u64 = 1;
 // When fully synced, only poll peers for the latest epoch every this many seconds
 const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
@@ -11,11 +14,13 @@ const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
 pub struct SyncState {
     pub highest_seen_epoch: u64,
     pub synced: bool,
+    // True once at least one peer has confirmed our tip (via receiving any valid anchor)
+    pub peer_confirmed_tip: bool,
 }
 
 impl Default for SyncState {
     fn default() -> Self {
-        Self { highest_seen_epoch: 0, synced: false }
+        Self { highest_seen_epoch: 0, synced: false, peer_confirmed_tip: false }
     }
 }
 
@@ -24,6 +29,7 @@ pub fn spawn(
     net: NetHandle,
     sync_state: Arc<Mutex<SyncState>>,
     mut shutdown_rx: Receiver<()>,
+    has_bootstrap: bool,
 ) {
     let mut anchor_rx: Receiver<Anchor> = net.anchor_subscribe();
 
@@ -33,6 +39,7 @@ pub fn spawn(
         let mut sync_check_timer = interval(Duration::from_secs(SYNC_CHECK_INTERVAL_SECS));
         let mut idle_poll_timer = interval(Duration::from_secs(SYNC_IDLE_POLL_INTERVAL_SECS));
 
+        let mut last_tip_request: Option<(u64, std::time::Instant)> = None;
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -46,10 +53,19 @@ pub fn spawn(
                     if highest_seen > local_epoch {
                         // we are behind → mark unsynced
                         { let mut st = sync_state.lock().unwrap(); st.synced = false; }
-                        // Ask peers for the latest epoch so we can catch up quickly
-                        net.request_latest_epoch().await;
-                        println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
-                        request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                        // Avoid hammering the same tip if we've just requested it very recently
+                        let now = std::time::Instant::now();
+                        let should_request = match last_tip_request {
+                            Some((h, t)) if h == highest_seen && now.duration_since(t).as_millis() < TIP_REQUEST_BACKOFF_MS as u128 => false,
+                            _ => true,
+                        };
+                        if should_request {
+                            // Ask peers for the latest epoch so we can catch up quickly
+                            net.request_latest_epoch().await;
+                            println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
+                            request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                            last_tip_request = Some((highest_seen, now));
+                        }
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
                             println!("📊 Local epoch updated to: {}", local_epoch);
@@ -72,12 +88,18 @@ pub fn spawn(
                         net.request_latest_epoch().await;
                     } else if highest_seen == 0 {
                         if local_epoch > 0 {
-                            // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
-                            let mut st = sync_state.lock().unwrap();
-                            if !st.synced {
-                                st.synced = true;
-                                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
-                                println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                            if has_bootstrap {
+                                // With bootstrap configured, do not self-declare synced; keep polling peers.
+                                println!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
+                                net.request_latest_epoch().await;
+                            } else {
+                                // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
+                                let mut st = sync_state.lock().unwrap();
+                                if !st.synced {
+                                    st.synced = true;
+                                    if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                                    println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                }
                             }
                         } else {
                             // We haven't heard from the network yet and have no local chain; keep requesting

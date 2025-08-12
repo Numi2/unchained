@@ -247,6 +247,7 @@ pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
     proof_tx: broadcast::Sender<CoinProofResponse>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
+    connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +307,9 @@ pub async fn spawn(
         .heartbeat_interval(std::time::Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .mesh_n_low(3)
-        .mesh_outbound_min(3)
+        .mesh_outbound_min(1)
+        .mesh_n(6)
+        .mesh_n_high(12)
         .flood_publish(false)
         .build()?;
         
@@ -355,15 +358,19 @@ pub async fn spawn(
     let (proof_tx, _) = broadcast::channel(256);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone() });
+    let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
     let mut orphan_anchors: HashMap<u64, Vec<Anchor>> = HashMap::new();
-    let mut connected_peers: HashSet<PeerId> = HashSet::new();
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    // Dedupe outgoing epoch requests to avoid spamming the network when we're blocked on a missing fork parent
+    static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    const EPOCH_REQ_DEDUP_SECS: u64 = 5;
+    const REORG_BACKFILL: u64 = 16; // proactively backfill up to 16 predecessors on hash mismatch
 
     // Attempt to reorg to a better chain using buffered anchors.
     fn attempt_reorg(
@@ -408,7 +415,9 @@ pub async fn spawn(
         }
         if parent_candidates.is_empty() {
             net_log!("⛔ Reorg: missing fork anchor at height {} (local and alternates)", fork_height);
-            let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
+            // Request a backfill window ending at fork_height to discover the competing parent
+            let start = fork_height.saturating_sub(REORG_BACKFILL);
+            for n in start..=fork_height { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
             return;
         }
 
@@ -442,7 +451,12 @@ pub async fn spawn(
                 current_parents = vec![next];
             } else {
                 net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", height);
-                if height > 0 { let _ = command_tx.send(NetworkCommand::RequestEpoch(height - 1)); }
+                // Proactively request a window of predecessors up to the fork height to retrieve the missing parent chain
+                if height > 0 {
+                    let start = fork_height.saturating_sub(REORG_BACKFILL);
+                    let end = height - 1;
+                    for n in start..=end { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+                }
                 let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
                 return;
             }
@@ -599,8 +613,11 @@ pub async fn spawn(
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             net_log!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            connected_peers.insert(peer_id);
-                            crate::metrics::PEERS.set(connected_peers.len() as i64);
+                            {
+                                let mut set = connected_peers.lock().unwrap();
+                                set.insert(peer_id);
+                                crate::metrics::PEERS.set(set.len() as i64);
+                            }
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
@@ -623,11 +640,15 @@ pub async fn spawn(
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             net_log!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
-                            connected_peers.remove(&peer_id);
-                            crate::metrics::PEERS.set(connected_peers.len() as i64);
+                            {
+                                let mut set = connected_peers.lock().unwrap();
+                                set.remove(&peer_id);
+                                crate::metrics::PEERS.set(set.len() as i64);
+                            }
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
-                            let peer_id = message.source.unwrap_or_else(PeerId::random);
+                            // Require authenticated source (we configure Signed authenticity). Skip if missing.
+                            let Some(peer_id) = message.source else { continue };
                             let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             // Do not rate-limit inbound anchors – they are essential for fast catch-up.
@@ -639,6 +660,12 @@ pub async fn spawn(
                                     // Ignore duplicate anchors we have already stored to reduce log and CPU spam
                                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                                         if a.num == latest.num && a.hash == latest.hash {
+                                            // Treat duplicate as peer confirmation of our tip
+                                            {
+                                                let mut st = sync_state.lock().unwrap();
+                                                if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
+                                                st.peer_confirmed_tip = true;
+                                            }
                                             // Silently drop duplicate
                                             continue;
                                         }
@@ -650,15 +677,17 @@ pub async fn spawn(
                                     // If it fails because the parent is missing, buffer it.
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
+                                            // Any valid anchor received implies we have a responsive peer
+                                            {
+                                                let mut st = sync_state.lock().unwrap();
+                                                if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
+                                                st.peer_confirmed_tip = true;
+                                            }
                                             if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
                                                 net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                {
-                                                    let mut st = sync_state.lock().unwrap();
-                                                    st.highest_seen_epoch = a.num;
-                                                }
                                                 let _ = anchor_tx.send(a.clone());
                                             }
 
@@ -675,32 +704,8 @@ pub async fn spawn(
                                                 }
                                             }
 
-                                             // Regardless of whether it was better, attempt to process any buffered fork anchors
-                                            // that can now link from this height forward.
-                                             let mut next_num = a.num + 1;
-                                             loop {
-                                                 let mut progressed = false;
-                                                 if let Some(cands) = orphan_anchors.get_mut(&next_num) {
-                                                     let mut i = 0;
-                                                     while i < cands.len() {
-                                                         let orphan = cands[i].clone();
-                                                         if validate_anchor(&orphan, &db).is_ok() {
-                                                             net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
-                                                             if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                             if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                             if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                             let _ = anchor_tx.send(orphan);
-                                                             cands.remove(i);
-                                                             progressed = true;
-                                                         } else {
-                                                             i += 1;
-                                                         }
-                                                     }
-                                                     if cands.is_empty() { orphan_anchors.remove(&next_num); }
-                                                 }
-                                                 if progressed { next_num += 1; } else { break; }
-                                             }
-                                             // After linking forward, attempt a reorg if a better buffered tip exists
+                                             // After adoption, rely on the reorg procedure to evaluate any buffered
+                                             // alternate branches that can now link from this height forward.
                                              attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
                                             // Enforce orphan cap
                                              let orphan_len: usize = orphan_anchors.values().map(|v| v.len()).sum();
@@ -714,19 +719,31 @@ pub async fn spawn(
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
                                             net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
-                                            let entry = orphan_anchors.entry(a.num).or_default();
-                                            if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
-                                            
-                                            let mut state = sync_state.lock().unwrap();
+                                             let entry = orphan_anchors.entry(a.num).or_default();
+                                             if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
+                                             
+                                             let mut state = sync_state.lock().unwrap();
                                             if a.num > state.highest_seen_epoch {
                                                 state.highest_seen_epoch = a.num;
                                             }
+                                              state.peer_confirmed_tip = true;
                                             // Proactively request the missing predecessor to accelerate linking the chain
-                                            if a.num > 0 {
-                                                let prev_epoch = a.num - 1;
-                                                if let Ok(bytes) = bincode::serialize(&prev_epoch) {
-                                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                }
+                                                 if a.num > 0 {
+                                                 let now = std::time::Instant::now();
+                                                 // Trim old entries
+                                                 {
+                                                     let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                                                 }
+                                                 // Request immediate predecessor if not recently requested
+                                                 let prev_epoch = a.num - 1;
+                                                 let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                 if !map.contains_key(&prev_epoch) {
+                                                     if let Ok(bytes) = bincode::serialize(&prev_epoch) {
+                                                         let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                         map.insert(prev_epoch, now);
+                                                     }
+                                                 }
                                             }
                                              // Try reorg as we may already have a contiguous buffered segment
                                              attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
@@ -736,26 +753,39 @@ pub async fn spawn(
                                             // This can legitimately occur if different miners produced different merkle roots.
                                             // We ignore it (not better chain) but do not penalize the peer, and we still
                                             // advance the highest_seen_epoch so heartbeat logic doesn’t flap.
-                                            if e.contains("hash mismatch") {
-                                                net_log!("🔀 Alternate fork anchor at height {} (hash mismatch) – buffering for reorg", a.num);
-                                                // Buffer this anchor so once we obtain/confirm its predecessor we can advance this branch
-                                                let entry = orphan_anchors.entry(a.num).or_default();
-                                                if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
-                                                {
-                                                    let mut st = sync_state.lock().unwrap();
-                                                    if a.num > st.highest_seen_epoch {
-                                                        st.highest_seen_epoch = a.num;
-                                                    }
-                                                }
-                                                // Try to retrieve the predecessor to this fork height to see the competing chain
-                                                if a.num > 0 {
-                                                    let prev_epoch = a.num - 1;
-                                                    if let Ok(bytes) = bincode::serialize(&prev_epoch) {
-                                                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                    }
-                                                }
-                                                // Attempt full reorg if alternate tip looks ahead
-                                                attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
+                                              if e.contains("hash mismatch") {
+                                                 net_log!("🔀 Alternate fork anchor at height {} (hash mismatch) – buffering for reorg", a.num);
+                                                 // Buffer this anchor so once we obtain/confirm its predecessor we can advance this branch
+                                                 let entry = orphan_anchors.entry(a.num).or_default();
+                                                 if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
+                                                 // Proactively request a backfill window of predecessors to locate the true fork point
+                                                 if a.num > 0 {
+                                                     let now = std::time::Instant::now();
+                                                     {
+                                                         // GC old dedupe entries
+                                                         let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                                                     }
+                                                     let start = a.num.saturating_sub(REORG_BACKFILL);
+                                                     let end = a.num - 1;
+                                                     let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                     for n in start..=end {
+                                                         if !map.contains_key(&n) {
+                                                             if let Ok(bytes) = bincode::serialize(&n) {
+                                                                 let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                                 map.insert(n, now);
+                                                             }
+                                                         }
+                                                     }
+                                                 }
+                                                  // Mark that we observed a peer tip even if not adopted
+                                                  {
+                                                      let mut st = sync_state.lock().unwrap();
+                                                      if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
+                                                      st.peer_confirmed_tip = true;
+                                                  }
+                                                 // Attempt full reorg if alternate tip looks ahead
+                                                 attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
                                             } else {
                                                 println!("❌ Anchor validation failed: {}", e);
                                                 crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
@@ -864,19 +894,73 @@ pub async fn spawn(
                     }
                 },
                 Some(command) = command_rx.recv() => {
-                    let (topic, data) = match &command {
-                        NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                        NetworkCommand::GossipCoin(c) => (TOP_COIN, bincode::serialize(&c).ok()),
-                        NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
-                        NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
-                        NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
-                        NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
-                        NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                        NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
-                    };
-                    if let Some(d) = data {
-                        if swarm.behaviour_mut().publish(IdentTopic::new(topic), d.clone()).is_err() {
-                            pending_commands.push_back(command);
+                    match &command {
+                        NetworkCommand::RequestEpoch(n) => {
+                            // Dedupe request spam
+                            let now = std::time::Instant::now();
+                            {
+                                let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                            }
+                            let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                            if !map.contains_key(n) {
+                                if let Ok(data) = bincode::serialize(n) {
+                                    if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), data).is_err() {
+                                        pending_commands.push_back(command);
+                                    } else {
+                                        map.insert(*n, now);
+                                    }
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipAnchor(a) => {
+                            if let Ok(data) = bincode::serialize(a) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipCoin(c) => {
+                            if let Ok(data) = bincode::serialize(c) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipTransfer(tx) => {
+                            if let Ok(data) = bincode::serialize(tx) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_TX), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipSpend(sp) => {
+                            if let Ok(data) = bincode::serialize(sp) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::RequestCoin(id) => {
+                            if let Ok(data) = bincode::serialize(id) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::RequestLatestEpoch => {
+                            if let Ok(data) = bincode::serialize(&()) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_LATEST_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::RequestCoinProof(id) => {
+                            if let Ok(data) = bincode::serialize(&CoinProofRequest{ coin_id: *id }) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
                         }
                     }
                 }
@@ -901,8 +985,6 @@ impl Network {
     
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {
-        // This would need to be implemented with a shared state between the network thread and this struct
-        // For now, return a placeholder - in a full implementation, this would use Arc<Mutex<HashSet<PeerId>>>
-        0 // TODO: Implement actual peer counting
+        self.connected_peers.lock().unwrap().len()
     }
 }
