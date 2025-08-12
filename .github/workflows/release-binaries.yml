@@ -1,0 +1,123 @@
+name: Release (macOS + Windows)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and release ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --locked --release
+
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      - name: Codesign binaries (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          codesign --force --options runtime --timestamp -s "${{ secrets.MACOS_CERT_IDENTITY }}" target/release/unchained
+          codesign --force --options runtime --timestamp -s "${{ secrets.MACOS_CERT_IDENTITY }}" target/release/inspect_db
+          codesign -dv --verbose=2 target/release/unchained || true
+          codesign -dv --verbose=2 target/release/inspect_db || true
+
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          RELEASE_NAME="unchained-${{ github.ref_name }}-${{ matrix.target }}"
+          STAGE_DIR="$RELEASE_NAME"
+          mkdir -p "$STAGE_DIR"
+          cp target/release/unchained "$STAGE_DIR/"
+          cp target/release/inspect_db "$STAGE_DIR/"
+          for f in README.md LICENSE; do [ -f "$f" ] && cp "$f" "$STAGE_DIR/"; done
+          DMG_NAME="${RELEASE_NAME}.dmg"
+          hdiutil create -volname "$RELEASE_NAME" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_NAME"
+          echo "ASSET_PATH=$(pwd)/${DMG_NAME}" >> $GITHUB_ENV
+
+      - name: Notarize and staple DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          NOTARY_API_KEY_BASE64: ${{ secrets.NOTARY_API_KEY_BASE64 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euxo pipefail
+          KEY_PATH="/tmp/AuthKey.p8"
+          echo "$NOTARY_API_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          xcrun notarytool submit "$ASSET_PATH" \
+            --key "$KEY_PATH" \
+            --key-id "$NOTARY_API_KEY_ID" \
+            --issuer "$NOTARY_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$ASSET_PATH"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ReleaseName = "unchained-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $ReleaseName | Out-Null
+          Copy-Item -Path "target/release/unchained.exe" -Destination $ReleaseName
+          Copy-Item -Path "target/release/inspect_db.exe" -Destination $ReleaseName
+          if (Test-Path "README.md") { Copy-Item "README.md" $ReleaseName }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" $ReleaseName }
+          $Archive = "$ReleaseName.zip"
+          Compress-Archive -Path "$ReleaseName/*" -DestinationPath $Archive -Force
+          "ASSET_PATH=$((Get-Location).Path)\$Archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.ASSET_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+

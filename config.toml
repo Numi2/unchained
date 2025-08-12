@@ -21,7 +21,7 @@ sync_timeout_secs = 1800
 public_ip = "193.71.140.215"
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWByDCRsGqvDHD6MmuUq3kG4VYPTGUJpJZnPUf4wmiUCdE" ]
+bootstrap = [ "/ip4/34.174.184.89/udp/31000/quic-v1/p2p/12D3KooWBPTfoRzkw2UJuipj7gn9MyoHfMWtSrQ6mxSpfZUoxepH" ]
 
 
 
@@ -43,10 +43,10 @@ path = "../blockchain_data"
 # Duration of each epoch in seconds 
 seconds = 222
 # Target number of leading zeros for proof-of-work difficulty (start with 2 for public mining)
-target_leading_zeros = 1
+target_leading_zeros = 2
 # Retargeting parameters
 # Target number of coins per epoch for difficulty adjustment (reduced for public mining)
-target_coins_per_epoch = 3
+target_coins_per_epoch = 11
 # How often to retarget (every N epochs - more frequent for dynamic adjustment)
 retarget_interval = 2000
 
@@ -54,10 +54,10 @@ retarget_interval = 2000
 [mining]
 # Enable mining by default
 enabled = true
-# Memory usage for Argon2 hashing in KiB (32 MiB, optimized for mining speed)
+# Memory usage for Argon2 hashing in KiB 
 mem_kib = 16192
 # Number of parallel lanes for Argon2 (2 lanes for better parallelization)
-lanes = 2
+lanes = 1
 
 # Memory retargeting parameters
 # Minimum memory in KiB
@@ -75,7 +75,7 @@ heartbeat_interval_secs = 140
 # Maximum consecutive failures before restarting miner (more forgiving for network issues)
 max_consecutive_failures = 3
 # Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
-max_mining_attempts = 50000
+max_mining_attempts = 500000
 
 [metrics]
 # Optional – leave out to use the default "0.0.0.0:9100"
