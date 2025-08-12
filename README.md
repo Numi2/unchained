@@ -2,7 +2,7 @@
 
 Post‑quantum blockchain implementation - Dilithium3 for signatures, Kyber768 for stealth receiving, BLAKE3 for hashing, Argon2id for PoW. libp2p over QUIC does the gossip (libp2p prefer pq aws). 
 
-miners find Argon2id solutions, coins get committed into epoch Merkle roots, and ownership moves with Dilithium signatures. Receivers sends use one‑time keys (stealth) by default.
+Unchained, a permissionless blockchain that couples memory-hard proof-of-work with post-quantum (PQ) cryptography and an epoch-first issuance model. Time is divided into fixed-length epochs; miners submit coin candidates throughout an epoch using Argon2id. At the epoch boundary, the network finalizes an anchor that commits to up to N selected coins via a Merkle root, enabling independent verification and efficient synchronization. Ownership is tracked with Dilithium3 signatures; receivers obtain privacy via Kyber768-based stealth receiving with one-time keys. Unchained uses libp2p over QUIC for gossip
 
 
 
