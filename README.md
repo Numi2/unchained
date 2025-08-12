@@ -4,7 +4,6 @@ Post‑quantum blockchain implementation - Dilithium3 for signatures, Kyber768 f
 
 miners find Argon2id solutions, coins get committed into epoch Merkle roots, and ownership moves with Dilithium signatures. Receivers sends use one‑time keys (stealth) by default.
 
-## Highlights (why this isn’t just another toy chain)
 
 - Memory‑hard PoW  Argon2id; memory target retunes across epochs
 - End‑to‑end PQ: Dilithium3 signatures, Kyber768 for stealth, BLAKE3 everywhere
