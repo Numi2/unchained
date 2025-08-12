@@ -43,6 +43,7 @@ All commands accept `--config <path>` (default `config.toml`) and `--quiet-net`.
 
 - `mine` — start mining immediately (overrides `mining.enabled`)
 - `peer-id` — print local libp2p Peer ID (and multiaddr if `net.public_ip` is set)
+- `stealth-address` — print your stealth receiving address (base64-url)
 - `proof --coin-id <HEX>` — request and verify a Merkle proof for a coin
 - `proof-server [--bind HOST:PORT]` — HTTPS server that returns proofs
 - `send --stealth <ADDRESS> --amount <N>` — send to a stealth address
@@ -88,16 +89,8 @@ Env vars that matter:
 
 1) Export your stealth address (a signed bundle that binds your normal address to your Kyber768 public key):
 
-```rust
-use std::sync::Arc;
-use unchained::{storage::Store, wallet::Wallet};
-
-fn main() -> anyhow::Result<()> {
-    let db = Arc::new(Store::open("./data")?);
-    let wallet = Wallet::load_or_create(db)?;
-    println!("{}", wallet.export_stealth_address());
-    Ok(())
-}
+```bash
+cargo run --release --bin unchained -- stealth-address
 ```
 
 Share this base64‑url string with senders. They’ll encrypt a one‑time Dilithium key to your Kyber PK. Your wallet can decrypt it, nobody else can.

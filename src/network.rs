@@ -359,7 +359,7 @@ pub async fn spawn(
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
-    let mut orphan_anchors: HashMap<u64, Anchor> = HashMap::new();
+    let mut orphan_anchors: HashMap<u64, Vec<Anchor>> = HashMap::new();
     let mut connected_peers: HashSet<PeerId> = HashSet::new();
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
@@ -368,7 +368,7 @@ pub async fn spawn(
     // Attempt to reorg to a better chain using buffered anchors.
     fn attempt_reorg(
         db: &Store,
-        orphan_anchors: &mut HashMap<u64, Anchor>,
+        orphan_anchors: &mut HashMap<u64, Vec<Anchor>>,
         anchor_tx: &broadcast::Sender<Anchor>,
         sync_state: &Arc<Mutex<SyncState>>,
         command_tx: &mpsc::UnboundedSender<NetworkCommand>,
@@ -380,55 +380,76 @@ pub async fn spawn(
         let Some(&max_buf_height) = orphan_anchors.keys().max() else { return };
         if max_buf_height <= current_latest.num { return; }
 
-        // Build a contiguous segment ending at max_buf_height down to the first gap
-        let mut segment: Vec<Anchor> = Vec::new();
+        // Determine earliest contiguous height present in the orphan buffer
         let mut h = max_buf_height;
-        while let Some(a) = orphan_anchors.get(&h) {
-            segment.push(a.clone());
-            if h == 0 { break; }
-            h -= 1;
+        while h > 0 {
+            match orphan_anchors.get(&h) {
+                Some(v) if !v.is_empty() => { h -= 1; }
+                _ => break,
+            }
         }
-        if segment.is_empty() { return; }
-        segment.reverse(); // ascending
-        let fork_height = segment[0].num.saturating_sub(1);
+        let first_height = if orphan_anchors.get(&h).is_some() { h } else { h + 1 };
+        if first_height > max_buf_height { return; }
+        let fork_height = first_height.saturating_sub(1);
         net_log!("🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
-            segment.first().map(|a| a.num).unwrap_or(0),
-            segment.last().map(|a| a.num).unwrap_or(0),
-            segment.len(),
+            first_height,
+            max_buf_height,
+            (max_buf_height - first_height + 1),
             fork_height
         );
 
-        // Need fork point present locally
-        let Some(fork_anchor) = db.get::<Anchor>("epoch", &fork_height.to_le_bytes()).ok().flatten() else {
-            net_log!("⛔ Reorg: missing local fork anchor at height {}", fork_height);
-            // Proactively request the fork parent so we can validate and adopt the buffered segment
+        // Build candidate parents at fork point: local chain and any alternates at fork height
+        let mut parent_candidates: Vec<Anchor> = Vec::new();
+        if let Ok(Some(local_parent)) = db.get::<Anchor>("epoch", &fork_height.to_le_bytes()) {
+            parent_candidates.push(local_parent);
+        }
+        if let Some(alts_at_fork) = orphan_anchors.get(&fork_height) {
+            for a in alts_at_fork { parent_candidates.push(a.clone()); }
+        }
+        if parent_candidates.is_empty() {
+            net_log!("⛔ Reorg: missing fork anchor at height {} (local and alternates)", fork_height);
             let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
             return;
-        };
-
-        // Validate linkage and cumulative work across the segment
-        let mut prev = fork_anchor.clone();
-        for alt in &segment {
-            let expected_work = Anchor::expected_work_for_difficulty(alt.difficulty);
-            let expected_cum = prev.cumulative_work.saturating_add(expected_work);
-            if alt.cumulative_work != expected_cum {
-                net_log!("⛔ Reorg: cumulative work mismatch at {} (expected {}, got {})",
-                    alt.num, expected_cum, alt.cumulative_work);
-                return;
-            }
-            let mut hsh = blake3::Hasher::new();
-            hsh.update(&alt.merkle_root);
-            hsh.update(&prev.hash);
-            let recomputed = *hsh.finalize().as_bytes();
-            if alt.hash != recomputed {
-                net_log!("⛔ Reorg: anchor hash mismatch at {} (recomputed {}, got {})",
-                    alt.num, hex::encode(recomputed), hex::encode(alt.hash));
-                return;
-            }
-            prev = alt.clone();
         }
 
-        let seg_tip = segment.last().unwrap();
+        // Try to assemble a valid alternate branch from first_height..=max_buf_height by selecting, at each
+        // height, the candidate whose hash links to the current parent. Start by trying all candidate parents.
+        let mut chosen_chain: Vec<Anchor> = Vec::new();
+        let mut resolved_parent: Option<Anchor> = None;
+        let mut current_parents = parent_candidates;
+        for height in first_height..=max_buf_height {
+            let Some(cands) = orphan_anchors.get(&height) else { break; };
+            if cands.is_empty() { break; }
+            let mut linked: Option<(Anchor, Anchor)> = None; // (next, parent)
+            'parent_loop: for p in &current_parents {
+                for alt in cands {
+                    let expected_work = Anchor::expected_work_for_difficulty(alt.difficulty);
+                    let expected_cum = p.cumulative_work.saturating_add(expected_work);
+                    if alt.cumulative_work != expected_cum { continue; }
+                    let mut hsh = blake3::Hasher::new();
+                    hsh.update(&alt.merkle_root);
+                    hsh.update(&p.hash);
+                    let recomputed = *hsh.finalize().as_bytes();
+                    if alt.hash == recomputed {
+                        linked = Some((alt.clone(), p.clone()));
+                        break 'parent_loop;
+                    }
+                }
+            }
+            if let Some((next, p)) = linked {
+                if resolved_parent.is_none() { resolved_parent = Some(p); }
+                chosen_chain.push(next.clone());
+                current_parents = vec![next];
+            } else {
+                net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", height);
+                if height > 0 { let _ = command_tx.send(NetworkCommand::RequestEpoch(height - 1)); }
+                let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
+                return;
+            }
+        }
+        if chosen_chain.is_empty() { return; }
+
+        let seg_tip = chosen_chain.last().unwrap();
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
             net_log!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
@@ -444,8 +465,8 @@ pub async fn spawn(
         let mut batch = WriteBatch::default();
 
         // Keep track of the parent as we walk the ascending segment so we can re-run deterministic selection
-        let mut parent = fork_anchor.clone();
-        for alt in &segment {
+        let mut parent = resolved_parent.expect("parent must be set when chosen_chain is non-empty");
+        for alt in &chosen_chain {
             // 1) Overwrite anchor mappings for this epoch and advance latest
             let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return };
             batch.put_cf(epoch_cf, alt.num.to_le_bytes(), &ser);
@@ -555,12 +576,18 @@ pub async fn spawn(
             eprintln!("🔥 Reorg write failed: {}", e);
             return;
         }
-        for alt in &segment { let _ = anchor_tx.send(alt.clone()); }
+        for alt in &chosen_chain { let _ = anchor_tx.send(alt.clone()); }
         {
             let mut st = sync_state.lock().unwrap();
             st.highest_seen_epoch = seg_tip.num;
         }
-        for alt in &segment { orphan_anchors.remove(&alt.num); }
+        // Remove adopted anchors from buffer while keeping other alternates
+        for alt in &chosen_chain {
+            if let Some(vec) = orphan_anchors.get_mut(&alt.num) {
+                vec.retain(|a| a.hash != alt.hash);
+                if vec.is_empty() { orphan_anchors.remove(&alt.num); }
+            }
+        }
         net_log!("🔁 Reorg adopted up to epoch {} (better cumulative work)", seg_tip.num);
     }
 
@@ -635,35 +662,60 @@ pub async fn spawn(
                                                 let _ = anchor_tx.send(a.clone());
                                             }
 
-                                             // Regardless of whether it was better, attempt to process any buffered fork anchors
-                                            // that can now link from this height forward.
-                                            let mut next_num = a.num + 1;
-                                            while let Some(orphan) = orphan_anchors.remove(&next_num) {
-                                                if validate_anchor(&orphan, &db).is_ok() {
-                                                    net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
-                                                    if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                    if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                    if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                    let _ = anchor_tx.send(orphan);
-                                                    next_num += 1;
-                                                } else {
-                                                    orphan_anchors.insert(orphan.num, orphan);
-                                                    break;
+                                            // If this valid anchor is not adopted (either equal to current or not better),
+                                            // and it conflicts with the stored anchor at the same height, buffer it as an
+                                            // alternate so reorg can consider it as a fork parent.
+                                            if let Ok(Some(existing)) = db.get::<Anchor>("epoch", &a.num.to_le_bytes()) {
+                                                if existing.hash != a.hash {
+                                                    let entry = orphan_anchors.entry(a.num).or_default();
+                                                    if !entry.iter().any(|x| x.hash == a.hash) {
+                                                        net_log!("🔀 Buffered alternate anchor at height {} (valid but not adopted)", a.num);
+                                                        entry.push(a.clone());
+                                                    }
                                                 }
                                             }
+
+                                             // Regardless of whether it was better, attempt to process any buffered fork anchors
+                                            // that can now link from this height forward.
+                                             let mut next_num = a.num + 1;
+                                             loop {
+                                                 let mut progressed = false;
+                                                 if let Some(cands) = orphan_anchors.get_mut(&next_num) {
+                                                     let mut i = 0;
+                                                     while i < cands.len() {
+                                                         let orphan = cands[i].clone();
+                                                         if validate_anchor(&orphan, &db).is_ok() {
+                                                             net_log!("✅ Processing buffered orphan anchor for epoch {}", orphan.num);
+                                                             if db.put("epoch", &orphan.num.to_le_bytes(), &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                             if db.put("anchor", &orphan.hash, &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                             if db.put("epoch", b"latest", &orphan).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                             let _ = anchor_tx.send(orphan);
+                                                             cands.remove(i);
+                                                             progressed = true;
+                                                         } else {
+                                                             i += 1;
+                                                         }
+                                                     }
+                                                     if cands.is_empty() { orphan_anchors.remove(&next_num); }
+                                                 }
+                                                 if progressed { next_num += 1; } else { break; }
+                                             }
                                              // After linking forward, attempt a reorg if a better buffered tip exists
                                              attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
                                             // Enforce orphan cap
-                                            crate::metrics::ORPHAN_BUFFER_LEN.set(orphan_anchors.len() as i64);
-                                            if orphan_anchors.len() > MAX_ORPHAN_ANCHORS {
-                                                let oldest = *orphan_anchors.keys().min().unwrap();
-                                                orphan_anchors.remove(&oldest);
-                                                eprintln!("⚠️ Orphan buffer cap exceeded, dropping oldest epoch {}", oldest);
-                                            }
+                                             let orphan_len: usize = orphan_anchors.values().map(|v| v.len()).sum();
+                                             crate::metrics::ORPHAN_BUFFER_LEN.set(orphan_len as i64);
+                                             if orphan_len > MAX_ORPHAN_ANCHORS {
+                                                 if let Some(&oldest) = orphan_anchors.keys().min() {
+                                                     orphan_anchors.remove(&oldest);
+                                                     eprintln!("⚠️ Orphan buffer cap exceeded, dropping oldest epoch {}", oldest);
+                                                 }
+                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
                                             net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
-                                            orphan_anchors.insert(a.num, a.clone());
+                                            let entry = orphan_anchors.entry(a.num).or_default();
+                                            if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
                                             
                                             let mut state = sync_state.lock().unwrap();
                                             if a.num > state.highest_seen_epoch {
@@ -687,7 +739,8 @@ pub async fn spawn(
                                             if e.contains("hash mismatch") {
                                                 net_log!("🔀 Alternate fork anchor at height {} (hash mismatch) – buffering for reorg", a.num);
                                                 // Buffer this anchor so once we obtain/confirm its predecessor we can advance this branch
-                                                orphan_anchors.insert(a.num, a.clone());
+                                                let entry = orphan_anchors.entry(a.num).or_default();
+                                                if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
                                                 {
                                                     let mut st = sync_state.lock().unwrap();
                                                     if a.num > st.highest_seen_epoch {

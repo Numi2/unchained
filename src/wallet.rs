@@ -264,10 +264,11 @@ impl Wallet {
     // ---------------------------------------------------------------------
     // 🪙 UTXO helpers
     // ---------------------------------------------------------------------
-    /// Returns all coins created by this wallet that are currently **unspent**.
-    /// A coin is considered unspent if:
-    ///   1. It belongs to `self.address`, **and**
-    ///   2. There is no transfer recorded with the same `coin_id`.
+    /// Returns all coins currently owned by this wallet that are **unspent**.
+    /// Rules:
+    /// - Exclude coins that already have a V2 spend recorded
+    /// - If no legacy transfer exists: creator still owns it (creator_address == self.address)
+    /// - If a legacy transfer exists: we own it if we can recover the one-time SK from its stealth output
     pub fn list_unspent(&self) -> Result<Vec<crate::coin::Coin>> {
         let store = self
             ._db
@@ -284,11 +285,22 @@ impl Wallet {
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                if coin.creator_address == self.address {
-                    let spent: Option<crate::transfer::Transfer> =
-                        store.get("transfer", &coin.id)?;
-                    if spent.is_none() {
-                        utxos.push(coin);
+                // Skip coins that already have a V2 spend
+                let spent_v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
+                if spent_v2.is_some() { continue; }
+
+                // Check legacy transfer chain to determine current owner
+                let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
+                match last_tx {
+                    None => {
+                        if coin.creator_address == self.address {
+                            utxos.push(coin);
+                        }
+                    }
+                    Some(t) => {
+                        if t.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                            utxos.push(coin);
+                        }
                     }
                 }
             }
@@ -362,21 +374,19 @@ impl Wallet {
                 ).await?;
                 transfers.push(transfer);
             } else {
-                // Build a V2 spend using the recovered current owner secret (we are the owner, so use self.sk only if our address matches last recipient).
+                // Build a V2 spend using the recovered current owner secret.
                 let last = last_tx.unwrap();
-                // Confirm ownership
-                if last.recipient() != self.address {
-                    // Not owned by this wallet anymore
-                    continue;
-                }
                 // Request proof for the coin
                 network.request_coin_proof(coin.id).await;
                 let mut proof_rx = network.proof_subscribe();
                 let proof_resp = tokio::time::timeout(std::time::Duration::from_secs(5), proof_rx.recv()).await
                     .map_err(|_| anyhow!("Timed out waiting for coin proof"))??;
                 if proof_resp.coin.id != coin.id { continue; }
-                // Recover one-time spend key from the last incoming stealth output
-                let owner_sk = last.to.try_recover_one_time_sk(&self.kyber_sk)?;
+                // Recover one-time spend key from the last incoming stealth output to prove ownership
+                let owner_sk = match last.to.try_recover_one_time_sk(&self.kyber_sk) {
+                    Ok(sk) => sk,
+                    Err(_) => { continue; }
+                };
                 let spend = crate::transfer::Spend::create(
                     coin.id,
                     &proof_resp.anchor,
