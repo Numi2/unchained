@@ -33,13 +33,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build (release)
+      - name: Build (release, static CRT)
         run: cargo build --locked --release
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
 
-      - name: Verify binaries exist
+      - name: Smoke test executable
         shell: pwsh
         run: |
+          & target/release/unchained.exe --version
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          # Verify binaries exist
           Get-ChildItem -Path target/release -Filter *.exe
+          # Staging directory for flattened zip contents
+          $dist = "dist/windows"
+          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          # Copy artifacts into staging dir (flattened)
+          Copy-Item -Path target/release/unchained.exe -Destination "$dist/unchained.exe" -Force
+          Copy-Item -Path target/release/inspect_db.exe -Destination "$dist/inspect_db.exe" -Force
+          Copy-Item -Path config.toml -Destination "$dist/config.toml" -Force
+          Copy-Item -Path README.md -Destination "$dist/README.md" -Force
+          Copy-Item -Path unchained-run.bat -Destination "$dist/unchained-run.bat" -Force
+          # Bundle a zip with exe + config + README + launcher (flattened)
+          $zipPath = "target/release/unchained-windows-x86_64.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "$dist/*" -DestinationPath $zipPath
 
       - name: Compute release metadata
         id: meta
@@ -58,6 +80,8 @@ jobs:
           files: |
             target/release/unchained.exe
             target/release/inspect_db.exe
+            target/release/unchained-windows-x86_64.zip
+            unchained-run.bat
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

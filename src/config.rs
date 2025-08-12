@@ -161,6 +161,18 @@ pub fn load<P: AsRef<Path>>(p: P) -> Result<Config> {
     Ok(cfg)
 }
 
+/// Parse configuration from a TOML string and apply the same validations as `load`.
+pub fn load_from_str(text: &str) -> Result<Config> {
+    let val: TomlValue = toml::from_str(text)
+        .with_context(|| "📝  invalid TOML in embedded/default config".to_string())?;
+    warn_unknown_keys(&val);
+    let mut cfg: Config = val.try_into().with_context(|| "📝  invalid config schema".to_string())?;
+    // Sanity clamps
+    if cfg.mining.mem_kib < cfg.mining.min_mem_kib { cfg.mining.mem_kib = cfg.mining.min_mem_kib; }
+    if cfg.mining.mem_kib > cfg.mining.max_mem_kib { cfg.mining.mem_kib = cfg.mining.max_mem_kib; }
+    Ok(cfg)
+}
+
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;

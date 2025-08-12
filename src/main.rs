@@ -57,7 +57,37 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.quiet_net { network::set_quiet_logging(true); }
 
-    let mut cfg = config::load(&cli.config)?;
+    // Try reading config from CLI path, then from the executable directory, else fallback to embedded default
+    let mut cfg = match config::load(&cli.config) {
+        Ok(c) => c,
+        Err(e1) => {
+            // Attempt exe-dir config.toml
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            if let Some(dir) = exe_dir {
+                let candidate = dir.join("config.toml");
+                match config::load(&candidate) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        eprintln!("⚠️  Could not read config from '{}' or exe dir: {} | {}", &cli.config, e1, e2);
+                        // Embedded minimal default config ensures the Windows .exe can run standalone
+                        const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
+                        match config::load_from_str(EMBEDDED_CONFIG) {
+                            Ok(c) => c,
+                            Err(e3) => return Err(anyhow::anyhow!("failed to load configuration: {} / {} / {}", e1, e2, e3)),
+                        }
+                    }
+                }
+            } else {
+                const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
+                match config::load_from_str(EMBEDDED_CONFIG) {
+                    Ok(c) => c,
+                    Err(e3) => return Err(anyhow::anyhow!("failed to load configuration: {} / {}", e1, e3)),
+                }
+            }
+        }
+    };
 
     // Resolve storage path: if relative, place under user's home at ~/.unchained/unchained_data
     if std::path::Path::new(&cfg.storage.path).is_relative() {
@@ -162,6 +192,12 @@ async fn main() -> anyhow::Result<()> {
             }
 
             miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+            println!(
+                "⛏️  Mining started (workers: {}, mem_kib: {}, heartbeat_secs: {})",
+                cfg.mining.workers,
+                cfg.mining.mem_kib,
+                cfg.mining.heartbeat_interval_secs
+            );
         }
         Some(Cmd::PeerId) => {
             let id = network::peer_id_string()?;
@@ -435,6 +471,12 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
+                println!(
+                    "⛏️  Mining started (workers: {}, mem_kib: {}, heartbeat_secs: {})",
+                    cfg.mining.workers,
+                    cfg.mining.mem_kib,
+                    cfg.mining.heartbeat_interval_secs
+                );
             }
         }
     }
