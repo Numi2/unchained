@@ -64,6 +64,10 @@ const TOP_COIN_PROOF_REQUEST: &str = "unchained/coin_proof_request/v1";
 const TOP_COIN_PROOF_RESPONSE: &str = "unchained/coin_proof_response/v1";
 const TOP_TX: &str = "unchained/tx/v1";
 const TOP_SPEND: &str = "unchained/spend/v2";
+const TOP_TX_REQUEST: &str = "unchained/tx_request/v1";          // payload: [u8;32] coin_id
+const TOP_TX_RESPONSE: &str = "unchained/tx_response/v1";        // payload: Option<Transfer>
+const TOP_SPEND_REQUEST: &str = "unchained/spend_request/v2";    // payload: [u8;32] coin_id
+const TOP_SPEND_RESPONSE: &str = "unchained/spend_response/v2";  // payload: Option<Spend>
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
@@ -257,6 +261,8 @@ enum NetworkCommand {
     GossipTransfer(Transfer),
     GossipSpend(Spend),
     RequestEpoch(u64),
+    RequestTx([u8;32]),
+    RequestSpend([u8;32]),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
     RequestCoinProof([u8; 32]),
@@ -317,7 +323,12 @@ pub async fn spawn(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!(e))?;
-    for t in [TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_SPEND, TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST, TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE] {
+    for t in [
+        TOP_ANCHOR, TOP_COIN, TOP_TX, TOP_SPEND,
+        TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
+        TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE,
+        TOP_TX_REQUEST, TOP_TX_RESPONSE, TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
+    ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
@@ -622,13 +633,15 @@ pub async fn spawn(
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
                                 NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
-                                 NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                                NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                                 NetworkCommand::GossipTransfer(tx) => (TOP_TX, bincode::serialize(&tx).ok()),
                                 NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                 NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                 NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                 NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                                 NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                                NetworkCommand::RequestTx(id) => (TOP_TX_REQUEST, bincode::serialize(&id).ok()),
+                                NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
                             };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
@@ -812,6 +825,26 @@ pub async fn spawn(
                                         score.record_validation_failure();
                                     }
                                 },
+                                TOP_TX_REQUEST => if let Ok(coin_id) = bincode::deserialize::<[u8;32]>(&message.data) {
+                                    if let Ok(Some(tx)) = db.get::<Transfer>("transfer", &coin_id) {
+                                        if let Ok(data) = bincode::serialize(&Some(tx)) {
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_TX_RESPONSE), data).ok();
+                                        }
+                                    } else {
+                                        // answer with None to let requester stop retrying
+                                        if let Ok(data) = bincode::serialize(&Option::<Transfer>::None) {
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_TX_RESPONSE), data).ok();
+                                        }
+                                    }
+                                },
+                                TOP_TX_RESPONSE => if let Ok(resp) = bincode::deserialize::<Option<Transfer>>(&message.data) {
+                                    if let Some(tx) = resp {
+                                        if validate_transfer(&tx, &db).is_ok() {
+                                            db.put("transfer", &tx.coin_id, &tx).ok();
+                                            let _ = db.put("nullifier", &tx.nullifier, &[1u8;1]);
+                                        }
+                                    }
+                                },
                                 TOP_SPEND => if let Ok(sp) = bincode::deserialize::<Spend>(&message.data) {
                                     if validate_spend(&sp, &db).is_ok() {
                                         db.put("spend", &sp.coin_id, &sp).ok();
@@ -819,6 +852,25 @@ pub async fn spawn(
                                     } else {
                                         crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
                                         score.record_validation_failure();
+                                    }
+                                },
+                                TOP_SPEND_REQUEST => if let Ok(coin_id) = bincode::deserialize::<[u8;32]>(&message.data) {
+                                    if let Ok(Some(sp)) = db.get::<Spend>("spend", &coin_id) {
+                                        if let Ok(data) = bincode::serialize(&Some(sp)) {
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
+                                        }
+                                    } else {
+                                        if let Ok(data) = bincode::serialize(&Option::<Spend>::None) {
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
+                                        }
+                                    }
+                                },
+                                TOP_SPEND_RESPONSE => if let Ok(resp) = bincode::deserialize::<Option<Spend>>(&message.data) {
+                                    if let Some(sp) = resp {
+                                        if validate_spend(&sp, &db).is_ok() {
+                                            db.put("spend", &sp.coin_id, &sp).ok();
+                                            let _ = db.put("nullifier", &sp.nullifier, &[1u8;1]);
+                                        }
                                     }
                                 },
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
@@ -962,6 +1014,20 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::RequestTx(id) => {
+                            if let Ok(data) = bincode::serialize(id) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_TX_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::RequestSpend(id) => {
+                            if let Ok(data) = bincode::serialize(id) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -975,6 +1041,8 @@ impl Network {
     pub async fn gossip_coin(&self, c: &CoinCandidate) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
     pub async fn gossip_transfer(&self, tx: &Transfer) { let _ = self.command_tx.send(NetworkCommand::GossipTransfer(tx.clone())); }
     pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
+    pub async fn request_tx(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestTx(id)); }
+    pub async fn request_spend(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestSpend(id)); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }

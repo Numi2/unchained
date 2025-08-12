@@ -435,6 +435,7 @@ impl Manager {
                         // Persist selected coins into confirmed coin CF and index selected IDs per-epoch
                         if let Some(coin_cf) = self.db.db.cf_handle("coin") {
                             for cand in &selected {
+                                // Include creator_pk for genesis V2 spends
                                 let coin = cand.clone().into_confirmed();
                                 if let Ok(bytes) = bincode::serialize(&coin) {
                                     batch.put_cf(coin_cf, &coin.id, &bytes);

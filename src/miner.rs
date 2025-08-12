@@ -1,5 +1,6 @@
 use crate::{storage::Store, crypto, epoch::Anchor, coin::{Coin, CoinCandidate}, network::NetHandle, wallet::Wallet};
 use rand::Rng;
+use pqcrypto_traits::sign::PublicKey as _;
 use std::sync::Arc;
 use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
 use tokio::sync::broadcast::error::RecvError;
@@ -318,7 +319,15 @@ impl Miner {
                     // Finding a coin proves the current epoch is still active.
                     self.last_heartbeat = time::Instant::now();
 
-                    let candidate = CoinCandidate::new(anchor.hash, nonce, creator_address, pow_hash);
+                    let mut creator_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+                    creator_pk.copy_from_slice(self.wallet.public_key().as_bytes());
+                    let candidate = CoinCandidate::new(
+                        anchor.hash,
+                        nonce,
+                        creator_address,
+                        creator_pk,
+                        pow_hash,
+                    );
                     println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(candidate.id), attempts);
                     crate::metrics::MINING_FOUND.inc();
 

@@ -306,6 +306,8 @@ impl TransferManager {
     }
 
     pub fn is_coin_spent(&self, coin_id: &[u8; 32]) -> Result<bool> {
+        // Consider a coin spent if either a V2 spend exists or a legacy transfer exists
+        if self.db.get::<crate::transfer::Spend>("spend", coin_id)?.is_some() { return Ok(true); }
         Ok(self.get_transfer_for_coin(coin_id)?.is_some())
     }
 
@@ -465,15 +467,8 @@ impl Spend {
         let seen: Option<[u8; 1]> = db.get("nullifier", &self.nullifier)
             .context("Failed to query nullifier")?;
         if seen.is_some() { return Err(anyhow!("Nullifier already seen (double spend)")); }
-        // 5) Signature by current owner: verify against coin.creator_address
-        // We need a pk whose address hashes to creator_address. For Dilithium, this means
-        // reconstruct the pk from sig? Not possible. Instead, we require the signer pk equals the one that created the coin.
-        // We can verify by checking that the public key derived from the signature and message matches coin.creator_address
-        // However Dilithium has no key recovery. So we must store current owner pk somewhere.
-        // In this design, the spend auth must be verified against a public key whose address equals coin's current owner address.
-        // The signer public key is the one-time pk of the current owner (which created this coin or received via previous spend).
-        // Therefore require that the signature verifies under some pk that hashes to expected owner address.
-        // We reconstruct expected owner address from last transfer (or coin.creator_address if unspent).
+        // 5) Signature by current owner: verify against current owner public key.
+        // Determine expected current owner address from last transfer; else coin creator.
         let last_transfer: Option<Transfer> = db.get("transfer", &self.coin_id)
             .context("Failed to query legacy transfer")?;
         let expected_owner_addr = match last_transfer {
@@ -492,9 +487,16 @@ impl Spend {
                 }
             }
         } else {
-            // No previous transfer: owner is the coin creator, but we don't have their pk on chain.
-            // For genesis spend, we fallback to V1 path in wallet to create a legacy transfer first.
-            return Err(anyhow!("Cannot validate spend without previous owner pk (genesis spend requires legacy transfer)"));
+            // No previous transfer: owner is the coin creator, verify signature against creator_pk
+            if coin.creator_pk != [0u8; DILITHIUM3_PK_BYTES] {
+                if let Ok(pk) = DiliPk::from_bytes(&coin.creator_pk) {
+                    if address_from_pk(&pk) == expected_owner_addr {
+                        if let Ok(sig) = DetachedSignature::from_bytes(&self.sig) {
+                            if verify_detached_signature(&sig, &self.auth_bytes(), &pk).is_ok() { ok = true; }
+                        }
+                    }
+                }
+            }
         }
         if !ok { return Err(anyhow!("Invalid spend signature")); }
         // 6) Basic sanity of `to`

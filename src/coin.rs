@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
-use crate::crypto::Address;
+use crate::crypto::{Address, DILITHIUM3_PK_BYTES};
+use serde_big_array::BigArray;
 
 
 /// Confirmed coin committed in an epoch anchor (does not store PoW hash).
@@ -10,6 +11,9 @@ pub struct Coin {
     pub epoch_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
+    /// New: full Dilithium3 public key of the coin creator (enables genesis V2 spend validation)
+    #[serde(with = "BigArray")]
+    pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
 }
 
 /// Unconfirmed coin candidate used during selection. Contains the PoW hash.
@@ -20,6 +24,9 @@ pub struct CoinCandidate {
     pub epoch_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
+    /// New: full Dilithium3 public key of the coin creator
+    #[serde(with = "BigArray")]
+    pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
     pub pow_hash: [u8; 32],
 }
 
@@ -54,9 +61,14 @@ impl Coin {
     }
 
     /// Creates a new confirmed coin (value=1) from raw fields.
-    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address) -> Self {
+    pub fn new_with_creator_pk(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES]) -> Self {
         let id = Self::calculate_id(&epoch_hash, nonce, &creator_address);
-        Coin { id, value: 1, epoch_hash, nonce, creator_address }
+        Coin { id, value: 1, epoch_hash, nonce, creator_address, creator_pk }
+    }
+
+    /// Backward-compatible constructor (no creator_pk stored)
+    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address) -> Self {
+        Self::new_with_creator_pk(epoch_hash, nonce, creator_address, [0u8; DILITHIUM3_PK_BYTES])
     }
 
     
@@ -68,13 +80,13 @@ impl Coin {
 }
 
 impl CoinCandidate {
-    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, pow_hash: [u8; 32]) -> Self {
+    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES], pow_hash: [u8; 32]) -> Self {
         let id = Coin::calculate_id(&epoch_hash, nonce, &creator_address);
-        CoinCandidate { id, value: 1, epoch_hash, nonce, creator_address, pow_hash }
+        CoinCandidate { id, value: 1, epoch_hash, nonce, creator_address, creator_pk, pow_hash }
     }
 
     pub fn into_confirmed(self) -> Coin {
-        Coin { id: self.id, value: self.value, epoch_hash: self.epoch_hash, nonce: self.nonce, creator_address: self.creator_address }
+        Coin { id: self.id, value: self.value, epoch_hash: self.epoch_hash, nonce: self.nonce, creator_address: self.creator_address, creator_pk: self.creator_pk }
     }
 }
 
@@ -83,8 +95,16 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, bincode::Error> {
     match bincode::deserialize::<Coin>(bytes) {
         Ok(c) => Ok(c),
         Err(_) => {
+            // Legacy fallback (no creator_pk field).
             let v1: CoinV1Compat = bincode::deserialize(bytes)?;
-            Ok(Coin { id: v1.id, value: v1.value, epoch_hash: v1.epoch_hash, nonce: v1.nonce, creator_address: v1.creator_address })
+            Ok(Coin {
+                id: v1.id,
+                value: v1.value,
+                epoch_hash: v1.epoch_hash,
+                nonce: v1.nonce,
+                creator_address: v1.creator_address,
+                creator_pk: [0u8; DILITHIUM3_PK_BYTES],
+            })
         }
     }
 }

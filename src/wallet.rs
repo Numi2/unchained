@@ -308,11 +308,48 @@ impl Wallet {
         Ok(utxos)
     }
 
-    /// Sum of `value` across all unspent coins.
+    /// Sum of `value` across all coins where current owner is this wallet
+    /// Prefers V2 spends chain when present; otherwise uses legacy transfer.
     pub fn balance(&self) -> Result<u64> {
-        let unspent = self.list_unspent()?;
-        let balance = unspent.iter().map(|c| c.value).sum();
-        Ok(balance)
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+
+        let cf = store
+            .db
+            .cf_handle("coin")
+            .ok_or_else(|| anyhow!("'coin' column family missing"))?;
+        let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut sum: u64 = 0;
+        for item in iter {
+            let (_key, value) = item?;
+            if let Ok(coin) = crate::coin::decode_coin(&value) {
+                // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
+                let v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
+                if let Some(sp) = v2 {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                        sum = sum.saturating_add(coin.value);
+                    }
+                    continue;
+                }
+                // Else look at legacy transfer chain if present
+                let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
+                match last_tx {
+                    Some(t) => {
+                        if t.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                            sum = sum.saturating_add(coin.value);
+                        }
+                    }
+                    None => {
+                        if coin.creator_address == self.address {
+                            sum = sum.saturating_add(coin.value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(sum)
     }
 
     /// Selects a minimal set of inputs whose combined value ≥ `amount`.
@@ -358,47 +395,42 @@ impl Wallet {
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         let coins_to_spend = self.select_inputs(amount)?;
-        let transfer_mgr = crate::transfer::TransferManager::new(store.clone());
-        let mut transfers = Vec::new();
+        let transfers = Vec::new();
         let mut spends = Vec::new();
         for coin in coins_to_spend {
-            // If coin has a legacy path (no prior transfer), fallback to V1 transfer for genesis spend.
+            // Always prefer V2 spend flow. If no previous transfer, validate against coin.creator_pk.
+            // Request proof for the coin
+            network.request_coin_proof(coin.id).await;
+            let mut proof_rx = network.proof_subscribe();
+            let proof_resp = tokio::time::timeout(std::time::Duration::from_secs(5), proof_rx.recv()).await
+                .map_err(|_| anyhow!("Timed out waiting for coin proof"))??;
+            if proof_resp.coin.id != coin.id { continue; }
+
+            // Determine current owner secret key:
+            // - If legacy transfer exists, recover from last incoming stealth
+            // - Else, this wallet created the coin: sign with wallet SK directly
             let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-            if last_tx.is_none() {
-                let transfer = transfer_mgr.send_stealth_transfer(
-                    coin.id,
-                    self.pk.clone(),
-                    &self.sk,
-                    &recipient_kyber_pk,
-                    network,
-                ).await?;
-                transfers.push(transfer);
-            } else {
-                // Build a V2 spend using the recovered current owner secret.
-                let last = last_tx.unwrap();
-                // Request proof for the coin
-                network.request_coin_proof(coin.id).await;
-                let mut proof_rx = network.proof_subscribe();
-                let proof_resp = tokio::time::timeout(std::time::Duration::from_secs(5), proof_rx.recv()).await
-                    .map_err(|_| anyhow!("Timed out waiting for coin proof"))??;
-                if proof_resp.coin.id != coin.id { continue; }
-                // Recover one-time spend key from the last incoming stealth output to prove ownership
-                let owner_sk = match last.to.try_recover_one_time_sk(&self.kyber_sk) {
+            let owner_sk = if let Some(last) = last_tx {
+                match last.to.try_recover_one_time_sk(&self.kyber_sk) {
                     Ok(sk) => sk,
                     Err(_) => { continue; }
-                };
-                let spend = crate::transfer::Spend::create(
-                    coin.id,
-                    &proof_resp.anchor,
-                    proof_resp.proof,
-                    &owner_sk,
-                    &recipient_kyber_pk,
-                )?;
-                spend.validate(&store)?;
-                spend.apply(&store)?;
-                network.gossip_spend(&spend).await;
-                spends.push(spend);
-            }
+                }
+            } else {
+                // Use wallet SK (we are creator)
+                self.sk.clone()
+            };
+
+            let spend = crate::transfer::Spend::create(
+                coin.id,
+                &proof_resp.anchor,
+                proof_resp.proof,
+                &owner_sk,
+                &recipient_kyber_pk,
+            )?;
+            spend.validate(&store)?;
+            spend.apply(&store)?;
+            network.gossip_spend(&spend).await;
+            spends.push(spend);
         }
         Ok(SendOutcome { transfers, spends })
     }

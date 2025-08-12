@@ -38,6 +38,7 @@ pub fn spawn(
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_REQUESTS));
         let mut sync_check_timer = interval(Duration::from_secs(SYNC_CHECK_INTERVAL_SECS));
         let mut idle_poll_timer = interval(Duration::from_secs(SYNC_IDLE_POLL_INTERVAL_SECS));
+        let mut backfill_timer = interval(Duration::from_secs(10));
 
         let mut last_tip_request: Option<(u64, std::time::Instant)> = None;
         loop {
@@ -104,6 +105,29 @@ pub fn spawn(
                         } else {
                             // We haven't heard from the network yet and have no local chain; keep requesting
                             net.request_latest_epoch().await;
+                        }
+                    }
+                }
+
+                _ = backfill_timer.tick() => {
+                    // Background transfer/spend backfill to ensure offline receivers catch up
+                    if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
+                        let window: u64 = 16; // scan recent epochs
+                        let start = latest.num.saturating_sub(window);
+                        for n in start..=latest.num {
+                            if let Ok(ids) = db.get_selected_coin_ids_for_epoch(n) {
+                                for id in ids {
+                                    // If we don't yet have a spend, request it; otherwise ensure transfer is known
+                                    let have_spend: Option<crate::transfer::Spend> = db.get("spend", &id).unwrap_or(None);
+                                    if have_spend.is_some() {
+                                        continue;
+                                    }
+                                    let have_transfer: Option<crate::transfer::Transfer> = db.get("transfer", &id).unwrap_or(None);
+                                    if have_transfer.is_none() {
+                                        net.request_tx(id).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
