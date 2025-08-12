@@ -21,8 +21,6 @@ pub struct Net {
     pub bootstrap: Vec<String>,          // multiaddrs
     #[serde(default = "default_max_peers")]
     pub max_peers: u32,                  // maximum peer connections
-    #[serde(default = "default_min_peers")]
-    pub min_peers: u32,                  // maintain at least this many connections
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64,    // connection timeout
     #[serde(default)]
@@ -46,25 +44,30 @@ pub struct P2p {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Storage {
     pub path: String,
-    #[serde(default)]
-    pub require_encryption: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Epoch {
     pub seconds: u64,
+    pub target_leading_zeros: usize,
     #[serde(default = "default_target_coins")]
     pub target_coins_per_epoch: u32,
-    // Removed max_coins_per_epoch under threshold-only winners
+    /// Hard cap of selected coins per epoch (consensus). If not specified,
+    /// defaults to the same as target_coins_per_epoch.
+    #[serde(default = "default_target_coins")]
+    pub max_coins_per_epoch: u32,
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
-    // Selection rules
-    #[serde(default = "default_max_selected")] 
-    pub max_selected_per_epoch: u32, // N_max
-    #[serde(default = "default_selected_min")] 
-    pub selected_min_per_epoch: u32, // λ_min
-    #[serde(default = "default_selected_max")] 
-    pub selected_max_per_epoch: u32, // λ_max
+    /// Minimum/maximum difficulty clamp for retargeting
+    #[serde(default = "default_difficulty_min")]
+    pub difficulty_min: usize,
+    #[serde(default = "default_difficulty_max")]
+    pub difficulty_max: usize,
+    /// Percent thresholds for retargeting windows (e.g., 110 = 110%)
+    #[serde(default = "default_retarget_upper_pct")]
+    pub retarget_upper_pct: u64,
+    #[serde(default = "default_retarget_lower_pct")]
+    pub retarget_lower_pct: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -79,6 +82,21 @@ pub struct Mining {
     pub max_mem_kib: u32,
     #[serde(default = "default_max_memory_adjustment")]
     pub max_memory_adjustment: f64,
+    /// Miner heartbeat timeout interval (seconds)
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Maximum attempts per epoch before giving up
+    #[serde(default = "default_max_mining_attempts")]
+    pub max_attempts: u64,
+    /// Attempts between runtime yield/anchor checks
+    #[serde(default = "default_check_interval_attempts")]
+    pub check_interval_attempts: u64,
+    /// Number of parallel mining workers (logical threads)
+    #[serde(default = "default_workers")]
+    pub workers: u32,
+    /// Offload Argon2 hashing to blocking threads
+    #[serde(default = "default_offload_blocking")]
+    pub offload_blocking: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -93,9 +111,10 @@ fn default_bind() -> String { "127.0.0.1:9100".into() }
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
 fn default_retarget_interval() -> u64 { 10 }
-fn default_max_selected() -> u32 { 64 }
-fn default_selected_min() -> u32 { 8 }
-fn default_selected_max() -> u32 { 32 }
+fn default_difficulty_min() -> usize { 1 }
+fn default_difficulty_max() -> usize { 12 }
+fn default_retarget_upper_pct() -> u64 { 110 }
+fn default_retarget_lower_pct() -> u64 { 90 }
 
 
 // Mining memory retargeting defaults
@@ -107,10 +126,12 @@ pub fn default_max_memory_adjustment() -> f64 { 1.5 }
 pub fn default_heartbeat_interval() -> u64 { 30 }  // 30 seconds
 pub fn default_max_consecutive_failures() -> u32 { 5 }
 pub fn default_max_mining_attempts() -> u64 { 1_000_000 }
+fn default_check_interval_attempts() -> u64 { 1_000 }
+fn default_workers() -> u32 { 1 }
+fn default_offload_blocking() -> bool { true }
 
 // Network defaults for production deployment
 fn default_max_peers() -> u32 { 100 }
-fn default_min_peers() -> u32 { 4 }
 fn default_connection_timeout() -> u64 { 30 }
 fn default_sync_timeout() -> u64 { 180 }
 
@@ -152,17 +173,17 @@ fn warn_unknown_keys(val: &TomlValue) {
             }
             match (k.as_str(), v) {
                 ("net", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "listen_port","bootstrap","max_peers","min_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
+                    "listen_port","bootstrap","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
                 ]),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window"
                 ]),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
                 ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "seconds","target_coins_per_epoch","retarget_interval","max_selected_per_epoch","selected_min_per_epoch","selected_max_per_epoch"
+                    "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval","difficulty_min","difficulty_max","retarget_upper_pct","retarget_lower_pct"
                 ]),
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment"
+                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","check_interval_attempts","workers","offload_blocking"
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind"]),
                 _ => {}

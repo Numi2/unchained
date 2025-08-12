@@ -1,192 +1,117 @@
 # unchained
 
-Post-quantum, epoch-based blockchain with Argon2id PoW, Dilithium3 signatures, and Kyber768-secured RPC.
+Post-quantum blockchain: Dilithium3 signatures, BLAKE3 hashing, Argon2id PoW, and stealth transfers using Kyber768.
 
-every coin is its own object, and time is the chain.
+## features
 
-## Key features
+- **Memory-hard PoW (Argon2id)**
+- **BLAKE3** for all hashing/commitments
+- **Dilithium3** for signatures and addressing
+- **Stealth outputs**: Kyber768 KEM + AES-256-GCM-SIV to encrypt the one-time Dilithium SK
+- **Nullifiers**:
+  - v1 (legacy): `BLAKE3("nullifier_v1" || coin_id || sig)`
+  - v2 (current): `BLAKE3("nullifier_v2" || sk_spend || coin_id)`; stored in `nullifier` CF
+- **libp2p gossipsub** for propagation
+- **RocksDB** persistence
 
-- Epoch finality; fork choice = highest cumulative work (tie-break by height)
-- Memory-hard PoW (Argon2id, lanes=1); auto difficulty + memory retargeting
-- Anchor commitments include: selected coin set, transfers, per-coin work Merkle, retarget params, and cumulative work
-- PQ networking: Kyber768 KEM + AEAD (AES-GCM-SIV) for encrypted RPC; gossipsub carries IDs only
-- Transport-layer PQ for P2P: QUIC over rustls 0.23 with `aws-lc-rs` + `prefer-post-quantum` (ML‑KEM hybrids when supported);
-  gossip remains announcements-only and carries no sensitive payloads
-- Verifiable light clients: Merkle proofs for coins and per-coin work
-- Probabilistic verification mode: sample 690 coins to detect 1% fraud with 99.9% confidence
-- RocksDB storage (CFs) with proof-friendly indices; Prometheus metrics
-- Canonical compact-target encoding and validation (Bitcoin-style nBits): anchors must use normalized form
-
-## Anchor structure (v4)
-
-`Anchor { num, hash, merkle_root, transfers_root, work_root, target_nbits, mem_kib, t_cost, coin_count, cumulative_work }`
-
-- `hash` = BLAKE3("unchained/anchor/v4", merkle_root, transfers_root, prev_hash?, work_root, target_nbits, mem_kib, t_cost, coin_count, cumulative_work)
-- `work_root` = Merkle over leaves `BLAKE3("workleaf", coin_id, work_value)`; internal nodes domain-separated `"worknode"`
-
-## Quickstart
+## usage
 
 ```bash
 cargo build --release
-cargo run --release -- mine
+cargo run --release --bin unchained mine
 ```
 
-- Generates wallet on first run and starts networking. Configure via `config.toml`.
+generates wallet on first run, begins mining and network participation.
 
-Peer ID:
-```bash
-cargo run --release -- peer-id
-```
+### show your peer id
 
-Wallet helpers and transfers:
-```bash
-# Show wallet balance and address
-cargo run --release -- balance
-
-# Send 1 or more coins to a 32-byte hex address
-cargo run --release -- send --to <hex32> --amount <u64>
-
-# List transfer history (sent/received)
-cargo run --release -- history
-```
-
-## Networking
-
-- QUIC transport; PQ TLS negotiation preferred (rustls `prefer-post-quantum` with `aws-lc-rs` provider).
-  Falls back to classical when a peer doesn’t support PQ; no protocol changes required.
-- PQ handshake (Dilithium3 + Ed25519 cross-sign) on `unchained/auth/v1`
-- Gossip: announcements only (anchor {num,hash}, coin {epoch_hash,coin_id}, transfer {tx_id})
-- RPC methods: `LatestAnchor`, `EpochSummary(n)`, `EpochSelectedIds(n)`, `Coin(id)`, `CoinProof(id)`
-  - Full validation path: fetch `EpochSummary` then recompute all commitments
-  - Probabilistic path: fetch `EpochSelectedIds`; recompute `merkle_root`; sample 690 coins; verify inclusion and per-coin work proofs against `work_root`
-
-RPC response authenticity (client-side):
-- Verify `ServerHelloUnsigned` signatures `sig_ed25519` and `sig_dilithium` against pinned server keys learned during `TOP_AUTH`.
-- Enforce binding: `local_peer_id` = remote peer, `remote_peer_id` = local peer, `suites` = `PINNED_SUITES`, `expiry` is fresh.
-- Enforce key equality: `ed25519_pk` and `dilithium_pk` in `ServerHelloUnsigned` must equal pinned keys; reject on mismatch.
-- Check `server_hello.unsigned.kyber_ct` equals outer `kyber_ct` before decryption.
-
-## Storage layout
-
-Column families:
-- `epoch`, `anchor`, `coin`, `coin_candidate`, `transfer`, `tx_pool`
-- `epoch_selected` (selected coin IDs), `epoch_leaves` (sorted coin leaf hashes)
-- `epoch_work_leaves` (sorted per-coin work leaf hashes), `epoch_transfers`
-- `wallet`, `replay`, `head`
-
-Data directory:
-- If `storage.path` in `config.toml` is relative, it is resolved to `~/.unchained/unchained_data` at runtime.
-- RocksDB logs and backups are organized under the chosen path; individual coin files may be mirrored to `coins/` when enabled (see env below).
-
-## Security
-
-- Dilithium3 signatures for transfers and node auth; Kyber768 for RPC key exchange.
-- P2P transport: rustls 0.23 + `aws-lc-rs` with `prefer-post-quantum` enabled to negotiate ML‑KEM hybrids on QUIC
-  when supported by both peers (graceful fallback otherwise).
-- RPC AEAD keys derive per-request subkeys from transcript masters using `(request_id, dir)`; nonces derive from Kyber ciphertexts. Invariants: monotonic `request_id` per stream; fresh Kyber ciphertext per request.
-- Server authenticity on responses: dual-signature verification against pinned keys; peer-ID/suite/expiry/ct binding checks prior to AEAD open.
-- PoW validation: Argon2id with salt = prev_anchor_hash (first 16 bytes), lanes=1, t_cost=1.
-- Compact-target (nBits) normalization enforced: exponent in [1,32], mantissa high-bit cleared; anchors must be canonical; emission normalized at genesis/retarget.
-- Anchor pre-validation before persistence/broadcast; metrics on rejection.
-- Encrypted at-rest keys; wallet/node identities use Argon2id + XChaCha20-Poly1305.
-
-Deterministic genesis:
-- If no peers respond and no bootstrap peers are configured, the node will create a deterministic genesis anchor locally to allow single-node operation.
-- If bootstrap peers are configured, the node waits for the network and avoids creating a conflicting local genesis.
-
-### Limits
-- Request cap: 128 KiB; Response cap: 4 MiB (anchors/proofs). Caps enforced in codec read/write.
-
-## Config highlights (`config.toml`)
-
-- `net`: listen port, bootstrap peers, sync timeout
-- `epoch`: seconds per epoch, target coins, retarget interval (compact-target difficulty; `target_nbits` in anchors)
-- `mining`: mem_kib bounds, enabled flag
-- `metrics`: bind address (`127.0.0.1:9100`)
-- `storage`: database path
-
-## Ops
-
-- Headless env var: `QUANTUM_PASSPHRASE`.
-- Proof server is loopback-only by default; front with TLS reverse proxy for external access
-- Monitor Prometheus metrics for health and sync state
-
-Environment variables (selected):
-- `QUANTUM_PASSPHRASE`: required in non-interactive mode to unlock wallet/node/db keys.
-- `DB_ENC_KEY_HEX`: 64-hex char key to encrypt DB values (except wallet) instead of prompting.
-- `DB_ENC_MEM_MIB`, `DB_ENC_TIME`: Argon2id parameters for DB key derivation when passphrase-based.
-- `WALLET_KDF_MEM_MIB`, `WALLET_KDF_TIME`: Argon2id parameters for wallet encryption.
-- `COIN_MIRRORING=1`: writes plaintext coin blobs under `<db>/coins` for debugging (do not use in prod).
-- `ROCKSDB_USE_FSYNC=0`: relax fsync if you accept durability tradeoffs.
-- `PROOF_SERVER_TOKEN`: static token required via `x-auth-token` header by the proof HTTP server.
-
-## Quick commands
+Print the local libp2p Peer ID (and your full multiaddr if `net.public_ip` is set in `config.toml`):
 
 ```bash
-# Build & run
-cargo build --release
-cargo run --release -- mine                       # start node (networking); mining per config
-
-# Show peer ID / multiaddr
-cargo run --release -- peer-id
-
-# Ask a proof for a coin (verifies locally)
-cargo run --release -- proof --coin-id <hex32>
-
-# Serve HTTP proof endpoint (loopback only)
-cargo run --release -- proof-server --bind 127.0.0.1:9090
-#   Optional: require token via env PROOF_SERVER_TOKEN, header x-auth-token: <token> (simple rate limit applies)
-
-# Metrics (default)
-curl -s http://127.0.0.1:9100/ | head
-
-# Edit configuration
-$EDITOR config.toml   # tune net.listen_port, epoch.seconds, mining.mem_kib, epoch.retarget_interval
-
-# Database path (resolved to absolute in main)
-ls -la ~/.unchained/unchained_data
-
-# Sampling target (probabilistic)
-# Detect 1% cheating with 99.9% confidence: n >= ln(1-0.999)/ln(1-0.01) ≈ 690
+cargo run --release --bin unchained -- peer-id
 ```
 
-## Architecture (overview)
+Example output:
 
-```mermaid
-flowchart TD
-  subgraph P2P
-    GS[Gossipsub (IDs only)]
-    RPC[Request/Response (Kyber768 + AEAD)]
-  end
-
-  NET[Network]:::node
-  EM[Epoch Manager]:::node
-  ST[(RocksDB CFs\nepoch, anchor, coin,\nepoch_selected, epoch_leaves,\nepoch_work_leaves, epoch_transfers)]:::store
-  MINER[Miner]:::node
-  METRICS[Prometheus]:::io
-  WALLET[Wallet]:::node
-
-  GS --> NET
-  RPC --> NET
-  NET --> EM
-  EM --> ST
-  EM --> METRICS
-  EM --> GS
-  MINER --> GS
-  WALLET --> GS
-
-  subgraph AnchorCommit[v4 Anchor Commitments]
-    MR[merkle_root]
-    TR[transfers_root]
-    WR[work_root (per-coin work Merkle)]
-    RT[target_nbits, mem_kib, t_cost]
-    CNT[coin_count]
-    CW[cumulative_work]
-  end
-
-  AnchorCommit --> EM
-
-  classDef node fill:#eef,stroke:#446,stroke-width:1px;
-  classDef store fill:#efe,stroke:#484,stroke-width:1px;
-  classDef io fill:#fee,stroke:#844,stroke-width:1px;
+```text
+🆔 Peer ID: 12D3KooW...
+📫 Multiaddr: /ip4/203.0.113.10/udp/31000/quic-v1/p2p/12D3KooW...
 ```
+
+Notes
+- The peer identity is persisted in `peer_identity.key` (created on first run). Keep it to retain the same Peer ID across restarts.
+- The node also logs the peer ID at startup unless `--quiet-net` is used.
+
+## network protocol
+
+- QUIC transport over UDP
+- rustls 0.23.22 with aws-lc-rs provider
+- prefer-post-quantum TLS handshakes
+
+## data structures
+
+- **Coins**: `blake3(epoch_hash || nonce || creator_address)` identifier
+- **Transfers**:
+  - Signature: Dilithium3 over canonical bytes `coin_id || sender_pk || stealth_output || prev_tx_hash`
+  - Stealth output: `{ one_time_pk, kyber_ct, enc_one_time_sk, nonce }`
+  - Recipient address: `addr(one_time_pk)` (unlinkable)
+  - Nullifier: `BLAKE3("nullifier_v1" || coin_id || sig)`; enforced unique in DB/mempool
+- **Epochs**: difficulty/Argon2id memory retargeting
+
+## configuration
+
+Modify `config.toml` for network settings, bootstrap peers, mining parameters, and storage location.
+
+## stealth transfers and spends
+
+### 1) Share your stealth address
+Programmatically export a signed stealth address (binds your Dilithium address to your Kyber768 public key):
+
+```rust
+use std::sync::Arc;
+use unchained::{storage::Store, wallet::Wallet};
+
+fn main() -> anyhow::Result<()> {
+    let db = Arc::new(Store::open("./data")?);
+    let wallet = Wallet::load_or_create(db)?;
+    let stealth = wallet.export_stealth_address();
+    println!("{}", stealth);
+    Ok(())
+}
+```
+
+This is a base64-url string. Share it with senders.
+
+### 2) Send coins to a stealth address (CLI)
+
+```bash
+cargo run --release --bin unchained -- send --stealth <STEALTH_ADDRESS_STRING> --amount 1
+```
+
+This command now sends PQ-ready V2 spends by default where possible:
+
+- If the coin was never transferred before (genesis spend), it falls back to a legacy V1 transfer once to establish the owner’s one-time key.
+- Otherwise, it produces a V2 spend with a blinded nullifier and Merkle inclusion proof.
+
+### V2 spend format (no decoys)
+
+- Spend fields:
+  - `coin_id`: 32 bytes
+  - `root`: epoch Merkle root (32 bytes)
+  - `proof`: Merkle inclusion proof for `coin_id` leaf (array of `(sibling_hash, sibling_is_left)`)
+  - `to`: stealth output `{ one_time_pk, kyber_ct, enc_one_time_sk, nonce }`
+  - `commitment`: `BLAKE3(to.canonical_bytes())`
+  - `nullifier`: `BLAKE3("nullifier_v2" || sk_spend || coin_id)` (linkable per coin to prevent double-spend)
+  - `sig`: Dilithium3 signature over `auth_bytes`
+
+- Authorization bytes: `auth_bytes = root || nullifier || commitment || coin_id`
+
+- Verification:
+  1) Check coin exists and anchor/root match
+  2) Verify Merkle proof for `coin_id`
+  3) Check nullifier is unseen
+  4) Verify Dilithium3 signature against the current owner’s one-time public key (from the previous transfer’s `to.one_time_pk`)
+
+### Notes
+- Nullifiers are stored in the `nullifier` column family to prevent double-spends.
+- Stealth scanning: recipients can scan spends/transfers and recover the one-time SK with their Kyber secret key.

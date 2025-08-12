@@ -6,7 +6,7 @@ use anyhow;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
-pub mod rpc;       pub mod sync;     pub mod metrics;  pub mod wallet;
+pub mod sync;      pub mod metrics;  pub mod wallet;
 
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
@@ -38,8 +38,9 @@ enum Cmd {
             bind: String,
         },
     Send {
+        /// Recipient stealth address (base64-url, from `wallet export-stealth-address`)
         #[arg(long)]
-        to: String,
+        stealth: String,
         #[arg(long)]
         amount: u64,
     },
@@ -49,23 +50,10 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging early. Use RUST_LOG or default to info. Also initialize tracing for richer diagnostics.
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().filter_or("RUST_LOG", "info")).try_init();
-    // Optional tracing subscriber; ignore errors if already set
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
     println!("--- unchained Node ---");
 
     let cli = Cli::parse();
     if cli.quiet_net { network::set_quiet_logging(true); }
-
-    // Install aws-lc-rs as rustls's default crypto provider so QUIC (via quinn) uses it.
-    // This enables PQ hybrid KEM negotiation when supported by the peer.
-    crate::crypto::ensure_aws_lc_rs_provider_installed();
 
     let mut cfg = config::load(&cli.config)?;
 
@@ -91,22 +79,7 @@ async fn main() -> anyhow::Result<()> {
     
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
-    // Auto-detect public IP if not provided or set to "auto"
-    if cfg.net.public_ip.as_deref() == Some("auto") || cfg.net.public_ip.is_none() {
-        if let Some(ip) = network::detect_public_ipv4(1500).await {
-            cfg.net.public_ip = Some(ip);
-        }
-    }
-
-    let net = network::spawn(
-        cfg.net.clone(),
-        cfg.p2p.clone(),
-        db.clone(),
-        sync_state.clone(),
-        cfg.epoch.clone(),
-        cfg.mining.clone(),
-        shutdown_tx.subscribe(),
-    ).await?;
+    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -137,12 +110,6 @@ async fn main() -> anyhow::Result<()> {
         let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
         let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
         let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
-        // Respect background sync task state to avoid deadlock when we have a local chain but no network view yet
-        if sync_state.lock().unwrap().synced {
-            println!("✅ Synchronization complete (background). Local epoch is {}.", local_epoch);
-            synced = true;
-            break;
-        }
 
         // Case 1: We have a network view and our local chain has caught up
         if highest_seen > 0 && local_epoch >= highest_seen {
@@ -153,8 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Case 2: No peers responded, but we already have a local anchor (genesis) → proceed
-        // Allow proceeding regardless of bootstrap peers to enable genesis/startup in isolated conditions.
-        if highest_seen == 0 && latest_opt.is_some() {
+        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
             println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
             {
                 let mut st = sync_state.lock().unwrap();
@@ -176,19 +142,16 @@ async fn main() -> anyhow::Result<()> {
 
     if !synced {
         println!(
-            "⚠️  Could not fully sync within {}s.",
+            "⚠️  Could not sync with network after {}s. Starting as a new chain.",
             cfg.net.sync_timeout_secs
         );
-        // As a safety valve, allow standalone operation if we already have a local chain,
-        // even if bootstrap peers are configured. Background sync will flip us back to
-        // unsynced if/when the network tip advances beyond our local epoch.
+        // Fallback: if we have a local anchor (e.g., genesis created by epoch manager),
+        // allow the node to proceed as a standalone chain even if bootstrap peers are configured.
         if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
             let mut st = sync_state.lock().unwrap();
             st.synced = true;
             if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-            println!("✅ Proceeding in standalone mode with local chain at epoch {}.", latest.num);
-        } else {
-            println!("⚠️  No peers and no local chain found. Waiting for network…");
+            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
         }
     }
     
@@ -234,27 +197,44 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Cmd::ProofServer { bind }) => {
-            // Async Hyper server with simple auth and rate limit
-            use hyper::{Body, Request as HRequest, Response as HResponse, Server, Method, StatusCode};
-            use hyper::service::{make_service_fn, service_fn};
+            // HTTPS server over rustls (aws-lc provider, PQ/hybrid TLS1.3)
+            use hyper::{Body, Request as HRequest, Response as HResponse, Method, StatusCode};
+            use hyper::service::service_fn;
             use std::net::SocketAddr;
+            use tokio_rustls::TlsAcceptor;
+            use tokio::net::TcpListener;
+            use hyper::server::conn::Http;
             let addr: SocketAddr = bind.parse().map_err(|e| anyhow::anyhow!("invalid bind {}: {}", bind, e))?;
             let net_clone = net.clone();
             let auth_token = std::env::var("PROOF_SERVER_TOKEN").ok();
             let rate = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, (std::time::Instant, u32)>::new()));
 
-            // Pass the remote socket address into request extensions to avoid relying on XFF
-            let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
+            // Self-signed cert for local serving
+            let (_cert_der, _key_der) = crypto::generate_self_signed_cert(&libp2p::identity::Keypair::generate_ed25519())?;
+            let tls_cfg = crypto::create_pq_server_config(_cert_der, _key_der)?;
+            let acceptor = TlsAcceptor::from(tls_cfg.clone());
+            let listener = TcpListener::bind(addr).await?;
+            println!("🔐 Proof server (TLS) listening on https://{}", bind);
+
+            loop {
+                let (stream, peer_addr) = listener.accept().await?;
+                let acceptor = acceptor.clone();
                 let net = net_clone.clone();
                 let auth = auth_token.clone();
                 let rate = rate.clone();
-                let remote_addr = conn.remote_addr();
-                async move {
-                    Ok::<_, anyhow::Error>(service_fn(move |mut req: HRequest<Body>| {
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TLS accept error: {}", e);
+                            return;
+                        }
+                    };
+                    let service = service_fn(move |req: HRequest<Body>| {
                         let net = net.clone();
                         let auth = auth.clone();
                         let rate = rate.clone();
-                        req.extensions_mut().insert(remote_addr);
+                        let remote_ip = peer_addr.ip().to_string();
                         async move {
                             // Auth
                             if let Some(token) = &auth {
@@ -263,16 +243,11 @@ async fn main() -> anyhow::Result<()> {
                                     return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::UNAUTHORIZED).body(Body::from("unauthorized"))?);
                                 }
                             }
-                            // Simple per-IP rate limit: 5 req / 10s window. Prefer socket addr over XFF unless explicitly trusted.
-                            let ip = req
-                                .extensions()
-                                .get::<SocketAddr>()
-                                .map(|a| a.ip().to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
+                            // Simple per-IP rate limit: 5 req / 10s window.
                             {
                                 let mut map = rate.lock().await;
                                 let now = std::time::Instant::now();
-                                let entry = map.entry(ip.clone()).or_insert((now, 0));
+                                let entry = map.entry(remote_ip.clone()).or_insert((now, 0));
                                 if now.duration_since(entry.0) > std::time::Duration::from_secs(10) { *entry = (now, 0); }
                                 entry.1 += 1;
                                 if entry.1 > 5 { return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::TOO_MANY_REQUESTS).body(Body::from("rate limit"))?); }
@@ -305,8 +280,7 @@ async fn main() -> anyhow::Result<()> {
                                                 "proof_len": r.proof.len()
                                             }
                                         }))?;
-                                    let status = if ok { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY };
-                                    Ok::<_, anyhow::Error>(HResponse::builder().status(status).header("Content-Type", "application/json").body(Body::from(body))?)
+                                        Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::OK).header("Content-Type", "application/json").body(Body::from(body))?)
                                     }
                                     Ok(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("mismatch"))?),
                                     Err(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::GATEWAY_TIMEOUT).body(Body::from("timeout"))?),
@@ -315,42 +289,28 @@ async fn main() -> anyhow::Result<()> {
                                 Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found"))?)
                             }
                         }
-                    }))
-                }
-            });
-            // If binding to non-loopback without TLS, refuse to start. Use a TLS reverse proxy in front.
-            if !addr.ip().is_loopback() {
-                eprintln!("Refusing to serve plaintext HTTP on non-loopback. Front this endpoint with a TLS reverse proxy (e.g., Caddy/Nginx) or run on loopback.");
-                return Err(anyhow::anyhow!("plaintext over non-loopback is forbidden"));
+                    });
+                    if let Err(e) = Http::new().serve_connection(tls_stream, service).await {
+                        eprintln!("HTTP serve error: {}", e);
+                    }
+                });
             }
-            println!("🌐 Proof server listening on http://{}", bind);
-            // Run server in foreground and await shutdown via Ctrl+C
-            if let Err(e) = Server::bind(&addr).serve(make_svc).await {
-                eprintln!("proof server error: {}", e);
-            }
-            return Ok(());
         }
-        Some(Cmd::Send { to, amount }) => {
-            // Parse recipient address
-            let recipient = hex::decode(to)
-                .map_err(|e| anyhow::anyhow!("Invalid recipient address: {}", e))?;
-            if recipient.len() != 32 {
-                return Err(anyhow::anyhow!("Recipient address must be 32 bytes"));
-            }
-            let mut recipient_addr = [0u8; 32];
-            recipient_addr.copy_from_slice(&recipient);
-
-            // Send transfer
-            println!("💰 Sending {} coins to {}", amount, hex::encode(recipient_addr));
-            match wallet.send_transfer(recipient_addr, *amount, &net).await {
-                Ok(transfers) => {
-                    println!("✅ Transfer successful! Sent {} transfers", transfers.len());
-                    for (i, transfer) in transfers.iter().enumerate() {
-                        println!("  Transfer {}: coin {} -> {}", i + 1, hex::encode(transfer.coin_id), hex::encode(transfer.recipient()));
+        Some(Cmd::Send { stealth, amount }) => {
+            println!("💰 Sending {} coins to stealth recipient", amount);
+            match wallet.send_to_stealth_address(stealth, *amount, &net).await {
+                Ok(outcome) => {
+                    let total = outcome.transfers.len() + outcome.spends.len();
+                    println!("✅ Sent {} records ({} legacy transfers, {} spends)", total, outcome.transfers.len(), outcome.spends.len());
+                    for (i, t) in outcome.transfers.iter().enumerate() {
+                        println!("  V1 transfer {}: coin {} -> {}", i + 1, hex::encode(t.coin_id), hex::encode(t.recipient()));
+                    }
+                    for (i, s) in outcome.spends.iter().enumerate() {
+                        println!("  V2 spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
                     }
                 }
                 Err(e) => {
-                    eprintln!("❌ Transfer failed: {}", e);
+                    eprintln!("❌ Send failed: {}", e);
                     return Err(e);
                 }
             }
@@ -396,53 +356,44 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         None => {
-            // No command specified: run as a syncing node only (no mining) by default.
-            // To mine explicitly, use: `-- Mine` or set mining.enabled=true and `unchnained Mine`.
-            if cfg.mining.enabled {
-                println!("ℹ️  Mining is enabled in config, but default mode without subcommand does not start mining. Use 'Mine' subcommand to mine.");
+            // No command specified, start mining if enabled
+            let mining_enabled = cfg.mining.enabled;
+            if mining_enabled {
+                miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
             }
         }
     }
 
-    let _metrics_bind = cfg.metrics.bind.clone();
-    let metrics_actual = metrics::serve(cfg.metrics)?;
+    let metrics_bind = cfg.metrics.bind.clone();
+    metrics::serve(cfg.metrics)?;
 
     println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
     if let Some(public_ip) = cfg.net.public_ip {
         println!("   📢 Public IP announced as: {public_ip}");
     }
-    println!("   📊 Metrics available on http://{metrics_actual}");
+    println!("   📊 Metrics available on http://{metrics_bind}");
     println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
-    println!("   🎯 Target coins per epoch: {}", cfg.epoch.target_coins_per_epoch);
+    println!("   🎯 Epoch coin cap (max selected): {}", cfg.epoch.max_coins_per_epoch);
     println!("   Press Ctrl+C to stop");
 
-    // Graceful shutdown on Ctrl+C, SIGTERM or SIGQUIT (Unix)
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sigquit = signal(SignalKind::quit())?;
-        tokio::select! {
-            _ = signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
-            _ = sigquit.recv() => {},
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            println!("\n🛑 Shutdown signal received, cleaning up...");
+            let _ = shutdown_tx.send(());
+            println!("⏳ Waiting for tasks to shutdown gracefully...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            if let Err(e) = db.close() {
+                eprintln!("Warning: Database cleanup failed: {e}");
+            } else {
+                println!("✅ Database closed cleanly");
+            }
+            println!("👋 unchained node stopped");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Error waiting for shutdown signal: {err}");
+            Err(err.into())
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = signal::ctrl_c().await;
-    }
-
-    println!("\n🛑 Shutdown signal received, cleaning up...");
-    let _ = shutdown_tx.send(());
-    println!("⏳ Waiting for tasks to shutdown gracefully...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-    if let Err(e) = db.close() {
-        eprintln!("Warning: Database cleanup failed: {e}");
-    } else {
-        println!("✅ Database closed cleanly");
-    }
-    println!("👋 unchained node stopped");
-    Ok(())
 }
