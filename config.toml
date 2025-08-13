@@ -4,7 +4,7 @@
 # Port to listen on for P2P connections
 listen_port = 31000
 peer_exchange = false
-public_ip = ""
+public_ip = "193.71.140.215"
 
 # Maximum number of peer connections (prevents resource exhaustion)
 max_peers = 133337
