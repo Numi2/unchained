@@ -152,22 +152,8 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
 
 #[allow(dead_code)]
 fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
-    use pqcrypto_dilithium::dilithium3::{PublicKey, DetachedSignature, verify_detached_signature};
-    let coin: Coin = db.get("coin", &tx.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
-    // Nullifier unseen check for uniqueness
-    if db.get::<[u8; 1]>("nullifier", &tx.nullifier).unwrap().is_some() {
-        return Err("Nullifier already seen (possible double spend)".into());
-    }
-    let sender_pk = PublicKey::from_bytes(&tx.sender_pk).map_err(|_| "Invalid sender PK")?;
-    let sender_addr = crypto::address_from_pk(&sender_pk);
-    if sender_addr != coin.creator_address { return Err("Sender is not coin creator".into()); }
-    let sig = DetachedSignature::from_bytes(&tx.sig).map_err(|_| "Invalid signature")?;
-    if verify_detached_signature(&sig, &tx.signing_bytes(), &sender_pk).is_err() { return Err("Invalid signature".into()); }
-    // Basic stealth output sanity: ensure one-time pk decodes
-    if pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&tx.to.one_time_pk).is_err() {
-        return Err("Invalid one-time recipient public key".into());
-    }
-    Ok(())
+    // Delegate to the canonical validator implemented in transfer.rs
+    tx.validate(db).map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
@@ -702,6 +688,88 @@ pub async fn spawn(
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 let _ = anchor_tx.send(a.clone());
+
+                                                // Attempt to reconstruct and persist the selected set for this adopted anchor so
+                                                // local services (wallet balance, proofs) have confirmed coins available.
+                                                if a.num > 0 {
+                                                    if let Ok(Some(parent)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                        // Gather candidates that reference the parent hash
+                                                        let mut candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
+                                                            Ok(v) => v,
+                                                            Err(_) => Vec::new(),
+                                                        };
+                                                        if parent.difficulty > 0 {
+                                                            candidates.retain(|c| c.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0));
+                                                        }
+                                                        // Select up to the anchor-declared coin_count by smallest pow_hash
+                                                        let cap = a.coin_count as usize;
+                                                        if cap == 0 {
+                                                            // Nothing selected for this epoch
+                                                        } else if candidates.len() > cap {
+                                                            let _ = candidates.select_nth_unstable_by(cap - 1, |x, y| x
+                                                                .pow_hash
+                                                                .cmp(&y.pow_hash)
+                                                                .then_with(|| x.id.cmp(&y.id))
+                                                            );
+                                                            candidates.truncate(cap);
+                                                            candidates.sort_by(|x, y| x.pow_hash.cmp(&y.pow_hash).then_with(|| x.id.cmp(&y.id)));
+                                                        } else {
+                                                            candidates.sort_by(|x, y| x.pow_hash.cmp(&y.pow_hash).then_with(|| x.id.cmp(&y.id)));
+                                                        }
+
+                                                        // Build leaves and verify against the adopted merkle_root
+                                                        let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
+                                                        let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                                                        leaves.sort();
+                                                        let computed_root = if leaves.is_empty() { [0u8;32] } else {
+                                                            let mut tmp = leaves.clone();
+                                                            while tmp.len() > 1 {
+                                                                let mut next = Vec::new();
+                                                                for chunk in tmp.chunks(2) {
+                                                                    let mut hasher = blake3::Hasher::new();
+                                                                    hasher.update(&chunk[0]);
+                                                                    hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+                                                                    next.push(*hasher.finalize().as_bytes());
+                                                                }
+                                                                tmp = next;
+                                                            }
+                                                            tmp[0]
+                                                        };
+
+                                                        if computed_root == a.merkle_root && selected_ids.len() as u32 == a.coin_count {
+                                                            // Persist confirmed coins and per-epoch indexes for this height
+                                                            if let (Some(coin_cf), Some(sel_cf), Some(leaves_cf)) = (
+                                                                db.db.cf_handle("coin"),
+                                                                db.db.cf_handle("epoch_selected"),
+                                                                db.db.cf_handle("epoch_leaves"),
+                                                            ) {
+                                                                let mut batch = rocksdb::WriteBatch::default();
+                                                                for cand in &candidates {
+                                                                    let coin = cand.clone().into_confirmed();
+                                                                    if let Ok(bytes) = bincode::serialize(&coin) {
+                                                                        batch.put_cf(coin_cf, &coin.id, &bytes);
+                                                                    }
+                                                                }
+                                                                for coin_id in &selected_ids {
+                                                                    let mut key = Vec::with_capacity(8 + 32);
+                                                                    key.extend_from_slice(&a.num.to_le_bytes());
+                                                                    key.extend_from_slice(coin_id);
+                                                                    batch.put_cf(sel_cf, &key, &[]);
+                                                                }
+                                                                if let Ok(bytes) = bincode::serialize(&leaves) {
+                                                                    batch.put_cf(leaves_cf, &a.num.to_le_bytes(), &bytes);
+                                                                }
+                                                                if let Err(e) = db.db.write(batch) {
+                                                                    eprintln!("⚠️ Failed to persist selected coins for epoch {}: {}", a.num, e);
+                                                                } else {
+                                                                    net_log!("🪙 Confirmed {} coins for adopted epoch {}", selected_ids.len(), a.num);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            net_log!("ℹ️ Unable to reconstruct selected set for adopted epoch {} (root/count mismatch)", a.num);
+                                                        }
+                                                    }
+                                                }
                                             }
 
                                             // If this valid anchor is not adopted (either equal to current or not better),
@@ -807,13 +875,31 @@ pub async fn spawn(
                                         }
                                     }
                                 },
-                                TOP_COIN => if let Ok(c) = bincode::deserialize::<CoinCandidate>(&message.data) {
-                                    if validate_coin_candidate(&c, &db).is_ok() {
-                                        let key = Store::candidate_key(&c.epoch_hash, &c.id);
-                                        db.put("coin_candidate", &key, &c).ok();
-                                    } else {
-                                        crate::metrics::VALIDATION_FAIL_COIN.inc();
-                                        score.record_validation_failure();
+                                TOP_COIN => {
+                                    // First, try to interpret as a confirmed Coin (responses to TOP_COIN_REQUEST)
+                                    if let Ok(coin) = bincode::deserialize::<Coin>(&message.data) {
+                                        // Persist confirmed coin so wallet balance and proofs work locally
+                                        db.put("coin", &coin.id, &coin).ok();
+                                        // Best-effort: index under epoch_selected using anchor lookup by epoch_hash
+                                        if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
+                                            if let Some(sel_cf) = db.db.cf_handle("epoch_selected") {
+                                                let mut key = Vec::with_capacity(8 + 32);
+                                                key.extend_from_slice(&anchor.num.to_le_bytes());
+                                                key.extend_from_slice(&coin.id);
+                                                let mut batch = rocksdb::WriteBatch::default();
+                                                batch.put_cf(sel_cf, &key, &[]);
+                                                let _ = db.db.write(batch);
+                                            }
+                                        }
+                                    } else if let Ok(cand) = bincode::deserialize::<CoinCandidate>(&message.data) {
+                                        // Else, treat as a coin candidate gossip
+                                        if validate_coin_candidate(&cand, &db).is_ok() {
+                                            let key = Store::candidate_key(&cand.epoch_hash, &cand.id);
+                                            db.put("coin_candidate", &key, &cand).ok();
+                                        } else {
+                                            crate::metrics::VALIDATION_FAIL_COIN.inc();
+                                            score.record_validation_failure();
+                                        }
                                     }
                                 },
                                 TOP_TX => if let Ok(tx) = bincode::deserialize::<Transfer>(&message.data) {

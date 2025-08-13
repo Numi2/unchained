@@ -207,6 +207,12 @@ impl Miner {
                                 anchor.num, anchor.difficulty, anchor.mem_kib
                             );
                             
+                            // Always show wallet balance on new epoch (coins are finalized at epoch boundaries)
+                            if let Ok(balance) = self.wallet.balance() {
+                                println!("💰 Wallet balance: {} coins", balance);
+                                println!("📍 Address: {}", hex::encode(self.wallet.address()));
+                            }
+
                             self.current_epoch = Some(anchor.num);
                             self.mine_epoch(anchor).await?;
                         }
