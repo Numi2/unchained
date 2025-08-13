@@ -1,5 +1,8 @@
 # Peer identity files (should not be shared between nodes)
 peer_identity.key
+pq_identity.enc
+node_kyber.enc
+context.md
 
 # Blockchain data
 blockchain_data/

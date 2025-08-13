@@ -1,7 +1,126 @@
 # unchained
 
+
+1. install git + anything else u might need : 
+
+sudo apt install build-essential git curl cmake libclang-dev libssl-dev pkg-config -y
+
+2. download + install rust: 
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+3. git clone https://github.com/Numi2/unchained.git
+
+4. cd unchained
+
+5. cargo build --release && cargo run --release --bin unchained mine
+
+if u get any errors just ask AI for the commands to fix
+
+Unchained, a permissionless blockchain. Time is divided into 222s epochs; miners submit coin candidates throughout an epoch using Argon2id. At the end of an epoch, the network finalizes an anchor that commits to up to x nr selected coins via a Merkle root, enabling independent verification and efficient synchronization. 
+
+Ownership is tracked with Dilithium3 signatures; receivers obtain privacy via Kyber768-based stealth receiving with one-time keys. Unchained uses libp2p (quantum prefer branch) over QUIC for gossip
+
 Post‑quantum blockchain implementation - Dilithium3 for signatures, Kyber768 for stealth receiving, BLAKE3 for hashing, Argon2id for PoW. libp2p over QUIC does the gossip (libp2p prefer pq aws). 
 
+- Memory‑hard PoW  Argon2id; David balanced to Goliath
+- End‑to‑end PQ: Dilithium3 signatures, Kyber768 for stealth, BLAKE3 throughout the merkles
+- rocksdb
+
+Nullifiers (double‑spend protection):
+- v1 (legacy): BLAKE3("nullifier_v1" || coin_id || sig)
+- v2 (current): BLAKE3("nullifier_v2" || spend_sk || coin_id)
+
+## Quick start
+
+
+```bash
+cargo build --release
+cargo run --release --bin unchained mine
+```
+
+What happens on first run:
+- A wallet is created and encrypted with your passphrase
+- A persistent P2P identity is generated (`peer_identity.key`)
+- The node syncs, then starts mining (if enabled in `config.toml`)
+
+Stop with Ctrl+C.
+
+### Show your Peer ID (for peering/firewall rules)
+
+```bash
+cargo run --release --bin unchained -- peer-id
+```
+
+If `net.public_ip` is set in `config.toml`, you’ll also see your full multiaddr for others to dial.
+
+## CLI (no surprises)
+
+All commands accept `--config <path>` (default `config.toml`) and `--quiet-net`.
+
+- `mine` — start mining immediately (overrides `mining.enabled`)
+- `peer-id` — print local libp2p Peer ID (and multiaddr if `net.public_ip` is set)
+- `stealth-address` — print your stealth receiving address (base64-url)
+- `proof --coin-id <HEX>` — request and verify a Merkle proof for a coin
+- `proof-server [--bind HOST:PORT]` — HTTPS server that returns proofs
+- `send --stealth <ADDRESS> --amount <N>` — send to a stealth address
+- `balance` — show wallet balance + address
+- `history` — print simple tx history
+
+Examples:
+
+```bash
+# Send 1 coin to a recipient’s stealth address (base64‑url string)
+cargo run --release --bin unchained send --stealth <STEALTH_ADDR> --amount 1
+
+
+
+Nullifiers (double‑spend protection):
+- v1 (legacy): BLAKE3("nullifier_v1" || coin_id || sig)
+- v2 (current): BLAKE3("nullifier_v2" || spend_sk || coin_id)
+
+## Quick start
+
+
+```bash
+cargo build --release
+cargo run --release --bin unchained mine
+```
+
+What happens on first run:
+- A wallet is created and encrypted with your passphrase
+- A persistent P2P identity is generated (`peer_identity.key`)
+- The node syncs, then starts mining (if enabled in `config.toml`)
+
+Stop with Ctrl+C.
+
+### Show your Peer ID (for peering/firewall rules)
+
+```bash
+cargo run --release --bin unchained -- peer-id
+```
+
+If `net.public_ip` is set in `config.toml`, you’ll also see your full multiaddr for others to dial.
+
+## CLI (no surprises)
+
+All commands accept `--config <path>` (default `config.toml`) and `--quiet-net`.
+
+- `mine` — start mining immediately (overrides `mining.enabled`)
+- `peer-id` — print local libp2p Peer ID (and multiaddr if `net.public_ip` is set)
+- `stealth-address` — print your stealth receiving address (base64-url)
+- `proof --coin-id <HEX>` — request and verify a Merkle proof for a coin
+- `proof-server [--bind HOST:PORT]` — HTTPS server that returns proofs
+- `send --stealth <ADDRESS> --amount <N>` — send to a stealth address
+- `balance` — show wallet balance + address
+- `history` — print simple tx history
+
+Examples:
+
+```bash
+# Send 1 coin to a recipient’s stealth address (base64‑url string)
+cargo run --release --bin unchained send --stealth <STEALTH_ADDR> --amount 1
+
+EXAMPLE: cargo run --release --bin unchained send --stealth 
 
 Unchained, a permissionless blockchain that couples memory-hard proof-of-work with post-quantum (PQ) cryptography and an epoch-first issuance model. Time is divided into fixed-length epochs; miners submit coin candidates throughout an epoch using Argon2id. At the epoch boundary, the network finalizes an anchor that commits to up to N selected coins via a Merkle root, enabling independent verification and efficient synchronization. Ownership is tracked with Dilithium3 signatures; receivers obtain privacy via Kyber768-based stealth receiving with one-time keys. Unchained uses libp2p over QUIC for gossip
 
@@ -56,61 +175,152 @@ Examples:
 # Send 1 coin to a recipient’s stealth address (base64‑url string)
 cargo run --release --bin unchained send --stealth <STEALTH_ADDR> --amount 1
 
-EXAMPLE: cargo run --release --bin unchained send --stealth ARFwLmeyxSgkwlVCjfs46xKIE1SKjc4EL47jZu1PdA4doAcAAAAAAABFFbPO77e9SZkTnL1IkeuZxkqPQ1RvHMBQpk_BFZ1FYq1NZtPM5_lDoIFPQpwJlnMTukYxKmPGUKaI7K1uU2XoEGnNrMLRwTgwec4d7de8uSh37MtSTjsp7oaqpsnO4hbu3t1nIrBVAHsO9TBImk4rJoeTGN_4WdfYxB68ySLty4UF3yJc39h_wxU1YuHElS1kxxl3YnApxfLib723w8XKtTiYjYpM-voDFKL9eSgiaAPCunuwnI1xFjGCFDeKBvtqi_6msbC9iRxjkobMSg5e9LDscQOk5EUs1HbLJjbszo8otxAl8NdrL9Fsm8PFiDExyUI5VG5amecj_sOxsUXU-imNAD97cBL6QEA-aeqAeQi8qga0O1xAlmZv6QzvayXUXXfDyGApZYUMw8ctsx9KKGMWc5fuEyjlPNQET_KjHkWSGtDsHPrjatTV3XnP0yXPJFpCk1ApqwKUpK26mZshX3ERtkfbd1vDZYDqy3G23acYQAnefIz5fUKwLssGUwv0h-NXd-RdOM6t2A9N5aCv6pcmFmyVN2voFR4JjVHBcPdQUkgvYcZjtg08MbLE-TKf2bihhQXf6k_DmHSWXuXuF5SSRmLGRxMUDnmTeJGFloAKeEPpx8UOA5n05khoPmNLVQDN_ZzJbNhdqfT-1nBFXgMQX2tbY58sqZbH0hjsHvnxjLgbED-57UjZnUBE7D6UGheZvUGGTb6eZ9JwcH2KnfQwBFuPkucKA1pFeKRQnOndfqvZZWME7kcTXiIkH3jTnmB5fdddg2kJSq7nP8E6wW8I1WB5xdD9OI7_HCjrpR2MArf_rUMNvxFsRy89XQVYaBiowzgIP4ReOXEKWZLIz80_RC8mUkCv4M8f8cGIa2DvC3X-R26Ed2tmFYdFhkJV8ZIVGZvpSOWSnOLfqq_Swu6NxPO1hqCYm_tbgJ0KOmWFELyjOCwTrnHAFSXjulPjVmkfXwpcK7g-QYHhwLlvPsWKDVlT386N68Q1V0IxkJKnOpUYUbxZXMs17MFqq0atAKgTx12OzKbxuqOtJtEe8SMVa4nqecgFN5CSvnuSCLW_fueAl1z-1zQ1OrGYYz03L8J-5fRMIdLkfkmcYo3eqT2hQmbRsKXRka7avsx9VTIxdj1u2sKDjWeanN2w3n2Qys3L4VE1bVQQ9YwQsTr8uu-Sb_nU8btFK-GLV9wtF7AyHXeyPpLLirkoXCrOiP2f3QUhKwwH17hPG5W70_M64GGGxUj4HsnSl8kEGq-9bgrCkVq79lgRcXQ5_saq62-mqX0Mv_hsrGQlUn0GisjFPN_5A9klyGRLZ5QI3zOIWay_DNZKtKFSpdpL6LVtJrpNLUPx8hvYjnnAirqRdCyMja5b3jU9ApTOekDMI2BbNq6XKq3HQ6tVaGNaRIg_BBwpDxKr0Z7n0uGqB7u5f8yAG9YtvUe2mHEZ_S5ozKFqsHo6jzR3HrPSQvYdX4CDwl3g_bdTNuvgmgCxPiHOlJluGnzPqZwNJ5VR6bL0_6FhoP4atzDx1M7Erk1L6jelPMG8XuuzIVDXrQs0xZzNI7dBbX4ZVghB_kR8SEGdY8agd8GbvUpIf_aKpiulfi5tKuxIpgz-2CGeC00bJeDFO73qb473wR8ttww1lXWgoyipLIGVXTPiheAREpsO6X8wNGr8cfE781Nt71XadOtvQ3YcPURI1DCcJu1BhaXmze7n0l48kl2ExD0HQtClTCbQhzD9uAU4ft7AUcn9pDAEbhtKQquq527_zj-sreY3uOlLrrSCwL5neKGt7ozix5pvf9f6AfCvOC4o-4NFm0nw6tSCpCbrlfKSeqpZ78eDRlmKV1l8Tisx3CBJn7a2okfjd8uhjc4ZvKd7yTw_h-mEvkWyHh1YfwtVTbbvX1WITz4BIuOzo7BjjPuzWwYWUGZo9kRsRxbouDTalZLNVAblquy4CgfAkrO5Exf4EyIGV2Jc45zuuw4QF5RWnBaiMGUS--8zxN37Ev2RYEQ0qgrdqf_j1rmy_hIqqJnX1eiRYnpuRrlrWINg8GHrWjK2__Kt0oKFBf2ce3FYjj_hKEDEdGZ4azbGWeYzq0OmtQOXFb6YO4Qw3KbSBk2ZWXRPRK04M4xT5QNg9nN-VHQh8bDHlI6v1oPx2uFos6ReuIXta0QiEhJPar4zcU-iwNvNfyit-2npCQ0Z8yhEuVjUl8Jn7xMpUBY00FFjATlyhqtiA9CKRcBWP_lGaN2aphnezBUvDK7gBWt4ML4ZsPbtkv0vFzpr5sLAPkMwkputxn_Bx7s4dH_fA-4LUvSlrEbJQ2ySGJ3PcMFxGVWIvY7dV5CwLrMdaP8hdXL04fQ42TG-xPKdx0yWDZi5rj__ijocS74tG0PaY9bjnaqFkqpWSv3KZJ7rcAhO2RIzLYjSWA_VYV4X-jGGlv_1QpjIeB6Ef7t6oTOs8zAZZBXgmANDoI_ElPaV9AusYcjKx678DGBNYtmXyyXxTUZ_CZpBl4BmSWijrtu2KeLAHCfkmJa4_7EdXAFu5u_F8VvBKorfzJDtPb-YXugB-kQAvacO41gwd5nXSRiDnRHWZhAvJHiDhJd3NM3uxx6_Eg_v_wCA5x7pZRba9KAEAAAAAAAALsGhnqd6x8JsBaxxKTySiUSng5wJP3pl2Oth7UhB86MsxdKufmMRjYFbW0piRoTOYjcNoydO5MWp2gKqBho94QTNdOVwFbGQ9HA7dCioNqIQ4XAA6IDMCIM426sHQSYL4TWQ3OlCFZK2Y_sBL3NHnlE9HFWgLMbLOWoSiznNv_NBd2FXM7xuXioEO-ObkRTBV3ciJMrAsEpYKohbRhlvz7lGRCJ6TjUbVmg7OmI5THllreglhTh3qAdfFWvLBLpvUfsLt8lr8xAaC8mbgzgJjjIPGwAcTvk9DQIBKVyysSQ96BYjKafK-ENNiTAgmvHOEYPAf3RtdNAxSsJR6PZwMdIwZBKalqzDZrAqxHoGwZMzjZKs_qpIiqQt0PoRq3yQuWwKEFuyb2vKYiFTSLZrQFpDWYuWCjMcxLpVk5AoS7iAk_GCJJKG5HVU4dfEZ4i_2JQRL9QPqJKORcZ7YrC6FvgosdudE6gW11dZ7VG0oAJUmJd3ZaqB9mQAtSlFoYNV6XW47ICtewtmDkxiuzRBnxJn5qQfpkw7Qpoc2My2vMQVsmTBEpMa6FMNVRY4MaW1gzHEJ6y103kIhGKdjTeQo1IOvsqQAOcU6aoN_rUm7KdHfLEMwlaGEAQey6ZnRLEq3SNXMkgDWloCDLqmsbhxqYZxo1mEu9E5NQptINtInkTLsSOYCBadx3BDpsULEwa2_QQpjtbOd5EIoshFwJW7xOJzO2d89pGdt_OGZykhp6ZQ1zSL98hT2SFJu9sQtrhHvfUplMIeiWt1MWt4xRNvxZaCQCx2rZxCLPBo29iFrXl6czYZiUU_2lOiukKRL0NlFHdrNVgV1sbHMeIzCku2fngo0YcSXnk_hEWrQIQlTjsWmHaV_wk8PIlVXxvESWawKOwCXcXAItEtxIqokqqDYMGKtPK_RdRy77vIKUNLTiABJcSL4wN2PBcps2HIuVPLB5QL0WvPYdNFSZg5KinH9KtDQjA_o_S0yJOEBgsSaQV87PEy8GRAddiU0gnOi4WvmkoQI1EkQJPP9oXMztYvuJoCkBgsl1JrnHy1aGBKWAcT9wSCuwSOdpsA5Ba4u0ecnLB0R-xXXXBMrBZs7feNT2ln_vK-60RiOgp6IrgEatWGxORM6sXOEKh5LwCAbrwvq8NjljeRNaslLmEr33t_47KIpuVpoBasoMaiirg3pUKyOoQ19yVqyNiHFuOYAvakbZK8QqONbkexyiYfaZwn-kdcKUF6XaAghLK_L3on4kUIzuBaWobFaWFRqpqni6u6egZb05UV5YS2NDzIfCNSZ7u6ifhEqGKK5-E9RmaDavgEVbxYrMRgealj3WCjFNacZDWlp3GEhSVBX6NZroGKZMvOUnFcmKG-QrS2XCM9ogpfgPJZZqoEW3IkkUouySC5F6XB2hE1Fllom_gnfitQyui4G7eSIch9LeBDA9WkSOe3W1tWrwo6DBOsGKYYNAKtUpZqexOGH0h3QjOSQwmDylYQ9pSq_QoKkFZx4hRxcUfPC8BMpZQm-ouzEqqemdNZ2dKtO9SiXMa5STdAJ7QLuCa7XUS0vOgepS7pNHChSk_tDAAAAAAAAEU1LEV7U5PSfuiJqi8o5g921j5T5RWmhROtJGe2wGBpir20gbVp8gwxQo5LRBnIvN3fS2mF-dvjlgYGSpdo9AL9xZuZZ8_4opZF0o2qhYpDoViDgO1fOVoPd4ALbF2ycs4Zk3BYd8Qc7gaSh9gNU2aaMAzRkGdJulZ6vRyEJiPFiGWmWsweJAaAjT9LCBALmkz_rF9W2r0rVEjwTVckBMmh4-Yf9E4f6T50ILap0noQdBQdhkeDywCjyFbpJkD-nsHWviQuLtss-FeY-Od-3q9uDrDKf0M43H3P2SW_wieUKJwn0UJ2hjaWGj4UcEi-qwTkRXYld32RGv0JpCRTDopqk_02QpcXFDELIFyYLCjVVuYHUbqYLvywz8M5v6Iaia66rMnlMvULrkKyG0uCUAtsUfUwnEjTiGk97HYrmxHsEzXCM1WDyP6Nrwf0k8cfd1hD_elr-g5MmcK2Nq4EEpsVUIsuq0ih9N1-XeNVAzFoS2F63wblUeYPlnZMeU2hZ0BAAGzdL3iW9D0-pxqY_lgRaCfp35gc1P5LjqgqIr7uyaMdzAF52SvMDM1UZfAvK1uM3QEUbQaa5LfTf6EkjyE37aHYRpXG6TEEy7bxNkgOShquPms0kGTAr9bLQFqNDIJpWDoVJFIZXWve0yQuw0r9ULQpsuefjKAcZoOMFU2UBm86v32WDZnzZv5U74KOqTJx2v106CCy0nL9SI2h0_fYAzQBRhSFKXRgNPP3rflGYINEwLQboEem6B1zIG6wgInlyCceimYyA6OKJZH1fNPKkNIvHmRJ-GUHvoN9AsNO5ARrYV_z2y2zuDt3G_-yNe3P2kKNaxtx_0E5U_Gj8xKddR64NKIQ5uWCpqRndQdZ7ZUyFkAoUcRlKX6ntXKeCIA3JTzAr3RGk6sMf5mjCqfUI9tfnPlkZpYtHzhsKQW0kQLD5p6S3kMkZuUtC0F2Elgbe3w4PSq2AZjLf41nSC2oMWXaEpzVUmWkUYLeb0ktKwvqNhwgj8UVv_3o87NiqV1bSLMWl-C7rfHGiCWu4LsaDBpF8M05RjDsjlinzDP_OyMKEz2AmvyaAUoY0o1vTkzsfOGGh5vpyxehD2EBNiTcZ_I-qX3i0g5tE0qUVfsyoZXT3xdFkTpFKFZnj_DB701dicLfV5yA52BFx98TeFIQK4tGmgGSvlbpRegmqPmFUPxzgh-z18_igpqnjtxzcro89kQzl9cRWRXAsUFKUFszWQmC56jyFofVdSKn7KULqfNgxiWrSmuV8XSBItVt8a3Q2yWxHTsxRs0CZ24u_3CIqHYdvvbKcgf-Ejj0mS0HqBxmgWfGvhlw_rrJM3pr8ymqqgRa2RHbLx72pr-U6vfZq96F-mmRfupmwYsp8rRxD4tngug-aeWvoVt3cALfMAm8wBFSyhY8ZBb9BdYm7yGNkeSAyGEVoRfQfLjDQy9Pgl8DWyPSA_2UfMZbKO_uHRUpkYcD4ys8crF11O6qHh1y4m3N2_piPw6_KSs1aj_WPlCp5C4AJsE3gcEZj6Bn4mMhocMuF8zRqdM4rZwy5V2LvvDyEDjOFYiTjJILTe7MV9RHUP-OXwpXZbdpuXsK3wgFQqC70OgiGSrh9431k_vl1Lp4VFwpNrbvVvkMmJTYzRZUbsgOjlOhLf3OIXf4SVcTUbM1mzhJrCzlMm_ps9zyocu2LsLDjK83h_etGyFNU2nyydma1GSuHj8g2FXr7F8Mz5V7UiEZTs-PUCTrvnlIYwP-QslRzqyMid838DtFf_LIuTSAb4GKJgiH3vaDQT_pPT6g3MUbF5JxiPNgrwdCUbBwgqGxPcJxytdrea2pqcdodfXyrXRXVY6xFi1BrV-odoSm-qxBb4aK9bdI_jqmYa5pjdozZiK1Oy5pUjmuuxpSWROBtnUpKWC66cLSVpc35bCm7G286nHJfbFlAqry50VZFrepSZLJBrFyncpWP5pEa_GgksOyf_fLzW45E92B9zYERAvrM8s_KjUZeZACFvvO7sMnzSQanJ1XHv1rpJsuH5Y48xuYR9kfhlljjblLYXTgX48APBeDZ6Stm_VFYAYJaQ73D6OnBKmjhV9tpD9zoBirwTULXpcu87UDvjRzLyFng8l4clHdFpSenxsRk6HnodjTYqvuOW3B-JbSwrFhGaVCUlHYaJiys8a1M4gyYn-ipcc40dY0I565r2_WgYSnNOMRbqLaScmo4IqA5SQ4F26nnvvB_upkLRPIpVX43oa-Sc_hghMLB_EfD_HLDR4noXlXIqK3gLw1wrdc3bLX-HurK8PWTmzvLGI4UcpdkEjMSXiyut3UZYWVyZehJeepICaYYgqgkKX8uYZU-6UfQSeMbhQArcuMHTXnGMajro680o_w-VVhcBve4ceVlVCbC__6ImAwPT7lRfKWAQ01UAPK51EKgZwlOpabop_BpqO7l1lqIurjld61cHo_dUiXfgtEQpM9TsUpKpn7GsmI9XdGryACNXKsCtednDFGOCXDekDDTZ0Zndbr3DBRckG2GyZ_EoxrUgBbLNgIY4BzvJGgldrKjUVddezb1x2IIkR7Ohwc9HGx5c0t0tDmuUvgb4yA5MhYCmeYC9Vib5Puou1THuD5cBBogsqR0WCwJ1IMDT_va9oZEF0Fp0T88I0phlwg4jCwvLgGkXCoNXYBw4l_yfGuiGt2Z1rwP_nyHoOejlnLsSgKHZfJBAJhnBv5BxQraH8h4ClddnBHrwsEiT_Ftb3Twwdczn4LEUwkLspLFa9sP2iBX3cFwAo5wiAV2IP_V3umPt9HGGpNz77ghKUtGfL3oBeAjBITXfSrS6YAXKcf1iW--m5QWVm3wu30ieIRPU1W96moJmpvOMqVolQr-W497UClVyDe9X6t1Iq6gInsU1vTzEfDXIfRvfIHKJ__SboGNgAvY97mOddEifTU-VRA53GKdD5ydXYYP2X9qKhW5dKv9KTUxIDXfZUwdciCoDM1friCcbQL3Y0sENk6FFu_NmDLM-VvKvmWigAo-wGOQCxK1ZjmKbMY7NisPzJfxKnSVsgOI62L8UFiiLp-U9nLqtypK0LCSjbUg8wXCZbMX0pL4S8XqUTPWm1_Cm348_PM3TwKJ9weD2R5NkZzYtcP2tnSbipPCadUNkJue_DKyscwU8kKa3TXx43ypQWFs2qRC4l8WAYMollrziuUcxmK75CYx9ERF_QnOYrV6rRwhYD3ulhmKo6rPO7_miKqTcxmf4SnVLCRk_QtQcKY8VJwSgcj9DdT2j5shh8yG2XnKOt0dMgEViVd-yDbjfuEgxmt-H1voe2ugo9oymIobAJI2BL-tWtUmTxA22IIhw17rjkmP9gi5nCMGA7qkyDvf05ot0TSpKXeRcZ_gp7_7FcTBcCYRp1gAmmvWMG1lFQVaWNmpV_rj6D2YzFI9WChf90-fyzhG_aZN7q2AJm_Atr-N-e8BYcHvihKmu_JF0JDmPlJOev6n5nxzGBi0XInPK0qDHMAKhKCq1J4Hz8AjIsW4LFbr93eGh6Q2hKGl6c8JUtnN6G2rxKDDsjp5NFaZwldDg4Oh1d4IaytD8FvC0eC1y-gMP7WbwqIA9XwOyExlO7IV-9IdcIqzig52E1vmRd3UXp_KqMvaBs_k9kbInX04bndt5owVljvx4VCWl-fTHBcaTocaHep0ezxs2WbWgegJkq8hPRuVugFAOjyJHFrP3MJ2osrH7wpUB3__gkY57wHZujyt4Hr4S2mesxMhlNNbuCx2RWjTGnBC1nwdDo4aZXLEsFYdpBPEye8xmMMQ-P-nAqxyII0bQdrcaXr8IvEhyGVPcmQeuI7oc5WstI4Gj-RbyVlGOStIDi18HBdpz02oZJPVsg2QzrAq4UmLM-i9r1M_arbBJvCZDaPsgxo7ehtZO90FyfDXzNoBzjjL9qCOEV3rVO0iqAIMDKPAK6LRiHxiVuchO6lJ0b1tT_qUUvLf5DCYUqdvkMYJyyuwPPdYZ4zy6ibpgJt4ADtTYl8GgyXFqdeubhTgzb7sqi61LTvsTDkc51Jn2a2Plu4IpDagwBl3gsU6nm8aLeczaYvP5hDgbvFi5qUspnPdJPog-n-8O-KlUkE71BQN9br9SeLKlcHq9RgcL73SkB7OA_LqlQ1dyjNTPCjT_SEhFE4-FgweJbL2KcJH7GKkq5epwcexq2xtq0xFw0gFejKvhPn1AqeUmzoXdEU9uhXSRE372yIqdMZ8geK07Fsk7EWbTcdMmT-9ZU_vQGQE8rQymmE2dQKz7ubzHakckOvhx6P0hARCzW9ugOif_ydQFLMTSZ8T63anKbDbdfujDafG63e9rEuKFcADk5ba4eIis3svb7r_wWRoxAfc7zxR1lvcoarv-PkBUxmfrDL0AAAAAAAAAAAAAAAAAAAAAAAAAkNEBUeJQ 
-Unchained, a permissionless blockchain that couples memory-hard proof-of-work with post-quantum (PQ) cryptography and an epoch-first issuance model. Time is divided into fixed-length epochs; miners submit coin candidates throughout an epoch using Argon2id. At the epoch boundary, the network finalizes an anchor that commits to up to N selected coins via a Merkle root, enabling independent verification and efficient synchronization. Ownership is tracked with Dilithium3 signatures; receivers obtain privacy via Kyber768-based stealth receiving with one-time keys. Unchained uses libp2p over QUIC for gossip
+EXAMPLE: cargo run --release --bin unchained send --stealth ADRESSgoesHERE --amount 1
 
-- Memory‑hard PoW  Argon2id; memory target retunes across epochs
-- End‑to‑end PQ: Dilithium3 signatures, Kyber768 for stealth, BLAKE3 everywhere
-- Spends don’t shout who you are: one‑time keys and blinded nullifiers (V2)
-- rocksdb
-
-Nullifiers (double‑spend protection):
-- v1 (legacy): BLAKE3("nullifier_v1" || coin_id || sig)
-- v2 (current): BLAKE3("nullifier_v2" || spend_sk || coin_id)
-
-## Quick start
-
-
-```bash
-cargo build --release
-cargo run --release --bin unchained mine
+# Verify a coin’s inclusion proof by id (hex)
+cargo run --release --bin unchained -- proof --coin-id <64-hex>
 ```
 
-What happens on first run:
-- A wallet is created and encrypted with your passphrase
-- A persistent P2P identity is generated (`peer_identity.key`)
-- The node syncs, then starts mining (if enabled in `config.toml`)
+## Configuration (edit `config.toml`)
 
-Stop with Ctrl+C.
+- `[net]`: P2P port, bootstrap peers, optional `public_ip` (for NAT)
+- `[p2p]`: rate limits and ban windows for chatty/bad peers
+- `[storage]`: database path
+- `[epoch]`: epoch length, difficulty bounds, retarget tuning
+- `[mining]`: Argon2id memory bounds, attempts, workers, offload
+- `[metrics]`: Prometheus bind address
 
-### Show your Peer ID (for peering/firewall rules)
+Notes:
+- If `storage.path` is relative, the node stores data under `~/.unchained/unchained_data`
+- The shipped `config.toml` is a decent starting point
+
+## Wallet and security
+
+- Dilithium3 wallet keys are encrypted at rest with XChaCha20‑Poly1305
+- Keys come from your passphrase via Argon2id (large memory, slow to brute‑force)
+- Non‑interactive mode requires `WALLET_PASSPHRASE`
+- Legacy plaintext wallets (if found) are migrated to encrypted format
+
+Env vars that matter:
+- `WALLET_PASSPHRASE` — passphrase for non‑interactive runs
+- `PROOF_SERVER_TOKEN` — require `x-auth-token` for the proof server
+- `COIN_MIRRORING=0` — disable writing `<db>/coins/coin-*.bin`
+
+## Stealth receiving (how to get paid privately)
+
+1) Export your stealth address (a signed bundle that binds your normal address to your Kyber768 public key):
 
 ```bash
-cargo run --release --bin unchained -- peer-id
+cargo run --release --bin unchained -- stealth-address
 ```
 
-If `net.public_ip` is set in `config.toml`, you’ll also see your full multiaddr for others to dial.
+Share this base64‑url string with senders. They’ll encrypt a one‑time Dilithium key to your Kyber PK. Your wallet can decrypt it, nobody else can.
 
-## CLI (no surprises)
-
-All commands accept `--config <path>` (default `config.toml`) and `--quiet-net`.
-
-- `mine` — start mining immediately (overrides `mining.enabled`)
-- `peer-id` — print local libp2p Peer ID (and multiaddr if `net.public_ip` is set)
-- `stealth-address` — print your stealth receiving address (base64-url)
-- `proof --coin-id <HEX>` — request and verify a Merkle proof for a coin
-- `proof-server [--bind HOST:PORT]` — HTTPS server that returns proofs
-- `send --stealth <ADDRESS> --amount <N>` — send to a stealth address
-- `balance` — show wallet balance + address
-- `history` — print simple tx history
-
-Examples:
+2) Senders use the CLI:
 
 ```bash
-# Send 1 coin to a recipient’s stealth address (base64‑url string)
-cargo run --release --bin unchained send --stealth <STEALTH_ADDR> --amount 1
+cargo run --release --bin unchained -- send --stealth <STEALTH_ADDR> --amount 1
+```
 
-EXAMPLE: cargo run --release --bin unchained send --stealth ARFwLmeyxSgkwlVCjfs46xKIE1SKjc4EL47jZu1PdA4doAcAAAAAAABFFbPO77e9SZkTnL1IkeuZxkqPQ1RvHMBQpk_BFZ1FYq1NZtPM5_lDoIFPQpwJlnMTukYxKmPGUKaI7K1uU2XoEGnNrMLRwTgwec4d7de8uSh37MtSTjsp7oaqpsnO4hbu3t1nIrBVAHsO9TBImk4rJoeTGN_4WdfYxB68ySLty4UF3yJc39h_wxU1YuHElS1kxxl3YnApxfLib723w8XKtTiYjYpM-voDFKL9eSgiaAPCunuwnI1xFjGCFDeKBvtqi_6msbC9iRxjkobMSg5e9LDscQOk5EUs1HbLJjbszo8otxAl8NdrL9Fsm8PFiDExyUI5VG5amecj_sOxsUXU-imNAD97cBL6QEA-aeqAeQi8qga0O1xAlmZv6QzvayXUXXfDyGApZYUMw8ctsx9KKGMWc5fuEyjlPNQET_KjHkWSGtDsHPrjatTV3XnP0yXPJFpCk1ApqwKUpK26mZshX3ERtkfbd1vDZYDqy3G23acYQAnefIz5fUKwLssGUwv0h-NXd-RdOM6t2A9N5aCv6pcmFmyVN2voFR4JjVHBcPdQUkgvYcZjtg08MbLE-TKf2bihhQXf6k_DmHSWXuXuF5SSRmLGRxMUDnmTeJGFloAKeEPpx8UOA5n05khoPmNLVQDN_ZzJbNhdqfT-1nBFXgMQX2tbY58sqZbH0hjsHvnxjLgbED-57UjZnUBE7D6UGheZvUGGTb6eZ9JwcH2KnfQwBFuPkucKA1pFeKRQnOndfqvZZWME7kcTXiIkH3jTnmB5fdddg2kJSq7nP8E6wW8I1WB5xdD9OI7_HCjrpR2MArf_rUMNvxFsRy89XQVYaBiowzgIP4ReOXEKWZLIz80_RC8mUkCv4M8f8cGIa2DvC3X-R26Ed2tmFYdFhkJV8ZIVGZvpSOWSnOLfqq_Swu6NxPO1hqCYm_tbgJ0KOmWFELyjOCwTrnHAFSXjulPjVmkfXwpcK7g-QYHhwLlvPsWKDVlT386N68Q1V0IxkJKnOpUYUbxZXMs17MFqq0atAKgTx12OzKbxuqOtJtEe8SMVa4nqecgFN5CSvnuSCLW_fueAl1z-1zQ1OrGYYz03L8J-5fRMIdLkfkmcYo3eqT2hQmbRsKXRka7avsx9VTIxdj1u2sKDjWeanN2w3n2Qys3L4VE1bVQQ9YwQsTr8uu-Sb_nU8btFK-GLV9wtF7AyHXeyPpLLirkoXCrOiP2f3QUhKwwH17hPG5W70_M64GGGxUj4HsnSl8kEGq-9bgrCkVq79lgRcXQ5_saq62-mqX0Mv_hsrGQlUn0GisjFPN_5A9klyGRLZ5QI3zOIWay_DNZKtKFSpdpL6LVtJrpNLUPx8hvYjnnAirqRdCyMja5b3jU9ApTOekDMI2BbNq6XKq3HQ6tVaGNaRIg_BBwpDxKr0Z7n0uGqB7u5f8yAG9YtvUe2mHEZ_S5ozKFqsHo6jzR3HrPSQvYdX4CDwl3g_bdTNuvgmgCxPiHOlJluGnzPqZwNJ5VR6bL0_6FhoP4atzDx1M7Erk1L6jelPMG8XuuzIVDXrQs0xZzNI7dBbX4ZVghB_kR8SEGdY8agd8GbvUpIf_aKpiulfi5tKuxIpgz-2CGeC00bJeDFO73qb473wR8ttww1lXWgoyipLIGVXTPiheAREpsO6X8wNGr8cfE781Nt71XadOtvQ3YcPURI1DCcJu1BhaXmze7n0l48kl2ExD0HQtClTCbQhzD9uAU4ft7AUcn9pDAEbhtKQquq527_zj-sreY3uOlLrrSCwL5neKGt7ozix5pvf9f6AfCvOC4o-4NFm0nw6tSCpCbrlfKSeqpZ78eDRlmKV1l8Tisx3CBJn7a2okfjd8uhjc4ZvKd7yTw_h-mEvkWyHh1YfwtVTbbvX1WITz4BIuOzo7BjjPuzWwYWUGZo9kRsRxbouDTalZLNVAblquy4CgfAkrO5Exf4EyIGV2Jc45zuuw4QF5RWnBaiMGUS--8zxN37Ev2RYEQ0qgrdqf_j1rmy_hIqqJnX1eiRYnpuRrlrWINg8GHrWjK2__Kt0oKFBf2ce3FYjj_hKEDEdGZ4azbGWeYzq0OmtQOXFb6YO4Qw3KbSBk2ZWXRPRK04M4xT5QNg9nN-VHQh8bDHlI6v1oPx2uFos6ReuIXta0QiEhJPar4zcU-iwNvNfyit-2npCQ0Z8yhEuVjUl8Jn7xMpUBY00FFjATlyhqtiA9CKRcBWP_lGaN2aphnezBUvDK7gBWt4ML4ZsPbtkv0vFzpr5sLAPkMwkputxn_Bx7s4dH_fA-4LUvSlrEbJQ2ySGJ3PcMFxGVWIvY7dV5CwLrMdaP8hdXL04fQ42TG-xPKdx0yWDZi5rj__ijocS74tG0PaY9bjnaqFkqpWSv3KZJ7rcAhO2RIzLYjSWA_VYV4X-jGGlv_1QpjIeB6Ef7t6oTOs8zAZZBXgmANDoI_ElPaV9AusYcjKx678DGBNYtmXyyXxTUZ_CZpBl4BmSWijrtu2KeLAHCfkmJa4_7EdXAFu5u_F8VvBKorfzJDtPb-YXugB-kQAvacO41gwd5nXSRiDnRHWZhAvJHiDhJd3NM3uxx6_Eg_v_wCA5x7pZRba9KAEAAAAAAAALsGhnqd6x8JsBaxxKTySiUSng5wJP3pl2Oth7UhB86MsxdKufmMRjYFbW0piRoTOYjcNoydO5MWp2gKqBho94QTNdOVwFbGQ9HA7dCioNqIQ4XAA6IDMCIM426sHQSYL4TWQ3OlCFZK2Y_sBL3NHnlE9HFWgLMbLOWoSiznNv_NBd2FXM7xuXioEO-ObkRTBV3ciJMrAsEpYKohbRhlvz7lGRCJ6TjUbVmg7OmI5THllreglhTh3qAdfFWvLBLpvUfsLt8lr8xAaC8mbgzgJjjIPGwAcTvk9DQIBKVyysSQ96BYjKafK-ENNiTAgmvHOEYPAf3RtdNAxSsJR6PZwMdIwZBKalqzDZrAqxHoGwZMzjZKs_qpIiqQt0PoRq3yQuWwKEFuyb2vKYiFTSLZrQFpDWYuWCjMcxLpVk5AoS7iAk_GCJJKG5HVU4dfEZ4i_2JQRL9QPqJKORcZ7YrC6FvgosdudE6gW11dZ7VG0oAJUmJd3ZaqB9mQAtSlFoYNV6XW47ICtewtmDkxiuzRBnxJn5qQfpkw7Qpoc2My2vMQVsmTBEpMa6FMNVRY4MaW1gzHEJ6y103kIhGKdjTeQo1IOvsqQAOcU6aoN_rUm7KdHfLEMwlaGEAQey6ZnRLEq3SNXMkgDWloCDLqmsbhxqYZxo1mEu9E5NQptINtInkTLsSOYCBadx3BDpsULEwa2_QQpjtbOd5EIoshFwJW7xOJzO2d89pGdt_OGZykhp6ZQ1zSL98hT2SFJu9sQtrhHvfUplMIeiWt1MWt4xRNvxZaCQCx2rZxCLPBo29iFrXl6czYZiUU_2lOiukKRL0NlFHdrNVgV1sbHMeIzCku2fngo0YcSXnk_hEWrQIQlTjsWmHaV_wk8PIlVXxvESWawKOwCXcXAItEtxIqokqqDYMGKtPK_RdRy77vIKUNLTiABJcSL4wN2PBcps2HIuVPLB5QL0WvPYdNFSZg5KinH9KtDQjA_o_S0yJOEBgsSaQV87PEy8GRAddiU0gnOi4WvmkoQI1EkQJPP9oXMztYvuJoCkBgsl1JrnHy1aGBKWAcT9wSCuwSOdpsA5Ba4u0ecnLB0R-xXXXBMrBZs7feNT2ln_vK-60RiOgp6IrgEatWGxORM6sXOEKh5LwCAbrwvq8NjljeRNaslLmEr33t_47KIpuVpoBasoMaiirg3pUKyOoQ19yVqyNiHFuOYAvakbZK8QqONbkexyiYfaZwn-kdcKUF6XaAghLK_L3on4kUIzuBaWobFaWFRqpqni6u6egZb05UV5YS2NDzIfCNSZ7u6ifhEqGKK5-E9RmaDavgEVbxYrMRgealj3WCjFNacZDWlp3GEhSVBX6NZroGKZMvOUnFcmKG-QrS2XCM9ogpfgPJZZqoEW3IkkUouySC5F6XB2hE1Fllom_gnfitQyui4G7eSIch9LeBDA9WkSOe3W1tWrwo6DBOsGKYYNAKtUpZqexOGH0h3QjOSQwmDylYQ9pSq_QoKkFZx4hRxcUfPC8BMpZQm-ouzEqqemdNZ2dKtO9SiXMa5STdAJ7QLuCa7XUS0vOgepS7pNHChSk_tDAAAAAAAAEU1LEV7U5PSfuiJqi8o5g921j5T5RWmhROtJGe2wGBpir20gbVp8gwxQo5LRBnIvN3fS2mF-dvjlgYGSpdo9AL9xZuZZ8_4opZF0o2qhYpDoViDgO1fOVoPd4ALbF2ycs4Zk3BYd8Qc7gaSh9gNU2aaMAzRkGdJulZ6vRyEJiPFiGWmWsweJAaAjT9LCBALmkz_rF9W2r0rVEjwTVckBMmh4-Yf9E4f6T50ILap0noQdBQdhkeDywCjyFbpJkD-nsHWviQuLtss-FeY-Od-3q9uDrDKf0M43H3P2SW_wieUKJwn0UJ2hjaWGj4UcEi-qwTkRXYld32RGv0JpCRTDopqk_02QpcXFDELIFyYLCjVVuYHUbqYLvywz8M5v6Iaia66rMnlMvULrkKyG0uCUAtsUfUwnEjTiGk97HYrmxHsEzXCM1WDyP6Nrwf0k8cfd1hD_elr-g5MmcK2Nq4EEpsVUIsuq0ih9N1-XeNVAzFoS2F63wblUeYPlnZMeU2hZ0BAAGzdL3iW9D0-pxqY_lgRaCfp35gc1P5LjqgqIr7uyaMdzAF52SvMDM1UZfAvK1uM3QEUbQaa5LfTf6EkjyE37aHYRpXG6TEEy7bxNkgOShquPms0kGTAr9bLQFqNDIJpWDoVJFIZXWve0yQuw0r9ULQpsuefjKAcZoOMFU2UBm86v32WDZnzZv5U74KOqTJx2v106CCy0nL9SI2h0_fYAzQBRhSFKXRgNPP3rflGYINEwLQboEem6B1zIG6wgInlyCceimYyA6OKJZH1fNPKkNIvHmRJ-GUHvoN9AsNO5ARrYV_z2y2zuDt3G_-yNe3P2kKNaxtx_0E5U_Gj8xKddR64NKIQ5uWCpqRndQdZ7ZUyFkAoUcRlKX6ntXKeCIA3JTzAr3RGk6sMf5mjCqfUI9tfnPlkZpYtHzhsKQW0kQLD5p6S3kMkZuUtC0F2Elgbe3w4PSq2AZjLf41nSC2oMWXaEpzVUmWkUYLeb0ktKwvqNhwgj8UVv_3o87NiqV1bSLMWl-C7rfHGiCWu4LsaDBpF8M05RjDsjlinzDP_OyMKEz2AmvyaAUoY0o1vTkzsfOGGh5vpyxehD2EBNiTcZ_I-qX3i0g5tE0qUVfsyoZXT3xdFkTpFKFZnj_DB701dicLfV5yA52BFx98TeFIQK4tGmgGSvlbpRegmqPmFUPxzgh-z18_igpqnjtxzcro89kQzl9cRWRXAsUFKUFszWQmC56jyFofVdSKn7KULqfNgxiWrSmuV8XSBItVt8a3Q2yWxHTsxRs0CZ24u_3CIqHYdvvbKcgf-Ejj0mS0HqBxmgWfGvhlw_rrJM3pr8ymqqgRa2RHbLx72pr-U6vfZq96F-mmRfupmwYsp8rRxD4tngug-aeWvoVt3cALfMAm8wBFSyhY8ZBb9BdYm7yGNkeSAyGEVoRfQfLjDQy9Pgl8DWyPSA_2UfMZbKO_uHRUpkYcD4ys8crF11O6qHh1y4m3N2_piPw6_KSs1aj_WPlCp5C4AJsE3gcEZj6Bn4mMhocMuF8zRqdM4rZwy5V2LvvDyEDjOFYiTjJILTe7MV9RHUP-OXwpXZbdpuXsK3wgFQqC70OgiGSrh9431k_vl1Lp4VFwpNrbvVvkMmJTYzRZUbsgOjlOhLf3OIXf4SVcTUbM1mzhJrCzlMm_ps9zyocu2LsLDjK83h_etGyFNU2nyydma1GSuHj8g2FXr7F8Mz5V7UiEZTs-PUCTrvnlIYwP-QslRzqyMid838DtFf_LIuTSAb4GKJgiH3vaDQT_pPT6g3MUbF5JxiPNgrwdCUbBwgqGxPcJxytdrea2pqcdodfXyrXRXVY6xFi1BrV-odoSm-qxBb4aK9bdI_jqmYa5pjdozZiK1Oy5pUjmuuxpSWROBtnUpKWC66cLSVpc35bCm7G286nHJfbFlAqry50VZFrepSZLJBrFyncpWP5pEa_GgksOyf_fLzW45E92B9zYERAvrM8s_KjUZeZACFvvO7sMnzSQanJ1XHv1rpJsuH5Y48xuYR9kfhlljjblLYXTgX48APBeDZ6Stm_VFYAYJaQ73D6OnBKmjhV9tpD9zoBirwTULXpcu87UDvjRzLyFng8l4clHdFpSenxsRk6HnodjTYqvuOW3B-JbSwrFhGaVCUlHYaJiys8a1M4gyYn-ipcc40dY0I565r2_WgYSnNOMRbqLaScmo4IqA5SQ4F26nnvvB_upkLRPIpVX43oa-Sc_hghMLB_EfD_HLDR4noXlXIqK3gLw1wrdc3bLX-HurK8PWTmzvLGI4UcpdkEjMSXiyut3UZYWVyZehJeepICaYYgqgkKX8uYZU-6UfQSeMbhQArcuMHTXnGMajro680o_w-VVhcBve4ceVlVCbC__6ImAwPT7lRfKWAQ01UAPK51EKgZwlOpabop_BpqO7l1lqIurjld61cHo_dUiXfgtEQpM9TsUpKpn7GsmI9XdGryACNXKsCtednDFGOCXDekDDTZ0Zndbr3DBRckG2GyZ_EoxrUgBbLNgIY4BzvJGgldrKjUVddezb1x2IIkR7Ohwc9HGx5c0t0tDmuUvgb4yA5MhYCmeYC9Vib5Puou1THuD5cBBogsqR0WCwJ1IMDT_va9oZEF0Fp0T88I0phlwg4jCwvLgGkXCoNXYBw4l_yfGuiGt2Z1rwP_nyHoOejlnLsSgKHZfJBAJhnBv5BxQraH8h4ClddnBHrwsEiT_Ftb3Twwdczn4LEUwkLspLFa9sP2iBX3cFwAo5wiAV2IP_V3umPt9HGGpNz77ghKUtGfL3oBeAjBITXfSrS6YAXKcf1iW--m5QWVm3wu30ieIRPU1W96moJmpvOMqVolQr-W497UClVyDe9X6t1Iq6gInsU1vTzEfDXIfRvfIHKJ__SboGNgAvY97mOddEifTU-VRA53GKdD5ydXYYP2X9qKhW5dKv9KTUxIDXfZUwdciCoDM1friCcbQL3Y0sENk6FFu_NmDLM-VvKvmWigAo-wGOQCxK1ZjmKbMY7NisPzJfxKnSVsgOI62L8UFiiLp-U9nLqtypK0LCSjbUg8wXCZbMX0pL4S8XqUTPWm1_Cm348_PM3TwKJ9weD2R5NkZzYtcP2tnSbipPCadUNkJue_DKyscwU8kKa3TXx43ypQWFs2qRC4l8WAYMollrziuUcxmK75CYx9ERF_QnOYrV6rRwhYD3ulhmKo6rPO7_miKqTcxmf4SnVLCRk_QtQcKY8VJwSgcj9DdT2j5shh8yG2XnKOt0dMgEViVd-yDbjfuEgxmt-H1voe2ugo9oymIobAJI2BL-tWtUmTxA22IIhw17rjkmP9gi5nCMGA7qkyDvf05ot0TSpKXeRcZ_gp7_7FcTBcCYRp1gAmmvWMG1lFQVaWNmpV_rj6D2YzFI9WChf90-fyzhG_aZN7q2AJm_Atr-N-e8BYcHvihKmu_JF0JDmPlJOev6n5nxzGBi0XInPK0qDHMAKhKCq1J4Hz8AjIsW4LFbr93eGh6Q2hKGl6c8JUtnN6G2rxKDDsjp5NFaZwldDg4Oh1d4IaytD8FvC0eC1y-gMP7WbwqIA9XwOyExlO7IV-9IdcIqzig52E1vmRd3UXp_KqMvaBs_k9kbInX04bndt5owVljvx4VCWl-fTHBcaTocaHep0ezxs2WbWgegJkq8hPRuVugFAOjyJHFrP3MJ2osrH7wpUB3__gkY57wHZujyt4Hr4S2mesxMhlNNbuCx2RWjTGnBC1nwdDo4aZXLEsFYdpBPEye8xmMMQ-P-nAqxyII0bQdrcaXr8IvEhyGVPcmQeuI7oc5WstI4Gj-RbyVlGOStIDi18HBdpz02oZJPVsg2QzrAq4UmLM-i9r1M_arbBJvCZDaPsgxo7ehtZO90FyfDXzNoBzjjL9qCOEV3rVO0iqAIMDKPAK6LRiHxiVuchO6lJ0b1tT_qUUvLf5DCYUqdvkMYJyyuwPPdYZ4zy6ibpgJt4ADtTYl8GgyXFqdeubhTgzb7sqi61LTvsTDkc51Jn2a2Plu4IpDagwBl3gsU6nm8aLeczaYvP5hDgbvFi5qUspnPdJPog-n-8O-KlUkE71BQN9br9SeLKlcHq9RgcL73SkB7OA_LqlQ1dyjNTPCjT_SEhFE4-FgweJbL2KcJH7GKkq5epwcexq2xtq0xFw0gFejKvhPn1AqeUmzoXdEU9uhXSRE372yIqdMZ8geK07Fsk7EWbTcdMmT-9ZU_vQGQE8rQymmE2dQKz7ubzHakckOvhx6P0hARCzW9ugOif_ydQFLMTSZ8T63anKbDbdfujDafG63e9rEuKFcADk5ba4eIis3svb7r_wWRoxAfc7zxR1lvcoarv-PkBUxmfrDL0AAAAAAAAAAAAAAAAAAAAAAAAAkNEBUeJQ 
+The wallet will:
+- Use a legacy V1 transfer once for any coin that has never moved (to establish an owner one‑time key)
+- Use V2 spends thereafter (Merkle‑anchored, blinded nullifier)
+
+## V2 spend (PQ and practical)
+
+Fields:
+- `coin_id` — 32 bytes
+- `root` — epoch Merkle root
+- `proof` — inclusion proof for `coin_id` leaf
+- `to` — stealth output `{ one_time_pk, kyber_ct, enc_one_time_sk, enc_sk_nonce }`
+- `commitment` — BLAKE3(to.canonical_bytes())
+- `nullifier` — BLAKE3("nullifier_v2" || spend_sk || coin_id)
+- `sig` — Dilithium3 over `auth_bytes`
+
+Authorization bytes: `auth_bytes = root || nullifier || commitment || coin_id`
+
+Node checks:
+1) Coin exists and the epoch anchor matches `root`
+2) Merkle proof verifies
+3) Nullifier hasn’t been seen
+4) Signature verifies under current owner’s one‑time Dilithium public key
+
+## Network and protocol
+
+- Transport: QUIC over UDP (libp2p)
+- Gossip: gossipsub topics (anchors, coins, transfers, spends, proofs)
+- TLS: rustls + aws‑lc‑rs; prefers PQ/hybrid TLS 1.3
+
+Peer identity lives in `peer_identity.key`. Keep it if you want a stable Peer ID.
+
+## Proof server (HTTPS)
+
+Run a local HTTPS endpoint to fetch proofs by coin id:
+
+```bash
+cargo run --release --bin unchained -- proof-server --bind 127.0.0.1:9090
+```
+
+Optional auth: set `PROOF_SERVER_TOKEN` and send `x-auth-token` header.
+
+Example request:
+
+```bash
+curl -s \
+  -H "x-auth-token: $PROOF_SERVER_TOKEN" \
+  https://127.0.0.1:9090/proof/<COIN_ID_HEX> | jq .
+```
+
+Response (example):
+
+```json
+{
+  "ok": true,
+  "response": {
+    "coin": "…",
+    "epoch": 123,
+    "merkle_root": "…",
+    "proof_len": 17
+  }
+}
+```
+
+
+Notables: `unchained_peer_count`, `unchained_epoch_height`, `unchained_selected_coins`, `unchained_coin_proofs_served_total`, `unchained_mining_*`.
+
+## Data storage
+
+- RocksDB column families: `epoch`, `coin`, `coin_candidate`, `anchor`, `transfer`, `spend`, `nullifier`, …
+- Optional coin mirroring: `<db>/coins/coin-<id>.bin` (set `COIN_MIRRORING=0` to disable)
+- Simple backups: `<db>/backups/<timestamp>/`
+
+## Mining and epochs (how blocks happen)
+
+- Time is chunked into epochs (`[epoch].seconds`)
+- Miners produce coin candidates by meeting Argon2id difficulty
+- Each epoch selects up to `[epoch].max_coins_per_epoch` (best PoW) and commits IDs into a Merkle root
+- Difficulty and Argon2 memory adjust to aim for `[epoch].target_coins_per_epoch`
+
+## Troubleshooting
+
+- DB locked: don’t share `storage.path` across processes; only delete `LOCK` if the node is stopped
+- No peers: add at least one good `[net].bootstrap` multiaddr; open the UDP port or set `public_ip`
+- NAT: forward UDP `listen_port`; set `public_ip`
+- Non‑interactive: export `WALLET_PASSPHRASE`
+- Metrics port busy: it will try the next port; check logs for the new bind
+- Too chatty: pass `--quiet-net`
+
+## What makes it post‑quantum?
+
+- Dilithium3 for signatures and addresses (no classical curves)
+- Kyber768 for KEM (stealth receiving without leaking long‑term keys)
+- BLAKE3 + Argon2id (fast, modern, and not obviously broken by near‑term quantum)
+
+Net effect: you run a normal node and use normal commands, but the cryptography underneath is built for the long haul.
+
+---
+
+ARFwLmeyxSgkwlVCjfs46xKIE1SKjc4EL47jZu1PdA4doAcAAAAAAABFFbPO77e9SZkTnL1IkeuZxkqPQ1RvHMBQpk_BFZ1FYq1NZtPM5_lDoIFPQpwJlnMTukYxKmPGUKaI7K1uU2XoEGnNrMLRwTgwec4d7de8uSh37MtSTjsp7oaqpsnO4hbu3t1nIrBVAHsO9TBImk4rJoeTGN_4WdfYxB68ySLty4UF3yJc39h_wxU1YuHElS1kxxl3YnApxfLib723w8XKtTiYjYpM-voDFKL9eSgiaAPCunuwnI1xFjGCFDeKBvtqi_6msbC9iRxjkobMSg5e9LDscQOk5EUs1HbLJjbszo8otxAl8NdrL9Fsm8PFiDExyUI5VG5amecj_sOxsUXU-imNAD97cBL6QEA-aeqAeQi8qga0O1xAlmZv6QzvayXUXXfDyGApZYUMw8ctsx9KKGMWc5fuEyjlPNQET_KjHkWSGtDsHPrjatTV3XnP0yXPJFpCk1ApqwKUpK26mZshX3ERtkfbd1vDZYDqy3G23acYQAnefIz5fUKwLssGUwv0h-NXd-RdOM6t2A9N5aCv6pcmFmyVN2voFR4JjVHBcPdQUkgvYcZjtg08MbLE-TKf2bihhQXf6k_DmHSWXuXuF5SSRmLGRxMUDnmTeJGFloAKeEPpx8UOA5n05khoPmNLVQDN_ZzJbNhdqfT-1nBFXgMQX2tbY58sqZbH0hjsHvnxjLgbED-57UjZnUBE7D6UGheZvUGGTb6eZ9JwcH2KnfQwBFuPkucKA1pFeKRQnOndfqvZZWME7kcTXiIkH3jTnmB5fdddg2kJSq7nP8E6wW8I1WB5xdD9OI7_HCjrpR2MArf_rUMNvxFsRy89XQVYaBiowzgIP4ReOXEKWZLIz80_RC8mUkCv4M8f8cGIa2DvC3X-R26Ed2tmFYdFhkJV8ZIVGZvpSOWSnOLfqq_Swu6NxPO1hqCYm_tbgJ0KOmWFELyjOCwTrnHAFSXjulPjVmkfXwpcK7g-QYHhwLlvPsWKDVlT386N68Q1V0IxkJKnOpUYUbxZXMs17MFqq0atAKgTx12OzKbxuqOtJtEe8SMVa4nqecgFN5CSvnuSCLW_fueAl1z-1zQ1OrGYYz03L8J-5fRMIdLkfkmcYo3eqT2hQmbRsKXRka7avsx9VTIxdj1u2sKDjWeanN2w3n2Qys3L4VE1bVQQ9YwQsTr8uu-Sb_nU8btFK-GLV9wtF7AyHXeyPpLLirkoXCrOiP2f3QUhKwwH17hPG5W70_M64GGGxUj4HsnSl8kEGq-9bgrCkVq79lgRcXQ5_saq62-mqX0Mv_hsrGQlUn0GisjFPN_5A9klyGRLZ5QI3zOIWay_DNZKtKFSpdpL6LVtJrpNLUPx8hvYjnnAirqRdCyMja5b3jU9ApTOekDMI2BbNq6XKq3HQ6tVaGNaRIg_BBwpDxKr0Z7n0uGqB7u5f8yAG9YtvUe2mHEZ_S5ozKFqsHo6jzR3HrPSQvYdX4CDwl3g_bdTNuvgmgCxPiHOlJluGnzPqZwNJ5VR6bL0_6FhoP4atzDx1M7Erk1L6jelPMG8XuuzIVDXrQs0xZzNI7dBbX4ZVghB_kR8SEGdY8agd8GbvUpIf_aKpiulfi5tKuxIpgz-2CGeC00bJeDFO73qb473wR8ttww1lXWgoyipLIGVXTPiheAREpsO6X8wNGr8cfE781Nt71XadOtvQ3YcPURI1DCcJu1BhaXmze7n0l48kl2ExD0HQtClTCbQhzD9uAU4ft7AUcn9pDAEbhtKQquq527_zj-sreY3uOlLrrSCwL5neKGt7ozix5pvf9f6AfCvOC4o-4NFm0nw6tSCpCbrlfKSeqpZ78eDRlmKV1l8Tisx3CBJn7a2okfjd8uhjc4ZvKd7yTw_h-mEvkWyHh1YfwtVTbbvX1WITz4BIuOzo7BjjPuzWwYWUGZo9kRsRxbouDTalZLNVAblquy4CgfAkrO5Exf4EyIGV2Jc45zuuw4QF5RWnBaiMGUS--8zxN37Ev2RYEQ0qgrdqf_j1rmy_hIqqJnX1eiRYnpuRrlrWINg8GHrWjK2__Kt0oKFBf2ce3FYjj_hKEDEdGZ4azbGWeYzq0OmtQOXFb6YO4Qw3KbSBk2ZWXRPRK04M4xT5QNg9nN-VHQh8bDHlI6v1oPx2uFos6ReuIXta0QiEhJPar4zcU-iwNvNfyit-2npCQ0Z8yhEuVjUl8Jn7xMpUBY00FFjATlyhqtiA9CKRcBWP_lGaN2aphnezBUvDK7gBWt4ML4ZsPbtkv0vFzpr5sLAPkMwkputxn_Bx7s4dH_fA-4LUvSlrEbJQ2ySGJ3PcMFxGVWIvY7dV5CwLrMdaP8hdXL04fQ42TG-xPKdx0yWDZi5rj__ijocS74tG0PaY9bjnaqFkqpWSv3KZJ7rcAhO2RIzLYjSWA_VYV4X-jGGlv_1QpjIeB6Ef7t6oTOs8zAZZBXgmANDoI_ElPaV9AusYcjKx678DGBNYtmXyyXxTUZ_CZpBl4BmSWijrtu2KeLAHCfkmJa4_7EdXAFu5u_F8VvBKorfzJDtPb-YXugB-kQAvacO41gwd5nXSRiDnRHWZhAvJHiDhJd3NM3uxx6_Eg_v_wCA5x7pZRba9KAEAAAAAAAALsGhnqd6x8JsBaxxKTySiUSng5wJP3pl2Oth7UhB86MsxdKufmMRjYFbW0piRoTOYjcNoydO5MWp2gKqBho94QTNdOVwFbGQ9HA7dCioNqIQ4XAA6IDMCIM426sHQSYL4TWQ3OlCFZK2Y_sBL3NHnlE9HFWgLMbLOWoSiznNv_NBd2FXM7xuXioEO-ObkRTBV3ciJMrAsEpYKohbRhlvz7lGRCJ6TjUbVmg7OmI5THllreglhTh3qAdfFWvLBLpvUfsLt8lr8xAaC8mbgzgJjjIPGwAcTvk9DQIBKVyysSQ96BYjKafK-ENNiTAgmvHOEYPAf3RtdNAxSsJR6PZwMdIwZBKalqzDZrAqxHoGwZMzjZKs_qpIiqQt0PoRq3yQuWwKEFuyb2vKYiFTSLZrQFpDWYuWCjMcxLpVk5AoS7iAk_GCJJKG5HVU4dfEZ4i_2JQRL9QPqJKORcZ7YrC6FvgosdudE6gW11dZ7VG0oAJUmJd3ZaqB9mQAtSlFoYNV6XW47ICtewtmDkxiuzRBnxJn5qQfpkw7Qpoc2My2vMQVsmTBEpMa6FMNVRY4MaW1gzHEJ6y103kIhGKdjTeQo1IOvsqQAOcU6aoN_rUm7KdHfLEMwlaGEAQey6ZnRLEq3SNXMkgDWloCDLqmsbhxqYZxo1mEu9E5NQptINtInkTLsSOYCBadx3BDpsULEwa2_QQpjtbOd5EIoshFwJW7xOJzO2d89pGdt_OGZykhp6ZQ1zSL98hT2SFJu9sQtrhHvfUplMIeiWt1MWt4xRNvxZaCQCx2rZxCLPBo29iFrXl6czYZiUU_2lOiukKRL0NlFHdrNVgV1sbHMeIzCku2fngo0YcSXnk_hEWrQIQlTjsWmHaV_wk8PIlVXxvESWawKOwCXcXAItEtxIqokqqDYMGKtPK_RdRy77vIKUNLTiABJcSL4wN2PBcps2HIuVPLB5QL0WvPYdNFSZg5KinH9KtDQjA_o_S0yJOEBgsSaQV87PEy8GRAddiU0gnOi4WvmkoQI1EkQJPP9oXMztYvuJoCkBgsl1JrnHy1aGBKWAcT9wSCuwSOdpsA5Ba4u0ecnLB0R-xXXXBMrBZs7feNT2ln_vK-60RiOgp6IrgEatWGxORM6sXOEKh5LwCAbrwvq8NjljeRNaslLmEr33t_47KIpuVpoBasoMaiirg3pUKyOoQ19yVqyNiHFuOYAvakbZK8QqONbkexyiYfaZwn-kdcKUF6XaAghLK_L3on4kUIzuBaWobFaWFRqpqni6u6egZb05UV5YS2NDzIfCNSZ7u6ifhEqGKK5-E9RmaDavgEVbxYrMRgealj3WCjFNacZDWlp3GEhSVBX6NZroGKZMvOUnFcmKG-QrS2XCM9ogpfgPJZZqoEW3IkkUouySC5F6XB2hE1Fllom_gnfitQyui4G7eSIch9LeBDA9WkSOe3W1tWrwo6DBOsGKYYNAKtUpZqexOGH0h3QjOSQwmDylYQ9pSq_QoKkFZx4hRxcUfPC8BMpZQm-ouzEqqemdNZ2dKtO9SiXMa5STdAJ7QLuCa7XUS0vOgepS7pNHChSk_tDAAAAAAAAEU1LEV7U5PSfuiJqi8o5g921j5T5RWmhROtJGe2wGBpir20gbVp8gwxQo5LRBnIvN3fS2mF-dvjlgYGSpdo9AL9xZuZZ8_4opZF0o2qhYpDoViDgO1fOVoPd4ALbF2ycs4Zk3BYd8Qc7gaSh9gNU2aaMAzRkGdJulZ6vRyEJiPFiGWmWsweJAaAjT9LCBALmkz_rF9W2r0rVEjwTVckBMmh4-Yf9E4f6T50ILap0noQdBQdhkeDywCjyFbpJkD-nsHWviQuLtss-FeY-Od-3q9uDrDKf0M43H3P2SW_wieUKJwn0UJ2hjaWGj4UcEi-qwTkRXYld32RGv0JpCRTDopqk_02QpcXFDELIFyYLCjVVuYHUbqYLvywz8M5v6Iaia66rMnlMvULrkKyG0uCUAtsUfUwnEjTiGk97HYrmxHsEzXCM1WDyP6Nrwf0k8cfd1hD_elr-g5MmcK2Nq4EEpsVUIsuq0ih9N1-XeNVAzFoS2F63wblUeYPlnZMeU2hZ0BAAGzdL3iW9D0-pxqY_lgRaCfp35gc1P5LjqgqIr7uyaMdzAF52SvMDM1UZfAvK1uM3QEUbQaa5LfTf6EkjyE37aHYRpXG6TEEy7bxNkgOShquPms0kGTAr9bLQFqNDIJpWDoVJFIZXWve0yQuw0r9ULQpsuefjKAcZoOMFU2UBm86v32WDZnzZv5U74KOqTJx2v106CCy0nL9SI2h0_fYAzQBRhSFKXRgNPP3rflGYINEwLQboEem6B1zIG6wgInlyCceimYyA6OKJZH1fNPKkNIvHmRJ-GUHvoN9AsNO5ARrYV_z2y2zuDt3G_-yNe3P2kKNaxtx_0E5U_Gj8xKddR64NKIQ5uWCpqRndQdZ7ZUyFkAoUcRlKX6ntXKeCIA3JTzAr3RGk6sMf5mjCqfUI9tfnPlkZpYtHzhsKQW0kQLD5p6S3kMkZuUtC0F2Elgbe3w4PSq2AZjLf41nSC2oMWXaEpzVUmWkUYLeb0ktKwvqNhwgj8UVv_3o87NiqV1bSLMWl-C7rfHGiCWu4LsaDBpF8M05RjDsjlinzDP_OyMKEz2AmvyaAUoY0o1vTkzsfOGGh5vpyxehD2EBNiTcZ_I-qX3i0g5tE0qUVfsyoZXT3xdFkTpFKFZnj_DB701dicLfV5yA52BFx98TeFIQK4tGmgGSvlbpRegmqPmFUPxzgh-z18_igpqnjtxzcro89kQzl9cRWRXAsUFKUFszWQmC56jyFofVdSKn7KULqfNgxiWrSmuV8XSBItVt8a3Q2yWxHTsxRs0CZ24u_3CIqHYdvvbKcgf-Ejj0mS0HqBxmgWfGvhlw_rrJM3pr8ymqqgRa2RHbLx72pr-U6vfZq96F-mmRfupmwYsp8rRxD4tngug-aeWvoVt3cALfMAm8wBFSyhY8ZBb9BdYm7yGNkeSAyGEVoRfQfLjDQy9Pgl8DWyPSA_2UfMZbKO_uHRUpkYcD4ys8crF11O6qHh1y4m3N2_piPw6_KSs1aj_WPlCp5C4AJsE3gcEZj6Bn4mMhocMuF8zRqdM4rZwy5V2LvvDyEDjOFYiTjJILTe7MV9RHUP-OXwpXZbdpuXsK3wgFQqC70OgiGSrh9431k_vl1Lp4VFwpNrbvVvkMmJTYzRZUbsgOjlOhLf3OIXf4SVcTUbM1mzhJrCzlMm_ps9zyocu2LsLDjK83h_etGyFNU2nyydma1GSuHj8g2FXr7F8Mz5V7UiEZTs-PUCTrvnlIYwP-QslRzqyMid838DtFf_LIuTSAb4GKJgiH3vaDQT_pPT6g3MUbF5JxiPNgrwdCUbBwgqGxPcJxytdrea2pqcdodfXyrXRXVY6xFi1BrV-odoSm-qxBb4aK9bdI_jqmYa5pjdozZiK1Oy5pUjmuuxpSWROBtnUpKWC66cLSVpc35bCm7G286nHJfbFlAqry50VZFrepSZLJBrFyncpWP5pEa_GgksOyf_fLzW45E92B9zYERAvrM8s_KjUZeZACFvvO7sMnzSQanJ1XHv1rpJsuH5Y48xuYR9kfhlljjblLYXTgX48APBeDZ6Stm_VFYAYJaQ73D6OnBKmjhV9tpD9zoBirwTULXpcu87UDvjRzLyFng8l4clHdFpSenxsRk6HnodjTYqvuOW3B-JbSwrFhGaVCUlHYaJiys8a1M4gyYn-ipcc40dY0I565r2_WgYSnNOMRbqLaScmo4IqA5SQ4F26nnvvB_upkLRPIpVX43oa-Sc_hghMLB_EfD_HLDR4noXlXIqK3gLw1wrdc3bLX-HurK8PWTmzvLGI4UcpdkEjMSXiyut3UZYWVyZehJeepICaYYgqgkKX8uYZU-6UfQSeMbhQArcuMHTXnGMajro680o_w-VVhcBve4ceVlVCbC__6ImAwPT7lRfKWAQ01UAPK51EKgZwlOpabop_BpqO7l1lqIurjld61cHo_dUiXfgtEQpM9TsUpKpn7GsmI9XdGryACNXKsCtednDFGOCXDekDDTZ0Zndbr3DBRckG2GyZ_EoxrUgBbLNgIY4BzvJGgldrKjUVddezb1x2IIkR7Ohwc9HGx5c0t0tDmuUvgb4yA5MhYCmeYC9Vib5Puou1THuD5cBBogsqR0WCwJ1IMDT_va9oZEF0Fp0T88I0phlwg4jCwvLgGkXCoNXYBw4l_yfGuiGt2Z1rwP_nyHoOejlnLsSgKHZfJBAJhnBv5BxQraH8h4ClddnBHrwsEiT_Ftb3Twwdczn4LEUwkLspLFa9sP2iBX3cFwAo5wiAV2IP_V3umPt9HGGpNz77ghKUtGfL3oBeAjBITXfSrS6YAXKcf1iW--m5QWVm3wu30ieIRPU1W96moJmpvOMqVolQr-W497UClVyDe9X6t1Iq6gInsU1vTzEfDXIfRvfIHKJ__SboGNgAvY97mOddEifTU-VRA53GKdD5ydXYYP2X9qKhW5dKv9KTUxIDXfZUwdciCoDM1friCcbQL3Y0sENk6FFu_NmDLM-VvKvmWigAo-wGOQCxK1ZjmKbMY7NisPzJfxKnSVsgOI62L8UFiiLp-U9nLqtypK0LCSjbUg8wXCZbMX0pL4S8XqUTPWm1_Cm348_PM3TwKJ9weD2R5NkZzYtcP2tnSbipPCadUNkJue_DKyscwU8kKa3TXx43ypQWFs2qRC4l8WAYMollrziuUcxmK75CYx9ERF_QnOYrV6rRwhYD3ulhmKo6rPO7_miKqTcxmf4SnVLCRk_QtQcKY8VJwSgcj9DdT2j5shh8yG2XnKOt0dMgEViVd-yDbjfuEgxmt-H1voe2ugo9oymIobAJI2BL-tWtUmTxA22IIhw17rjkmP9gi5nCMGA7qkyDvf05ot0TSpKXeRcZ_gp7_7FcTBcCYRp1gAmmvWMG1lFQVaWNmpV_rj6D2YzFI9WChf90-fyzhG_aZN7q2AJm_Atr-N-e8BYcHvihKmu_JF0JDmPlJOev6n5nxzGBi0XInPK0qDHMAKhKCq1J4Hz8AjIsW4LFbr93eGh6Q2hKGl6c8JUtnN6G2rxKDDsjp5NFaZwldDg4Oh1d4IaytD8FvC0eC1y-gMP7WbwqIA9XwOyExlO7IV-9IdcIqzig52E1vmRd3UXp_KqMvaBs_k9kbInX04bndt5owVljvx4VCWl-fTHBcaTocaHep0ezxs2WbWgegJkq8hPRuVugFAOjyJHFrP3MJ2osrH7wpUB3__gkY57wHZujyt4Hr4S2mesxMhlNNbuCx2RWjTGnBC1nwdDo4aZXLEsFYdpBPEye8xmMMQ-P-nAqxyII0bQdrcaXr8IvEhyGVPcmQeuI7oc5WstI4Gj-RbyVlGOStIDi18HBdpz02oZJPVsg2QzrAq4UmLM-i9r1M_arbBJvCZDaPsgxo7ehtZO90FyfDXzNoBzjjL9qCOEV3rVO0iqAIMDKPAK6LRiHxiVuchO6lJ0b1tT_qUUvLf5DCYUqdvkMYJyyuwPPdYZ4zy6ibpgJt4ADtTYl8GgyXFqdeubhTgzb7sqi61LTvsTDkc51Jn2a2Plu4IpDagwBl3gsU6nm8aLeczaYvP5hDgbvFi5qUspnPdJPog-n-8O-KlUkE71BQN9br9SeLKlcHq9RgcL73SkB7OA_LqlQ1dyjNTPCjT_SEhFE4-FgweJbL2KcJH7GKkq5epwcexq2xtq0xFw0gFejKvhPn1AqeUmzoXdEU9uhXSRE372yIqdMZ8geK07Fsk7EWbTcdMmT-9ZU_vQGQE8rQymmE2dQKz7ubzHakckOvhx6P0hARCzW9ugOif_ydQFLMTSZ8T63anKbDbdfujDafG63e9rEuKFcADk5ba4eIis3svb7r_wWRoxAfc7zxR1lvcoarv-PkBUxmfrDL0AAAAAAAAAAAAAAAAAAAAAAAAAkNEBUeJQ 
 Unchained, a permissionless blockchain that couples memory-hard proof-of-work with post-quantum (PQ) cryptography and an epoch-first issuance model. Time is divided into fixed-length epochs; miners submit coin candidates throughout an epoch using Argon2id. At the epoch boundary, the network finalizes an anchor that commits to up to N selected coins via a Merkle root, enabling independent verification and efficient synchronization. Ownership is tracked with Dilithium3 signatures; receivers obtain privacy via Kyber768-based stealth receiving with one-time keys. Unchained uses libp2p over QUIC for gossip
 
 - Memory‑hard PoW  Argon2id; memory target retunes across epochs
