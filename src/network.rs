@@ -71,6 +71,7 @@ const TOP_SPEND_RESPONSE: &str = "unchained/spend_response/v2";  // payload: Opt
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
+const TOP_PEER_ADDR: &str = "unchained/peer_addr/v1";         // payload: String multiaddr
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -314,6 +315,7 @@ pub async fn spawn(
         TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
         TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE,
         TOP_TX_REQUEST, TOP_TX_RESPONSE, TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
+        TOP_PEER_ADDR,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -351,11 +353,35 @@ pub async fn spawn(
         }
     }
 
+    let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Also try dialing any previously stored peers
+    if let Ok(addrs) = db.load_peer_addrs() {
+        let mut dialed = 0usize;
+        let cap = net_cfg.max_peers as usize;
+        for addr in addrs {
+            if dialed >= cap { break; }
+            if net_cfg.bootstrap.contains(&addr) { continue; }
+            // Basic filter: only dial /ip4/*/udp/*/quic-v1/p2p/<id>
+            if !addr.starts_with("/ip4/") || !addr.contains("/udp/") || !addr.contains("/quic-v1/") || !addr.contains("/p2p/") { continue; }
+            // Avoid dialing ourselves if persisted
+            if let Some(id_str) = addr.split("/p2p/").last() { if id_str == swarm.local_peer_id().to_string() { continue; } }
+            if let Some(ip_str) = addr.split('/').nth(3) {
+                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
+            }
+            if let Ok(maddr) = addr.parse::<Multiaddr>() {
+                if connected_peers.lock().unwrap().len() + dialed < cap {
+                    net_log!("🔗 Dialing stored peer: {}", addr);
+                    let _ = swarm.dial(maddr);
+                    dialed += 1;
+                } else { break; }
+            }
+        }
+    }
+
     let (anchor_tx, _) = broadcast::channel(256);
     let (proof_tx, _) = broadcast::channel(256);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-    
-    let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
     let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
@@ -615,6 +641,29 @@ pub async fn spawn(
                                 set.insert(peer_id);
                                 crate::metrics::PEERS.set(set.len() as i64);
                             }
+                            // After connecting, exchange our external address (if enabled) to help others connect
+                            if net_cfg.peer_exchange {
+                                let to_advertise = if let Some(public_ip) = net_cfg.public_ip.clone() {
+                                    Some(format!("/ip4/{}/udp/{}/quic-v1/p2p/{}", public_ip, port, swarm.local_peer_id()))
+                                } else {
+                                    swarm.external_addresses().next().map(|a| format!("{}/p2p/{}", a, swarm.local_peer_id()))
+                                };
+                                if let Some(addr) = to_advertise {
+                                    // Only advertise if it looks public and not loopback/private
+                                    let ok_public = addr.starts_with("/ip4/") && addr.contains("/udp/") && addr.contains("/quic-v1/");
+                                    if ok_public {
+                                        if let Some(ip_str) = addr.split('/').nth(3) {
+                                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                                if !ip.is_private() && !ip.is_loopback() {
+                                                    if let Ok(data) = bincode::serialize(&addr) {
+                                                        try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
@@ -655,6 +704,25 @@ pub async fn spawn(
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
                             match topic_str {
+                                TOP_PEER_ADDR => if net_cfg.peer_exchange {
+                                    if let Ok(addr) = bincode::deserialize::<String>(&message.data) {
+                                        // Only accept /ip4/*/udp/*/quic-v1/p2p/<peer_id>
+                                        if !addr.starts_with("/ip4/") || !addr.contains("/udp/") || !addr.contains("/quic-v1/") { continue; }
+                                        let Some(id_str) = addr.split("/p2p/").last() else { continue };
+                                        // Skip our own address
+                                        if id_str == swarm.local_peer_id().to_string() { continue; }
+                                        // Skip private/loopback ip4
+                                        if let Some(ip_str) = addr.split('/').nth(3) {
+                                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
+                                        }
+                                        if addr.parse::<Multiaddr>().is_err() { continue; }
+                                        // Persist and best-effort dial if under peer cap
+                                        db.store_peer_addr(&addr).ok();
+                                        if connected_peers.lock().unwrap().len() < net_cfg.max_peers as usize {
+                                            if let Ok(m) = addr.parse::<Multiaddr>() { let _ = swarm.dial(m); }
+                                        }
+                                    }
+                                },
                                 TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
                                     // Ignore duplicate anchors we have already stored to reduce log and CPU spam
                                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {

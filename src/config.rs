@@ -19,6 +19,8 @@ pub struct Net {
     // Removed unused iroh_key_path to avoid confusion
     #[serde(default)]
     pub bootstrap: Vec<String>,          // multiaddrs
+    #[serde(default)]
+    pub peer_exchange: bool,             // gossip known peers
     #[serde(default = "default_max_peers")]
     pub max_peers: u32,                  // maximum peer connections
     #[serde(default = "default_connection_timeout")]
@@ -185,7 +187,7 @@ fn warn_unknown_keys(val: &TomlValue) {
             }
             match (k.as_str(), v) {
                 ("net", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "listen_port","bootstrap","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
+                    "listen_port","bootstrap","peer_exchange","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
                 ]),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window"

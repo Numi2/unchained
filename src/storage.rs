@@ -87,6 +87,7 @@ impl Store {
             "transfer",
             "spend",
             "nullifier",
+            "peers",
         ];
         
         // Configure column family options with sane production defaults
@@ -433,6 +434,30 @@ impl Store {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None => Ok(None),
         }
+    }
+
+    /// Persist a peer multiaddr string into the peers CF (deduped by key)
+    pub fn store_peer_addr(&self, addr: &str) -> Result<()> {
+        let cf = self.db.cf_handle("peers")
+            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
+        // Key is the multiaddr string bytes; value empty
+        self.db.put_cf(cf, addr.as_bytes(), &[])?;
+        Ok(())
+    }
+
+    /// Load all known peer multiaddr strings
+    pub fn load_peer_addrs(&self) -> Result<Vec<String>> {
+        let cf = self.db.cf_handle("peers")
+            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut addrs = Vec::new();
+        for item in iter {
+            let (k, _v) = item?;
+            if let Ok(s) = std::str::from_utf8(&k) {
+                addrs.push(s.to_string());
+            }
+        }
+        Ok(addrs)
     }
 
     /// Gets selected coin IDs for an epoch
