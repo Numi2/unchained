@@ -1348,7 +1348,7 @@ pub async fn spawn(
                                             net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
                                              // Try to serve any pending coin-proof requests that belong to this epoch
                                              let now = std::time::Instant::now();
-                                             pending_proof_requests.retain(|coin_id, t| now.duration_since(*t) < std::time::Duration::from_secs(PENDING_PROOF_TTL_SECS));
+                                             pending_proof_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PENDING_PROOF_TTL_SECS));
                                              let mut satisfied: Vec<[u8;32]> = Vec::new();
                                              for (coin_id, _) in pending_proof_requests.iter() {
                                                  if let Ok(Some(coin)) = db.get::<Coin>("coin", coin_id) {
