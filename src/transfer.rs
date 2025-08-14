@@ -391,13 +391,20 @@ impl Spend {
             .context("Failed to query coin")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // 2) Anchor exists and root matches
-        let anchor: crate::epoch::Anchor = db.get("anchor", &coin.epoch_hash)
-            .context("Failed to query anchor")?
-            .ok_or_else(|| anyhow!("Anchor not found for coin's epoch"))?;
+        // 2) Anchor exists and root matches (use the epoch that COMMITTED this coin)
+        let commit_epoch = db
+            .get_epoch_for_coin(&self.coin_id)
+            .context("Failed to query coin->epoch mapping")?
+            .ok_or_else(|| anyhow!("Missing coin->epoch index for committed coin"))?;
+        let anchor: crate::epoch::Anchor = db
+            .get("epoch", &commit_epoch.to_le_bytes())
+            .context("Failed to query committing anchor by epoch number")?
+            .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?;
         if anchor.merkle_root != self.root { return Err(anyhow!("Merkle root mismatch")); }
 
         // 3) Proof verifies
+        let expected_len = crate::epoch::MerkleTree::expected_proof_len(anchor.coin_count);
+        if self.proof.len() != expected_len { return Err(anyhow!("Merkle proof length mismatch")); }
         let leaf = crate::coin::Coin::id_to_leaf_hash(&self.coin_id);
         if !crate::epoch::MerkleTree::verify_proof(&leaf, &self.proof, &self.root) {
             return Err(anyhow!("Invalid Merkle proof"));

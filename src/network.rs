@@ -142,8 +142,13 @@ impl PeerScore {
 
 #[allow(dead_code)]
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
-    let anchor: Anchor = db.get("anchor", &coin.epoch_hash).unwrap_or(None)
-        .ok_or_else(|| format!("Coin references non-existent epoch hash: {}", hex::encode(coin.epoch_hash)))?;
+    // Use committing epoch if known; fallback to legacy anchor lookup by hash
+    let anchor: Anchor = db.get_epoch_for_coin(&coin.id)
+        .ok()
+        .flatten()
+        .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
+        .or_else(|| db.get::<Anchor>("anchor", &coin.epoch_hash).ok().flatten())
+        .ok_or_else(|| format!("Coin references non-existent committed epoch (coin_id={})", hex::encode(coin.id)))?;
 
     if coin.creator_address == [0u8; 32] { return Err("Invalid creator address".into()); }
     
@@ -172,8 +177,16 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     // Mirror Spend::validate with String errors for network context;
     // Allow chaining: do not reject just because a prior spend exists.
     let coin: Coin = db.get("coin", &sp.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
-    let anchor: Anchor = db.get("anchor", &coin.epoch_hash).unwrap().ok_or("Anchor not found for coin's epoch")?;
+    // Resolve anchor via coin->epoch mapping when validating spends
+    let anchor: Anchor = db.get_epoch_for_coin(&sp.coin_id)
+        .ok()
+        .flatten()
+        .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
+        .ok_or("Anchor not found for coin's committed epoch")?;
     if anchor.merkle_root != sp.root { return Err("Merkle root mismatch".into()); }
+    // Enforce expected proof length from committed coin_count
+    let exp_len = crate::epoch::MerkleTree::expected_proof_len(anchor.coin_count);
+    if sp.proof.len() != exp_len { return Err("Merkle proof length mismatch".into()); }
     let leaf = crate::coin::Coin::id_to_leaf_hash(&sp.coin_id);
     if !crate::epoch::MerkleTree::verify_proof(&leaf, &sp.proof, &sp.root) { return Err("Invalid Merkle proof".into()); }
 
@@ -485,6 +498,8 @@ pub async fn spawn(
     // Buffer for out-of-order spends (by coin_id)
     let mut pending_spends: HashMap<[u8;32], Vec<Spend>> = HashMap::new();
     let mut pending_spend_deadline: HashMap<[u8;32], std::time::Instant> = HashMap::new();
+    // Pending coin-proof requests we could not answer immediately (awaiting leaves/coins)
+    let mut pending_proof_requests: HashMap<[u8;32], std::time::Instant> = HashMap::new();
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -493,6 +508,7 @@ pub async fn spawn(
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const EPOCH_REQ_DEDUP_SECS: u64 = 5;
     const PENDING_SPEND_TTL_SECS: u64 = 15;
+    const PENDING_PROOF_TTL_SECS: u64 = 30;
     const REORG_BACKFILL: u64 = 16; // proactively backfill up to 16 predecessors on hash mismatch
 
     // Attempt to reorg to a better chain using buffered anchors.
@@ -859,24 +875,12 @@ pub async fn spawn(
                                                         let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
                                                         let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
                                                         leaves.sort();
-                                                        let computed_root = if leaves.is_empty() { [0u8;32] } else {
-                                                            let mut tmp = leaves.clone();
-                                                            while tmp.len() > 1 {
-                                                                let mut next = Vec::new();
-                                                                for chunk in tmp.chunks(2) {
-                                                                    let mut hasher = blake3::Hasher::new();
-                                                                    hasher.update(&chunk[0]);
-                                                                    hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
-                                                                    next.push(*hasher.finalize().as_bytes());
-                                                                }
-                                                                tmp = next;
-                                                            }
-                                                            tmp[0]
-                                                        };
+                                                        let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
 
                                                         if computed_root == a.merkle_root && selected_ids.len() as u32 == a.coin_count {
-                                                            if let (Some(coin_cf), Some(sel_cf), Some(leaves_cf)) = (
+                                                            if let (Some(coin_cf), Some(coin_epoch_cf), Some(sel_cf), Some(leaves_cf)) = (
                                                                 db.db.cf_handle("coin"),
+                                                                db.db.cf_handle("coin_epoch"),
                                                                 db.db.cf_handle("epoch_selected"),
                                                                 db.db.cf_handle("epoch_leaves"),
                                                             ) {
@@ -886,6 +890,7 @@ pub async fn spawn(
                                                                     if let Ok(bytes) = bincode::serialize(&coin) {
                                                                         batch.put_cf(coin_cf, &coin.id, &bytes);
                                                                     }
+                                                                    batch.put_cf(coin_epoch_cf, &coin.id, &a.num.to_le_bytes());
                                                                 }
                                                                 for coin_id in &selected_ids {
                                                                     let mut key = Vec::with_capacity(8 + 32);
@@ -1012,15 +1017,13 @@ pub async fn spawn(
                                 },
                                 TOP_COIN => {
                                     if let Ok(coin) = bincode::deserialize::<Coin>(&message.data) {
+                                        // Only store coin object locally
                                         db.put("coin", &coin.id, &coin).ok();
+                                        // If we already know an anchor at this coin's epoch hash, and can map its epoch number, set coin_epoch
                                         if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
-                                            if let Some(sel_cf) = db.db.cf_handle("epoch_selected") {
-                                                let mut key = Vec::with_capacity(8 + 32);
-                                                key.extend_from_slice(&anchor.num.to_le_bytes());
-                                                key.extend_from_slice(&coin.id);
-                                                let mut batch = rocksdb::WriteBatch::default();
-                                                batch.put_cf(sel_cf, &key, &[]);
-                                                let _ = db.db.write(batch);
+                                            // Find epoch by anchor.hash
+                                            if let Ok(Some(epoch_anchor)) = db.get::<Anchor>("epoch", &anchor.num.to_le_bytes()) {
+                                                let _ = db.put_coin_epoch(&coin.id, epoch_anchor.num);
                                             }
                                         }
                                     } else if let Ok(cand) = bincode::deserialize::<CoinCandidate>(&message.data) {
@@ -1216,27 +1219,13 @@ pub async fn spawn(
                                         map.insert(req.coin_id, now);
                                     }
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &req.coin_id) {
-                                        if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
-                                            // Prefer precomputed epoch leaves for deterministic proofs
-                                            let mut responded = false;
-                                            if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
-                                                let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-                                                if leaves.binary_search(&target_leaf).is_ok() {
-                                                    if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
-                                                        let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
-                                                        if let Ok(data) = bincode::serialize(&resp) {
-                                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
-                                                            crate::metrics::PROOFS_SERVED.inc();
-                                                            responded = true;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if !responded {
-                                                if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
-                                                    let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
-                                                    if set.contains(&coin.id) {
-                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                        if let Ok(Some(epoch_num)) = db.get_epoch_for_coin(&coin.id) {
+                                            if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
+                                                let mut responded = false;
+                                                if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
+                                                    let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                    if leaves.binary_search(&target_leaf).is_ok() {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
                                                                 swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
@@ -1246,26 +1235,44 @@ pub async fn spawn(
                                                         }
                                                     }
                                                 }
-                                            }
-                                            if !responded {
-                                                // As a last resort, reconstruct the selected set by scanning confirmed coins for this epoch.
-                                                if let Ok(all_confirmed) = db.iterate_coins() {
-                                                    let mut ids: Vec<[u8;32]> = all_confirmed
-                                                        .into_iter()
-                                                        .filter(|c| c.epoch_hash == anchor.hash)
-                                                        .map(|c| c.id)
-                                                        .collect();
-                                                    if ids.len() as u32 == anchor.coin_count {
-                                                        let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
+                                                if !responded {
+                                                    if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
+                                                        let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
                                                         if set.contains(&coin.id) {
                                                             if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                                                                let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                                                let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                                 if let Ok(data) = bincode::serialize(&resp) {
                                                                     swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                     crate::metrics::PROOFS_SERVED.inc();
+                                                                    responded = true;
                                                                 }
                                                             }
                                                         }
+                                                    }
+                                                }
+                                                if !responded {
+                                                    if let Ok(all_confirmed) = db.iterate_coins() {
+                                                        let mut ids: Vec<[u8;32]> = all_confirmed
+                                                            .into_iter()
+                                                            .filter(|c| db.get_epoch_for_coin(&c.id).ok().flatten() == Some(anchor.num))
+                                                            .map(|c| c.id)
+                                                            .collect();
+                                                        if ids.len() as u32 == anchor.coin_count {
+                                                            let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
+                                                            if set.contains(&coin.id) {
+                                                                if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                                    let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                                                    if let Ok(data) = bincode::serialize(&resp) {
+                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                        crate::metrics::PROOFS_SERVED.inc();
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            pending_proof_requests.insert(req.coin_id, std::time::Instant::now());
+                                                        }
+                                                    } else {
+                                                        pending_proof_requests.insert(req.coin_id, std::time::Instant::now());
                                                     }
                                                 }
                                             }
@@ -1283,34 +1290,58 @@ pub async fn spawn(
                                         // Recompute root from provided leaves (sorted) and verify
                                         let mut leaves = bundle.leaves.clone();
                                         leaves.sort();
-                                        let computed_root = if leaves.is_empty() { [0u8;32] } else {
-                                            let mut tmp = leaves.clone();
-                                            while tmp.len() > 1 {
-                                                let mut next = Vec::new();
-                                                for chunk in tmp.chunks(2) {
-                                                    let mut hasher = blake3::Hasher::new();
-                                                    hasher.update(&chunk[0]);
-                                                    hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
-                                                    next.push(*hasher.finalize().as_bytes());
-                                                }
-                                                tmp = next;
-                                            }
-                                            tmp[0]
-                                        };
+                                        let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                         if computed_root != anchor.merkle_root { continue; }
                                         // Persist leaves for proof serving
                                         if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
                                             net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
+                                             // Try to serve any pending coin-proof requests that belong to this epoch
+                                             let now = std::time::Instant::now();
+                                             pending_proof_requests.retain(|coin_id, t| now.duration_since(*t) < std::time::Duration::from_secs(PENDING_PROOF_TTL_SECS));
+                                             let mut satisfied: Vec<[u8;32]> = Vec::new();
+                                             for (coin_id, _) in pending_proof_requests.iter() {
+                                                 if let Ok(Some(coin)) = db.get::<Coin>("coin", coin_id) {
+                                                     if db.get_epoch_for_coin(&coin.id).ok().flatten() == Some(anchor.num) {
+                                                         let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                         if leaves.binary_search(&target_leaf).is_ok() {
+                                                             if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
+                                                                 let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                                 if let Ok(data) = bincode::serialize(&resp) {
+                                                                     swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                     crate::metrics::PROOFS_SERVED.inc();
+                                                                     satisfied.push(*coin_id);
+                                                                 }
+                                                             }
+                                                         }
+                                                     }
+                                                 }
+                                             }
+                                             for id in satisfied { pending_proof_requests.remove(&id); }
                                         }
                                     }
                                 },
                                 TOP_EPOCH_LEAVES_REQUEST => if let Ok(epoch_num) = bincode::deserialize::<u64>(&message.data) {
-                                    // If we have leaves, gossip them
+                                    // If we have leaves, gossip them immediately
                                     if let Ok(Some(leaves)) = db.get_epoch_leaves(epoch_num) {
                                         if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                                             let bundle = EpochLeavesBundle { epoch_num, merkle_root: anchor.merkle_root, leaves };
                                             if let Ok(data) = bincode::serialize(&bundle) {
                                                 try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
+                                            }
+                                        }
+                                    } else {
+                                        // No leaves yet: attempt to reconstruct from selected index
+                                        if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
+                                            if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(epoch_num) {
+                                                let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                                                leaves.sort();
+                                                let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
+                                                if computed_root == anchor.merkle_root {
+                                                    let bundle = EpochLeavesBundle { epoch_num, merkle_root: anchor.merkle_root, leaves };
+                                                    if let Ok(data) = bincode::serialize(&bundle) {
+                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
+                                                    }
+                                                }
                                             }
                                         }
                                     }

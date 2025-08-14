@@ -81,6 +81,7 @@ impl Store {
             "coin_candidate",
             "epoch_selected", // per-epoch selected coin IDs
             "epoch_leaves",   // per-epoch sorted leaf hashes for proofs
+            "coin_epoch",     // coin_id -> epoch number mapping (child epoch that committed the coin)
             "head",
             "wallet",
             "anchor",
@@ -476,6 +477,67 @@ impl Store {
             ids.push(id);
         }
         Ok(ids)
+    }
+
+    /// Persist a mapping coin_id -> epoch number that committed it
+    pub fn put_coin_epoch(&self, coin_id: &[u8;32], epoch_num: u64) -> Result<()> {
+        let cf = self.db.cf_handle("coin_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&epoch_num.to_le_bytes());
+        self.db.put_cf(cf, coin_id, &bytes)?;
+        Ok(())
+    }
+
+    /// Delete a mapping coin_id -> epoch number (used during reorgs)
+    pub fn delete_coin_epoch(&self, coin_id: &[u8;32]) -> Result<()> {
+        let cf = self.db.cf_handle("coin_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
+        self.db.delete_cf(cf, coin_id)?;
+        Ok(())
+    }
+
+    /// Retrieve epoch number that committed the given coin, if known
+    pub fn get_coin_epoch(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
+        let cf = self.db.cf_handle("coin_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
+        match self.db.get_cf(cf, coin_id)? {
+            Some(v) => {
+                if v.len() != 8 { return Ok(None); }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&v);
+                Ok(Some(u64::from_le_bytes(arr)))
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Fallback: scan `epoch_selected` to find the epoch that selected this coin
+    pub fn find_coin_epoch_via_scan(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
+        let sel_cf = self.db.cf_handle("epoch_selected")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
+        // Iterate all entries; stop on first matching suffix
+        let iter = self.db.iterator_cf(sel_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (k, _v) = item?;
+            if k.len() == 8 + 32 && &k[8..] == coin_id {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&k[0..8]);
+                return Ok(Some(u64::from_le_bytes(arr)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retrieve the epoch number for a coin using the index or fallback scan
+    pub fn get_epoch_for_coin(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
+        if let Some(n) = self.get_coin_epoch(coin_id)? { return Ok(Some(n)); }
+        self.find_coin_epoch_via_scan(coin_id)
+    }
+
+    /// Convenience: fetch anchor by epoch number
+    pub fn get_anchor_by_epoch_num(&self, epoch_num: u64) -> Result<Option<crate::epoch::Anchor>> {
+        self.get("epoch", &epoch_num.to_le_bytes())
     }
 
     /// Gets the total number of coins in the database

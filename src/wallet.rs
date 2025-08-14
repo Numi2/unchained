@@ -484,9 +484,13 @@ impl Wallet {
         for coin in coins_to_spend {
             // Always prefer V2 spend flow. If no previous transfer, validate against coin.creator_pk.
             // 1) Try building a Merkle proof locally from stored epoch data.
+            // Resolve the epoch that committed this coin; do not use coin.epoch_hash (parent anchor hash)
+            let commit_epoch = store
+                .get_epoch_for_coin(&coin.id)?
+                .ok_or_else(|| anyhow!("Missing coin->epoch index for committed coin"))?;
             let local_anchor: crate::epoch::Anchor = store
-                .get("anchor", &coin.epoch_hash)?
-                .ok_or_else(|| anyhow!("Anchor not found for coin's epoch"))?;
+                .get("epoch", &commit_epoch.to_le_bytes())?
+                .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?;
             let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
             let mut anchor_used: crate::epoch::Anchor = local_anchor.clone();
             let mut proof_used: Option<Vec<([u8; 32], bool)>> = None;
@@ -538,7 +542,7 @@ impl Wallet {
             // 2) If local proof unavailable, request and validate from the network with a deadline.
             if proof_used.is_none() {
                 let mut proof_rx = network.proof_subscribe();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
                 // Proactively request sorted epoch leaves to help peers serve proofs deterministically
                 network.request_epoch_leaves(local_anchor.num).await;
                 network.request_coin_proof(coin.id).await;

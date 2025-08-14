@@ -101,24 +101,35 @@ pub fn calculate_retarget(
 
 pub struct MerkleTree;
 impl MerkleTree {
+    /// Compute Merkle root from a set of coin IDs. This method:
+    /// - Hashes each coin id into a leaf using `Coin::id_to_leaf_hash`
+    /// - Sorts leaves ascending to obtain a canonical order
+    /// - Reduces pairwise (duplicate last when odd) using BLAKE3
     pub fn build_root(coin_ids: &HashSet<[u8; 32]>) -> [u8; 32] {
         if coin_ids.is_empty() { return [0u8; 32]; }
         let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
         leaves.sort();
-        while leaves.len() > 1 {
-            let mut next_level = Vec::new();
-            for chunk in leaves.chunks(2) {
+        Self::compute_root_from_sorted_leaves(&leaves)
+    }
+}
+impl MerkleTree {
+    /// Compute Merkle root from a precomputed sorted leaf list.
+    /// The `sorted_leaves` slice MUST be sorted ascending.
+    pub fn compute_root_from_sorted_leaves(sorted_leaves: &[[u8; 32]]) -> [u8; 32] {
+        if sorted_leaves.is_empty() { return [0u8; 32]; }
+        let mut level: Vec<[u8; 32]> = sorted_leaves.to_vec();
+        while level.len() > 1 {
+            let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&chunk[0]);
                 hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
                 next_level.push(*hasher.finalize().as_bytes());
             }
-            leaves = next_level;
+            level = next_level;
         }
-        leaves[0]
+        level[0]
     }
-}
-impl MerkleTree {
     pub fn build_proof(
         coin_ids: &HashSet<[u8; 32]>,
         target_id: &[u8; 32],
@@ -184,11 +195,17 @@ impl MerkleTree {
         Some(proof)
     }
 
+    /// Maximum accepted Merkle depth for proofs. Conservative upper bound to
+    /// reject pathological inputs without affecting valid trees.
+    pub const MAX_PROOF_DEPTH: usize = 64;
+
     pub fn verify_proof(
         leaf_hash: &[u8; 32],
         proof: &[( [u8; 32], bool )],
         root: &[u8; 32],
     ) -> bool {
+        // Basic sanity bound: prevents absurdly large proofs from causing CPU burn.
+        if proof.len() > Self::MAX_PROOF_DEPTH { return false; }
         let mut computed = *leaf_hash;
         for (sibling, sibling_is_left) in proof {
             let mut hasher = blake3::Hasher::new();
@@ -202,6 +219,14 @@ impl MerkleTree {
             computed = *hasher.finalize().as_bytes();
         }
         &computed == root
+    }
+
+    /// Expected proof length (tree height) for a Merkle tree with `coin_count` leaves,
+    /// using the canonical odd-node duplication strategy. For example:
+    /// - 1 -> 0, 2 -> 1, 3..4 -> 2, 5..8 -> 3, etc.
+    #[inline]
+    pub fn expected_proof_len(coin_count: u32) -> usize {
+        if coin_count <= 1 { 0 } else { (32 - (coin_count - 1).leading_zeros()) as usize }
     }
 }
 
@@ -400,20 +425,7 @@ impl Manager {
                         if prev_anchor.is_some() && selected_ids.is_empty() {
                             continue;
                         }
-                        let merkle_root = if leaves.is_empty() { [0u8;32] } else {
-                            let mut tmp = leaves.clone();
-                            while tmp.len() > 1 {
-                                let mut next = Vec::new();
-                                for chunk in tmp.chunks(2) {
-                                    let mut hasher = blake3::Hasher::new();
-                                    hasher.update(&chunk[0]);
-                                    hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
-                                    next.push(*hasher.finalize().as_bytes());
-                                }
-                                tmp = next;
-                            }
-                            tmp[0]
-                        };
+                        let merkle_root = MerkleTree::compute_root_from_sorted_leaves(&leaves);
                         // Anchor hash commits to merkle_root and previous anchor hash (if any)
                         let hash = {
                             let mut h = blake3::Hasher::new();
@@ -469,9 +481,19 @@ impl Manager {
                         batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
 
                         // Persist selected coins into confirmed coin CF and index selected IDs per-epoch
-                        if let Some(coin_cf) = self.db.db.cf_handle("coin") {
+                        if let (Some(coin_cf), Some(coin_epoch_cf)) = (self.db.db.cf_handle("coin"), self.db.db.cf_handle("coin_epoch")) {
                             for cand in &selected {
                                 // Include creator_pk for genesis V2 spends
+                                let coin = cand.clone().into_confirmed();
+                                if let Ok(bytes) = bincode::serialize(&coin) {
+                                    batch.put_cf(coin_cf, &coin.id, &bytes);
+                                }
+                                // Record the epoch number that committed this coin
+                                batch.put_cf(coin_epoch_cf, &coin.id, &current_epoch.to_le_bytes());
+                            }
+                        } else if let Some(coin_cf) = self.db.db.cf_handle("coin") {
+                            // Fallback: write coins even if coin_epoch CF is missing (should not happen)
+                            for cand in &selected {
                                 let coin = cand.clone().into_confirmed();
                                 if let Ok(bytes) = bincode::serialize(&coin) {
                                     batch.put_cf(coin_cf, &coin.id, &bytes);
