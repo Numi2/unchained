@@ -82,6 +82,8 @@ const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
 const TOP_PEER_ADDR: &str = "unchained/peer_addr/v1";            // payload: String multiaddr
+const TOP_EPOCH_LEAVES: &str = "unchained/epoch_leaves/v1";       // payload: EpochLeavesBundle
+const TOP_EPOCH_LEAVES_REQUEST: &str = "unchained/epoch_leaves_request/v1"; // payload: u64 epoch number
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -319,6 +321,13 @@ pub struct CoinProofResponse {
     pub proof: Vec<([u8; 32], bool)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochLeavesBundle {
+    pub epoch_num: u64,
+    pub merkle_root: [u8; 32],
+    pub leaves: Vec<[u8; 32]>, // sorted leaf hashes
+}
+
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
@@ -337,6 +346,8 @@ enum NetworkCommand {
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
     RequestCoinProof([u8; 32]),
+    RequestEpochLeaves(u64),
+    GossipEpochLeaves(EpochLeavesBundle),
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -399,6 +410,7 @@ pub async fn spawn(
         TOP_ANCHOR, TOP_COIN, TOP_SPEND,
         TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
         TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE,
+        TOP_EPOCH_LEAVES, TOP_EPOCH_LEAVES_REQUEST,
         TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
         TOP_PEER_ADDR,
     ] {
@@ -479,6 +491,7 @@ pub async fn spawn(
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const EPOCH_REQ_DEDUP_SECS: u64 = 5;
     const PENDING_SPEND_TTL_SECS: u64 = 15;
@@ -752,6 +765,8 @@ pub async fn spawn(
                                     NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                                     NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
                                     NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
+                                    NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
+                                    NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                                 };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
@@ -887,10 +902,27 @@ pub async fn spawn(
                                                                     eprintln!("⚠️ Failed to persist selected coins for epoch {}: {}", a.num, e);
                                                                 } else {
                                                                     net_log!("🪙 Confirmed {} coins for adopted epoch {}", selected_ids.len(), a.num);
+                                                                    // Proactively gossip epoch leaves to help peers serve proofs
+                                                                    let bundle = EpochLeavesBundle { epoch_num: a.num, merkle_root: a.merkle_root, leaves: leaves.clone() };
+                                                                    if let Ok(data) = bincode::serialize(&bundle) {
+                                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
+                                                                    }
                                                                 }
                                                             }
                                                         } else {
                                                             net_log!("ℹ️ Unable to reconstruct selected set for adopted epoch {} (root/count mismatch)", a.num);
+                                                            // Ask peers for the authoritative sorted leaves so we can serve proofs
+                                                            let now = std::time::Instant::now();
+                                                            {
+                                                                let mut map = RECENT_LEAVES_REQS.lock().unwrap();
+                                                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
+                                                                if !map.contains_key(&a.num) {
+                                                                    if let Ok(bytes) = bincode::serialize(&a.num) {
+                                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES_REQUEST, bytes, "epoch-leaves-req");
+                                                                    }
+                                                                    map.insert(a.num, now);
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1222,6 +1254,46 @@ pub async fn spawn(
                                 TOP_COIN_PROOF_RESPONSE => if let Ok(resp) = bincode::deserialize::<CoinProofResponse>(&message.data) {
                                     let _ = proof_tx.send(resp);
                                 },
+                                TOP_EPOCH_LEAVES => if let Ok(bundle) = bincode::deserialize::<EpochLeavesBundle>(&message.data) {
+                                    // Validate bundle against stored anchor
+                                    if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes()) {
+                                        if anchor.merkle_root != bundle.merkle_root { continue; }
+                                        if anchor.coin_count as usize != bundle.leaves.len() { continue; }
+                                        // Recompute root from provided leaves (sorted) and verify
+                                        let mut leaves = bundle.leaves.clone();
+                                        leaves.sort();
+                                        let computed_root = if leaves.is_empty() { [0u8;32] } else {
+                                            let mut tmp = leaves.clone();
+                                            while tmp.len() > 1 {
+                                                let mut next = Vec::new();
+                                                for chunk in tmp.chunks(2) {
+                                                    let mut hasher = blake3::Hasher::new();
+                                                    hasher.update(&chunk[0]);
+                                                    hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+                                                    next.push(*hasher.finalize().as_bytes());
+                                                }
+                                                tmp = next;
+                                            }
+                                            tmp[0]
+                                        };
+                                        if computed_root != anchor.merkle_root { continue; }
+                                        // Persist leaves for proof serving
+                                        if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
+                                            net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
+                                        }
+                                    }
+                                },
+                                TOP_EPOCH_LEAVES_REQUEST => if let Ok(epoch_num) = bincode::deserialize::<u64>(&message.data) {
+                                    // If we have leaves, gossip them
+                                    if let Ok(Some(leaves)) = db.get_epoch_leaves(epoch_num) {
+                                        if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
+                                            let bundle = EpochLeavesBundle { epoch_num, merkle_root: anchor.merkle_root, leaves };
+                                            if let Ok(data) = bincode::serialize(&bundle) {
+                                                try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
+                                            }
+                                        }
+                                    }
+                                },
                                 _ => {}
                             }
                         },
@@ -1296,6 +1368,20 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::RequestEpochLeaves(epoch) => {
+                            if let Ok(data) = bincode::serialize(epoch) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_LEAVES_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipEpochLeaves(bundle) => {
+                            if let Ok(data) = bincode::serialize(bundle) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_LEAVES), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1316,6 +1402,8 @@ impl Network {
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }
     pub async fn request_coin_proof(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoinProof(id)); }
+    pub async fn request_epoch_leaves(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochLeaves(epoch_num)); }
+    pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) { let _ = self.command_tx.send(NetworkCommand::GossipEpochLeaves(bundle)); }
     
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {

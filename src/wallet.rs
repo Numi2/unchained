@@ -20,6 +20,7 @@ pub struct StealthAddressDoc {
 }
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
+use std::collections::HashSet;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use argon2::{Argon2, Params};
 use chacha20poly1305::{
@@ -242,9 +243,18 @@ impl Wallet {
     }
 
     pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(addr_str)
-            .map_err(|_| anyhow!("Invalid stealth address encoding"))?;
+        // Be tolerant to surrounding whitespace and accidental padding from clipboard
+        let s = addr_str.trim();
+        // Strip common accidental wrappers
+        let s = s.trim_matches('"');
+        let s = s.trim_matches('\'');
+        let s = s.trim_matches('`');
+        // Try URL_SAFE_NO_PAD first, then URL_SAFE with padding
+        let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
+            Ok(b) => b,
+            Err(_) => base64::engine::general_purpose::URL_SAFE.decode(s)
+                .map_err(|_| anyhow!("Invalid stealth address encoding"))?,
+        };
         let doc: StealthAddressDoc = bincode::deserialize(&bytes)
             .map_err(|_| anyhow!("Invalid stealth address payload"))?;
         if doc.version != 1 { bail!("Unsupported stealth address version"); }
@@ -406,35 +416,65 @@ impl Wallet {
 
         for coin in coins_to_spend {
             // Always prefer V2 spend flow. If no previous transfer, validate against coin.creator_pk.
-            // Request and validate a Merkle proof for the coin (retry until valid or timeout)
-            let mut proof_rx = network.proof_subscribe();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            network.request_coin_proof(coin.id).await;
-            let proof_resp = loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(anyhow!("Timed out waiting for valid coin proof"));
-                }
-                match tokio::time::timeout(remaining, proof_rx.recv()).await {
-                    Ok(Ok(resp)) => {
-                        if resp.coin.id != coin.id { continue; }
-                        // Ensure the provided anchor matches our local anchor for this coin
-                        if let Some(local_anchor) = store.get::<crate::epoch::Anchor>("anchor", &coin.epoch_hash)? {
-                            if local_anchor.merkle_root != resp.anchor.merkle_root { continue; }
-                        }
-                        // Verify the proof locally before proceeding
-                        let leaf = crate::coin::Coin::id_to_leaf_hash(&resp.coin.id);
-                        if crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root) {
-                            break resp;
-                        } else {
-                            // Ask peers again and keep waiting within the deadline
-                            network.request_coin_proof(coin.id).await;
-                            continue;
+            // 1) Try building a Merkle proof locally from stored epoch data.
+            let local_anchor: crate::epoch::Anchor = store
+                .get("anchor", &coin.epoch_hash)?
+                .ok_or_else(|| anyhow!("Anchor not found for coin's epoch"))?;
+            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+            let mut anchor_used: crate::epoch::Anchor = local_anchor.clone();
+            let mut proof_used: Option<Vec<([u8; 32], bool)>> = None;
+
+            if let Some(leaves) = store.get_epoch_leaves(local_anchor.num)? {
+                if leaves.binary_search(&leaf).is_ok() {
+                    if let Some(p) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf) {
+                        if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
+                            proof_used = Some(p);
                         }
                     }
-                    _ => { return Err(anyhow!("Timed out waiting for valid coin proof")); }
                 }
-            };
+            }
+            if proof_used.is_none() {
+                if let Ok(selected_ids) = store.get_selected_coin_ids_for_epoch(local_anchor.num) {
+                    let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
+                    if set.contains(&coin.id) {
+                        if let Some(p) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                            if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
+                                proof_used = Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2) If local proof unavailable, request and validate from the network with a deadline.
+            if proof_used.is_none() {
+                let mut proof_rx = network.proof_subscribe();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // Proactively request sorted epoch leaves to help peers serve proofs deterministically
+                network.request_epoch_leaves(local_anchor.num).await;
+                network.request_coin_proof(coin.id).await;
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() { return Err(anyhow!("Timed out waiting for valid coin proof")); }
+                    match tokio::time::timeout(remaining, proof_rx.recv()).await {
+                        Ok(Ok(resp)) => {
+                            if resp.coin.id != coin.id { continue; }
+                            // Require anchor root match
+                            if local_anchor.merkle_root != resp.anchor.merkle_root { continue; }
+                            if crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root) {
+                                anchor_used = resp.anchor;
+                                proof_used = Some(resp.proof);
+                                break;
+                            } else {
+                                network.request_coin_proof(coin.id).await;
+                                // Also re-ask for leaves in case peers lack them
+                                network.request_epoch_leaves(local_anchor.num).await;
+                            }
+                        }
+                        _ => { return Err(anyhow!("Timed out waiting for valid coin proof")); }
+                    }
+                }
+            }
 
             // Determine current owner (pk, sk):
             // - If legacy transfer exists, owner_pk = last one-time pk; recover owner_sk via Kyber
@@ -457,8 +497,8 @@ impl Wallet {
             // Build and broadcast V2 Spend
             let spend = crate::transfer::Spend::create(
                 coin.id,
-                &proof_resp.anchor,
-                proof_resp.proof,
+                &anchor_used,
+                proof_used.expect("proof must be present after local or network path"),
                 &owner_pk,               // NEW: pass public key for nullifier_v2 computation
                 &owner_sk,
                 &recipient_kyber_pk,

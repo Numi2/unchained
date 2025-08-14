@@ -500,6 +500,9 @@ impl Manager {
                             crate::metrics::EPOCH_HEIGHT.set(current_epoch as i64);
                             crate::metrics::SELECTED_COINS.set(selected_ids.len() as i64);
                             self.net.gossip_anchor(&anchor).await;
+                            // Also gossip sorted leaves to help peers serve proofs deterministically
+                            let bundle = crate::network::EpochLeavesBundle { epoch_num: current_epoch, merkle_root, leaves: leaves.clone() };
+                            self.net.gossip_epoch_leaves(bundle).await;
                             if let Err(e) = self.anchor_tx.send(anchor) {
                                 eprintln!("⚠️  Failed to broadcast anchor: {}", e);
                             }
