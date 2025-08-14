@@ -152,6 +152,38 @@ impl MerkleTree {
         Some(proof)
     }
 
+    /// Build a Merkle proof using a precomputed sorted leaf list.
+    /// `sorted_leaves` must be sorted ascending and contain `target_leaf`.
+    pub fn build_proof_from_leaves(
+        sorted_leaves: &[[u8; 32]],
+        target_leaf: &[u8; 32],
+    ) -> Option<Vec<([u8; 32], bool)>> {
+        if sorted_leaves.is_empty() { return None; }
+        let mut index = sorted_leaves.iter().position(|h| h == target_leaf)?;
+        let mut level: Vec<[u8;32]> = sorted_leaves.to_vec();
+        let mut proof: Vec<([u8; 32], bool)> = Vec::new();
+        while level.len() > 1 {
+            let (sibling_hash, sibling_is_left) = if index % 2 == 0 {
+                let sib = *level.get(index + 1).unwrap_or(&level[index]);
+                (sib, false)
+            } else {
+                let sib = level[index - 1];
+                (sib, true)
+            };
+            proof.push((sibling_hash, sibling_is_left));
+            let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&chunk[0]);
+                hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+                next_level.push(*hasher.finalize().as_bytes());
+            }
+            index /= 2;
+            level = next_level;
+        }
+        Some(proof)
+    }
+
     pub fn verify_proof(
         leaf_hash: &[u8; 32],
         proof: &[( [u8; 32], bool )],

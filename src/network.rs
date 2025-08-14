@@ -1187,14 +1187,31 @@ pub async fn spawn(
                                     }
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &req.coin_id) {
                                         if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &coin.epoch_hash) {
-                                            if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
-                                                let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
-                                                if set.contains(&coin.id) {
-                                                    if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                                                        let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                            // Prefer precomputed epoch leaves for deterministic proofs
+                                            let mut responded = false;
+                                            if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
+                                                let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                if leaves.binary_search(&target_leaf).is_ok() {
+                                                    if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
+                                                        let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                         if let Ok(data) = bincode::serialize(&resp) {
                                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                             crate::metrics::PROOFS_SERVED.inc();
+                                                            responded = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !responded {
+                                                if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
+                                                    let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
+                                                    if set.contains(&coin.id) {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                            let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                                            if let Ok(data) = bincode::serialize(&resp) {
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                crate::metrics::PROOFS_SERVED.inc();
+                                                            }
                                                         }
                                                     }
                                                 }
