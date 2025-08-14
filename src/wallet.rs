@@ -1,14 +1,16 @@
 use crate::{
     storage::Store,
-    crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES},
+    crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, KYBER768_PK_BYTES, KYBER768_SK_BYTES},
 };
 use pqcrypto_dilithium::dilithium3::{
     PublicKey, SecretKey, DetachedSignature, verify_detached_signature, detached_sign,
 };
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
+use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
 use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
+use serde::{Serialize, Deserialize};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StealthAddressDoc {
@@ -40,6 +42,16 @@ const WALLET_VERSION_WITH_KYBER: u8 = 2;
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
+
+#[derive(Serialize, Deserialize)]
+struct WalletSecretsV2 {
+    #[serde(with = "serde_big_array::BigArray")]
+    dili_sk: [u8; DILITHIUM3_SK_BYTES],
+    #[serde(with = "serde_big_array::BigArray")]
+    kyber_sk: [u8; KYBER768_SK_BYTES],
+    #[serde(with = "serde_big_array::BigArray")]
+    kyber_pk: [u8; KYBER768_PK_BYTES],
+}
 
 pub struct Wallet {
     _db: std::sync::Weak<Store>,
@@ -93,23 +105,28 @@ impl Wallet {
                 let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
                 let mut nonce = [0u8; NONCE_LEN];
                 OsRng.fill_bytes(&mut nonce);
+                // V2: encrypt Dilithium SK + Kyber SK/PK together as one payload
+                let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
+                let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES]; dili_sk.copy_from_slice(sk.as_bytes());
+                let mut kyb_sk = [0u8; KYBER768_SK_BYTES]; kyb_sk.copy_from_slice(kyber_sk.as_bytes());
+                let mut kyb_pk = [0u8; KYBER768_PK_BYTES]; kyb_pk.copy_from_slice(kyber_pk.as_bytes());
+                let secrets = WalletSecretsV2 { dili_sk, kyber_sk: kyb_sk, kyber_pk: kyb_pk };
+                let plaintext = bincode::serialize(&secrets)?;
                 let ciphertext = cipher
-                    .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
-                    .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
+                    .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+                    .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
                 // best-effort zeroize
                 key.iter_mut().for_each(|b| *b = 0);
 
                 let mut new_encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
                 new_encoded.extend_from_slice(pk.as_bytes());
-                new_encoded.push(WALLET_VERSION_ENCRYPTED);
+                new_encoded.push(WALLET_VERSION_WITH_KYBER);
                 new_encoded.extend_from_slice(&salt);
                 new_encoded.extend_from_slice(&nonce);
                 new_encoded.extend_from_slice(&ciphertext);
                 db.put("wallet", WALLET_KEY, &new_encoded)?;
 
                 let address = crypto::address_from_pk(&pk);
-                // Generate Kyber keypair on migration
-                let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
                 println!("🔐 Wallet migrated and unlocked. Address: {}", hex::encode(address));
                 return Ok(Wallet { _db: Arc::downgrade(&db), pk, sk, kyber_pk, kyber_sk, address });
             }
@@ -138,21 +155,65 @@ impl Wallet {
                 .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
 
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-            let sk_bytes = cipher
+            let decrypted = cipher
                 .decrypt(XNonce::from_slice(nonce), ciphertext)
                 .map_err(|_| anyhow!("Invalid pass-phrase"))?;
 
             let pk = PublicKey::from_bytes(pk_bytes)
                 .with_context(|| "Failed to decode public key")?;
-            let sk = SecretKey::from_bytes(&sk_bytes)
-                .with_context(|| "Failed to decode secret key bytes")?;
+            let (sk, kyber_pk, kyber_sk) = if version == WALLET_VERSION_ENCRYPTED {
+                // V1: only Dilithium SK present; migrate to V2 by adding Kyber keys
+                let sk = SecretKey::from_bytes(&decrypted)
+                    .with_context(|| "Failed to decode secret key bytes")?;
+                let (kpk, ksk) = pqcrypto_kyber::kyber768::keypair();
+                // Write back as V2
+                let passphrase = obtain_passphrase("Upgrade wallet: confirm pass-phrase to re-encrypt: ")?;
+                let mut salt = [0u8; SALT_LEN];
+                OsRng.fill_bytes(&mut salt);
+                let mut key2 = [0u8; 32];
+                let params2 = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+                    .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
+                Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params2)
+                    .hash_password_into(passphrase.as_bytes(), &salt, &mut key2)
+                    .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
+                let cipher2 = XChaCha20Poly1305::new(Key::from_slice(&key2));
+                let mut nonce2 = [0u8; NONCE_LEN];
+                OsRng.fill_bytes(&mut nonce2);
+                let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES]; dili_sk.copy_from_slice(sk.as_bytes());
+                let mut kyb_sk = [0u8; KYBER768_SK_BYTES]; kyb_sk.copy_from_slice(ksk.as_bytes());
+                let mut kyb_pk = [0u8; KYBER768_PK_BYTES]; kyb_pk.copy_from_slice(kpk.as_bytes());
+                let secrets = WalletSecretsV2 { dili_sk, kyber_sk: kyb_sk, kyber_pk: kyb_pk };
+                let plaintext2 = bincode::serialize(&secrets)?;
+                let ciphertext2 = cipher2
+                    .encrypt(XNonce::from_slice(&nonce2), plaintext2.as_ref())
+                    .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
+                // zeroize key material
+                key2.iter_mut().for_each(|b| *b = 0);
+                let mut new_encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext2.len());
+                new_encoded.extend_from_slice(pk.as_bytes());
+                new_encoded.push(WALLET_VERSION_WITH_KYBER);
+                new_encoded.extend_from_slice(&salt);
+                new_encoded.extend_from_slice(&nonce2);
+                new_encoded.extend_from_slice(&ciphertext2);
+                db.put("wallet", WALLET_KEY, &new_encoded)?;
+                (sk, kpk, ksk)
+            } else {
+                // V2: parse composite secrets
+                let secrets: WalletSecretsV2 = bincode::deserialize(&decrypted)
+                    .map_err(|_| anyhow!("Corrupted wallet payload (V2)"))?;
+                let sk = SecretKey::from_bytes(&secrets.dili_sk)
+                    .with_context(|| "Failed to decode Dilithium secret key")?;
+                let kyber_pk = KyberPk::from_bytes(&secrets.kyber_pk)
+                    .map_err(|_| anyhow!("Invalid Kyber PK in wallet"))?;
+                let kyber_sk = KyberSk::from_bytes(&secrets.kyber_sk)
+                    .map_err(|_| anyhow!("Invalid Kyber SK in wallet"))?;
+                (sk, kyber_pk, kyber_sk)
+            };
             // zeroize key and decrypted buffer
             let mut key_zero = key;
             key_zero.iter_mut().for_each(|b| *b = 0);
 
             let address = crypto::address_from_pk(&pk);
-            // If version 1, generate Kyber keys now (in-memory only). For version 2, we would parse stored Kyber keys.
-            let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
             // Avoid printing address unless explicitly requested via logs
             return Ok(Wallet { _db: Arc::downgrade(&db), pk, sk, kyber_pk, kyber_sk, address })
 
@@ -178,15 +239,21 @@ impl Wallet {
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
+        // V2 composite secrets: encrypt Dilithium SK + Kyber SK/PK
+        let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES]; dili_sk.copy_from_slice(sk.as_bytes());
+        let mut kyb_sk = [0u8; KYBER768_SK_BYTES]; kyb_sk.copy_from_slice(kyber_sk.as_bytes());
+        let mut kyb_pk = [0u8; KYBER768_PK_BYTES]; kyb_pk.copy_from_slice(kyber_pk.as_bytes());
+        let secrets = WalletSecretsV2 { dili_sk, kyber_sk: kyb_sk, kyber_pk: kyb_pk };
+        let plaintext = bincode::serialize(&secrets)?;
         let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), sk.as_bytes())
-            .map_err(|e| anyhow!("Failed to encrypt secret key: {}", e))?;
+            .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
         // best-effort zeroize
         key.iter_mut().for_each(|b| *b = 0);
 
         let mut encoded = Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
         encoded.extend_from_slice(pk.as_bytes());
-        encoded.push(WALLET_VERSION_ENCRYPTED);
+        encoded.push(WALLET_VERSION_WITH_KYBER);
         encoded.extend_from_slice(&salt);
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
@@ -446,6 +513,28 @@ impl Wallet {
                 }
             }
 
+            // 1c) Last-resort local reconstruction: scan confirmed coins for this epoch and
+            //     reconstruct the selected set deterministically. Only trust if complete.
+            if proof_used.is_none() {
+                if let Ok(all_confirmed) = store.iterate_coins() {
+                    let mut ids: Vec<[u8;32]> = all_confirmed
+                        .into_iter()
+                        .filter(|c| c.epoch_hash == local_anchor.hash)
+                        .map(|c| c.id)
+                        .collect();
+                    if ids.len() as u32 == local_anchor.coin_count {
+                        let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
+                        if set.contains(&coin.id) {
+                            if let Some(p) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
+                                    proof_used = Some(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 2) If local proof unavailable, request and validate from the network with a deadline.
             if proof_used.is_none() {
                 let mut proof_rx = network.proof_subscribe();
@@ -459,7 +548,8 @@ impl Wallet {
                     match tokio::time::timeout(remaining, proof_rx.recv()).await {
                         Ok(Ok(resp)) => {
                             if resp.coin.id != coin.id { continue; }
-                            // Require anchor root match
+                            // Require exact epoch anchor match (hash and root)
+                            if resp.anchor.hash != local_anchor.hash { continue; }
                             if local_anchor.merkle_root != resp.anchor.merkle_root { continue; }
                             if crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root) {
                                 anchor_used = resp.anchor;
@@ -469,6 +559,17 @@ impl Wallet {
                                 network.request_coin_proof(coin.id).await;
                                 // Also re-ask for leaves in case peers lack them
                                 network.request_epoch_leaves(local_anchor.num).await;
+                                // Attempt local reconstruction again in case we fetched fresh leaves
+                                if let Ok(Some(leaves)) = store.get_epoch_leaves(local_anchor.num) {
+                                    if leaves.binary_search(&leaf).is_ok() {
+                                        if let Some(p) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf) {
+                                            if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
+                                                proof_used = Some(p);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => { return Err(anyhow!("Timed out waiting for valid coin proof")); }

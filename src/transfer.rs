@@ -403,11 +403,9 @@ impl Spend {
             return Err(anyhow!("Invalid Merkle proof"));
         }
 
-        // 4) Commitment check
+        // 4) Commitment check – must be H(canonical_bytes(to))
         let expected_commitment = crate::crypto::commitment_of_stealth_output(&self.to.canonical_bytes());
-        if expected_commitment != self.commitment {
-            return Err(anyhow!("Commitment mismatch"));
-        }
+        if expected_commitment != self.commitment { return Err(anyhow!("Commitment mismatch")); }
 
         // 5) Nullifier unseen (DB collision check)
         if db.get::<[u8; 1]>("nullifier", &self.nullifier)

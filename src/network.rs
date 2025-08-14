@@ -177,11 +177,9 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     let leaf = crate::coin::Coin::id_to_leaf_hash(&sp.coin_id);
     if !crate::epoch::MerkleTree::verify_proof(&leaf, &sp.proof, &sp.root) { return Err("Invalid Merkle proof".into()); }
 
-    // Commitment check
+    // Commitment check – ensure canonical bytes are used exclusively
     let expected_commitment = crate::crypto::commitment_of_stealth_output(&sp.to.canonical_bytes());
-    if expected_commitment != sp.commitment {
-        return Err("Commitment mismatch".into());
-    }
+    if expected_commitment != sp.commitment { return Err("Commitment mismatch".into()); }
 
     // Nullifier seen?
     if db.get::<[u8;1]>("nullifier", &sp.nullifier).unwrap().is_some() {
@@ -1239,10 +1237,33 @@ pub async fn spawn(
                                                     let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
                                                     if set.contains(&coin.id) {
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                                                            let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                                            let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
                                                                 swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
+                                                                responded = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !responded {
+                                                // As a last resort, reconstruct the selected set by scanning confirmed coins for this epoch.
+                                                if let Ok(all_confirmed) = db.iterate_coins() {
+                                                    let mut ids: Vec<[u8;32]> = all_confirmed
+                                                        .into_iter()
+                                                        .filter(|c| c.epoch_hash == anchor.hash)
+                                                        .map(|c| c.id)
+                                                        .collect();
+                                                    if ids.len() as u32 == anchor.coin_count {
+                                                        let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
+                                                        if set.contains(&coin.id) {
+                                                            if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                                let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
+                                                                if let Ok(data) = bincode::serialize(&resp) {
+                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                    crate::metrics::PROOFS_SERVED.inc();
+                                                                }
                                                             }
                                                         }
                                                     }
