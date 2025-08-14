@@ -406,12 +406,35 @@ impl Wallet {
 
         for coin in coins_to_spend {
             // Always prefer V2 spend flow. If no previous transfer, validate against coin.creator_pk.
-            // Request proof for the coin
-            network.request_coin_proof(coin.id).await;
+            // Request and validate a Merkle proof for the coin (retry until valid or timeout)
             let mut proof_rx = network.proof_subscribe();
-            let proof_resp = tokio::time::timeout(std::time::Duration::from_secs(5), proof_rx.recv()).await
-                .map_err(|_| anyhow!("Timed out waiting for coin proof"))??;
-            if proof_resp.coin.id != coin.id { continue; }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            network.request_coin_proof(coin.id).await;
+            let proof_resp = loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow!("Timed out waiting for valid coin proof"));
+                }
+                match tokio::time::timeout(remaining, proof_rx.recv()).await {
+                    Ok(Ok(resp)) => {
+                        if resp.coin.id != coin.id { continue; }
+                        // Ensure the provided anchor matches our local anchor for this coin
+                        if let Some(local_anchor) = store.get::<crate::epoch::Anchor>("anchor", &coin.epoch_hash)? {
+                            if local_anchor.merkle_root != resp.anchor.merkle_root { continue; }
+                        }
+                        // Verify the proof locally before proceeding
+                        let leaf = crate::coin::Coin::id_to_leaf_hash(&resp.coin.id);
+                        if crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root) {
+                            break resp;
+                        } else {
+                            // Ask peers again and keep waiting within the deadline
+                            network.request_coin_proof(coin.id).await;
+                            continue;
+                        }
+                    }
+                    _ => { return Err(anyhow!("Timed out waiting for valid coin proof")); }
+                }
+            };
 
             // Determine current owner (pk, sk):
             // - If legacy transfer exists, owner_pk = last one-time pk; recover owner_sk via Kyber
