@@ -12,6 +12,7 @@ pub mod network;
 pub mod sync;
 pub mod metrics;
 pub mod wallet;
+pub mod consensus;
 
 // Re-export commonly used types for convenience
 pub use coin::Coin;

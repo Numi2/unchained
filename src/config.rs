@@ -51,6 +51,7 @@ pub struct Storage {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Epoch {
     pub seconds: u64,
+    #[serde(default = "default_target_leading_zeros")]
     pub target_leading_zeros: usize,
     #[serde(default = "default_target_coins")]
     pub target_coins_per_epoch: u32,
@@ -88,7 +89,7 @@ pub struct Mining {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
     /// Maximum attempts per epoch before giving up
-    #[serde(default = "default_max_mining_attempts")]
+    #[serde(default = "default_max_mining_attempts", alias = "max_mining_attempts")]
     pub max_attempts: u64,
     /// Attempts between runtime yield/anchor checks
     #[serde(default = "default_check_interval_attempts")]
@@ -117,6 +118,7 @@ fn default_difficulty_min() -> usize { 1 }
 fn default_difficulty_max() -> usize { 12 }
 fn default_retarget_upper_pct() -> u64 { 110 }
 fn default_retarget_lower_pct() -> u64 { 90 }
+fn default_target_leading_zeros() -> usize { 2 }
 
 
 // Mining memory retargeting defaults
@@ -197,7 +199,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     "seconds","target_leading_zeros","target_coins_per_epoch","max_coins_per_epoch","retarget_interval","difficulty_min","difficulty_max","retarget_upper_pct","retarget_lower_pct"
                 ]),
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","check_interval_attempts","workers","offload_blocking"
+                    "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","max_mining_attempts","check_interval_attempts","workers","offload_blocking"
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind"]),
                 _ => {}

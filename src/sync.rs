@@ -124,7 +124,7 @@ pub fn spawn(
                                     }
                                     let have_transfer: Option<crate::transfer::Transfer> = db.get("transfer", &id).unwrap_or(None);
                                     if have_transfer.is_none() {
-                                        net.request_tx(id).await;
+                                        net.request_spend(id).await;
                                     }
                                 }
                             }

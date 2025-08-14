@@ -41,41 +41,26 @@ max_messages_per_window = 1000
 path = "../blockchain_data"
 
 [epoch]
-# Duration of each epoch in seconds 
+# Duration of each epoch in seconds (timing only; does not affect consensus validation)
 seconds = 222
-# Target number of leading zeros for proof-of-work difficulty (start with 2 for public mining)
-target_leading_zeros = 2
-# Retargeting parameters
-# Target number of coins per epoch for difficulty adjustment (reduced for public mining)
-target_coins_per_epoch = 11
-# How often to retarget (every N epochs - more frequent for dynamic adjustment)
-retarget_interval = 2000
 
 
 [mining]
 # Enable mining by default
 enabled = true
-# Memory usage for Argon2 hashing in KiB 
-mem_kib = 16192
 
-
-# Memory retargeting parameters
-# Minimum memory in KiB
-min_mem_kib = 16192
-
-# Maximum memor in KiB 
-max_mem_kib = 512007
-
-# Memory adjustment factor 
-max_memory_adjustment = 1.02
-
-# Miner stability settings for multi-node environments
+# Miner runtime tuning (does not change consensus)
 # Heartbeat interval in seconds (more frequent for network stability)
 heartbeat_interval_secs = 140
 
-
-# Maximum mining attempts per epoch before moving to next epoch (higher for public mining)
+# Maximum mining attempts per epoch before moving to next epoch
+# (alias for `max_attempts` in code)
 max_mining_attempts = 200000
+
+# Optional knobs (uncomment to override defaults):
+# check_interval_attempts = 1000
+# workers = 1
+# offload_blocking = true
 
 [metrics]
 # Optional – leave out to use the default "0.0.0.0:9100"

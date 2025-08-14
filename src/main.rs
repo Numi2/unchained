@@ -6,7 +6,7 @@ use anyhow;
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
-pub mod sync;      pub mod metrics;  pub mod wallet;
+pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
 
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
@@ -125,7 +125,6 @@ async fn main() -> anyhow::Result<()> {
             let epoch_mgr = epoch::Manager::new(
                 db.clone(),
                 cfg.epoch.clone(),
-                cfg.mining.clone(),
                 cfg.net.clone(),
                 net.clone(),
                 coin_rx,
@@ -406,7 +405,6 @@ async fn main() -> anyhow::Result<()> {
                 let epoch_mgr = epoch::Manager::new(
                     db.clone(),
                     cfg.epoch.clone(),
-                    cfg.mining.clone(),
                     cfg.net.clone(),
                     net.clone(),
                     coin_rx,

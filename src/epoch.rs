@@ -1,4 +1,10 @@
 use crate::{storage::Store, network::NetHandle, coin::{Coin, CoinCandidate}};
+use crate::consensus::{
+    calculate_retarget_consensus,
+    TARGET_LEADING_ZEROS,
+    DEFAULT_MEM_KIB,
+    RETARGET_INTERVAL,
+};
 use tokio::{sync::{broadcast, mpsc}, time};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
@@ -170,7 +176,6 @@ impl MerkleTree {
 pub struct Manager {
     db:   Arc<Store>,
     cfg:  crate::config::Epoch,
-    mining_cfg: crate::config::Mining,
     net_cfg: crate::config::Net,
     net:  NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
@@ -182,7 +187,6 @@ impl Manager {
     pub fn new(
         db: Arc<Store>, 
         cfg: crate::config::Epoch, 
-        mining_cfg: crate::config::Mining, 
         net_cfg: crate::config::Net,
         net: NetHandle, 
         coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
@@ -190,7 +194,7 @@ impl Manager {
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, mining_cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state }
+        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state }
     }
 
     pub fn spawn_loop(mut self) {
@@ -386,17 +390,17 @@ impl Manager {
                             *h.finalize().as_bytes()
                         };
                         
-                        let (difficulty, mem_kib) = if current_epoch > 0 && current_epoch % self.cfg.retarget_interval == 0 {
+                        let (difficulty, mem_kib) = if current_epoch > 0 && current_epoch % RETARGET_INTERVAL == 0 {
                             let mut recent_anchors = Vec::new();
-                            for i in 0..self.cfg.retarget_interval {
-                                let epoch_num = current_epoch.saturating_sub(self.cfg.retarget_interval - i);
+                            for i in 0..RETARGET_INTERVAL {
+                                let epoch_num = current_epoch.saturating_sub(RETARGET_INTERVAL - i);
                                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                                     recent_anchors.push(anchor);
                                 }
                             }
-                            calculate_retarget(&recent_anchors, &self.cfg, &self.mining_cfg)
+                            calculate_retarget_consensus(&recent_anchors)
                         } else {
-                            prev_anchor.as_ref().map_or((self.cfg.target_leading_zeros, self.mining_cfg.mem_kib), |p| (p.difficulty, p.mem_kib))
+                            prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
                         };
                         
                         let current_work = Anchor::expected_work_for_difficulty(difficulty);

@@ -2,9 +2,11 @@ use crate::{
     storage::Store,
     crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES},
 };
-use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey, DetachedSignature, verify_detached_signature, detached_sign};
+use pqcrypto_dilithium::dilithium3::{
+    PublicKey, SecretKey, DetachedSignature, verify_detached_signature, detached_sign,
+};
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
-use pqcrypto_traits::kem::{PublicKey as KyberPkTrait};
+use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
 use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
 
@@ -20,7 +22,10 @@ use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use argon2::{Argon2, Params};
-use chacha20poly1305::{aead::{Aead, NewAead}, XChaCha20Poly1305, Key, XNonce};
+use chacha20poly1305::{
+    aead::{Aead, NewAead},
+    XChaCha20Poly1305, Key, XNonce,
+};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rpassword;
@@ -190,8 +195,6 @@ impl Wallet {
         Ok(Wallet { _db: Arc::downgrade(&db), pk, sk, kyber_pk, kyber_sk, address })
     }
 
-    
-
     pub fn address(&self) -> Address {
         self.address
     }
@@ -220,7 +223,6 @@ impl Wallet {
     // ---------------------------------------------------------------------
     // Format (bincode then base64-url):
     // { version: u8=1, recipient_addr: [u8;32], dili_pk: [u8;DILITHIUM3_PK_BYTES], kyber_pk: [u8;crypto::KYBER768_PK_BYTES], sig: Dilithium sig over ("stealth_addr_v1" || addr || kyber_pk) }
-    // struct was moved to module scope below
 
     pub fn export_stealth_address(&self) -> String {
         let mut to_sign = Vec::with_capacity(16 + 32 + self.kyber_pk.as_bytes().len());
@@ -285,11 +287,15 @@ impl Wallet {
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                // Skip coins that already have a V2 spend
-                let spent_v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
-                if spent_v2.is_some() { continue; }
+                // If there is a V2 spend recorded, the current owner is the recipient of that spend
+                if let Some(sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                        utxos.push(coin);
+                    }
+                    continue;
+                }
 
-                // Check legacy transfer chain to determine current owner
+                // Else determine owner via legacy transfer or genesis
                 let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
                 match last_tx {
                     None => {
@@ -382,7 +388,7 @@ impl Wallet {
         Err(anyhow!("send_transfer(Address, ...) is deprecated. Use send_to_stealth_address(stealth_address, amount, network)"))
     }
 
-    /// Sends stealth transfers to a recipient using a signed stealth address string.
+    /// Sends stealth **V2 Spends** to a recipient using a signed stealth address string.
     pub async fn send_to_stealth_address(
         &self,
         stealth_address_str: &str,
@@ -397,6 +403,7 @@ impl Wallet {
         let coins_to_spend = self.select_inputs(amount)?;
         let transfers = Vec::new();
         let mut spends = Vec::new();
+
         for coin in coins_to_spend {
             // Always prefer V2 spend flow. If no previous transfer, validate against coin.creator_pk.
             // Request proof for the coin
@@ -406,24 +413,30 @@ impl Wallet {
                 .map_err(|_| anyhow!("Timed out waiting for coin proof"))??;
             if proof_resp.coin.id != coin.id { continue; }
 
-            // Determine current owner secret key:
-            // - If legacy transfer exists, recover from last incoming stealth
-            // - Else, this wallet created the coin: sign with wallet SK directly
+            // Determine current owner (pk, sk):
+            // - If legacy transfer exists, owner_pk = last one-time pk; recover owner_sk via Kyber
+            // - Else, coin was created by this wallet: owner_pk/sk = wallet keys
             let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-            let owner_sk = if let Some(last) = last_tx {
+            let (owner_pk, owner_sk) = if let Some(last) = last_tx {
+                // Recover one-time SK, and take PK directly from last transfer
                 match last.to.try_recover_one_time_sk(&self.kyber_sk) {
-                    Ok(sk) => sk,
+                    Ok(sk) => {
+                        let pk = PublicKey::from_bytes(&last.to.one_time_pk)
+                            .context("Invalid one-time pk in last transfer")?;
+                        (pk, sk)
+                    }
                     Err(_) => { continue; }
                 }
             } else {
-                // Use wallet SK (we are creator)
-                self.sk.clone()
+                (self.pk.clone(), self.sk.clone())
             };
 
+            // Build and broadcast V2 Spend
             let spend = crate::transfer::Spend::create(
                 coin.id,
                 &proof_resp.anchor,
                 proof_resp.proof,
+                &owner_pk,               // NEW: pass public key for nullifier_v2 computation
                 &owner_sk,
                 &recipient_kyber_pk,
             )?;
@@ -498,19 +511,27 @@ impl Wallet {
                     // Counterparty is recipient address derived from one_time_pk
                     let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&spend.to.one_time_pk)?;
                     let recipient_addr = crypto::address_from_pk(&pk);
-                    history.push(TransactionRecord { coin_id: spend.coin_id, transfer_hash: tx_hash, timestamp: std::time::SystemTime::now(), is_sender: true, amount: coin.value, counterparty: recipient_addr });
+                    history.push(TransactionRecord {
+                        coin_id: spend.coin_id,
+                        transfer_hash: tx_hash,
+                        timestamp: std::time::SystemTime::now(),
+                        is_sender: true,
+                        amount: coin.value,
+                        counterparty: recipient_addr,
+                    });
                     continue;
                 }
 
-                // Incoming (to me)? Try to recover one-time SK using kyber_sk
-                if let Ok(sk) = spend.to.try_recover_one_time_sk(&self.kyber_sk) {
-                    // Confirm address matches
-                    let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&spend.to.one_time_pk)?;
-                    let my_addr = crypto::address_from_pk(&pk);
-                    if my_addr == self.address {
-                        history.push(TransactionRecord { coin_id: spend.coin_id, transfer_hash: tx_hash, timestamp: std::time::SystemTime::now(), is_sender: false, amount: coin.value, counterparty: prev_owner_addr });
-                    }
-                    let _ = sk; // silence unused warning in release profiles
+                // Incoming (to me)? If we can recover the one-time SK, it's ours.
+                if spend.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                    history.push(TransactionRecord {
+                        coin_id: spend.coin_id,
+                        transfer_hash: tx_hash,
+                        timestamp: std::time::SystemTime::now(),
+                        is_sender: false,
+                        amount: coin.value,
+                        counterparty: prev_owner_addr,
+                    });
                 }
             }
         }
