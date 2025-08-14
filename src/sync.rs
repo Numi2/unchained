@@ -110,23 +110,30 @@ pub fn spawn(
                 }
 
                 _ = backfill_timer.tick() => {
-                    // Background transfer/spend backfill to ensure offline receivers catch up
+                    // Background spend backfill to ensure offline receivers catch up
                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                         let window: u64 = 16; // scan recent epochs
                         let start = latest.num.saturating_sub(window);
                         for n in start..=latest.num {
-                            if let Ok(ids) = db.get_selected_coin_ids_for_epoch(n) {
-                                for id in ids {
-                                    // If we don't yet have a spend, request it; otherwise ensure transfer is known
-                                    let have_spend: Option<crate::transfer::Spend> = db.get("spend", &id).unwrap_or(None);
-                                    if have_spend.is_some() {
-                                        continue;
-                                    }
-                                    let have_transfer: Option<crate::transfer::Transfer> = db.get("transfer", &id).unwrap_or(None);
-                                    if have_transfer.is_none() {
-                                        net.request_spend(id).await;
+                            // Preferred path: use per-epoch selected ids index
+                            let mut ids: Vec<[u8;32]> = db.get_selected_coin_ids_for_epoch(n).unwrap_or_default();
+                            // Fallback: if selected index missing/empty, derive ids from stored confirmed coins for that epoch
+                            if ids.is_empty() {
+                                if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                                    if let Ok(all_confirmed) = db.iterate_coins() {
+                                        ids = all_confirmed
+                                            .into_iter()
+                                            .filter(|c| c.epoch_hash == anchor.hash)
+                                            .map(|c| c.id)
+                                            .collect();
                                     }
                                 }
+                            }
+                            for id in ids {
+                                // If we don't yet have a spend, request it
+                                let have_spend: Option<crate::transfer::Spend> = db.get("spend", &id).unwrap_or(None);
+                                if have_spend.is_some() { continue; }
+                                net.request_spend(id).await;
                             }
                         }
                     }
