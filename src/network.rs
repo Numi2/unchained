@@ -504,6 +504,8 @@ pub async fn spawn(
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    // Deduplicate coin fetch requests when we receive spends for unknown coins
+    static RECENT_COIN_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const EPOCH_REQ_DEDUP_SECS: u64 = 5;
@@ -1026,6 +1028,38 @@ pub async fn spawn(
                                                 let _ = db.put_coin_epoch(&coin.id, epoch_anchor.num);
                                             }
                                         }
+
+                                        // If we had buffered spends for this coin due to it being missing, try to validate/apply them now
+                                        if let Some(mut queued) = pending_spends.remove(&coin.id) {
+                                            let mut made_progress = true;
+                                            while made_progress {
+                                                made_progress = false;
+                                                let mut remaining: Vec<Spend> = Vec::new();
+                                                for q in queued.drain(..) {
+                                                    if validate_spend(&q, &db).is_ok() {
+                                                        if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
+                                                            let mut batch = rocksdb::WriteBatch::default();
+                                                            if let Ok(bytes) = bincode::serialize(&q) {
+                                                                batch.put_cf(sp_cf, &q.coin_id, &bytes);
+                                                            }
+                                                            batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
+                                                            let _ = db.db.write(batch);
+                                                        }
+                                                        made_progress = true;
+                                                    } else {
+                                                        remaining.push(q);
+                                                    }
+                                                }
+                                                if remaining.is_empty() { break; }
+                                                queued = remaining;
+                                            }
+                                            if !queued.is_empty() {
+                                                pending_spends.insert(coin.id, queued);
+                                                pending_spend_deadline.insert(coin.id, std::time::Instant::now());
+                                            } else {
+                                                pending_spend_deadline.remove(&coin.id);
+                                            }
+                                        }
                                     } else if let Ok(cand) = bincode::deserialize::<CoinCandidate>(&message.data) {
                                         if validate_coin_candidate(&cand, &db).is_ok() {
                                             let key = Store::candidate_key(&cand.epoch_hash, &cand.id);
@@ -1109,6 +1143,23 @@ pub async fn spawn(
                                                         // Ask peers for their latest spend for this coin
                                                         if let Ok(data) = bincode::serialize(&coin_id) {
                                                             try_publish_gossip(&mut swarm, TOP_SPEND_REQUEST, data, "spend-req");
+                                                        }
+                                                        map.insert(coin_id, now);
+                                                    }
+                                                }
+                                        } else if es.contains("Referenced coin does not exist") {
+                                                let coin_id = sp.coin_id;
+                                                // Buffer this spend until the coin is fetched
+                                                pending_spends.entry(coin_id).or_default().push(sp);
+                                                pending_spend_deadline.insert(coin_id, std::time::Instant::now());
+                                                // Deduplicate coin fetch requests
+                                                let now = std::time::Instant::now();
+                                                {
+                                                    let mut map = RECENT_COIN_REQS.lock().unwrap();
+                                                    map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
+                                                    if !map.contains_key(&coin_id) {
+                                                        if let Ok(data) = bincode::serialize(&coin_id) {
+                                                            try_publish_gossip(&mut swarm, TOP_COIN_REQUEST, data, "coin-req");
                                                         }
                                                         map.insert(coin_id, now);
                                                     }

@@ -1,15 +1,109 @@
 use anyhow::Result;
+use bytes::Bytes;
+use hyper::{Body, Request as HRequest, Response as HResponse, StatusCode};
+use hyper::service::{make_service_fn, service_fn};
 use once_cell::sync::Lazy;
-use prometheus::{Registry, IntGauge, IntCounter, Encoder, TextEncoder};
-use std::thread;
+use std::collections::VecDeque;
+use std::net::TcpListener as StdTcpListener;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+// --- Lightweight in-process metrics that emit log events ---
+
+static LOG_BUS: Lazy<LogBus> = Lazy::new(LogBus::new);
+
+const LOG_BUFFER_CAPACITY: usize = 1000;
+
+struct LogBus {
+    buffer: Mutex<VecDeque<String>>,
+    tx: tokio::sync::broadcast::Sender<String>,
+}
+
+impl LogBus {
+    fn new() -> Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(2048);
+        Self {
+            buffer: Mutex::new(VecDeque::with_capacity(LOG_BUFFER_CAPACITY)),
+            tx,
+        }
+    }
+
+    fn push(&self, line: String) {
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() == LOG_BUFFER_CAPACITY { buf.pop_front(); }
+        buf.push_back(line.clone());
+        let _ = self.tx.send(line);
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.buffer.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+fn log_line(kind: &str, name: &str, msg: String) {
+    LOG_BUS.push(format!("{} [{}] {}: {}", now_millis(), kind, name, msg));
+}
+
+pub struct IntGauge {
+    name: &'static str,
+    description: &'static str,
+    value: std::sync::atomic::AtomicI64,
+}
+
+impl IntGauge {
+    pub fn new(name: &'static str, description: &'static str) -> std::result::Result<Self, ()> {
+        Ok(Self { name, description, value: std::sync::atomic::AtomicI64::new(0) })
+    }
+    pub fn set(&self, val: i64) {
+        self.value.store(val, std::sync::atomic::Ordering::Relaxed);
+        log_line("gauge", self.name, format!("set {} ({})", val, self.description));
+    }
+}
+
+pub struct IntCounter {
+    name: &'static str,
+    description: &'static str,
+    value: std::sync::atomic::AtomicU64,
+}
+
+impl IntCounter {
+    pub fn new(name: &'static str, description: &'static str) -> std::result::Result<Self, ()> {
+        Ok(Self { name, description, value: std::sync::atomic::AtomicU64::new(0) })
+    }
+    pub fn inc(&self) {
+        let v = self.value.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        log_line("counter", self.name, format!("inc -> {} ({})", v, self.description));
+    }
+    pub fn inc_by(&self, by: u64) {
+        let v = self.value.fetch_add(by, std::sync::atomic::Ordering::Relaxed) + by;
+        log_line("counter", self.name, format!("inc_by {} -> {} ({})", by, v, self.description));
+    }
+}
+
+pub struct Histogram {
+    name: &'static str,
+    description: &'static str,
+}
+
+impl Histogram {
+    pub fn new(name: &'static str, description: &'static str) -> Self {
+        Self { name, description }
+    }
+    pub fn observe(&self, value: f64) {
+        log_line("histogram", self.name, format!("observe {:.3} ({})", value, self.description));
+    }
+}
+
 pub static PEERS: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_peer_count", "Connected libp2p peers").unwrap());
 pub static EPOCH_HEIGHT: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_epoch_height", "Current epoch height").unwrap());
 pub static CANDIDATE_COINS: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_candidate_coins", "Candidate coins observed for current epoch").unwrap());
 pub static SELECTED_COINS: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_selected_coins", "Selected coins in last finalized epoch").unwrap());
 pub static PROOFS_SERVED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_coin_proofs_served_total", "Number of coin proofs served").unwrap());
-pub static PROOF_LATENCY_MS: Lazy<prometheus::Histogram> = Lazy::new(|| prometheus::Histogram::with_opts(prometheus::HistogramOpts::new("unchained_coin_proof_latency_ms", "Proof serving latency (ms)").buckets(vec![10.0,25.0,50.0,100.0,250.0,500.0,1000.0,2000.0,5000.0])).unwrap());
+pub static PROOF_LATENCY_MS: Lazy<Histogram> = Lazy::new(|| Histogram::new("unchained_coin_proof_latency_ms", "Proof serving latency (ms)"));
 pub static ORPHAN_BUFFER_LEN: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_orphan_buffer_len", "Number of buffered orphan anchors").unwrap());
 pub static VALIDATION_FAIL_ANCHOR: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_validation_failures_anchor_total", "Count of invalid anchors received").unwrap());
 pub static VALIDATION_FAIL_COIN: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_validation_failures_coin_total", "Count of invalid coin candidates received").unwrap());
@@ -19,71 +113,86 @@ pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("u
 pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_selection_threshold_u64", "Threshold (first 8 bytes of pow_hash) for last selected coin").unwrap());
 pub static MINING_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_attempts_total", "Total mining attempts (nonces tried)").unwrap());
 pub static MINING_FOUND: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_solutions_total", "Total found PoW solutions").unwrap());
-pub static MINING_HASH_TIME_MS: Lazy<prometheus::Histogram> = Lazy::new(|| prometheus::Histogram::with_opts(
-    prometheus::HistogramOpts::new("unchained_mining_hash_time_ms", "Argon2 PoW hashing time per attempt (ms)")
-        .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0])
-).unwrap());
+pub static MINING_HASH_TIME_MS: Lazy<Histogram> = Lazy::new(|| Histogram::new("unchained_mining_hash_time_ms", "Argon2 PoW hashing time per attempt (ms)"));
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
-    REGISTRY.register(Box::new(PEERS.clone()))?;
-    REGISTRY.register(Box::new(EPOCH_HEIGHT.clone()))?;
-    REGISTRY.register(Box::new(CANDIDATE_COINS.clone()))?;
-    REGISTRY.register(Box::new(SELECTED_COINS.clone()))?;
-    REGISTRY.register(Box::new(PROOFS_SERVED.clone()))?;
-    REGISTRY.register(Box::new(PROOF_LATENCY_MS.clone()))?;
-    REGISTRY.register(Box::new(ORPHAN_BUFFER_LEN.clone()))?;
-    REGISTRY.register(Box::new(VALIDATION_FAIL_ANCHOR.clone()))?;
-    REGISTRY.register(Box::new(VALIDATION_FAIL_COIN.clone()))?;
-    REGISTRY.register(Box::new(VALIDATION_FAIL_TRANSFER.clone()))?;
-    REGISTRY.register(Box::new(DB_WRITE_FAILS.clone()))?;
-    REGISTRY.register(Box::new(PRUNED_CANDIDATES.clone()))?;
-    REGISTRY.register(Box::new(SELECTION_THRESHOLD_U64.clone()))?;
-    REGISTRY.register(Box::new(MINING_ATTEMPTS.clone()))?;
-    REGISTRY.register(Box::new(MINING_FOUND.clone()))?;
-    REGISTRY.register(Box::new(MINING_HASH_TIME_MS.clone()))?;
+    // Initialize some defaults
     PEERS.set(0);
 
-    // Start metrics server, retrying on port conflicts by incrementing port number.
+    // Start an HTTP server offering a single SSE endpoint at /logs.
     let bind_addr = cfg.bind.clone();
-    thread::spawn(move || {
+    tokio::spawn(async move {
         let mut addr = bind_addr.clone();
-        let server = loop {
-            match tiny_http::Server::http(&addr) {
-                Ok(s) => break s,
+        let listener = loop {
+            match StdTcpListener::bind(&addr) {
+                Ok(l) => break l,
                 Err(e) => {
-                    if e.to_string().contains("Address already in use") {
-                        // Try next port
+                    let already = e.kind() == std::io::ErrorKind::AddrInUse || e.to_string().contains("in use");
+                    if already {
                         if let Some((host, port_str)) = addr.rsplit_once(':') {
                             if let Ok(port) = port_str.parse::<u16>() {
-                                let next_port = port.saturating_add(1);
-                                addr = format!("{}:{}", host, next_port);
-                                eprintln!("🔥 Metrics port in use, trying {}", addr);
+                                let next = port.saturating_add(1);
+                                addr = format!("{}:{}", host, next);
+                                eprintln!("🔥 Logs API port in use, trying {}", addr);
                                 continue;
                             }
                         }
                     }
-                    eprintln!("🔥 Could not start metrics server on {addr}: {e}");
+                    eprintln!("🔥 Could not bind logs API on {addr}: {e}");
                     return;
                 }
             }
         };
-        eprintln!("📊 Prometheus metrics serving on http://{}", addr);
+        listener.set_nonblocking(true).ok();
 
-        for request in server.incoming_requests() {
-            let mut buffer = vec![];
-            let encoder = TextEncoder::new();
-            let metric_families = REGISTRY.gather();
-            if encoder.encode(&metric_families, &mut buffer).is_err() {
-                eprintln!("🔥 Could not encode metrics");
-                continue;
-            }
+        let service = make_service_fn(|_conn| async move {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: HRequest<Body>| async move {
+                if req.method() == hyper::Method::GET && req.uri().path() == "/logs" {
+                    // Prepare SSE body
+                    let (mut tx, body) = Body::channel();
+                    let mut rx = LOG_BUS.tx.subscribe();
+                    // Send current snapshot first
+                    let snapshot = LOG_BUS.snapshot();
+                    // Send in a separate task to keep the response return non-blocking
+                    tokio::spawn(async move {
+                        // Helper to send one event line
+                        async fn send_line(tx: &mut hyper::body::Sender, line: &str) -> Result<(), ()> {
+                            let data = format!("data: {}\n\n", line);
+                            tx.send_data(Bytes::from(data)).await.map_err(|_| ())
+                        }
+                        for line in snapshot {
+                            if send_line(&mut tx, &line).await.is_err() { return; }
+                        }
+                        loop {
+                            match rx.recv().await {
+                                Ok(line) => {
+                                    if send_line(&mut tx, &line).await.is_err() { break; }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
+                        }
+                    });
 
-            let response = tiny_http::Response::from_data(buffer)
-                .with_header("Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8".parse::<tiny_http::Header>().unwrap());
-            
-            let _ = request.respond(response);
+                    let mut resp = HResponse::new(body);
+                    let headers = resp.headers_mut();
+                    headers.insert(hyper::header::CONTENT_TYPE, hyper::header::HeaderValue::from_static("text/event-stream"));
+                    headers.insert(hyper::header::CACHE_CONTROL, hyper::header::HeaderValue::from_static("no-cache"));
+                    headers.insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("keep-alive"));
+                    headers.insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, hyper::header::HeaderValue::from_static("*"));
+                    Ok::<_, std::convert::Infallible>(resp)
+                } else {
+                    Ok::<_, std::convert::Infallible>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found")).unwrap())
+                }
+            }))
+        });
+
+        match hyper::Server::from_tcp(listener).unwrap().serve(service).await {
+            Ok(()) => {}
+            Err(e) => eprintln!("🔥 Logs API error: {}", e),
         }
     });
 
+    eprintln!("🖥  Real-time logs available via SSE at http://{}/logs", cfg.bind);
     Ok(())
 }
