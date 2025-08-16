@@ -1,10 +1,11 @@
 use blake3::Hasher;
 use argon2::{Argon2, Params, Version, Algorithm};
 use pqcrypto_dilithium::dilithium3::{
-    PublicKey, SecretKey, keypair,
+    PublicKey, SecretKey,
 };
+
 use anyhow::{Result, anyhow};
-use pqcrypto_traits::sign::{PublicKey as _};
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use libp2p::identity;
 use rcgen::{CertificateParams, KeyPair, SanType};
 use rustls::{ClientConfig, ServerConfig, RootCertStore};
@@ -12,10 +13,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use zeroize::Zeroizing;
+use zeroize::Zeroize;
+use std::sync::Mutex;
 use anyhow::bail;
 use atty;
 use rpassword;
 use webpki_roots;
+use oqs_sys::rand::OQS_randombytes_custom_algorithm;
 
 // Constants for post-quantum crypto primitives ensure type safety and clarity.
 pub const DILITHIUM3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
@@ -94,7 +98,96 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
 }
 
 pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
-    keypair()
+    // Bleeding-edge deterministic only: generating with a fixed zero seed is disallowed.
+    // Callers must use dilithium3_seeded_keypair with an explicit seed.
+    panic!("Use dilithium3_seeded_keypair with an explicit seed");
+}
+
+/// Deterministically generate a Dilithium3 keypair from a 32-byte seed.
+/// Uses liboqs (ML-DSA-65) with a custom deterministic RNG fed by the seed.
+pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
+    // Global critical section: liboqs randombytes callback is global; prevent races
+    static KEYGEN_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
+    let _kg_lock = KEYGEN_LOCK.get_or_init(|| Mutex::new(())).lock().expect("keygen lock poisoned");
+
+    // Initialize liboqs (idempotent)
+    oqs::init();
+
+    // Install per-call deterministic RNG state
+    struct DetRngState {
+        seed: [u8; 32],
+        counter: u64,
+    }
+    impl Zeroize for DetRngState {
+        fn zeroize(&mut self) {
+            self.seed.zeroize();
+            self.counter.zeroize();
+        }
+    }
+    impl DetRngState {
+        fn fill_bytes(&mut self, out: &mut [u8]) {
+            let mut written = 0usize;
+            while written < out.len() {
+                let mut h = Hasher::new_derive_key("unchained-oqs-rng-v1");
+                h.update(&self.seed);
+                h.update(&self.counter.to_le_bytes());
+                let block = h.finalize();
+                self.counter = self.counter.wrapping_add(1);
+                let block_bytes = block.as_bytes();
+                let take = std::cmp::min(block_bytes.len(), out.len() - written);
+                out[written..written + take].copy_from_slice(&block_bytes[..take]);
+                written += take;
+            }
+        }
+    }
+
+    static DET_RNG: OnceCell<Mutex<Option<DetRngState>>> = OnceCell::new();
+
+    unsafe extern "C" fn oqs_custom_randombytes(out_ptr: *mut u8, out_len: usize) {
+        let slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
+        if let Some(cell) = DET_RNG.get() {
+            if let Ok(mut guard) = cell.lock() {
+                if let Some(state) = guard.as_mut() {
+                    state.fill_bytes(slice);
+                    return;
+                }
+            }
+        }
+        // Deterministic-only: state must be set for key generation
+        panic!("deterministic RNG state not initialized");
+    }
+
+    // Set the RNG state for this call
+    let cell = DET_RNG.get_or_init(|| Mutex::new(None));
+    {
+        let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
+        *guard = Some(DetRngState { seed: seed32, counter: 0 });
+    }
+
+    // Override liboqs RNG with our deterministic provider
+    unsafe { OQS_randombytes_custom_algorithm(Some(oqs_custom_randombytes)); }
+
+    // Generate ML-DSA-65 keypair deterministically
+    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65)
+        .expect("liboqs ML-DSA-65 not available");
+    let (oqs_pk, oqs_sk) = sig.keypair().expect("liboqs keypair failed");
+    let pk_bytes = oqs_pk.as_ref();
+    let sk_bytes = oqs_sk.as_ref();
+
+    // Restore liboqs RNG to default; clear state
+    unsafe { OQS_randombytes_custom_algorithm(None); }
+    {
+        let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
+        if let Some(ref mut st) = *guard { st.zeroize(); }
+        *guard = None;
+    }
+
+    // Convert to pqcrypto_dilithium types
+    assert_eq!(pk_bytes.len(), DILITHIUM3_PK_BYTES, "ML-DSA-65 pk size mismatch");
+    assert_eq!(sk_bytes.len(), DILITHIUM3_SK_BYTES, "ML-DSA-65 sk size mismatch");
+    let dili_pk = PublicKey::from_bytes(pk_bytes).expect("invalid Dilithium3 public key bytes");
+    let dili_sk = SecretKey::from_bytes(sk_bytes).expect("invalid Dilithium3 secret key bytes");
+    (dili_pk, dili_sk)
 }
 
 /// Deterministically derive a Dilithium3 keypair from a 32-byte seed.
@@ -119,21 +212,25 @@ pub fn commitment_of_stealth_ct(kyber_ct_bytes: &[u8]) -> [u8; 32] {
     blake3_hash(kyber_ct_bytes)
 }
 
-/// Canonical stealth seed derivation used by both sender and receiver.
-/// seed = BLAKE3("unchained-stealth-v1" || ss || receiver_dilithium_pk || commitment || amount_le)
-pub fn derive_stealth_seed(
-    shared_secret: &[u8],
-    receiver_dilithium_pk: &PublicKey,
-    commitment: &[u8; 32],
-    amount: u64,
-)-> [u8; 32] {
-    let mut h = Hasher::new_derive_key("unchained-stealth-v1");
-    h.update(shared_secret);
-    h.update(receiver_dilithium_pk.as_bytes());
-    h.update(commitment);
-    h.update(&amount.to_le_bytes());
-    *h.finalize().as_bytes()
+/// Length-prefixed stealth seed derivation bound to chain id and algo tags.
+/// TAG = "unchained-stealth-v1|mlkem768|mldsa65"
+/// seed32 = BLAKE3(TAG || lp(ss)||ss || lp(recv_pk)||recv_pk || lp(ct)||ct || lp(value_tag)||value_tag || chain_id32)
+pub fn stealth_seed_v1(ss: &[u8], recv_dili_pk_bytes: &[u8], kyber_ct_bytes: &[u8], value_tag: &[u8], chain_id32: &[u8; 32]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"unchained-stealth-v1|mlkem768|mldsa65");
+    h.update(&lp(ss.len()));          h.update(ss);
+    h.update(&lp(recv_dili_pk_bytes.len())); h.update(recv_dili_pk_bytes);
+    h.update(&lp(kyber_ct_bytes.len()));     h.update(kyber_ct_bytes);
+    h.update(&lp(value_tag.len()));   h.update(value_tag);
+    h.update(chain_id32);
+    let out = h.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&out.as_bytes()[..32]);
+    seed
 }
+
+// default_chain_id helper removed; chain id is retrieved from Store::get_chain_id()
 
 /// Generate a self-signed X.509 certificate from a libp2p Ed25519 keypair
 /// This cert is used for QUIC's TLS stack authentication

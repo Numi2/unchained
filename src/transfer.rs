@@ -12,7 +12,7 @@ use crate::crypto::{
     Address, blake3_hash, address_from_pk,
     DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, DILITHIUM3_SIG_BYTES,
     KYBER768_CT_BYTES as KYBER_CT_BYTES,
-    commitment_of_stealth_ct, derive_stealth_seed,
+    commitment_of_stealth_ct, stealth_seed_v1, dilithium3_seeded_keypair,
 };
 use pqcrypto_dilithium::dilithium3::{
     PublicKey as DiliPk, SecretKey as DiliSk, DetachedSignature,
@@ -26,11 +26,7 @@ use pqcrypto_kyber::kyber768::{
 };
 use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
 
-use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
-use aes_gcm_siv::Aes256GcmSiv;
-use rand::rngs::OsRng;
-use rand::RngCore;
-use hex;
+// use subtle::ConstantTimeEq;  // not needed; using fully-qualified call
 
 // ------------ Stealth Output ------------
 
@@ -42,13 +38,8 @@ pub struct StealthOutput {
     // Kyber768 ciphertext so recipient can derive the shared secret
     #[serde(with = "BigArray")]
     pub kyber_ct: [u8; KYBER_CT_BYTES],
-    // Nonce for AES-GCM-SIV (12 bytes)
-    #[serde(with = "BigArray")]
-    pub enc_sk_nonce: [u8; 12],
-    // One-time Dilithium3 secret key encrypted under key derived from canonical seed
-    // Length: DILITHIUM3_SK_BYTES + 16 (AEAD tag)
-    #[serde(with = "BigArray")]
-    pub enc_one_time_sk: [u8; DILITHIUM3_SK_BYTES + 16],
+    // Amount (little-endian on wire as u64)
+    pub amount_le: u64,
 }
 
 impl StealthOutput {
@@ -59,47 +50,23 @@ impl StealthOutput {
         );
         v.extend_from_slice(&self.one_time_pk);
         v.extend_from_slice(&self.kyber_ct);
-        v.extend_from_slice(&self.enc_sk_nonce);
-        v.extend_from_slice(&self.enc_one_time_sk);
+        v.extend_from_slice(&self.amount_le.to_le_bytes());
         v
     }
 
     /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver Dilithium PK.
-    pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, amount: u64) -> Result<DiliSk> {
+    pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, chain_id32: &[u8;32]) -> Result<DiliSk> {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
         let shared = decapsulate(&ct, kyber_sk);
-        let commitment = commitment_of_stealth_ct(ct.as_bytes());
-        let seed = derive_stealth_seed(shared.as_bytes(), receiver_dili_pk, &commitment, amount);
-        // Without deterministic Dilithium seed keygen, we only validate AEAD decryption and log mismatch against provided pk
-        // by re-hashing; the pk cannot be reconstructed from seed. We retain the AEAD key = seed property.
-        if false {
-            let ct_h = blake3_hash(ct.as_bytes());
-            let want_h = blake3_hash(&self.one_time_pk);
-            let got_h = want_h;
-            eprintln!(
-                "❌ Stealth KDF mismatch: KyberCT={}, to.one_time_pk={}, derived_pk={}",
-                hex::encode(ct_h), hex::encode(want_h), hex::encode(got_h)
-            );
+        let value_tag = self.amount_le.to_le_bytes();
+        let seed = stealth_seed_v1(shared.as_bytes(), receiver_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
+        let (derived_pk, derived_sk) = dilithium3_seeded_keypair(seed);
+        // Constant-time compare
+        if subtle::ConstantTimeEq::ct_eq(derived_pk.as_bytes(), &self.one_time_pk).unwrap_u8() != 1 {
+            return Err(anyhow!("Derived OTP pk mismatch"));
         }
-        let aead_key = seed; // 32 bytes
-        let cipher = Aes256GcmSiv::new_from_slice(&aead_key)
-            .expect("key length is 32");
-        let plaintext = cipher.decrypt(
-            self.enc_sk_nonce.as_slice().into(),
-            Payload {
-                msg: &self.enc_one_time_sk,
-                // bind decryption to one_time_pk to prevent cross-swap
-                aad: &self.one_time_pk,
-            },
-        ).map_err(|_| anyhow!("Failed to decrypt one-time Dilithium SK"))?;
-
-        let mut sk_bytes = [0u8; DILITHIUM3_SK_BYTES];
-        if plaintext.len() != DILITHIUM3_SK_BYTES {
-            return Err(anyhow!("Unexpected SK length"));
-        }
-        sk_bytes.copy_from_slice(&plaintext);
-        let sk = DiliSk::from_bytes(&sk_bytes)
+        let sk = DiliSk::from_bytes(derived_sk.as_bytes())
             .context("Invalid Dilithium3 SK bytes")?;
         Ok(sk)
     }
@@ -135,13 +102,14 @@ pub struct Spend {
 }
 
 impl Spend {
-    /// Authorization bytes: root || nullifier || commitment || coin_id
+    /// Authorization bytes: root || nullifier || commitment || coin_id || to.canonical_bytes()
     pub fn auth_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(32 + 32 + 32 + 32);
+        let mut v = Vec::with_capacity(32 + 32 + 32 + 32 + self.to.canonical_bytes().len());
         v.extend_from_slice(&self.root);
         v.extend_from_slice(&self.nullifier);
         v.extend_from_slice(&self.commitment);
         v.extend_from_slice(&self.coin_id);
+        v.extend_from_slice(&self.to.canonical_bytes());
         v
     }
 
@@ -157,36 +125,21 @@ impl Spend {
         recipient_dili_pk: &DiliPk,
         recipient_kyber_pk: &KyberPk,
         amount: u64,
+        chain_id32: &[u8; 32],
     ) -> Result<Self> {
-        // Kyber encapsulation returns (shared_secret, ciphertext)
         let (shared, ct) = encapsulate(recipient_kyber_pk);
-        // Derive commitment from Kyber CT to avoid circular dependency
         let commitment = commitment_of_stealth_ct(ct.as_bytes());
-        // OTP key is random from scheme; AEAD key remains deterministic from canonical seed
-        let (ot_pk, ot_sk) = pqcrypto_dilithium::dilithium3::keypair();
-        let ot_pk_bytes = ot_pk.as_bytes();
-        let ot_sk_bytes = ot_sk.as_bytes();
-
-        // AEAD key = canonical seed shared between sender and receiver
-        let aead_key = derive_stealth_seed(shared.as_bytes(), recipient_dili_pk, &commitment, amount);
-        let cipher = Aes256GcmSiv::new_from_slice(&aead_key).expect("key length is 32");
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
-        let enc = cipher.encrypt(
-            nonce.as_slice().into(),
-            Payload { msg: ot_sk_bytes, aad: ot_pk_bytes },
-        ).map_err(|_| anyhow!("AEAD encrypt one-time SK failed"))?;
-        if enc.len() != DILITHIUM3_SK_BYTES + 16 { return Err(anyhow!("Unexpected AEAD ciphertext length")); }
-        let mut enc_sk = [0u8; DILITHIUM3_SK_BYTES + 16];
-        enc_sk.copy_from_slice(&enc);
+        let value_tag = amount.to_le_bytes();
+        let chain_id = chain_id32;
+        let seed = stealth_seed_v1(shared.as_bytes(), recipient_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id);
+        let (ot_pk, _ot_sk) = dilithium3_seeded_keypair(seed);
 
         let mut to = StealthOutput {
             one_time_pk: [0u8; DILITHIUM3_PK_BYTES],
             kyber_ct: [0u8; KYBER_CT_BYTES],
-            enc_sk_nonce: nonce,
-            enc_one_time_sk: enc_sk,
+            amount_le: amount,
         };
-        to.one_time_pk.copy_from_slice(ot_pk_bytes);
+        to.one_time_pk.copy_from_slice(ot_pk.as_bytes());
         to.kyber_ct.copy_from_slice(ct.as_bytes());
 
         // Commitment was defined as H(kyber_ct)
@@ -292,7 +245,9 @@ impl Spend {
             return Err(anyhow!("Nullifier mismatch"));
         }
 
-        // 8) Basic sanity of `to`
+        // 8) Basic sanity of `to` (strict size checks before parsing)
+        if self.to.one_time_pk.len() != DILITHIUM3_PK_BYTES { return Err(anyhow!("Invalid one-time pk length")); }
+        if self.to.kyber_ct.len() != KYBER_CT_BYTES { return Err(anyhow!("Invalid Kyber ct length")); }
         let _ = DiliPk::from_bytes(&self.to.one_time_pk).context("Invalid one-time pk")?;
         let _ = KyberCt::from_bytes(&self.to.kyber_ct).context("Invalid Kyber ct")?;
 

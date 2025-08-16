@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use anyhow::{Result, Context};
 use hex;
 use std::sync::Arc;
+use serde::Deserialize;
 use std::collections::HashSet;
 // use std::process; // removed unused
 
@@ -20,6 +21,14 @@ pub struct Store {
 
 // Global counter to ensure unique database paths
 static DB_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Encrypted OTP secret key record (version 1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtpSkRecordV1 {
+    pub salt: [u8; 16],
+    pub nonce: [u8; 24],
+    pub ct: Vec<u8>,
+}
 
 impl Store {
     /// Perform database health check and recovery
@@ -88,6 +97,8 @@ impl Store {
             "anchor",
             "spend",
             "nullifier",
+            "otp_sk",
+            "otp_index",
             "peers",
         ];
         
@@ -457,6 +468,86 @@ impl Store {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None => Ok(None),
         }
+    }
+
+    /// Returns the chain id (32 bytes) derived from the genesis anchor hash (epoch 0).
+    /// Errors if the genesis anchor is not yet available.
+    pub fn get_chain_id(&self) -> Result<[u8; 32]> {
+        let genesis: Option<crate::epoch::Anchor> = self.get("epoch", &0u64.to_le_bytes())?;
+        match genesis {
+            Some(a) => Ok(a.hash),
+            None => anyhow::bail!("Genesis anchor not found; chain id unavailable"),
+        }
+    }
+
+    // (moved to module scope below)
+
+    /// Store a one-time secret key under pk_hash if absent. Returns Ok(()) even if already present.
+    pub fn put_otp_sk_if_absent(&self, pk_hash: &[u8;32], sk_bytes: &[u8]) -> Result<()> {
+        use rand::RngCore;
+        use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, NewAead}, XNonce, Key};
+        use rand::rngs::OsRng;
+        use argon2::{Argon2, Params};
+
+        let cf = self.db.cf_handle("otp_sk").ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
+        if self.db.get_cf(cf, pk_hash)?.is_some() { return Ok(()); }
+
+        // Derive encryption key for OTP SKs from unified passphrase
+        let pass = crate::crypto::unified_passphrase(Some("Enter pass-phrase to protect OTP keys:"))?;
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let params = Params::new(256 * 1024, 3, 1, None).map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?; // 256 MiB, 3 iters, lanes=1
+        let mut key_bytes = [0u8; 32];
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(pass.as_bytes(), &salt, &mut key_bytes)
+            .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+        let mut nonce = [0u8; 24]; OsRng.fill_bytes(&mut nonce);
+        let ct = cipher.encrypt(XNonce::from_slice(&nonce), sk_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt OTP SK: {}", e))?;
+        key_bytes.iter_mut().for_each(|b| *b = 0);
+
+        let rec = OtpSkRecordV1 { salt, nonce, ct };
+        let ser = bincode::serialize(&rec)?;
+        self.db.put_cf(cf, pk_hash, &ser)?;
+        Ok(())
+    }
+
+    /// Retrieve and decrypt a one-time secret key by pk_hash
+    pub fn get_otp_sk(&self, pk_hash: &[u8;32]) -> Result<Option<Vec<u8>>> {
+        use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, NewAead}, XNonce, Key};
+        use argon2::{Argon2, Params};
+
+        let cf = self.db.cf_handle("otp_sk").ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
+        let Some(v) = self.db.get_cf(cf, pk_hash)? else { return Ok(None) };
+        let rec: OtpSkRecordV1 = bincode::deserialize(&v)?;
+        let pass = crate::crypto::unified_passphrase(Some("Enter pass-phrase to unlock OTP keys:"))?;
+        let params = Params::new(256 * 1024, 3, 1, None).map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?;
+        let mut key_bytes = [0u8; 32];
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(pass.as_bytes(), &rec.salt, &mut key_bytes)
+            .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+        let pt = cipher.decrypt(XNonce::from_slice(&rec.nonce), rec.ct.as_ref())
+            .map_err(|_| anyhow::anyhow!("Failed to decrypt OTP SK (wrong passphrase?)"))?;
+        key_bytes.iter_mut().for_each(|b| *b = 0);
+        Ok(Some(pt))
+    }
+
+    /// Index coin_id -> pk_hash to locate OTP SK for spends later
+    pub fn put_otp_index(&self, coin_id: &[u8;32], pk_hash: &[u8;32]) -> Result<()> {
+        let cf = self.db.cf_handle("otp_index").ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
+        self.db.put_cf(cf, coin_id, pk_hash)?;
+        Ok(())
+    }
+
+    pub fn get_otp_pk_hash_for_coin(&self, coin_id: &[u8;32]) -> Result<Option<[u8;32]>> {
+        let cf = self.db.cf_handle("otp_index").ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
+        if let Some(v) = self.db.get_cf(cf, coin_id)? {
+            if v.len() == 32 { let mut h=[0u8;32]; h.copy_from_slice(&v); return Ok(Some(h)); }
+        }
+        Ok(None)
     }
 
     /// Persist a peer multiaddr string into the peers CF (deduped by key)

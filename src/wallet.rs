@@ -8,7 +8,6 @@ use pqcrypto_dilithium::dilithium3::{
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
 use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
-use pqcrypto_traits::kem::SharedSecret as KyberSharedSecretTrait; // enables SharedSecret::as_bytes()
 use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
 use serde::{Serialize, Deserialize};
@@ -30,7 +29,7 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     XChaCha20Poly1305, Key, XNonce,
 };
-use aes_gcm_siv::{aead::{Aead as _, KeyInit as _}};
+// no AEAD usage in deterministic OTP flow
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rpassword;
@@ -223,13 +222,21 @@ impl Wallet {
 
         // --- Brand new wallet ---
         println!("✨ No wallet found, creating a new one...");
-        let (pk, sk) = crypto::dilithium3_keypair();
-        let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
-        let address = crypto::address_from_pk(&pk);
-
+        // Deterministic-only: derive seed for wallet master key deterministically from passphrase and salt
         let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
+        let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
+            .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
+        let mut seed = [0u8; 32];
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut seed)
+            .map_err(|e| anyhow!("Argon2id seed derivation failed: {}", e))?;
+        let (pk, sk) = crypto::dilithium3_seeded_keypair(seed);
+        let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
+        let address = crypto::address_from_pk(&pk);
+
+        // passphrase and salt are already set above for deterministic seed
 
         let mut key = [0u8; 32];
         let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
@@ -368,7 +375,8 @@ impl Wallet {
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 // If there is a V2 spend recorded, the current owner is the recipient of that spend
                 if let Some(sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
+                    let chain_id = store.get_chain_id()?;
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         utxos.push(coin);
                     }
                     continue;
@@ -391,10 +399,15 @@ impl Wallet {
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        // Verify OTP matches deterministic KDF; amount is coin value
+        // Verify OTP matches deterministic KDF
         let coin: Option<crate::coin::Coin> = store.get("coin", &spend.coin_id)?;
         if let Some(coin) = coin {
-            if spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
+            let chain_id = store.get_chain_id()?;
+            if let Ok(sk) = spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
+                // Persist OTP SK for this output (idempotent)
+                let pk_hash = crate::crypto::blake3_hash(&spend.to.one_time_pk);
+                store.put_otp_sk_if_absent(&pk_hash, sk.as_bytes())?;
+                store.put_otp_index(&coin.id, &pk_hash)?;
                 // Invariants: coin exists; spending updates are already recorded under CFs
                 // Nothing to write here; scanning functions will reflect ownership.
                 // Log once for visibility
@@ -424,7 +437,8 @@ impl Wallet {
                 // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
                 let v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
                 if let Some(sp) = v2 {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
+                    let chain_id = store.get_chain_id()?;
+                    if let Ok(_sk) = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
                         sum = sum.saturating_add(coin.value);
                     }
                     continue;
@@ -583,11 +597,50 @@ impl Wallet {
                 }
             }
 
-            // Determine current owner (pk, sk): genesis owner is this wallet.
-            let (owner_pk, owner_sk) = (self.pk.clone(), self.sk.clone());
+            // Determine current owner (pk, sk): prefer last V2 spend's OTP key, else genesis creator
+            let (owner_pk, owner_sk) = {
+                // If we have an OTP index entry, use it; otherwise attempt recovery for last spend; fallback to genesis owner
+                let last_spend: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
+                if let Some(sp) = last_spend {
+                    // Owner is OTP pk from last spend
+                    let pk = PublicKey::from_bytes(&sp.to.one_time_pk)
+                        .context("Invalid one-time pk in last spend")?;
+                    // Try fetch persisted SK
+                    if let Some(pk_hash) = store.get_otp_pk_hash_for_coin(&coin.id)? {
+                        if let Some(sk_bytes) = store.get_otp_sk(&pk_hash)? {
+                            let sk = SecretKey::from_bytes(&sk_bytes)
+                                .map_err(|_| anyhow!("Corrupted stored OTP SK for coin"))?;
+                            (pk, sk)
+                        } else {
+                            // Derive on-the-fly and persist
+                            let chain_id = store.get_chain_id()?;
+                            let sk = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id)
+                                .context("Failed to derive OTP SK for our coin")?;
+                            let pk_hash = crate::crypto::blake3_hash(&sp.to.one_time_pk);
+                            store.put_otp_sk_if_absent(&pk_hash, sk.as_bytes())?;
+                            store.put_otp_index(&coin.id, &pk_hash)?;
+                            (pk, sk)
+                        }
+                    } else {
+                        // No index; derive and persist
+                        let chain_id = store.get_chain_id()?;
+                        let sk = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id)
+                            .context("Failed to derive OTP SK for our coin")?;
+                        let pk_hash = crate::crypto::blake3_hash(&sp.to.one_time_pk);
+                        store.put_otp_sk_if_absent(&pk_hash, sk.as_bytes())?;
+                        store.put_otp_index(&coin.id, &pk_hash)?;
+                        (pk, sk)
+                    }
+                } else if coin.creator_address == self.address {
+                    (self.pk.clone(), self.sk.clone())
+                } else {
+                    // Not owned by this wallet
+                    continue;
+                }
+            };
 
             // Build and broadcast V2 Spend
-            let mut spend = crate::transfer::Spend::create(
+            let spend = crate::transfer::Spend::create(
                 coin.id,
                 &anchor_used,
                 proof_used.expect("proof must be present after local or network path"),
@@ -596,6 +649,7 @@ impl Wallet {
                 &recipient_dili_pk,
                 &recipient_kyber_pk,
                 coin.value,
+                &store.get_chain_id()?,
             )?;
             // Encryption already canonical in Spend::create
             spend.validate(&store)?;
@@ -652,7 +706,8 @@ impl Wallet {
                 }
 
                 // Incoming (to me)? If we can recover the one-time SK via canonical KDF, it's ours.
-                if spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
+                let chain_id = store.get_chain_id()?;
+                if let Ok(_sk) = spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,
