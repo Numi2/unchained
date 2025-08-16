@@ -7,7 +7,7 @@
 //! Only V2 spends are gossiped/served.
 
 use crate::{
-    storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::{Transfer, Spend}, crypto, config, sync::SyncState,
+    storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Spend, crypto, config, sync::SyncState,
 };
 use crate::consensus::{
     calculate_retarget_consensus,
@@ -168,11 +168,7 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
     Ok(())
 }
 
-#[allow(dead_code)]
-fn validate_transfer(tx: &Transfer, db: &Store) -> Result<(), String> {
-    // Delegate to the canonical validator implemented in transfer.rs (legacy, local-only)
-    tx.validate(db).map_err(|e| e.to_string())
-}
+// (Legacy V1 transfer validation removed)
 
 #[allow(dead_code)]
 fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
@@ -218,16 +214,7 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
             }
         }
     }
-    // b) legacy transfer
-    if verified_pk.is_none() {
-        if let Ok(Some(t)) = db.get::<Transfer>("transfer", &sp.coin_id) {
-            if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&t.to.one_time_pk) {
-                if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
-                    verified_pk = Some(pk);
-                }
-            }
-        }
-    }
+    // (Legacy V1 transfer owner fallback removed)
     // c) genesis creator
     if verified_pk.is_none() && coin.creator_pk != [0u8; crate::crypto::DILITHIUM3_PK_BYTES] {
         if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&coin.creator_pk) {

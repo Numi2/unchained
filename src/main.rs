@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
 use anyhow;
+use std::io::{self, Write};
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
@@ -40,11 +41,9 @@ enum Cmd {
             bind: String,
         },
     Send {
-        /// Recipient stealth address (base64-url, from `wallet export-stealth-address`)
+        /// Use interactive mode (prompts for stealth address and amount)
         #[arg(long)]
-        stealth: String,
-        #[arg(long)]
-        amount: u64,
+        stealth: bool,
     },
     Balance,
     History,
@@ -339,15 +338,173 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
         }
-        Some(Cmd::Send { stealth, amount }) => {
-            println!("💰 Sending {} coins to stealth recipient", amount);
-            match wallet.send_to_stealth_address(stealth, *amount, &net).await {
-                Ok(outcome) => {
-                    let total = outcome.transfers.len() + outcome.spends.len();
-                    println!("✅ Sent {} records ({} legacy transfers, {} spends)", total, outcome.transfers.len(), outcome.spends.len());
-                    for (i, t) in outcome.transfers.iter().enumerate() {
-                        println!("  V1 transfer {}: coin {} -> {}", i + 1, hex::encode(t.coin_id), hex::encode(t.recipient()));
+        Some(Cmd::Send { stealth: _ }) => {
+            // Enable quiet network logging for interactive send
+            network::set_quiet_logging(true);
+            
+            // Give a moment for quiet logging to take effect and clear any pending output
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            // Clear screen or add visual separation
+            println!("\n\n\n");
+            println!("{}", "=".repeat(60));
+            println!("💰 Interactive Send Command");
+            println!("{}", "=".repeat(60));
+            println!();
+            
+            // Pause network activity during interactive input
+            println!("⏸️  Pausing network activity for clean input...");
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            
+            // Prompt for stealth address
+            println!("📤 Enter recipient's stealth address:");
+            println!("   (You can paste a long base64-encoded address)");
+            println!("   Or type 'file:' followed by a filename to read from file");
+            println!("   Or type 'test' to use the test address from test_stealth_address.txt");
+            print!("   Address: ");
+            io::stdout().flush()?;
+            
+            // Use a more robust input method for long addresses
+            println!("   💡 For very long addresses, consider using:");
+            println!("      - 'test' to use the test address");
+            println!("      - 'file:filename' to read from a file");
+            println!("      - Or paste the address in chunks (press Enter after each chunk)");
+            println!();
+            
+            let mut stealth = String::new();
+            let mut chunk_count = 0;
+            
+            loop {
+                chunk_count += 1;
+                print!("   Address chunk {}: ", chunk_count);
+                io::stdout().flush()?;
+                
+                let mut chunk = String::new();
+                io::stdin().read_line(&mut chunk)?;
+                let chunk = chunk.trim();
+                
+                if chunk.is_empty() {
+                    if chunk_count == 1 {
+                        eprintln!("   ❌ Address cannot be empty");
+                        return Ok(());
                     }
+                    break; // Empty line means we're done
+                }
+                
+                stealth.push_str(chunk);
+                
+                // If this looks like a complete address (ends with typical base64 padding), or if user wants to stop
+                if chunk.ends_with("==") || chunk.ends_with("=") || chunk.len() < 100 {
+                    print!("   ✅ Address appears complete. Press Enter to continue or type 'more' to add more: ");
+                    io::stdout().flush()?;
+                    let mut continue_input = String::new();
+                    io::stdin().read_line(&mut continue_input)?;
+                    if continue_input.trim() != "more" {
+                        break;
+                    }
+                }
+                
+                println!("   📝 Chunk {} added ({} chars total)", chunk_count, stealth.len());
+            }
+            
+            let stealth = stealth.trim().to_string();
+            
+            let stealth = if stealth == "test" {
+                match std::fs::read_to_string("test_stealth_address.txt") {
+                    Ok(content) => content.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("❌ Failed to read test file 'test_stealth_address.txt': {}", e);
+                        return Ok(());
+                    }
+                }
+            } else if stealth.starts_with("file:") {
+                let filename = &stealth[5..].trim();
+                match std::fs::read_to_string(filename) {
+                    Ok(content) => content.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("❌ Failed to read file '{}': {}", filename, e);
+                        return Ok(());
+                    }
+                }
+            } else {
+                stealth
+            };
+            
+            if stealth.is_empty() {
+                eprintln!("❌ Stealth address cannot be empty");
+                return Ok(());
+            }
+            
+            // Validate stealth address format (should be base64-url safe)
+            if !stealth.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                eprintln!("❌ Invalid stealth address format. Expected base64-url safe characters only.");
+                return Ok(());
+            }
+            
+            println!("   ✅ Address length: {} characters", stealth.len());
+            
+            // Ask if user wants to save this address for future use
+            print!("   💾 Save this address to a file for future use? (y/N): ");
+            io::stdout().flush()?;
+            let mut save_choice = String::new();
+            io::stdin().read_line(&mut save_choice)?;
+            let save_choice = save_choice.trim().to_lowercase();
+            
+            if save_choice == "y" || save_choice == "yes" {
+                print!("   📁 Enter filename to save address: ");
+                io::stdout().flush()?;
+                let mut filename = String::new();
+                io::stdin().read_line(&mut filename)?;
+                let filename = filename.trim();
+                
+                if !filename.is_empty() {
+                    match std::fs::write(filename, &stealth) {
+                        Ok(_) => println!("   ✅ Address saved to '{}'", filename),
+                        Err(e) => eprintln!("   ❌ Failed to save address: {}", e),
+                    }
+                }
+            }
+            
+            println!();
+            
+            // Prompt for amount
+            print!("💰 Enter amount to send: ");
+            io::stdout().flush()?;
+            let mut amount_str = String::new();
+            io::stdin().read_line(&mut amount_str)?;
+            let amount_str = amount_str.trim();
+            
+            let amount = match amount_str.parse::<u64>() {
+                Ok(amt) => amt,
+                Err(_) => {
+                    eprintln!("❌ Invalid amount. Please enter a valid number.");
+                    return Ok(());
+                }
+            };
+            
+            if amount == 0 {
+                eprintln!("❌ Amount must be greater than 0");
+                return Ok(());
+            }
+            
+            println!();
+            
+            // Confirm the transaction
+            println!("📋 Transaction Summary:");
+            println!("  Recipient: {}", stealth);
+            println!("  Amount: {} coins", amount);
+            println!();
+            print!("✅ Press Enter to confirm and send, or Ctrl+C to cancel: ");
+            io::stdout().flush()?;
+            
+            let mut confirm = String::new();
+            io::stdin().read_line(&mut confirm)?;
+            
+            println!("\n🚀 Sending {} coins to stealth recipient...", amount);
+            match wallet.send_to_stealth_address(&stealth, amount, &net).await {
+                Ok(outcome) => {
+                    let total = outcome.spends.len();
+                    println!("✅ Sent {} spend{}", total, if total == 1 { "" } else { "s" });
                     for (i, s) in outcome.spends.iter().enumerate() {
                         println!("  V2 spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
                     }

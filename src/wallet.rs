@@ -374,19 +374,9 @@ impl Wallet {
                     continue;
                 }
 
-                // Else determine owner via legacy transfer or genesis
-                let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-                match last_tx {
-                    None => {
-                        if coin.creator_address == self.address {
-                            utxos.push(coin);
-                        }
-                    }
-                    Some(t) => {
-                        if t.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
-                            utxos.push(coin);
-                        }
-                    }
+                // Else determine owner via genesis (no legacy transfers)
+                if coin.creator_address == self.address {
+                    utxos.push(coin);
                 }
             }
         }
@@ -439,19 +429,9 @@ impl Wallet {
                     }
                     continue;
                 }
-                // Else look at legacy transfer chain if present
-                let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-                match last_tx {
-                    Some(t) => {
-                        if t.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
-                            sum = sum.saturating_add(coin.value);
-                        }
-                    }
-                    None => {
-                        if coin.creator_address == self.address {
-                            sum = sum.saturating_add(coin.value);
-                        }
-                    }
+                // Else genesis owner is the creator
+                if coin.creator_address == self.address {
+                    sum = sum.saturating_add(coin.value);
                 }
             }
         }
@@ -484,7 +464,7 @@ impl Wallet {
         _to: crate::crypto::Address,
         _amount: u64,
         _network: &crate::network::NetHandle,
-    ) -> Result<Vec<crate::transfer::Transfer>> {
+    ) -> Result<Vec<crate::transfer::Spend>> {
         Err(anyhow!("send_transfer(Address, ...) is deprecated. Use send_to_stealth_address(stealth_address, amount, network)"))
     }
 
@@ -501,7 +481,6 @@ impl Wallet {
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         let coins_to_spend = self.select_inputs(amount)?;
-        let transfers = Vec::new();
         let mut spends = Vec::new();
 
         for coin in coins_to_spend {
@@ -604,23 +583,8 @@ impl Wallet {
                 }
             }
 
-            // Determine current owner (pk, sk):
-            // - If legacy transfer exists, owner_pk = last one-time pk; recover owner_sk via Kyber
-            // - Else, coin was created by this wallet: owner_pk/sk = wallet keys
-            let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
-            let (owner_pk, owner_sk) = if let Some(last) = last_tx {
-                // Recover one-time SK, and take PK directly from last transfer
-                match last.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value) {
-                    Ok(sk) => {
-                        let pk = PublicKey::from_bytes(&last.to.one_time_pk)
-                            .context("Invalid one-time pk in last transfer")?;
-                        (pk, sk)
-                    }
-                    Err(_) => { continue; }
-                }
-            } else {
-                (self.pk.clone(), self.sk.clone())
-            };
+            // Determine current owner (pk, sk): genesis owner is this wallet.
+            let (owner_pk, owner_sk) = (self.pk.clone(), self.sk.clone());
 
             // Build and broadcast V2 Spend
             let mut spend = crate::transfer::Spend::create(
@@ -648,52 +612,18 @@ impl Wallet {
             network.gossip_spend(&spend).await;
             spends.push(spend);
         }
-        Ok(SendOutcome { transfers, spends })
+        Ok(SendOutcome { spends })
     }
 
-    /// Gets all transfers involving this wallet (as sender or recipient)
-    pub fn get_transfers(&self) -> Result<Vec<crate::transfer::Transfer>> {
-        let store = self
-            ._db
-            .upgrade()
-            .ok_or_else(|| anyhow!("Database connection dropped"))?;
-
-        let transfer_mgr = crate::transfer::TransferManager::new(store);
-        // Fallback: scan DB and filter by involvement
-        let cf = transfer_mgr.db.db.cf_handle("transfer")
-            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
-        let iter = transfer_mgr.db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut v = Vec::new();
-        for item in iter {
-            let (_k, value) = item?;
-            if let Ok(t) = bincode::deserialize::<crate::transfer::Transfer>(&value) {
-                if t.is_to(&self.address()) || t.is_from(&self.address())? {
-                    v.push(t);
-                }
-            }
-        }
-        Ok(v)
-    }
+    // (Legacy transfers listing removed)
 
     /// Gets the transaction history for this wallet
     pub fn get_transaction_history(&self) -> Result<Vec<TransactionRecord>> {
-        let transfers = self.get_transfers()?;
+        // Legacy transfers removed
         let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
         let mut history = Vec::new();
 
-        // Legacy V1 transfers
-        for transfer in transfers {
-            let is_sender = transfer.is_from(&self.address)?;
-            let record = TransactionRecord {
-                coin_id: transfer.coin_id,
-                transfer_hash: transfer.hash(),
-                timestamp: std::time::SystemTime::now(),
-                is_sender,
-                amount: 1,
-                counterparty: if is_sender { transfer.recipient() } else { transfer.sender()? },
-            };
-            history.push(record);
-        }
+        // (No V1 transfers)
 
         // V2 spends (outgoing and incoming)
         let cf = store.db.cf_handle("spend").ok_or_else(|| anyhow!("'spend' column family missing"))?;
@@ -709,8 +639,7 @@ impl Wallet {
                         continue;
                     }
                 };
-                let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &spend.coin_id)?;
-                let prev_owner_addr = last_tx.as_ref().map(|t| t.recipient()).unwrap_or(coin.creator_address);
+                let prev_owner_addr = coin.creator_address;
 
                 // Compute transfer_hash for display as H(auth_bytes)
                 let tx_hash = crypto::blake3_hash(&spend.auth_bytes());
@@ -760,9 +689,8 @@ pub struct TransactionRecord {
     pub counterparty: crate::crypto::Address,
 }
 
-/// Outcome of a send operation including both legacy transfers and V2 spends.
+/// Outcome of a send operation (V2 spends only).
 #[derive(Debug, Clone)]
 pub struct SendOutcome {
-    pub transfers: Vec<crate::transfer::Transfer>,
     pub spends: Vec<crate::transfer::Spend>,
 }

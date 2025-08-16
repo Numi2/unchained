@@ -86,7 +86,6 @@ impl Store {
             "head",
             "wallet",
             "anchor",
-            "transfer",
             "spend",
             "nullifier",
             "peers",
@@ -339,10 +338,9 @@ impl Store {
         let mut unspent_coins = Vec::new();
         
         for coin in coins {
-            // Check if coin is spent
-            let legacy_spent: Option<crate::transfer::Transfer> = self.get("transfer", &coin.id)?;
+            // Check if coin is spent via V2 only
             let v2_spent: Option<crate::transfer::Spend> = self.get("spend", &coin.id)?;
-            if legacy_spent.is_none() && v2_spent.is_none() { unspent_coins.push(coin); }
+            if v2_spent.is_none() { unspent_coins.push(coin); }
         }
         
         Ok(unspent_coins)
@@ -577,7 +575,7 @@ impl Store {
     /// Gets statistics about the database
     pub fn get_stats(&self) -> Result<DatabaseStats> {
         let coin_count = self.coin_count()?;
-        let transfer_count = self.transfer_count()?;
+        let transfer_count = self.spend_count()?;
         let epoch_count = self.epoch_count()?;
         
         Ok(DatabaseStats {
@@ -587,10 +585,10 @@ impl Store {
         })
     }
 
-    /// Gets the total number of transfers in the database
-    pub fn transfer_count(&self) -> Result<u64> {
-        let cf = self.db.cf_handle("transfer")
-            .ok_or_else(|| anyhow::anyhow!("'transfer' column family missing"))?;
+    /// Gets the total number of spends in the database
+    pub fn spend_count(&self) -> Result<u64> {
+        let cf = self.db.cf_handle("spend")
+            .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let count = iter.count() as u64;

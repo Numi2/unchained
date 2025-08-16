@@ -20,4 +20,5 @@ pub use crypto::{Address, blake3_hash, argon2id_pow, address_from_pk, dilithium3
 pub use storage::Store;
 pub use epoch::{Anchor, MerkleTree};
 pub use wallet::Wallet;
-pub use transfer::Transfer;
+// Legacy Transfer removed; export only Spend
+pub use transfer::Spend;

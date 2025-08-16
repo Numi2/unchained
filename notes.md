@@ -64,10 +64,10 @@ Add sync metrics for orphan buffer size and range request progress; bound orphan
 
 ### Transfers and spends
 - **Spend rules**:
-  - A `Transfer` references a confirmed coin (requires inclusion proof at spend time).
-  - Signature: Dilithium3 over canonical bytes; `prev_tx_hash` should refer to the last transfer (enable multi-hop spend chains), not just `coin_id`.
+  - V2 `Spend` references a confirmed coin with an inclusion proof at spend time.
+  - Signature: Dilithium3 over authorization bytes; ownership is defined by previous spend or genesis.
 - **Mempool**:
-  - Accept only transfers that spend confirmed coins and pass sig/ownership checks.
+  - Accept only spends that spend confirmed coins and pass proof/sig/ownership checks.
   - Fee optional; if you keep fee-less, rate-limit and prioritize by age/size to prevent spam.
 
 ### Storage and data layout

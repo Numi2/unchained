@@ -2,8 +2,7 @@
 // Copyright 2025 The Unchained Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stealth transfer implementation (V1 kept read-only; V2 is active).
-//! V1 transfers are no longer produced or gossiped. Use V2 `Spend`.
+//! Stealth transfer implementation (V2 only).
 
 use serde::{Serialize, Deserialize};
 use serde_big_array::BigArray;
@@ -112,193 +111,7 @@ impl StealthOutput {
         Ok(address_from_pk(&pk))
     }
 }
-
-// ------------ Transfer V1 (legacy; read-only) ------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Transfer {
-    pub coin_id: [u8; 32],
-    // Sender's Dilithium3 full public key (reveals current owner)
-    #[serde(with = "BigArray")]
-    pub sender_pk: [u8; DILITHIUM3_PK_BYTES],
-    // Stealth output to new owner
-    pub to: StealthOutput,
-    // Previous tx hash in this coin's chain
-    pub prev_tx_hash: [u8; 32],
-    // Dilithium3 signature by current owner over canonical bytes
-    #[serde(with = "BigArray")]
-    pub sig: [u8; DILITHIUM3_SIG_BYTES],
-    // Nullifier for uniqueness (derived from signature; stored & checked by nodes)
-    pub nullifier: [u8; 32],
-}
-
-impl Transfer {
-    /// Canonical bytes-to-sign: coin_id ‖ sender_pk ‖ to.canonical_bytes() ‖ prev_tx_hash
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(
-            32 + DILITHIUM3_PK_BYTES + self.to.canonical_bytes().len() + 32
-        );
-        v.extend_from_slice(&self.coin_id);
-        v.extend_from_slice(&self.sender_pk);
-        v.extend_from_slice(&self.to.canonical_bytes());
-        v.extend_from_slice(&self.prev_tx_hash);
-        v
-    }
-
-    /// BLAKE3 hash of canonical signing bytes (tx id / commitment)
-    pub fn hash(&self) -> [u8; 32] {
-        blake3_hash(&self.signing_bytes())
-    }
-
-    /// Recipient's one-time address (derived from one-time pk)
-    pub fn recipient(&self) -> Address {
-        self.to.recipient_address().expect("one-time pk already validated")
-    }
-
-    /// Sender's address (derived from sender pk)
-    pub fn sender(&self) -> Result<Address> {
-        let sender_pk = DiliPk::from_bytes(&self.sender_pk)
-            .context("Invalid sender public key")?;
-        Ok(address_from_pk(&sender_pk))
-    }
-
-    /// Validate legacy transfer locally (read-only path).
-    /// - Reject if a V2 spend exists for the coin.
-    /// - Validate signature, prev hash, basic stealth fields.
-    /// - Recompute and enforce nullifier_v1.
-    pub fn validate(&self, db: &crate::storage::Store) -> Result<()> {
-        // Reject if already spent via V2
-        if db.get::<crate::transfer::Spend>("spend", &self.coin_id)?
-            .is_some() {
-            return Err(anyhow!("Coin already spent (V2)"));
-        }
-
-        // 1) coin exists
-        let coin: crate::coin::Coin = db.get("coin", &self.coin_id)
-            .context("Failed to query coin")?
-            .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
-
-        // 2) determine current owner + expected prev hash
-        let last_tx: Option<Transfer> = db.get("transfer", &self.coin_id)
-            .context("Failed to query transfer")?;
-        let (expected_owner_addr, expected_prev_hash) = match last_tx {
-            Some(ref t) => (t.recipient(), t.hash()),
-            None => (coin.creator_address, self.coin_id),
-        };
-
-        // 3) sender is current owner
-        let sender_pk = DiliPk::from_bytes(&self.sender_pk)
-            .context("Invalid sender public key")?;
-        let sender_addr = address_from_pk(&sender_pk);
-        if sender_addr != expected_owner_addr {
-            return Err(anyhow!("Sender is not current owner"));
-        }
-
-        // 4) signature valid
-        let sig = DetachedSignature::from_bytes(&self.sig)
-            .context("Invalid signature format")?;
-        verify_detached_signature(&sig, &self.signing_bytes(), &sender_pk)
-            .map_err(|_| anyhow!("Invalid signature"))?;
-
-        // 5) prev-tx chain
-        if self.prev_tx_hash != expected_prev_hash {
-            return Err(anyhow!("Invalid prev_tx_hash"));
-        }
-
-        // 6) basic stealth output sanity
-        let _ = DiliPk::from_bytes(&self.to.one_time_pk)
-            .context("Invalid one-time pk")?;
-        let _ = KyberCt::from_bytes(&self.to.kyber_ct)
-            .context("Invalid Kyber ct")?;
-
-        // 7) nullifier unseen
-        let seen: Option<[u8; 1]> = db.get("nullifier", &self.nullifier)
-            .context("Failed to query nullifier")?;
-        if seen.is_some() {
-            return Err(anyhow!("Nullifier already seen (possible double spend)"));
-        }
-
-        // 8) Recompute and enforce nullifier_v1 = H("nullifier_v1" || coin_id || sig)
-        let mut preimage = Vec::with_capacity(12 + 32 + DILITHIUM3_SIG_BYTES);
-        preimage.extend_from_slice(b"nullifier_v1");
-        preimage.extend_from_slice(&self.coin_id);
-        preimage.extend_from_slice(&self.sig);
-        let expected = blake3_hash(&preimage);
-        if self.nullifier != expected {
-            return Err(anyhow!("Nullifier mismatch"));
-        }
-
-        Ok(())
-    }
-
-    /// Apply transfer: store tx and mark nullifier seen. (Legacy local apply)
-    pub fn apply(&self, db: &crate::storage::Store) -> Result<()> {
-        db.put("transfer", &self.coin_id, self)
-            .context("Failed to store transfer")?;
-        db.put("nullifier", &self.nullifier, &[1u8; 1])
-            .context("Failed to store nullifier")?;
-        Ok(())
-    }
-
-    /// Convenience checks
-    pub fn is_to(&self, addr: &Address) -> bool { &self.recipient() == addr }
-    pub fn is_from(&self, addr: &Address) -> Result<bool> { Ok(self.sender()? == *addr) }
-}
-
-// ------------ Transfer Manager (V1 disabled for sending) ------------
-
-pub struct TransferManager {
-    pub(crate) db: std::sync::Arc<crate::storage::Store>,
-}
-
-impl TransferManager {
-    pub fn new(db: std::sync::Arc<crate::storage::Store>) -> Self { Self { db } }
-
-    pub fn get_transfer_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<Transfer>> {
-        self.db.get("transfer", coin_id)
-    }
-
-    pub fn is_coin_spent(&self, coin_id: &[u8; 32]) -> Result<bool> {
-        // Consider a coin spent if either a V2 spend exists or a legacy transfer exists
-        if self.db.get::<crate::transfer::Spend>("spend", coin_id)?.is_some() { return Ok(true); }
-        Ok(self.get_transfer_for_coin(coin_id)?.is_some())
-    }
-
-    /// Legacy V1 send path is disabled. Use V2 Spend.
-    pub async fn send_stealth_transfer(
-        &self,
-        _coin_id: [u8; 32],
-        _sender_pk: DiliPk,
-        _sender_sk: &DiliSk,
-        _recipient_kyber_pk: &KyberPk,
-        _network: &crate::network::NetHandle,
-    ) -> Result<Transfer> {
-        Err(anyhow!("Legacy V1 transfers are disabled. Use V2 Spend::create/apply."))
-    }
-
-    /// Optional: scan all transfers to find those addressed to you (by Kyber SK).
-    pub fn scan_for_me(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk) -> Result<Vec<(Transfer, DiliSk)>> {
-        let cf = self.db.db.cf_handle("transfer")
-            .ok_or_else(|| anyhow!("'transfer' column family missing"))?;
-        let iter = self.db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-
-        let mut found = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            if let Ok(t) = bincode::deserialize::<Transfer>(&value) {
-                if let Ok(sk) = t.to.try_recover_one_time_sk(kyber_sk, receiver_dili_pk, 1) {
-                    // Confirm that addr(one_time_pk) matches computed recipient
-                    let addr = t.recipient();
-                    let pk = DiliPk::from_bytes(&t.to.one_time_pk)?;
-                    if address_from_pk(&pk) == addr {
-                        found.push((t, sk));
-                    }
-                }
-            }
-        }
-        Ok(found)
-    }
-}
+// (Legacy V1 transfer has been fully removed.)
 
 // ------------ Spend-key-blinded nullifier (V2) ------------
 
@@ -438,11 +251,9 @@ impl Spend {
             return Err(anyhow!("Nullifier already seen (double spend)"));
         }
 
-        // 6) Determine expected current owner (prefer last V2 spend, else legacy transfer, else creator)
+        // 6) Determine expected current owner (prefer last V2 spend, else creator)
         let last_spend: Option<Spend> = db.get("spend", &self.coin_id)
             .context("Failed to query last spend")?;
-        let last_transfer: Option<Transfer> = db.get("transfer", &self.coin_id)
-            .context("Failed to query legacy transfer")?;
 
         let sig = DetachedSignature::from_bytes(&self.sig)
             .context("Invalid spend signature format")?;
@@ -458,16 +269,7 @@ impl Spend {
                 }
             }
         }
-        // b) Else, if there was a legacy transfer, the owner is its one-time pk
-        if verified_pk.is_none() {
-            if let Some(t) = &last_transfer {
-                if let Ok(pk) = DiliPk::from_bytes(&t.to.one_time_pk) {
-                    if verify_detached_signature(&sig, &self.auth_bytes(), &pk).is_ok() {
-                        verified_pk = Some(pk);
-                    }
-                }
-            }
-        }
+        // (Legacy V1 transfer support removed)
         // c) Else genesis owner is the coin creator
         if verified_pk.is_none() && coin.creator_pk != [0u8; DILITHIUM3_PK_BYTES] {
             if let Ok(pk) = DiliPk::from_bytes(&coin.creator_pk) {
@@ -503,8 +305,4 @@ impl Spend {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TransferRecord {
-    V1(Transfer),
-    V2(Spend),
-}
+// (Legacy TransferRecord variant removed)

@@ -223,8 +223,7 @@ cargo run --release --bin unchained -- send --stealth <STEALTH_ADDR> --amount 1
 ```
 
 The wallet will:
-- Use a legacy V1 transfer once for any coin that has never moved (to establish an owner one‑time key)
-- Use V2 spends thereafter (Merkle‑anchored, blinded nullifier)
+- Use V2 spends (Merkle‑anchored, blinded nullifier) for all transfers
 
 ## V2 spend (PQ and practical)
 
@@ -421,8 +420,7 @@ cargo run --release --bin unchained -- send --stealth <STEALTH_ADDR> --amount 1
 ```
 
 The wallet will:
-- Use a legacy V1 transfer once for any coin that has never moved (to establish an owner one‑time key)
-- Use V2 spends thereafter (Merkle‑anchored, blinded nullifier)
+- Use V2 spends (Merkle‑anchored, blinded nullifier) for all transfers
 
 ## V2 spend (PQ and practical)
 
@@ -614,14 +612,14 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
 
 ### Transfers and stealth addresses
 - Stealth address format exports `(recipient_addr, Dilithium pk, Kyber pk, signature over "stealth_addr_v1" || addr || kyber_pk)`. Parsing validates the sig and reconstructs the Kyber pk.
-- Legacy Transfer (V1): sender reveals Dilithium pk and signs over the transfer body; publishes a stealth output that includes a one-time Dilithium key and a Kyber ciphertext encrypting the one-time SK under the shared secret (KEM+AEAD).
-- V2 Spend: replaces V1 with a proof-bearing spend that commits to the stealth output and includes a nullifier bound to the spending secret and coin id, plus a Merkle proof of inclusion.
+- V2 Spend: commits to the stealth output and includes a nullifier bound to the spending secret and coin id, plus a Merkle proof of inclusion. This replaces V1 entirely.
 
 Key parts:
-```142:216:/Users/numan/unchained/src/transfer.rs
-pub fn create_stealth(...) -> Result<Self> { ... }  // V1 legacy transfer
+```362:513:/Users/numan/unchained/src/transfer.rs
+pub struct Spend { coin_id, root, proof, commitment, nullifier, sig, to }
 ...
-pub fn validate(&self, db: &Store) -> Result<()> { ... }  // signature, ownership, prev-tx, nullifier uniqueness
+pub fn create(...) -> Result<Self> { ... }
+pub fn validate(&self, db: &Store) -> Result<()> { ... }
 ```
 
 ```362:513:/Users/numan/unchained/src/transfer.rs
@@ -684,7 +682,7 @@ pub struct Coin { id, value, epoch_hash, nonce, creator_address, creator_pk }
   - Consider anchor-level PoW or define cumulative work as a function of actually selected coins (e.g., sum of −log2(pow_hash/2^256) or equivalent).
   - Enforce minimum non-empty epochs after genesis to prevent empty-epoch grinding, or discount empty epochs in cumulative work.
 - Transaction model
-  - Complete migration to V2 spends; keep V1 only for backward-compat. Add fees and change outputs or coin-splitting to handle arbitrary amounts and reduce UTXO bloat if values >1 are used.
+  - V2 spends only. Add fees and change outputs or coin-splitting to handle arbitrary amounts and reduce UTXO bloat if values >1 are used.
   - Add replay protection across reorgs: ensure nullifiers remain unique across forks (e.g., commit epoch root or anchor hash into nullifier preimage or nullifier set semantics).
 - Privacy
   - For V1, sender_pk leaks identity. Encourage V2 by default and deprecate V1 in networking accept rules over time.
@@ -706,7 +704,7 @@ pub struct Coin { id, value, epoch_hash, nonce, creator_address, creator_pk }
 ### Quick answers to your focal questions
 - PoW performed: Argon2id over header (prev epoch hash, nonce, creator address), lanes=1, salt from BLAKE3(header). Solution criterion: leading zero bytes equal to difficulty.
 - Coin selection per epoch: from candidates referencing prev anchor, filter by prev difficulty, choose up to cap smallest pow_hash, commit their ids via a sorted-leaf BLAKE3 Merkle tree into the anchor.
-- Transfers: Legacy V1 reveals sender pk and uses stealth output; V2 Spend proves coin inclusion, authorizes with current owner SK, commits to new stealth output, and publishes a nullifier to prevent double spends.
+- Transfers: V2 Spend proves coin inclusion, authorizes with current owner SK, commits to new stealth output, and publishes a nullifier to prevent double spends.
 - Stealth addresses/transfers: Recipient publishes Dilithium+Kyber pair with a signed descriptor; sender KEM-encapsulates to recipient’s Kyber pk and delivers a one-time Dilithium key encrypted under AEAD; recipient decapsulates to recover the SK. Address for recipient is derived from the one-time pk.
 - Coin structure: `Coin{id, value, epoch_hash, nonce, creator_address, creator_pk}`, minted with `value=1` by convention; `CoinCandidate` adds `pow_hash`.
 
