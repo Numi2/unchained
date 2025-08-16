@@ -104,7 +104,7 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
 }
 
 /// Deterministically generate a Dilithium3 keypair from a 32-byte seed.
-/// Uses liboqs (ML-DSA-65) with a custom deterministic RNG fed by the seed.
+/// Uses liboqs (Dilithium-3) with a custom deterministic RNG fed by the seed.
 pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     // Global critical section: liboqs randombytes callback is global; prevent races
     static KEYGEN_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
@@ -167,9 +167,9 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     // Override liboqs RNG with our deterministic provider
     unsafe { OQS_randombytes_custom_algorithm(Some(oqs_custom_randombytes)); }
 
-    // Generate ML-DSA-65 keypair deterministically
-    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65)
-        .expect("liboqs ML-DSA-65 not available");
+    // Generate Dilithium-3 keypair deterministically
+    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::Dilithium3)
+        .expect("liboqs Dilithium-3 not available");
     let (oqs_pk, oqs_sk) = sig.keypair().expect("liboqs keypair failed");
     let pk_bytes = oqs_pk.as_ref();
     let sk_bytes = oqs_sk.as_ref();
@@ -183,8 +183,8 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     }
 
     // Convert to pqcrypto_dilithium types
-    assert_eq!(pk_bytes.len(), DILITHIUM3_PK_BYTES, "ML-DSA-65 pk size mismatch");
-    assert_eq!(sk_bytes.len(), DILITHIUM3_SK_BYTES, "ML-DSA-65 sk size mismatch");
+    assert_eq!(pk_bytes.len(), DILITHIUM3_PK_BYTES, "Dilithium-3 pk size mismatch");
+    assert_eq!(sk_bytes.len(), DILITHIUM3_SK_BYTES, "Dilithium-3 sk size mismatch");
     let dili_pk = PublicKey::from_bytes(pk_bytes).expect("invalid Dilithium3 public key bytes");
     let dili_sk = SecretKey::from_bytes(sk_bytes).expect("invalid Dilithium3 secret key bytes");
     (dili_pk, dili_sk)

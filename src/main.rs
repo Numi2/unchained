@@ -439,6 +439,8 @@ async fn main() -> anyhow::Result<()> {
             }
             
             let stealth = stealth.trim().to_string();
+            // Be tolerant to accidental surrounding quotes/backticks
+            let stealth = stealth.trim_matches('"').trim_matches('\'').trim_matches('`').to_string();
             
             let stealth = if stealth == "test" {
                 match std::fs::read_to_string("test_stealth_address.txt") {
@@ -450,6 +452,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else if stealth.starts_with("file:") {
                 let filename = &stealth[5..].trim();
+                // Tolerate quoted filenames like file:"/path" or file:'/path'
+                let filename = filename.trim_matches('"').trim_matches('\'').trim_matches('`');
                 match std::fs::read_to_string(filename) {
                     Ok(content) => content.trim().to_string(),
                     Err(e) => {
@@ -466,8 +470,8 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             
-            // Validate stealth address format (should be base64-url safe)
-            if !stealth.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            // Validate stealth address format (should be base64-url safe; tolerate padding '=')
+            if !stealth.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=') {
                 eprintln!("❌ Invalid stealth address format. Expected base64-url safe characters only.");
                 return Ok(());
             }

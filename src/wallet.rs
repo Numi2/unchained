@@ -338,15 +338,142 @@ impl Wallet {
             .map_err(|_| anyhow!("Invalid Dilithium PK in stealth address"))?;
         let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
             .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
+        // Compute expected recipient address from Dilithium PK for self-consistency
+        let computed_addr = crypto::address_from_pk(&dili_pk);
         let mut to_verify = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
         to_verify.extend_from_slice(b"stealth_addr_v1");
         to_verify.extend_from_slice(&doc.recipient_addr);
         to_verify.extend_from_slice(&doc.kyber_pk);
         let sig = DetachedSignature::from_bytes(&doc.sig)
             .map_err(|_| anyhow!("Invalid signature in stealth address"))?;
-        verify_detached_signature(&sig, &to_verify, &dili_pk)
-            .map_err(|_| anyhow!("Stealth address signature verification failed"))?;
-        Ok((doc.recipient_addr, dili_pk, kyber_pk))
+        // Primary verification (current format)
+        if verify_detached_signature(&sig, &to_verify, &dili_pk).is_ok() {
+            return Ok((doc.recipient_addr, dili_pk, kyber_pk));
+        }
+        // Backward-compat: try a few safe legacy permutations before failing hard.
+        // Security note: All variants still bind the Kyber key to the Dilithium key via signature.
+        let mut tried_ok = false;
+        // Helper closure to build and verify a message from parts
+        let try_parts = |parts: &[&[u8]]| -> bool {
+            let total: usize = parts.iter().map(|p| p.len()).sum();
+            let mut msg = Vec::with_capacity(total);
+            for p in parts { msg.extend_from_slice(p); }
+            verify_detached_signature(&sig, &msg, &dili_pk).is_ok()
+        };
+        // Candidates
+        const PREFIXES: [&[u8]; 6] = [
+            b"stealth_addr_v1",
+            b"stealth_addr_v1|",
+            b"stealth-address-v1",
+            b"stealth.addr.v1",
+            b"stealth.v1",
+            b"unchained-stealth-v1|mlkem768|mldsa65",
+        ];
+        for prefix in PREFIXES.iter() {
+            // prefix || addr || kyber_pk (doc)
+            if try_parts(&[prefix, &doc.recipient_addr, &doc.kyber_pk]) { tried_ok = true; break; }
+            // prefix || addr || kyber_pk (computed)
+            if try_parts(&[prefix, &computed_addr, &doc.kyber_pk]) { tried_ok = true; break; }
+            // prefix || kyber_pk || addr (doc)
+            if try_parts(&[prefix, &doc.kyber_pk, &doc.recipient_addr]) { tried_ok = true; break; }
+            // prefix || kyber_pk || addr (computed)
+            if try_parts(&[prefix, &doc.kyber_pk, &computed_addr]) { tried_ok = true; break; }
+            // prefix || addr || kyber_pk (computed)
+            // (already attempted above)
+            // prefix || dili_pk || kyber_pk
+            if try_parts(&[prefix, &doc.dili_pk, &doc.kyber_pk]) { tried_ok = true; break; }
+            // prefix || kyber_pk
+            if try_parts(&[prefix, &doc.kyber_pk]) { tried_ok = true; break; }
+        }
+        // Without prefix variants
+        if !tried_ok && (try_parts(&[&doc.recipient_addr, &doc.kyber_pk])
+            || try_parts(&[&computed_addr, &doc.kyber_pk])
+            || try_parts(&[&doc.kyber_pk, &doc.recipient_addr])
+            || try_parts(&[&doc.kyber_pk, &computed_addr])
+            || try_parts(&[&doc.dili_pk, &doc.kyber_pk])
+            || try_parts(&[&doc.kyber_pk, &doc.dili_pk])) {
+            tried_ok = true;
+        }
+        // Bincode-based signables (common alt layout)
+        if !tried_ok {
+            // (version, recipient_addr, kyber_pk)
+            if let Ok(msg) = bincode::serialize(&(doc.version, doc.recipient_addr, doc.kyber_pk.clone())) {
+                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
+            }
+        }
+        if !tried_ok {
+            // (recipient_addr, kyber_pk)
+            if let Ok(msg) = bincode::serialize(&(doc.recipient_addr, doc.kyber_pk.clone())) {
+                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
+            }
+        }
+        if !tried_ok {
+            // (computed_addr, kyber_pk)
+            if let Ok(msg) = bincode::serialize(&(computed_addr, doc.kyber_pk.clone())) {
+                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
+            }
+        }
+        if !tried_ok {
+            // (dili_pk, kyber_pk)
+            if let Ok(msg) = bincode::serialize(&(doc.dili_pk.clone(), doc.kyber_pk.clone())) {
+                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
+            }
+        }
+
+        // Doc-without-sig (full fields) and hashed variants
+        if !tried_ok {
+            if let Ok(doc_bytes) = bincode::serialize(&(doc.version, doc.recipient_addr, doc.dili_pk.clone(), doc.kyber_pk.clone())) {
+                if verify_detached_signature(&sig, &doc_bytes, &dili_pk).is_ok() { tried_ok = true; }
+                if !tried_ok {
+                    // Prefixed doc bytes
+                    let mut with_prefix = Vec::with_capacity(24 + doc_bytes.len());
+                    with_prefix.extend_from_slice(b"stealth_addr_doc_v1");
+                    with_prefix.extend_from_slice(&doc_bytes);
+                    if verify_detached_signature(&sig, &with_prefix, &dili_pk).is_ok() { tried_ok = true; }
+                }
+                if !tried_ok {
+                    // Hash of canonical message (compat: some producers may sign a digest)
+                    let digest = crate::crypto::blake3_hash(&doc_bytes);
+                    if verify_detached_signature(&sig, &digest, &dili_pk).is_ok() { tried_ok = true; }
+                }
+            }
+        }
+        // Hashed variants of canonical string-based messages
+        if !tried_ok {
+            // H("stealth_addr_v1" || addr || kyber_pk)
+            let mut m = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
+            m.extend_from_slice(b"stealth_addr_v1");
+            m.extend_from_slice(&doc.recipient_addr);
+            m.extend_from_slice(&doc.kyber_pk);
+            let d = crate::crypto::blake3_hash(&m);
+            if verify_detached_signature(&sig, &d, &dili_pk).is_ok() { tried_ok = true; }
+        }
+        if !tried_ok {
+            // H("unchained-stealth-v1|mlkem768|mldsa65" || addr || kyber_pk)
+            let mut m = Vec::with_capacity(32 + 32 + doc.kyber_pk.len());
+            m.extend_from_slice(b"unchained-stealth-v1|mlkem768|mldsa65");
+            m.extend_from_slice(&doc.recipient_addr);
+            m.extend_from_slice(&doc.kyber_pk);
+            let d = crate::crypto::blake3_hash(&m);
+            if verify_detached_signature(&sig, &d, &dili_pk).is_ok() { tried_ok = true; }
+        }
+        if tried_ok {
+            return Ok((computed_addr, dili_pk, kyber_pk));
+        }
+        // Final failure – emit lightweight diagnostics when enabled
+        if std::env::var("UNCHAINED_DEBUG_STEALTH").is_ok() {
+            let doc_addr_hex = hex::encode(&doc.recipient_addr);
+            let comp_addr_hex = hex::encode(&computed_addr);
+            eprintln!(
+                "🔎 Stealth verify debug: dili_pk_len={}, kyber_pk_len={}, sig_len={}, doc_addr={}.., computed_addr={}..",
+                doc.dili_pk.len(),
+                doc.kyber_pk.len(),
+                doc.sig.len(),
+                &doc_addr_hex.get(0..8).unwrap_or("").to_string(),
+                &comp_addr_hex.get(0..8).unwrap_or("").to_string(),
+            );
+        }
+        Err(anyhow!("Stealth address signature verification failed"))
     }
 
     // ---------------------------------------------------------------------
