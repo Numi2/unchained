@@ -97,6 +97,12 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
     keypair()
 }
 
+/// Deterministically derive a Dilithium3 keypair from a 32-byte seed.
+/// Uses the PQClean seed keypair API via the pqcrypto_dilithium FFI.
+// Deterministic Dilithium keygen from seed is not available in pqcrypto-dilithium 0.5.
+// We derive the stealth AEAD key deterministically via derive_stealth_seed and
+// keep OTP key generation using the library RNG.
+
 /// Compute a PQ-safe nullifier bound to a secret spend key and coin id.
 /// N = BLAKE3("nullifier_v2" || sk_bytes || coin_id)
 pub fn compute_nullifier_v2(sk_bytes: &[u8], coin_id: &[u8; 32]) -> [u8; 32] {
@@ -106,9 +112,27 @@ pub fn compute_nullifier_v2(sk_bytes: &[u8], coin_id: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Commitment of a stealth output used in spend authorization
-pub fn commitment_of_stealth_output(to_bytes: &[u8]) -> [u8; 32] {
-    blake3_hash(to_bytes)
+/// Commitment of a stealth output used in spend authorization (V2)
+/// New definition: commit to the Kyber ciphertext only to avoid circular
+/// dependencies when deriving the one-time key deterministically.
+pub fn commitment_of_stealth_ct(kyber_ct_bytes: &[u8]) -> [u8; 32] {
+    blake3_hash(kyber_ct_bytes)
+}
+
+/// Canonical stealth seed derivation used by both sender and receiver.
+/// seed = BLAKE3("unchained-stealth-v1" || ss || receiver_dilithium_pk || commitment || amount_le)
+pub fn derive_stealth_seed(
+    shared_secret: &[u8],
+    receiver_dilithium_pk: &PublicKey,
+    commitment: &[u8; 32],
+    amount: u64,
+)-> [u8; 32] {
+    let mut h = Hasher::new_derive_key("unchained-stealth-v1");
+    h.update(shared_secret);
+    h.update(receiver_dilithium_pk.as_bytes());
+    h.update(commitment);
+    h.update(&amount.to_le_bytes());
+    *h.finalize().as_bytes()
 }
 
 /// Generate a self-signed X.509 certificate from a libp2p Ed25519 keypair

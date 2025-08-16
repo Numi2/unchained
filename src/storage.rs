@@ -5,6 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use anyhow::{Result, Context};
 use hex;
 use std::sync::Arc;
+use std::collections::HashSet;
 // use std::process; // removed unused
 
 // Using bincode for fast, compact binary serialization instead of JSON.
@@ -99,11 +100,6 @@ impl Store {
         // Target file size for compaction levels
         cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
         // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
-        
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
-            .collect();
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -144,6 +140,34 @@ impl Store {
         db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
         db_opts.set_max_subcompactions(4);
         
+        // Discover any existing column families to ensure compatibility with older DBs
+        let existing_cfs: Vec<String> = match DB::list_cf(&db_opts, &db_path) {
+            Ok(names) => names,
+            Err(_)
+                // New database paths may not have any CF metadata yet; default to an empty list
+                => Vec::new(),
+        };
+
+        // Union of existing CFs and required CFs
+        let mut cf_name_set: HashSet<String> = existing_cfs.into_iter().collect();
+        for name in cf_names.iter() {
+            cf_name_set.insert((*name).to_string());
+        }
+        // Ensure 'default' is always present
+        cf_name_set.insert("default".to_string());
+
+        // Build descriptors from the unified list. Keep a stable order: 'default' first, then others sorted.
+        let mut final_cf_names: Vec<String> = cf_name_set.into_iter().collect();
+        final_cf_names.sort();
+        if let Some(pos) = final_cf_names.iter().position(|n| n == "default") {
+            let default = final_cf_names.remove(pos);
+            final_cf_names.insert(0, default);
+        }
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = final_cf_names
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.clone(), cf_opts.clone()))
+            .collect();
+
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors)
             .with_context(|| format!("Failed to open database at '{db_path}'"))?;
 

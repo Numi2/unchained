@@ -8,6 +8,7 @@ use pqcrypto_dilithium::dilithium3::{
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
 use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
+use pqcrypto_traits::kem::SharedSecret as KyberSharedSecretTrait; // enables SharedSecret::as_bytes()
 use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
 use serde::{Serialize, Deserialize};
@@ -29,6 +30,7 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     XChaCha20Poly1305, Key, XNonce,
 };
+use aes_gcm_siv::{aead::{Aead as _, KeyInit as _}};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rpassword;
@@ -309,7 +311,7 @@ impl Wallet {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
+    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, PublicKey, KyberPk)> {
         // Be tolerant to surrounding whitespace and accidental padding from clipboard
         let s = addr_str.trim();
         // Strip common accidental wrappers
@@ -337,7 +339,7 @@ impl Wallet {
             .map_err(|_| anyhow!("Invalid signature in stealth address"))?;
         verify_detached_signature(&sig, &to_verify, &dili_pk)
             .map_err(|_| anyhow!("Stealth address signature verification failed"))?;
-        Ok((doc.recipient_addr, kyber_pk))
+        Ok((doc.recipient_addr, dili_pk, kyber_pk))
     }
 
     // ---------------------------------------------------------------------
@@ -366,7 +368,7 @@ impl Wallet {
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 // If there is a V2 spend recorded, the current owner is the recipient of that spend
                 if let Some(sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
                         utxos.push(coin);
                     }
                     continue;
@@ -381,7 +383,7 @@ impl Wallet {
                         }
                     }
                     Some(t) => {
-                        if t.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                        if t.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
                             utxos.push(coin);
                         }
                     }
@@ -389,6 +391,27 @@ impl Wallet {
             }
         }
         Ok(utxos)
+    }
+
+    /// Deterministically process a received spend for this wallet (idempotent).
+    /// - If our Kyber SK can derive the OTP SK using our Dilithium PK and amount, we consider it ours.
+    /// - Inserts coin ownership into wallet view implicitly through balance/list_unspent logic.
+    pub fn scan_spend_for_me(&self, spend: &crate::transfer::Spend) -> Result<()> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        // Verify OTP matches deterministic KDF; amount is coin value
+        let coin: Option<crate::coin::Coin> = store.get("coin", &spend.coin_id)?;
+        if let Some(coin) = coin {
+            if spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
+                // Invariants: coin exists; spending updates are already recorded under CFs
+                // Nothing to write here; scanning functions will reflect ownership.
+                // Log once for visibility
+                println!("📥 Detected incoming spend for me: coin {} value {}", hex::encode(coin.id), coin.value);
+            }
+        }
+        Ok(())
     }
 
     /// Sum of `value` across all coins where current owner is this wallet
@@ -411,7 +434,7 @@ impl Wallet {
                 // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
                 let v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
                 if let Some(sp) = v2 {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
                         sum = sum.saturating_add(coin.value);
                     }
                     continue;
@@ -420,7 +443,7 @@ impl Wallet {
                 let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
                 match last_tx {
                     Some(t) => {
-                        if t.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                        if t.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
                             sum = sum.saturating_add(coin.value);
                         }
                     }
@@ -472,7 +495,7 @@ impl Wallet {
         amount: u64,
         network: &crate::network::NetHandle,
     ) -> Result<SendOutcome> {
-        let (_recipient_addr, recipient_kyber_pk) = Self::parse_and_verify_stealth_address(stealth_address_str)?;
+        let (_recipient_addr, recipient_dili_pk, recipient_kyber_pk) = Self::parse_and_verify_stealth_address(stealth_address_str)?;
         let store = self
             ._db
             .upgrade()
@@ -587,7 +610,7 @@ impl Wallet {
             let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &coin.id)?;
             let (owner_pk, owner_sk) = if let Some(last) = last_tx {
                 // Recover one-time SK, and take PK directly from last transfer
-                match last.to.try_recover_one_time_sk(&self.kyber_sk) {
+                match last.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value) {
                     Ok(sk) => {
                         let pk = PublicKey::from_bytes(&last.to.one_time_pk)
                             .context("Invalid one-time pk in last transfer")?;
@@ -600,7 +623,7 @@ impl Wallet {
             };
 
             // Build and broadcast V2 Spend
-            let spend = crate::transfer::Spend::create(
+            let mut spend = crate::transfer::Spend::create(
                 coin.id,
                 &anchor_used,
                 proof_used.expect("proof must be present after local or network path"),
@@ -608,6 +631,18 @@ impl Wallet {
                 &owner_sk,
                 &recipient_kyber_pk,
             )?;
+            // AEAD key = canonical seed; OTP pk stays as created in Spend::create
+            let (shared, _ct) = pqcrypto_kyber::kyber768::encapsulate(&recipient_kyber_pk);
+            let commitment = crate::crypto::commitment_of_stealth_ct(&spend.to.kyber_ct);
+            let seed = crate::crypto::derive_stealth_seed(shared.as_bytes(), &recipient_dili_pk, &commitment, coin.value);
+            // Re-encrypt existing SK under seed-derived AEAD key with existing nonce and AAD=current OTP pk
+            let cipher = aes_gcm_siv::Aes256GcmSiv::new_from_slice(&seed).expect("seed length");
+            let enc = cipher.encrypt(
+                spend.to.enc_sk_nonce.as_slice().into(),
+                aes_gcm_siv::aead::Payload { msg: &spend.to.enc_one_time_sk[..DILITHIUM3_SK_BYTES], aad: &spend.to.one_time_pk },
+            ).map_err(|_| anyhow!("AEAD encrypt one-time SK failed"))?;
+            if enc.len() != DILITHIUM3_SK_BYTES + 16 { return Err(anyhow!("Unexpected AEAD ciphertext length")); }
+            spend.to.enc_one_time_sk.copy_from_slice(&enc);
             spend.validate(&store)?;
             spend.apply(&store)?;
             network.gossip_spend(&spend).await;
@@ -667,7 +702,13 @@ impl Wallet {
             let (_k, value) = item?;
             if let Ok(spend) = bincode::deserialize::<crate::transfer::Spend>(&value) {
                 // Determine previous owner address
-                let coin = store.get::<crate::coin::Coin>("coin", &spend.coin_id)?.ok_or_else(|| anyhow!("Coin not found for spend"))?;
+                let coin = match store.get::<crate::coin::Coin>("coin", &spend.coin_id)? {
+                    Some(c) => c,
+                    None => {
+                        // Reorg or partial data: skip this spend in history view
+                        continue;
+                    }
+                };
                 let last_tx: Option<crate::transfer::Transfer> = store.get("transfer", &spend.coin_id)?;
                 let prev_owner_addr = last_tx.as_ref().map(|t| t.recipient()).unwrap_or(coin.creator_address);
 
@@ -690,8 +731,8 @@ impl Wallet {
                     continue;
                 }
 
-                // Incoming (to me)? If we can recover the one-time SK, it's ours.
-                if spend.to.try_recover_one_time_sk(&self.kyber_sk).is_ok() {
+                // Incoming (to me)? If we can recover the one-time SK via canonical KDF, it's ours.
+                if spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,

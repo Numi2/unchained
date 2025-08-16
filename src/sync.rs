@@ -32,6 +32,7 @@ pub fn spawn(
     has_bootstrap: bool,
 ) {
     let mut anchor_rx: Receiver<Anchor> = net.anchor_subscribe();
+    let mut spend_rx = net.spend_subscribe();
 
     task::spawn(async move {
         let mut local_epoch = db.get::<Anchor>("epoch", b"latest").unwrap_or_default().map_or(0, |a| a.num);
@@ -136,6 +137,20 @@ pub fn spawn(
                                 net.request_spend(id).await;
                             }
                         }
+
+                        // Additionally, heal orphaned spends (spend present without its coin)
+                        if let Some(sp_cf) = db.db.cf_handle("spend") {
+                            let iter = db.db.iterator_cf(sp_cf, rocksdb::IteratorMode::Start);
+                            for item in iter {
+                                if let Ok((_k, v)) = item {
+                                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                                        if db.get::<crate::coin::Coin>("coin", &sp.coin_id).unwrap_or(None).is_none() {
+                                            net.request_coin(sp.coin_id).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -148,6 +163,9 @@ pub fn spawn(
                             local_epoch = anchor.num;
                         }
                     }
+                }
+                Ok(_sp) = spend_rx.recv() => {
+                    // Wallet rescan hook point; wallet scans are dynamic via list_unspent/balance.
                 }
             }
         }

@@ -192,8 +192,8 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     let leaf = crate::coin::Coin::id_to_leaf_hash(&sp.coin_id);
     if !crate::epoch::MerkleTree::verify_proof(&leaf, &sp.proof, &sp.root) { return Err("Invalid Merkle proof".into()); }
 
-    // Commitment check – ensure canonical bytes are used exclusively
-    let expected_commitment = crate::crypto::commitment_of_stealth_output(&sp.to.canonical_bytes());
+    // Commitment check – must be H(kyber_ct)
+    let expected_commitment = crate::crypto::commitment_of_stealth_ct(&sp.to.kyber_ct);
     if expected_commitment != sp.commitment { return Err("Commitment mismatch".into()); }
 
     // Nullifier seen?
@@ -352,6 +352,7 @@ pub struct SelectedIdsBundle {
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
     proof_tx: broadcast::Sender<CoinProofResponse>,
+    spend_tx: broadcast::Sender<Spend>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
@@ -473,34 +474,11 @@ pub async fn spawn(
 
     let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // Also try dialing any previously stored peers
-    if let Ok(addrs) = db.load_peer_addrs() {
-        let mut dialed = 0usize;
-        let cap = net_cfg.max_peers as usize;
-        for addr in addrs {
-            if dialed >= cap { break; }
-            if net_cfg.bootstrap.contains(&addr) { continue; }
-            // Basic filter: only dial /ip4/*/udp/*/quic-v1/p2p/<id>
-            if !addr.starts_with("/ip4/") || !addr.contains("/udp/") || !addr.contains("/quic-v1/") || !addr.contains("/p2p/") { continue; }
-            // Avoid dialing ourselves if persisted
-            if let Some(id_str) = addr.split("/p2p/").last() { if id_str == swarm.local_peer_id().to_string() { continue; } }
-            if let Some(ip_str) = addr.split('/').nth(3) {
-                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
-            }
-            if let Ok(maddr) = addr.parse::<Multiaddr>() {
-                if connected_peers.lock().unwrap().len() + dialed < cap {
-                    net_log!("🔗 Dialing stored peer: {}", addr);
-                    let _ = swarm.dial(maddr);
-                    dialed += 1;
-                } else { break; }
-            }
-        }
-    }
-
+    let (spend_tx, _) = broadcast::channel(1024);
     let (anchor_tx, _) = broadcast::channel(256);
     let (proof_tx, _) = broadcast::channel(256);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -621,11 +599,14 @@ pub async fn spawn(
         }
 
         // Adopt: overwrite epochs and latest pointer; reconcile per-epoch selected/leaves/coins
-        let epoch_cf  = db.db.cf_handle("epoch").expect("epoch CF");
-        let anchor_cf = db.db.cf_handle("anchor").expect("anchor CF");
-        let sel_cf    = db.db.cf_handle("epoch_selected").expect("epoch_selected CF");
-        let leaves_cf = db.db.cf_handle("epoch_leaves").expect("epoch_leaves CF");
-        let coin_cf   = db.db.cf_handle("coin").expect("coin CF");
+        let epoch_cf      = db.db.cf_handle("epoch").expect("epoch CF");
+        let anchor_cf     = db.db.cf_handle("anchor").expect("anchor CF");
+        let sel_cf        = db.db.cf_handle("epoch_selected").expect("epoch_selected CF");
+        let leaves_cf     = db.db.cf_handle("epoch_leaves").expect("epoch_leaves CF");
+        let coin_cf       = db.db.cf_handle("coin").expect("coin CF");
+        let coin_epoch_cf = db.db.cf_handle("coin_epoch").expect("coin_epoch CF");
+        let spend_cf      = db.db.cf_handle("spend").expect("spend CF");
+        let nullifier_cf  = db.db.cf_handle("nullifier").expect("nullifier CF");
         let mut batch = WriteBatch::default();
 
         let mut parent = resolved_parent.expect("parent must be set when chosen_chain is non-empty");
@@ -639,7 +620,15 @@ pub async fn spawn(
             // 2) Remove previously confirmed coins that belonged to the replaced chain at this epoch
             if let Ok(prev_selected_ids) = db.get_selected_coin_ids_for_epoch(alt.num) {
                 for id in prev_selected_ids {
+                    // Remove coin object
                     batch.delete_cf(coin_cf, &id);
+                    // Remove coin->epoch index
+                    batch.delete_cf(coin_epoch_cf, &id);
+                    // If we had a spend recorded for this coin on the old branch, remove it and its nullifier
+                    if let Ok(Some(sp)) = db.get::<crate::transfer::Spend>("spend", &id) {
+                        batch.delete_cf(spend_cf, &id);
+                        batch.delete_cf(nullifier_cf, &sp.nullifier);
+                    }
                 }
             }
 
@@ -704,6 +693,8 @@ pub async fn spawn(
                     if let Ok(bytes) = bincode::serialize(&coin) {
                         batch.put_cf(coin_cf, &coin.id, &bytes);
                     }
+                    // Maintain coin->epoch index for spend validation and wallet lookups
+                    batch.put_cf(coin_epoch_cf, &coin.id, &alt.num.to_le_bytes());
                 }
                 for coin_id in &selected_ids {
                     let mut key = Vec::with_capacity(8 + 32);
@@ -771,13 +762,7 @@ pub async fn spawn(
                                     let ok_public = addr.starts_with("/ip4/") && addr.contains("/udp/") && addr.contains("/quic-v1/");
                                     if ok_public {
                                         if let Some(ip_str) = addr.split('/').nth(3) {
-                                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                                if !ip.is_private() && !ip.is_loopback() {
-                                                    if let Ok(data) = bincode::serialize(&addr) {
-                                                        try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
-                                                    }
-                                                }
-                                            }
+                                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
                                         }
                                     }
                                 }
@@ -1118,6 +1103,10 @@ pub async fn spawn(
                                                 }
                                                 batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]);
                                                 let _ = db.db.write(batch);
+                                            }
+                                            // Hard invariant: after a confirmed spend is processed, coin must exist
+                                            if db.get::<Coin>("coin", &sp.coin_id).ok().flatten().is_none() {
+                                                eprintln!("❌ Invariant violated: spend applied but coin missing: {}", hex::encode(sp.coin_id));
                                             }
 
                                             // Try to apply any buffered successor spends in order
@@ -1600,6 +1589,7 @@ impl Network {
     pub async fn request_spend(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestSpend(id)); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
+    pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> { self.spend_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }

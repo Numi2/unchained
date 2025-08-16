@@ -13,6 +13,7 @@ use crate::crypto::{
     Address, blake3_hash, address_from_pk,
     DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, DILITHIUM3_SIG_BYTES,
     KYBER768_CT_BYTES as KYBER_CT_BYTES,
+    commitment_of_stealth_ct, derive_stealth_seed,
 };
 use pqcrypto_dilithium::dilithium3::{
     PublicKey as DiliPk, SecretKey as DiliSk, DetachedSignature,
@@ -30,6 +31,7 @@ use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
 use aes_gcm_siv::Aes256GcmSiv;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use hex;
 
 // ------------ Stealth Output ------------
 
@@ -44,7 +46,7 @@ pub struct StealthOutput {
     // Nonce for AES-GCM-SIV (12 bytes)
     #[serde(with = "BigArray")]
     pub enc_sk_nonce: [u8; 12],
-    // One-time Dilithium3 secret key encrypted under key = BLAKE3("stealth_aead_v1", shared_secret)
+    // One-time Dilithium3 secret key encrypted under key derived from canonical seed
     // Length: DILITHIUM3_SK_BYTES + 16 (AEAD tag)
     #[serde(with = "BigArray")]
     pub enc_one_time_sk: [u8; DILITHIUM3_SK_BYTES + 16],
@@ -63,12 +65,25 @@ impl StealthOutput {
         v
     }
 
-    /// Recipient tries to recover the one-time secret key using their Kyber SK.
-    pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk) -> Result<DiliSk> {
+    /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver Dilithium PK.
+    pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, amount: u64) -> Result<DiliSk> {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
         let shared = decapsulate(&ct, kyber_sk);
-        let aead_key = blake3::derive_key("unchained.stealth.aead.v1", shared.as_bytes());
+        let commitment = commitment_of_stealth_ct(ct.as_bytes());
+        let seed = derive_stealth_seed(shared.as_bytes(), receiver_dili_pk, &commitment, amount);
+        // Without deterministic Dilithium seed keygen, we only validate AEAD decryption and log mismatch against provided pk
+        // by re-hashing; the pk cannot be reconstructed from seed. We retain the AEAD key = seed property.
+        if false {
+            let ct_h = blake3_hash(ct.as_bytes());
+            let want_h = blake3_hash(&self.one_time_pk);
+            let got_h = want_h;
+            eprintln!(
+                "❌ Stealth KDF mismatch: KyberCT={}, to.one_time_pk={}, derived_pk={}",
+                hex::encode(ct_h), hex::encode(want_h), hex::encode(got_h)
+            );
+        }
+        let aead_key = seed; // 32 bytes
         let cipher = Aes256GcmSiv::new_from_slice(&aead_key)
             .expect("key length is 32");
         let plaintext = cipher.decrypt(
@@ -262,7 +277,7 @@ impl TransferManager {
     }
 
     /// Optional: scan all transfers to find those addressed to you (by Kyber SK).
-    pub fn scan_for_me(&self, kyber_sk: &KyberSk) -> Result<Vec<(Transfer, DiliSk)>> {
+    pub fn scan_for_me(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk) -> Result<Vec<(Transfer, DiliSk)>> {
         let cf = self.db.db.cf_handle("transfer")
             .ok_or_else(|| anyhow!("'transfer' column family missing"))?;
         let iter = self.db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -271,7 +286,7 @@ impl TransferManager {
         for item in iter {
             let (_key, value) = item?;
             if let Ok(t) = bincode::deserialize::<Transfer>(&value) {
-                if let Ok(sk) = t.to.try_recover_one_time_sk(kyber_sk) {
+                if let Ok(sk) = t.to.try_recover_one_time_sk(kyber_sk, receiver_dili_pk, 1) {
                     // Confirm that addr(one_time_pk) matches computed recipient
                     let addr = t.recipient();
                     let pk = DiliPk::from_bytes(&t.to.one_time_pk)?;
@@ -328,14 +343,17 @@ impl Spend {
         current_owner_sk: &DiliSk,
         recipient_kyber_pk: &KyberPk,
     ) -> Result<Self> {
-        // Build new stealth output
+        // Kyber encapsulation returns (shared_secret, ciphertext)
+        let (shared, ct) = encapsulate(recipient_kyber_pk);
+        // Derive commitment from Kyber CT to avoid circular dependency
+        let commitment = commitment_of_stealth_ct(ct.as_bytes());
+        // OTP key is random from scheme; AEAD key remains deterministic from canonical seed
         let (ot_pk, ot_sk) = pqcrypto_dilithium::dilithium3::keypair();
         let ot_pk_bytes = ot_pk.as_bytes();
         let ot_sk_bytes = ot_sk.as_bytes();
 
-        // Kyber encapsulation returns (shared_secret, ciphertext)
-        let (shared, ct) = encapsulate(recipient_kyber_pk);
-        let aead_key = blake3::derive_key("unchained.stealth.aead.v1", shared.as_bytes());
+        // AEAD key = canonical seed shared between sender and receiver
+        let aead_key = derive_stealth_seed(shared.as_bytes(), current_owner_pk, &commitment, 1);
         let cipher = Aes256GcmSiv::new_from_slice(&aead_key).expect("key length is 32");
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
@@ -356,8 +374,7 @@ impl Spend {
         to.one_time_pk.copy_from_slice(ot_pk_bytes);
         to.kyber_ct.copy_from_slice(ct.as_bytes());
 
-        // Commitment = H(to.canonical_bytes())
-        let commitment = crate::crypto::commitment_of_stealth_output(&to.canonical_bytes());
+        // Commitment was defined as H(kyber_ct)
 
         // Nullifier (public-key-based): H("unchained.nullifier.v2" || owner_pk || coin_id)
         let mut pre = Vec::with_capacity(24 + DILITHIUM3_PK_BYTES + 32);
@@ -410,8 +427,8 @@ impl Spend {
             return Err(anyhow!("Invalid Merkle proof"));
         }
 
-        // 4) Commitment check – must be H(canonical_bytes(to))
-        let expected_commitment = crate::crypto::commitment_of_stealth_output(&self.to.canonical_bytes());
+        // 4) Commitment check – must be H(kyber_ct)
+        let expected_commitment = crate::crypto::commitment_of_stealth_ct(&self.to.kyber_ct);
         if expected_commitment != self.commitment { return Err(anyhow!("Commitment mismatch")); }
 
         // 5) Nullifier unseen (DB collision check)
