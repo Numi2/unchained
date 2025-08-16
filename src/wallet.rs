@@ -368,7 +368,7 @@ impl Wallet {
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 // If there is a V2 spend recorded, the current owner is the recipient of that spend
                 if let Some(sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
                         utxos.push(coin);
                     }
                     continue;
@@ -424,7 +424,7 @@ impl Wallet {
                 // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
                 let v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
                 if let Some(sp) = v2 {
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, 1).is_ok() {
+                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, coin.value).is_ok() {
                         sum = sum.saturating_add(coin.value);
                     }
                     continue;
@@ -593,20 +593,11 @@ impl Wallet {
                 proof_used.expect("proof must be present after local or network path"),
                 &owner_pk,               // NEW: pass public key for nullifier_v2 computation
                 &owner_sk,
+                &recipient_dili_pk,
                 &recipient_kyber_pk,
+                coin.value,
             )?;
-            // AEAD key = canonical seed; OTP pk stays as created in Spend::create
-            let (shared, _ct) = pqcrypto_kyber::kyber768::encapsulate(&recipient_kyber_pk);
-            let commitment = crate::crypto::commitment_of_stealth_ct(&spend.to.kyber_ct);
-            let seed = crate::crypto::derive_stealth_seed(shared.as_bytes(), &recipient_dili_pk, &commitment, coin.value);
-            // Re-encrypt existing SK under seed-derived AEAD key with existing nonce and AAD=current OTP pk
-            let cipher = aes_gcm_siv::Aes256GcmSiv::new_from_slice(&seed).expect("seed length");
-            let enc = cipher.encrypt(
-                spend.to.enc_sk_nonce.as_slice().into(),
-                aes_gcm_siv::aead::Payload { msg: &spend.to.enc_one_time_sk[..DILITHIUM3_SK_BYTES], aad: &spend.to.one_time_pk },
-            ).map_err(|_| anyhow!("AEAD encrypt one-time SK failed"))?;
-            if enc.len() != DILITHIUM3_SK_BYTES + 16 { return Err(anyhow!("Unexpected AEAD ciphertext length")); }
-            spend.to.enc_one_time_sk.copy_from_slice(&enc);
+            // Encryption already canonical in Spend::create
             spend.validate(&store)?;
             spend.apply(&store)?;
             network.gossip_spend(&spend).await;

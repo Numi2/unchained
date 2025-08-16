@@ -112,6 +112,37 @@ async fn main() -> anyhow::Result<()> {
 
     let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
 
+    // Background: subscribe to spends and anchors to trigger deterministic rescans for this wallet
+    {
+        let net_clone = net.clone();
+        let wallet_clone = wallet.clone();
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let mut spend_rx = net_clone.spend_subscribe();
+            let mut anchor_rx = net_clone.anchor_subscribe();
+            loop {
+                tokio::select! {
+                    Ok(sp) = spend_rx.recv() => {
+                        let _ = wallet_clone.scan_spend_for_me(&sp);
+                    },
+                    Ok(_a) = anchor_rx.recv() => {
+                        // On anchor adoption, rescan all spends idempotently (bounded by CF contents)
+                        if let Some(cf) = db_clone.db.cf_handle("spend") {
+                            let iter = db_clone.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+                            for item in iter {
+                                if let Ok((_k, v)) = item {
+                                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                                        let _ = wallet_clone.scan_spend_for_me(&sp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Spawn background sync task (safe for read-only commands; does not advance epochs itself)

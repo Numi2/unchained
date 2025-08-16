@@ -154,7 +154,9 @@ impl Spend {
         proof: Vec<([u8; 32], bool)>,
         current_owner_pk: &DiliPk,
         current_owner_sk: &DiliSk,
+        recipient_dili_pk: &DiliPk,
         recipient_kyber_pk: &KyberPk,
+        amount: u64,
     ) -> Result<Self> {
         // Kyber encapsulation returns (shared_secret, ciphertext)
         let (shared, ct) = encapsulate(recipient_kyber_pk);
@@ -166,7 +168,7 @@ impl Spend {
         let ot_sk_bytes = ot_sk.as_bytes();
 
         // AEAD key = canonical seed shared between sender and receiver
-        let aead_key = derive_stealth_seed(shared.as_bytes(), current_owner_pk, &commitment, 1);
+        let aead_key = derive_stealth_seed(shared.as_bytes(), recipient_dili_pk, &commitment, amount);
         let cipher = Aes256GcmSiv::new_from_slice(&aead_key).expect("key length is 32");
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
