@@ -3,7 +3,8 @@ peer_identity.key
 pq_identity.enc
 node_kyber.enc
 context.md
-
+data/
+test_stealth_address.txt
 # Blockchain data
 blockchain_data/
 node_kyber.enc

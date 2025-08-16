@@ -1,9 +1,29 @@
 use unchained::{storage, epoch::Anchor};
+use unchained::config;
 
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting unchained Database...");
-    
-    let db = storage::open(&unchained::config::Storage { path: "./data".to_string() });
+
+    // Load configured storage path; fall back to embedded config if needed
+    let mut cfg = match config::load("config.toml") {
+        Ok(c) => c,
+        Err(_) => {
+            let embedded = include_str!("../../config.toml");
+            config::load_from_str(embedded)?
+        }
+    };
+    // If relative, resolve under user's home like main.rs
+    if std::path::Path::new(&cfg.storage.path).is_relative() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let abs = std::path::Path::new(&home)
+            .join(".unchained")
+            .join("unchained_data");
+        cfg.storage.path = abs.to_string_lossy().into_owned();
+    }
+
+    let db = storage::open(&cfg.storage);
     
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {
@@ -50,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     
     // Show database storage info
     println!("\n🗄️ Database Storage Info:");
-    if let Ok(entries) = std::fs::read_dir("./data") {
+    if let Ok(entries) = std::fs::read_dir(&cfg.storage.path) {
         let mut sst_files = 0;
         let mut log_files = 0;
         let mut total_size = 0u64;
