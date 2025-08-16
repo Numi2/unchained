@@ -1,0 +1,16 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-Wl,-platform_version,macos,14.4,14.4",
+    "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/openssl@3/lib",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-Wl,-platform_version,macos,14.4,14.4",
+    "-C", "link-arg=-Wl,-rpath,/opt/homebrew/opt/openssl@3/lib",
+]
+ 
+[env]
+OPENSSL_ROOT_DIR = "/opt/homebrew/opt/openssl@3"
+LIBRARY_PATH = "/opt/homebrew/opt/openssl@3/lib"
+PKG_CONFIG_PATH = "/opt/homebrew/opt/openssl@3/lib/pkgconfig"

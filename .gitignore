@@ -16,7 +16,7 @@ target/
 # IDE files
 .vscode/
 .idea/
-.cargo
+
 
 # OS files
 .DS_Store
