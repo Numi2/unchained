@@ -11,6 +11,8 @@ pub struct Config {
     pub epoch: Epoch,
     pub mining: Mining,
     pub metrics: Metrics,
+    #[serde(default)]
+    pub wallet: WalletCfg,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -108,8 +110,15 @@ pub struct Metrics {
     pub bind: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WalletCfg {
+    #[serde(default = "default_auto_serve_commitments")]
+    pub auto_serve_commitments: bool,
+}
+
 fn default_mem() -> u32   { 65_536 }          // 64 MiB
 fn default_bind() -> String { "127.0.0.1:9100".into() }
+fn default_auto_serve_commitments() -> bool { true }
 
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 { 100 }
@@ -180,7 +189,7 @@ pub fn load_from_str(text: &str) -> Result<Config> {
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
-    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics"].into_iter().collect();
+    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics","wallet"].into_iter().collect();
     if let Some(table) = val.as_table() {
         for (k, v) in table.iter() {
             if !top_allowed.contains(k.as_str()) {
@@ -202,6 +211,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","max_mining_attempts","check_interval_attempts","workers","offload_blocking"
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind"]),
+                ("wallet", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["auto_serve_commitments"]),
                 _ => {}
             }
         }

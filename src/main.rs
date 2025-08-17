@@ -9,6 +9,19 @@ use std::io::{self, Write};
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
+use qrcode::QrCode;
+use qrcode::render::unicode;
+fn print_qr_to_terminal(data: &str) -> anyhow::Result<()> {
+    let code = QrCode::new(data.as_bytes())?;
+    let image = code.render::<unicode::Dense1x2>().dark_color(unicode::Dense1x2::Light).build();
+    println!("{}", image);
+    Ok(())
+}
+fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_string())?;
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
@@ -155,6 +168,26 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Auto-serve receiver commitments if configured
+    if cfg.wallet.auto_serve_commitments {
+        let net_clone = net.clone();
+        let wallet_clone = wallet.clone();
+        tokio::spawn(async move {
+            let mut sub = net_clone.commitment_request_subscribe();
+            loop {
+                match sub.recv().await {
+                    Ok(req) => {
+                        if req.recipient_addr != wallet_clone.address() { continue; }
+                        if let Ok(resp) = wallet_clone.build_commitment_response(&req) {
+                            let _ = net_clone.gossip_commitment_response(resp).await;
+                        }
+                    }
+                    Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
                 }
             }
         });
@@ -557,24 +590,44 @@ async fn main() -> anyhow::Result<()> {
                 Ok(v) => v,
                 Err(e) => { eprintln!("❌ Input selection failed: {}", e); return Err(e); }
             };
-            // Ask user if they want to attempt automatic network exchange
-            println!("🤝 Attempt automatic receiver commitment exchange over P2P? (Y/n): ");
-            io::stdout().flush()?;
-            let mut auto = String::new();
-            io::stdin().read_line(&mut auto)?;
-            let auto = auto.trim().to_lowercase();
-            let batch_token = if auto == "n" || auto == "no" {
-                println!("🔒 Paste single batch commitment token from receiver (base64-url):");
-                print!("   Token: ");
-                io::stdout().flush()?;
-                let mut tok = String::new();
-                io::stdin().read_line(&mut tok)?;
-                let tok = tok.trim().to_string();
-                if tok.is_empty() { eprintln!("❌ Batch commitment token cannot be empty"); return Ok(()); }
-                tok
-            } else {
-                String::new()
-            };
+            // Auto P2P attempt first; fallback to QR/paste if timeout or no peers
+            let mut batch_token = String::new();
+            {
+                // Build a request immediately so we can render QR if needed
+                let coins = wallet.select_inputs(amount)?;
+                use crate::network::{CommitmentRequest, CommitmentEntryReq};
+                let mut entries = Vec::with_capacity(coins.len());
+                for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
+                use rand::RngCore as _;
+                let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
+                let req = CommitmentRequest { request_id: rng_tag, recipient_addr: wallet.address(), entries, memo: None, expiry_unix_secs: None };
+
+                // Try network request if any peers connected
+                let mut used_network = false;
+                if net.peer_count() > 0 {
+                    let mut sub = net.commitment_response_subscribe();
+                    net.request_commitments(req.clone()).await;
+                    if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(12), sub.recv()).await {
+                        if resp.recipient_addr == wallet.address() && resp.entries.len() >= coins.len() {
+                            batch_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
+                            used_network = true;
+                        }
+                    }
+                }
+                if !used_network {
+                    // Show QR of the request and copy to clipboard
+                    let req_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&req)?);
+                    println!("\n📱 Receiver offline? Scan this request QR or share this code:");
+                    if let Err(e) = print_qr_to_terminal(&req_b64) { eprintln!("(QR unavailable: {})", e); }
+                    if let Err(_e) = copy_to_clipboard(&req_b64) { eprintln!("(clipboard unavailable)"); }
+                    println!("\nRequest: {}\n", req_b64);
+                    print!("🔒 Paste the receiver's batch token here: ");
+                    io::stdout().flush()?;
+                    let mut tok = String::new();
+                    io::stdin().read_line(&mut tok)?;
+                    batch_token = tok.trim().to_string();
+                }
+            }
 
             println!("\n🚀 Sending {} coins to stealth recipient...", amount);
             match wallet.send_to_stealth_address_with_commitments(&stealth, amount, &net, batch_token).await {
