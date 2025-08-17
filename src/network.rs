@@ -4,7 +4,7 @@
 
 //! Network layer for Unchained.
 //! V1 transfers are deprecated: no gossip or requests for V1 are produced or accepted.
-//! Only V2 spends are gossiped/served.
+//! Spends are gossiped/served. Supports V2 (signature) and V3 (hashlock).
 
 use crate::{
     storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Spend, crypto, config, sync::SyncState,
@@ -168,8 +168,6 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
     Ok(())
 }
 
-// (Legacy V1 transfer validation removed)
-
 #[allow(dead_code)]
 fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     // Mirror Spend::validate with String errors for network context;
@@ -197,42 +195,54 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
         return Err("Nullifier already seen (double spend)".into());
     }
 
-    // Determine current owner pk (prefer last spend's one-time pk, then legacy transfer, else coin creator)
-    let sig = match pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&sp.sig) {
-        Ok(s) => s,
-        Err(_) => return Err("Invalid spend signature format".into()),
-    };
-
-    let mut verified_pk: Option<pqcrypto_dilithium::dilithium3::PublicKey> = None;
-    // a) last V2 spend
-    if verified_pk.is_none() {
-        if let Ok(Some(prev_sp)) = db.get::<Spend>("spend", &sp.coin_id) {
-            if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&prev_sp.to.one_time_pk) {
+    // Authorization: prefer V3 hashlock when present, else fallback to V2 signature path
+    if let Some(preimage) = sp.unlock_preimage {
+        // Determine expected previous lock hash
+        let expected_lock_hash = if let Ok(Some(prev_sp)) = db.get::<Spend>("spend", &sp.coin_id) {
+            if let Some(h) = prev_sp.next_lock_hash { h } else { return Err("Previous spend missing next_lock_hash".into()); }
+        } else {
+            // Genesis lock hash stored in coin
+            coin.lock_hash
+        };
+        // Check preimage matches
+        if crate::crypto::lock_hash(&preimage) != expected_lock_hash { return Err("Invalid hashlock preimage".into()); }
+        // Recompute V3 nullifier and compare
+        let exp_nf = crate::crypto::compute_nullifier_v3(&preimage, &sp.coin_id);
+        if exp_nf != sp.nullifier { return Err("Nullifier mismatch".into()); }
+    } else {
+        // V2 signature path
+        let sig = match pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&sp.sig) {
+            Ok(s) => s,
+            Err(_) => return Err("Invalid spend signature format".into()),
+        };
+        let mut verified_pk: Option<pqcrypto_dilithium::dilithium3::PublicKey> = None;
+        if verified_pk.is_none() {
+            if let Ok(Some(prev_sp)) = db.get::<Spend>("spend", &sp.coin_id) {
+                if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&prev_sp.to.one_time_pk) {
+                    if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
+                        verified_pk = Some(pk);
+                    }
+                }
+            }
+        }
+        if verified_pk.is_none() && coin.creator_pk != [0u8; crate::crypto::DILITHIUM3_PK_BYTES] {
+            if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&coin.creator_pk) {
                 if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
                     verified_pk = Some(pk);
                 }
             }
         }
-    }
-    // (Legacy V1 transfer owner fallback removed)
-    // c) genesis creator
-    if verified_pk.is_none() && coin.creator_pk != [0u8; crate::crypto::DILITHIUM3_PK_BYTES] {
-        if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&coin.creator_pk) {
-            if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
-                verified_pk = Some(pk);
-            }
-        }
-    }
-    let pk = match verified_pk { Some(p) => p, None => return Err("Invalid spend signature".into()) };
+        let pk = match verified_pk { Some(p) => p, None => return Err("Invalid spend signature".into()) };
 
-    // Recompute public-key-based nullifier: H("unchained.nullifier.v2" || pk || coin_id)
-    let mut pre = Vec::with_capacity(24 + crate::crypto::DILITHIUM3_PK_BYTES + 32);
-    pre.extend_from_slice(b"unchained.nullifier.v2");
-    pre.extend_from_slice(pk.as_bytes());
-    pre.extend_from_slice(&sp.coin_id);
-    let expected_nullifier = crate::crypto::blake3_hash(&pre);
-    if sp.nullifier != expected_nullifier {
-        return Err("Nullifier mismatch".into());
+        // Recompute public-key-based nullifier: H("unchained.nullifier.v2" || pk || coin_id)
+        let mut pre = Vec::with_capacity(24 + crate::crypto::DILITHIUM3_PK_BYTES + 32);
+        pre.extend_from_slice(b"unchained.nullifier.v2");
+        pre.extend_from_slice(pk.as_bytes());
+        pre.extend_from_slice(&sp.coin_id);
+        let expected_nullifier = crate::crypto::blake3_hash(&pre);
+        if sp.nullifier != expected_nullifier {
+            return Err("Nullifier mismatch".into());
+        }
     }
 
     // Basic sanity of `to`

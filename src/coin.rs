@@ -14,6 +14,9 @@ pub struct Coin {
     /// New: full Dilithium3 public key of the coin creator (enables genesis V2 spend validation)
     #[serde(with = "BigArray")]
     pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
+    /// Signatureless spend lock: H(preimage_current). For genesis, set by miner.
+    #[serde(default)]
+    pub lock_hash: [u8; 32],
 }
 
 /// Unconfirmed coin candidate used during selection. Contains the PoW hash.
@@ -27,6 +30,9 @@ pub struct CoinCandidate {
     /// New: full Dilithium3 public key of the coin creator
     #[serde(with = "BigArray")]
     pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
+    /// Signatureless spend lock to be committed at confirmation
+    #[serde(default)]
+    pub lock_hash: [u8; 32],
     pub pow_hash: [u8; 32],
 }
 
@@ -39,6 +45,18 @@ pub struct CoinV1Compat {
     pub nonce: u64,
     pub creator_address: Address,
     pub pow_hash: [u8; 32],
+}
+
+/// Compatibility struct for coins without lock_hash but with creator_pk
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CoinV2Compat {
+    pub id: [u8; 32],
+    pub value: u64,
+    pub epoch_hash: [u8; 32],
+    pub nonce: u64,
+    pub creator_address: Address,
+    #[serde(with = "BigArray")]
+    pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
 }
 
 impl Coin {
@@ -61,17 +79,15 @@ impl Coin {
     }
 
     /// Creates a new confirmed coin (value=1) from raw fields.
-    pub fn new_with_creator_pk(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES]) -> Self {
+    pub fn new_with_creator_pk_and_lock(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES], lock_hash: [u8; 32]) -> Self {
         let id = Self::calculate_id(&epoch_hash, nonce, &creator_address);
-        Coin { id, value: 1, epoch_hash, nonce, creator_address, creator_pk }
+        Coin { id, value: 1, epoch_hash, nonce, creator_address, creator_pk, lock_hash }
     }
 
     /// Backward-compatible constructor (no creator_pk stored)
     pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address) -> Self {
-        Self::new_with_creator_pk(epoch_hash, nonce, creator_address, [0u8; DILITHIUM3_PK_BYTES])
+        Self::new_with_creator_pk_and_lock(epoch_hash, nonce, creator_address, [0u8; DILITHIUM3_PK_BYTES], [0u8; 32])
     }
-
-    
 
     /// Convert coin ID to a leaf hash for the Merkle tree.
     pub fn id_to_leaf_hash(coin_id: &[u8; 32]) -> [u8; 32] {
@@ -80,13 +96,13 @@ impl Coin {
 }
 
 impl CoinCandidate {
-    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES], pow_hash: [u8; 32]) -> Self {
+    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address, creator_pk: [u8; DILITHIUM3_PK_BYTES], lock_hash: [u8; 32], pow_hash: [u8; 32]) -> Self {
         let id = Coin::calculate_id(&epoch_hash, nonce, &creator_address);
-        CoinCandidate { id, value: 1, epoch_hash, nonce, creator_address, creator_pk, pow_hash }
+        CoinCandidate { id, value: 1, epoch_hash, nonce, creator_address, creator_pk, lock_hash, pow_hash }
     }
 
     pub fn into_confirmed(self) -> Coin {
-        Coin { id: self.id, value: self.value, epoch_hash: self.epoch_hash, nonce: self.nonce, creator_address: self.creator_address, creator_pk: self.creator_pk }
+        Coin { id: self.id, value: self.value, epoch_hash: self.epoch_hash, nonce: self.nonce, creator_address: self.creator_address, creator_pk: self.creator_pk, lock_hash: self.lock_hash }
     }
 }
 
@@ -95,7 +111,19 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, bincode::Error> {
     match bincode::deserialize::<Coin>(bytes) {
         Ok(c) => Ok(c),
         Err(_) => {
-            // Legacy fallback (no creator_pk field).
+            // Try coin-without-lock-hash layout
+            if let Ok(v2) = bincode::deserialize::<CoinV2Compat>(bytes) {
+                return Ok(Coin {
+                    id: v2.id,
+                    value: v2.value,
+                    epoch_hash: v2.epoch_hash,
+                    nonce: v2.nonce,
+                    creator_address: v2.creator_address,
+                    creator_pk: v2.creator_pk,
+                    lock_hash: [0u8; 32],
+                });
+            }
+            // Legacy fallback (no creator_pk/lock_hash fields).
             let v1: CoinV1Compat = bincode::deserialize(bytes)?;
             Ok(Coin {
                 id: v1.id,
@@ -104,6 +132,7 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, bincode::Error> {
                 nonce: v1.nonce,
                 creator_address: v1.creator_address,
                 creator_pk: [0u8; DILITHIUM3_PK_BYTES],
+                lock_hash: [0u8; 32],
             })
         }
     }

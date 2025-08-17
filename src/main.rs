@@ -541,7 +541,7 @@ async fn main() -> anyhow::Result<()> {
                     let total = outcome.spends.len();
                     println!("✅ Sent {} spend{}", total, if total == 1 { "" } else { "s" });
                     for (i, s) in outcome.spends.iter().enumerate() {
-                        println!("  V2 spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
+                        println!("  Spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
                     }
                 }
                 Err(e) => {
