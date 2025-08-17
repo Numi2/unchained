@@ -20,37 +20,6 @@ jobs:
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      # (Optional) Keep OpenSSL install for other crates; liboqs will NOT use it.
-      - name: Install OpenSSL
-        shell: pwsh
-        run: choco install openssl --no-progress -y
-
-      - name: Export OpenSSL environment
-        shell: pwsh
-        run: |
-          $candidates = @(
-            'C:\Program Files\OpenSSL-Win64',
-            'C:\Program Files\OpenSSL',
-            'C:\Program Files\OpenSSL-Win32'
-          )
-          $prefix = $null
-          foreach ($p in $candidates) { if (Test-Path $p) { $prefix = $p; break } }
-          if (-not $prefix) {
-            Write-Host "Could not find OpenSSL under default locations. Contents of C:\Program Files:"
-            Get-ChildItem 'C:\Program Files' | Where-Object { $_.Name -like 'OpenSSL*' } | ForEach-Object { Write-Host $_.FullName }
-            throw "OpenSSL install path not found"
-          }
-          $cryptoLib = Get-ChildItem -Path (Join-Path $prefix 'lib') -Recurse -Filter 'libcrypto.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $cryptoLib) { throw "Could not find libcrypto.lib under $prefix" }
-          if (-not (Test-Path (Join-Path $prefix 'include'))) { throw "Could not find OpenSSL include dir under $prefix" }
-          $includeDir = Join-Path $prefix 'include'
-          $libDir = Join-Path $prefix 'lib'
-          echo "OPENSSL_ROOT_DIR=$prefix" >> $env:GITHUB_ENV
-          echo "OPENSSL_DIR=$prefix" >> $env:GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$includeDir" >> $env:GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$($cryptoLib.DirectoryName)" >> $env:GITHUB_ENV
-          echo "Path=$env:Path;$prefix\bin" >> $env:GITHUB_ENV
-
       # CRITICAL: ensure liboqs builds WITHOUT OpenSSL and force a rebuild
       - name: Configure liboqs (disable OpenSSL backend)
         shell: pwsh
@@ -68,9 +37,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v3-noossl-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v4-noossl-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v3-noossl-
+            ${{ runner.os }}-cargo-v4-noossl-
 
       # Also hard-clean the workspace to blow away any previously built liboqs
       - name: Cargo clean
