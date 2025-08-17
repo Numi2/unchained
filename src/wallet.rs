@@ -464,6 +464,7 @@ impl Wallet {
 
         // As a last resort, attempt verification using liboqs for pre-FIPS Dilithium-3
         // and FIPS ML-DSA-65 against the canonical message.
+        #[cfg(feature = "liboqs")]
         {
             let mut msg = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
             msg.extend_from_slice(b"stealth_addr_v1");

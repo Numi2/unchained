@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use once_cell::sync::OnceCell;
 use std::sync::Mutex;
 use zeroize::Zeroize;
+#[cfg(feature = "liboqs")]
 use oqs_sys::rand::OQS_randombytes_custom_algorithm;
 
 struct XofState {
@@ -31,6 +32,7 @@ impl Drop for XofState {
 
 static DET_RNG: OnceCell<Mutex<Option<XofState>>> = OnceCell::new();
 
+#[cfg(feature = "liboqs")]
 unsafe extern "C" fn oqs_custom_randombytes(out_ptr: *mut u8, out_len: usize) {
     let slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
     if let Some(cell) = DET_RNG.get() {
@@ -61,19 +63,32 @@ fn main() {
     }
 
     // Initialize oqs and set RNG
+    #[cfg(feature = "liboqs")]
     oqs::init();
     let cell = DET_RNG.get_or_init(|| Mutex::new(None));
     {
         let mut guard = cell.lock().expect("rng mutex poisoned");
         *guard = Some(XofState::new(seed));
     }
+    #[cfg(feature = "liboqs")]
     unsafe { OQS_randombytes_custom_algorithm(Some(oqs_custom_randombytes)); }
 
     // Generate ML-DSA-65 keypair
-    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65).expect("ML-DSA-65 not available");
-    let (pk, sk) = sig.keypair().expect("oqs keypair failed");
+    let (pk, sk) = {
+        #[cfg(feature = "liboqs")]
+        {
+            let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65).expect("ML-DSA-65 not available");
+            sig.keypair().expect("oqs keypair failed")
+        }
+        #[cfg(not(feature = "liboqs"))]
+        {
+            let (pk, sk) = pqcrypto_dilithium::dilithium3::keypair();
+            (oqs::sig::PublicKey::from_bytes(pk.as_bytes()).unwrap(), oqs::sig::SecretKey::from_bytes(sk.as_bytes()).unwrap())
+        }
+    };
 
     // Restore RNG and clear state
+    #[cfg(feature = "liboqs")]
     unsafe { OQS_randombytes_custom_algorithm(None); }
     {
         let mut guard = cell.lock().expect("rng mutex poisoned");

@@ -20,14 +20,41 @@ jobs:
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      # CRITICAL: ensure liboqs builds WITHOUT OpenSSL and force a rebuild
+      # Force liboqs to build WITHOUT OpenSSL and ensure a rebuild
       - name: Configure liboqs (disable OpenSSL backend)
         shell: pwsh
         run: |
-          echo "OQS_SYS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF -DOQS_DIST_BUILD=ON" >> $env:GITHUB_ENV
+          # Clear any inherited OpenSSL env vars that could make CMake try to find OpenSSL
+          Remove-Item Env:OPENSSL_DIR -ErrorAction SilentlyContinue
+          Remove-Item Env:OPENSSL_ROOT_DIR -ErrorAction SilentlyContinue
+          Remove-Item Env:OPENSSL_INCLUDE_DIR -ErrorAction SilentlyContinue
+          Remove-Item Env:OPENSSL_LIB_DIR -ErrorAction SilentlyContinue
+          # oqs-sys build.rs reads LIBOQS_* env vars; pass CMake args via LIBOQS_CMAKE_ARGS
+          echo "LIBOQS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON -DOQS_BUILD_ONLY_LIB=ON -DOQS_ENABLE_SIG_ML_DSA=ON -DOQS_ENABLE_KEM_ML_KEM=ON" >> $env:GITHUB_ENV
+          echo "LIBOQS_NO_PKG_CONFIG=1" >> $env:GITHUB_ENV
+          echo "LIBOQS_STATIC=1" >> $env:GITHUB_ENV
+          echo "LIBOQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
+          echo "LIBOQS_OPENSSL=OFF" >> $env:GITHUB_ENV
+          echo "LIBOQS_NO_OPENSSL=1" >> $env:GITHUB_ENV
+          echo "OQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
+          echo "OQS_USE_OPENSSL=0" >> $env:GITHUB_ENV
+          echo "LIBOQS_DIST_BUILD=ON" >> $env:GITHUB_ENV
+          echo "CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON -DOQS_BUILD_ONLY_LIB=ON" >> $env:GITHUB_ENV
+          # Set legacy vars as well (some oqs-sys versions read these)
+          echo "OQS_SYS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON" >> $env:GITHUB_ENV
           echo "OQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
 
-      # Bump cache namespace so we don't reuse the OpenSSL-enabled liboqs
+      - name: Debug oqs-sys env
+        shell: pwsh
+        run: |
+          echo "LIBOQS_CMAKE_ARGS=$env:LIBOQS_CMAKE_ARGS"
+          echo "LIBOQS_USE_OPENSSL=$env:LIBOQS_USE_OPENSSL"
+          echo "LIBOQS_OPENSSL=$env:LIBOQS_OPENSSL"
+          echo "LIBOQS_NO_OPENSSL=$env:LIBOQS_NO_OPENSSL"
+          echo "CMAKE_ARGS=$env:CMAKE_ARGS"
+          echo "OQS_SYS_CMAKE_ARGS=$env:OQS_SYS_CMAKE_ARGS"
+          echo "OQS_USE_OPENSSL=$env:OQS_USE_OPENSSL"
+
       - name: Cache cargo and target
         uses: actions/cache@v4
         with:
@@ -41,14 +68,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-v4-noossl-
 
-      # Also hard-clean the workspace to blow away any previously built liboqs
       - name: Cargo clean
         run: cargo clean
 
       - name: Build (release, static CRT)
-        run: cargo build --locked --release
+        run: cargo build --locked --release --verbose
         env:
           RUSTFLAGS: -C target-feature=+crt-static
+          # Redundant env in the build step to guarantee oqs-sys sees them
+          LIBOQS_CMAKE_ARGS: -DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON -DOQS_BUILD_ONLY_LIB=ON -DOQS_ENABLE_SIG_ML_DSA=ON -DOQS_ENABLE_KEM_ML_KEM=ON
+          LIBOQS_NO_PKG_CONFIG: "1"
+          LIBOQS_STATIC: "1"
+          LIBOQS_USE_OPENSSL: "OFF"
+          LIBOQS_OPENSSL: "OFF"
+          LIBOQS_NO_OPENSSL: "1"
+          OQS_SYS_CMAKE_ARGS: -DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON
+          OQS_USE_OPENSSL: "OFF"
+          CMAKE_ARGS: -DOQS_USE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON -DOQS_DIST_BUILD=ON -DOQS_BUILD_ONLY_LIB=ON
 
       - name: Smoke test executable
         shell: pwsh
