@@ -80,8 +80,8 @@ jobs:
       - name: Build (release, static CRT)
         run: cargo build --locked --release
         env:
-    RUSTFLAGS: -C target-feature=+crt-static -Lnative=${{ env.OPENSSL_LIB_DIR }} -l dylib=crypto
-      - name: Smoke test executable
+  RUSTFLAGS: -C target-feature=+crt-static -l dylib=crypto
+
         shell: pwsh
         run: |
           & target/release/unchained.exe --version
