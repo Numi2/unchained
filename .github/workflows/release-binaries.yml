@@ -58,30 +58,31 @@ jobs:
           echo "LIBPATH=$($cryptoLib.DirectoryName);$env:LIBPATH;$libDir" >> $env:GITHUB_ENV
           $modules = Join-Path $libDir 'ossl-modules'
           if (Test-Path $modules) { echo "OPENSSL_MODULES=$modules" >> $env:GITHUB_ENV }
+- name: Configure liboqs (disable OpenSSL backend)
+  shell: pwsh
+  run: |
+    echo "OQS_SYS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
+    echo "OQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
 
-      - name: Configure liboqs (disable OpenSSL backend)
-        shell: pwsh
-        run: |
-          echo "CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
+- name: Cache cargo and target
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.cargo/bin/
+      ~/.cargo/registry/index/
+      ~/.cargo/registry/cache/
+      ~/.cargo/git/db/
+      target/
+    key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+    restore-keys: |
+      ${{ runner.os }}-cargo-v2-
 
-      - name: Cache cargo and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+- name: Build (release, static CRT)
+  run: cargo build --locked --release
+  env:
+    RUSTFLAGS: -C target-feature=+crt-static
 
-      - name: Build (release, static CRT)
-        run: cargo build --locked --release
-        env:
-  RUSTFLAGS: -C target-feature=+crt-static -l dylib=crypto
-
+      - name: Smoke test executable
         shell: pwsh
         run: |
           & target/release/unchained.exe --version
