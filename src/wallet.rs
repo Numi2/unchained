@@ -348,7 +348,8 @@ impl Wallet {
             .map_err(|_| anyhow!("Invalid signature in stealth address"))?;
         // Primary verification (current format)
         if verify_detached_signature(&sig, &to_verify, &dili_pk).is_ok() {
-            return Ok((doc.recipient_addr, dili_pk, kyber_pk));
+            // Enforce self-consistency: derive address from Dilithium PK
+            return Ok((computed_addr, dili_pk, kyber_pk));
         }
         // Backward-compat: try a few safe legacy permutations before failing hard.
         // Security note: All variants still bind the Kyber key to the Dilithium key via signature.
@@ -459,6 +460,29 @@ impl Wallet {
         }
         if tried_ok {
             return Ok((computed_addr, dili_pk, kyber_pk));
+        }
+
+        // As a last resort, attempt verification using liboqs for pre-FIPS Dilithium-3
+        // and FIPS ML-DSA-65 against the canonical message.
+        {
+            let mut msg = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
+            msg.extend_from_slice(b"stealth_addr_v1");
+            msg.extend_from_slice(&doc.recipient_addr);
+            msg.extend_from_slice(&doc.kyber_pk);
+            // liboqs is idempotent to init
+            oqs::init();
+            // Try Dilithium-3 (pre-FIPS)
+            if let Ok(sig) = oqs::sig::Sig::new(oqs::sig::Algorithm::Dilithium3) {
+                if let (Some(pk), Some(s)) = (sig.public_key_from_bytes(&doc.dili_pk), sig.signature_from_bytes(&doc.sig)) {
+                    if sig.verify(&msg, &s, &pk).is_ok() { return Ok((computed_addr, dili_pk, kyber_pk)); }
+                }
+            }
+            // Try ML-DSA-65 (FIPS)
+            if let Ok(sig) = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65) {
+                if let (Some(pk), Some(s)) = (sig.public_key_from_bytes(&doc.dili_pk), sig.signature_from_bytes(&doc.sig)) {
+                    if sig.verify(&msg, &s, &pk).is_ok() { return Ok((computed_addr, dili_pk, kyber_pk)); }
+                }
+            }
         }
         // Final failure – emit lightweight diagnostics when enabled
         if std::env::var("UNCHAINED_DEBUG_STEALTH").is_ok() {

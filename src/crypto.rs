@@ -13,7 +13,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use zeroize::Zeroizing;
-use zeroize::Zeroize;
+use std::io::Write;
 use std::sync::Mutex;
 use anyhow::bail;
 use atty;
@@ -107,83 +107,72 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
 /// Uses liboqs (ML-DSA-65) with a custom deterministic RNG fed by the seed so
 /// the output is reproducible across nodes.
 pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
-    // Global critical section: liboqs randombytes callback is global; prevent races
-    static KEYGEN_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
-    let _kg_lock = KEYGEN_LOCK.get_or_init(|| Mutex::new(())).lock().expect("keygen lock poisoned");
-
-    // Initialize liboqs (idempotent)
-    oqs::init();
-
-    // Install per-call deterministic RNG state
-    struct DetRngState {
-        seed: [u8; 32],
-        counter: u64,
-    }
-    impl Zeroize for DetRngState {
-        fn zeroize(&mut self) {
-            self.seed.zeroize();
-            self.counter.zeroize();
+    // Preferred robust path: invoke helper binary to isolate RNG override.
+    // Fallback to in-process override only if helper is missing or fails.
+    let helper_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("oqs_dili_seeded")))
+        .unwrap_or_else(|| std::path::PathBuf::from("oqs_dili_seeded"));
+    if let Ok(mut child) = std::process::Command::new(helper_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut sin) = child.stdin.take() {
+            let _ = sin.write_all(&seed32);
         }
-    }
-    impl DetRngState {
-        fn fill_bytes(&mut self, out: &mut [u8]) {
-            let mut written = 0usize;
-            while written < out.len() {
-                let mut h = Hasher::new_derive_key("unchained-oqs-rng-v1");
-                h.update(&self.seed);
-                h.update(&self.counter.to_le_bytes());
-                let block = h.finalize();
-                self.counter = self.counter.wrapping_add(1);
-                let block_bytes = block.as_bytes();
-                let take = std::cmp::min(block_bytes.len(), out.len() - written);
-                out[written..written + take].copy_from_slice(&block_bytes[..take]);
-                written += take;
+        let out = child.wait_with_output();
+        if let Ok(output) = out {
+            if output.status.success() {
+                let bytes = output.stdout;
+                if bytes.len() == DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES {
+                    let (pkb, skb) = bytes.split_at(DILITHIUM3_PK_BYTES);
+                    let pk = PublicKey::from_bytes(pkb).expect("invalid Dilithium3 public key bytes");
+                    let sk = SecretKey::from_bytes(skb).expect("invalid Dilithium3 secret key bytes");
+                    return (pk, sk);
+                }
             }
         }
+        // If helper path fails, continue to fallback in-process path
     }
 
-    static DET_RNG: OnceCell<Mutex<Option<DetRngState>>> = OnceCell::new();
+    // Fallback: in-process RNG override using BLAKE3 XOF
+    static KEYGEN_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
+    let _kg_lock = KEYGEN_LOCK.get_or_init(|| Mutex::new(())).lock().expect("keygen lock poisoned");
+    oqs::init();
 
+    struct XofRng { reader: blake3::OutputReader }
+    static DET_RNG: OnceCell<Mutex<Option<XofRng>>> = OnceCell::new();
     unsafe extern "C" fn oqs_custom_randombytes(out_ptr: *mut u8, out_len: usize) {
         let slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
         if let Some(cell) = DET_RNG.get() {
-            if let Ok(mut guard) = cell.lock() {
-                if let Some(state) = guard.as_mut() {
-                    state.fill_bytes(slice);
+            if let Ok(mut g) = cell.lock() {
+                if let Some(st) = g.as_mut() {
+                    st.reader.fill(slice);
                     return;
                 }
             }
         }
-        // Deterministic-only: state must be set for key generation
         panic!("deterministic RNG state not initialized");
     }
-
-    // Set the RNG state for this call
     let cell = DET_RNG.get_or_init(|| Mutex::new(None));
     {
+        let mut hasher = blake3::Hasher::new_keyed(&seed32);
+        hasher.update(b"unchained-oqs-rng-xof-v1");
+        let reader = hasher.finalize_xof();
         let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
-        *guard = Some(DetRngState { seed: seed32, counter: 0 });
+        *guard = Some(XofRng { reader });
     }
-
-    // Override liboqs RNG with our deterministic provider
     unsafe { OQS_randombytes_custom_algorithm(Some(oqs_custom_randombytes)); }
-
-    // Generate ML-DSA-65 keypair deterministically
-    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65)
-        .expect("liboqs ML-DSA-65 not available");
+    let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65).expect("liboqs ML-DSA-65 not available");
     let (oqs_pk, oqs_sk) = sig.keypair().expect("liboqs keypair failed");
     let pk_bytes = oqs_pk.as_ref();
     let sk_bytes = oqs_sk.as_ref();
-
-    // Restore liboqs RNG to default; clear state
     unsafe { OQS_randombytes_custom_algorithm(None); }
     {
         let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
-        if let Some(ref mut st) = *guard { st.zeroize(); }
-        *guard = None;
+        *guard = None; // reader dropped
     }
-
-    // Convert to pqcrypto_dilithium types
     assert_eq!(pk_bytes.len(), DILITHIUM3_PK_BYTES, "ML-DSA-65 pk size mismatch");
     assert_eq!(sk_bytes.len(), DILITHIUM3_SK_BYTES, "ML-DSA-65 sk size mismatch");
     let dili_pk = PublicKey::from_bytes(pk_bytes).expect("invalid Dilithium3 public key bytes");
