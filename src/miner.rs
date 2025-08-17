@@ -117,7 +117,7 @@ impl Miner {
         }
     }
 
-    async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { /* actual code continues */
+    async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut anchor_rx = self.net.anchor_subscribe();
         let mut heartbeat_interval = time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
         
@@ -320,18 +320,24 @@ impl Miner {
 
             // Consensus requires Argon2 parameters to be deterministic (lanes=1 enforced in function).
             {
-                                    if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+                if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
                     // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
                     // Finding a coin proves the current epoch is still active.
                     self.last_heartbeat = time::Instant::now();
 
                     let mut creator_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
                     creator_pk.copy_from_slice(self.wallet.public_key().as_bytes());
+                    let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_address);
+                    // Compute genesis lock for this coin deterministically from our Dilithium SK
+                    let chain_id = self.db.get_chain_id()?;
+                    let s0 = self.wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
+                    let lock_hash = crate::crypto::lock_hash(&s0);
                     let candidate = CoinCandidate::new(
                         anchor.hash,
                         nonce,
                         creator_address,
                         creator_pk,
+                        lock_hash,
                         pow_hash,
                     );
                     println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(candidate.id), attempts);
