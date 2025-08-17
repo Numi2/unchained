@@ -20,6 +20,18 @@ jobs:
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install OpenSSL
+        shell: pwsh
+        run: choco install openssl --no-progress -y
+
+      - name: Export OpenSSL environment
+        shell: pwsh
+        run: |
+          echo "OPENSSL_ROOT_DIR=C:\\Program Files\\OpenSSL-Win64" >> $env:GITHUB_ENV
+          echo "OPENSSL_DIR=C:\\Program Files\\OpenSSL-Win64" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=C:\\Program Files\\OpenSSL-Win64" >> $env:GITHUB_ENV
+          echo "Path=$env:Path;C:\\Program Files\\OpenSSL-Win64\\bin" >> $env:GITHUB_ENV
+
       - name: Cache cargo and target
         uses: actions/cache@v4
         with:
