@@ -2,7 +2,7 @@
 // Copyright 2025 The Unchained Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stealth transfer implementation (V2 only).
+//! Stealth transfer implementation (V2 + V3 hashlock).
 
 use serde::{Serialize, Deserialize};
 use serde_big_array::BigArray;
@@ -90,6 +90,22 @@ impl StealthOutput {
 // (Legacy V1 transfer has been fully removed.)
 
 // ------------ Spend-key-blinded nullifier (V2) + Hashlock (V3) ------------
+
+/// Receiver-supplied lock commitment for V3 hashlock spends.
+/// The receiver generates `kyber_ct` (encapsulated to their own Kyber PK), decapsulates to get
+/// the shared secret, derives the one-time Dilithium key deterministically using `stealth_seed_v1`,
+/// and computes the next-hop lock preimage `s_next` using `derive_next_lock_secret`.
+/// The receiver shares only commitment values: `one_time_pk`, `kyber_ct`, `next_lock_hash`, and
+/// the bound `amount_le`. The sender never learns `s_next`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiverLockCommitment {
+    #[serde(with = "BigArray")]
+    pub one_time_pk: [u8; DILITHIUM3_PK_BYTES],
+    #[serde(with = "BigArray")]
+    pub kyber_ct: [u8; KYBER_CT_BYTES],
+    pub next_lock_hash: [u8; 32],
+    pub amount_le: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Spend {
@@ -180,37 +196,33 @@ impl Spend {
         Ok(spend)
     }
 
-    /// Construct a signatureless hashlock-based spend (V3).
+    /// Construct a signatureless hashlock-based spend (V3) using a receiver-supplied commitment.
     pub fn create_hashlock(
         coin_id: [u8; 32],
         anchor: &crate::epoch::Anchor,
         proof: Vec<([u8; 32], bool)>,
         unlock_preimage: [u8; 32],
-        recipient_dili_pk: &DiliPk,
-        recipient_kyber_pk: &KyberPk,
+        receiver_commitment: &ReceiverLockCommitment,
         amount: u64,
-        chain_id32: &[u8; 32],
+        _chain_id32: &[u8; 32],
     ) -> Result<Self> {
-        // Produce stealth output (as in V2)
-        let (shared, ct) = encapsulate(recipient_kyber_pk);
-        let commitment = commitment_of_stealth_ct(ct.as_bytes());
-        let value_tag = amount.to_le_bytes();
-        let seed = stealth_seed_v1(shared.as_bytes(), recipient_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
-        let (ot_pk, _ot_sk) = dilithium3_seeded_keypair(seed);
-
+        // Enforce amount binding to receiver commitment to avoid OTP/key mismatch
+        if receiver_commitment.amount_le != amount {
+            return Err(anyhow!("Receiver commitment amount mismatch"));
+        }
+        let commitment = commitment_of_stealth_ct(&receiver_commitment.kyber_ct);
         let mut to = StealthOutput {
             one_time_pk: [0u8; DILITHIUM3_PK_BYTES],
             kyber_ct: [0u8; KYBER_CT_BYTES],
             amount_le: amount,
         };
-        to.one_time_pk.copy_from_slice(ot_pk.as_bytes());
-        to.kyber_ct.copy_from_slice(ct.as_bytes());
+        to.one_time_pk.copy_from_slice(&receiver_commitment.one_time_pk);
+        to.kyber_ct.copy_from_slice(&receiver_commitment.kyber_ct);
 
         // Nullifier (V3): H("unchained.nullifier.v3" || coin_id || unlock_preimage)
         let nullifier = compute_nullifier_v3(&unlock_preimage, &coin_id);
-        // Next-hop lock hash for recipient
-        let s_next = derive_next_lock_secret(shared.as_bytes(), ct.as_bytes(), amount, &coin_id, chain_id32);
-        let next_lock_hash = compute_lock_hash(&s_next);
+        // Next-hop lock hash provided by receiver
+        let next_lock_hash = receiver_commitment.next_lock_hash;
 
         Ok(Spend {
             coin_id,
@@ -281,7 +293,16 @@ impl Spend {
             let exp_nf = compute_nullifier_v3(&preimage, &self.coin_id);
             if exp_nf != self.nullifier { return Err(anyhow!("Nullifier mismatch")); }
         } else {
-            // V2 signature path (fallback)
+            // V2 signature path (fallback) – disabled when a hashlock is in force for this coin/state
+            if coin.lock_hash != [0u8;32] {
+                return Err(anyhow!("Hashlock enforced for this coin; signature-only spends are disabled"));
+            }
+            if let Some(prev) = db.get::<Spend>("spend", &self.coin_id)? {
+                if prev.next_lock_hash.is_some() {
+                    return Err(anyhow!("Hashlock chain in effect; signature-only spends are disabled"));
+                }
+            }
+            // V2 signature path (legacy)
             let last_spend: Option<Spend> = db.get("spend", &self.coin_id)
                 .context("Failed to query last spend")?;
 

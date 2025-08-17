@@ -535,8 +535,32 @@ async fn main() -> anyhow::Result<()> {
             let mut confirm = String::new();
             io::stdin().read_line(&mut confirm)?;
             
+            // Determine the inputs so we can request receiver commitments per coin
+            let _selected_inputs = match wallet.select_inputs(amount) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("❌ Input selection failed: {}", e); return Err(e); }
+            };
+            // Ask user if they want to attempt automatic network exchange
+            println!("🤝 Attempt automatic receiver commitment exchange over P2P? (Y/n): ");
+            io::stdout().flush()?;
+            let mut auto = String::new();
+            io::stdin().read_line(&mut auto)?;
+            let auto = auto.trim().to_lowercase();
+            let batch_token = if auto == "n" || auto == "no" {
+                println!("🔒 Paste single batch commitment token from receiver (base64-url):");
+                print!("   Token: ");
+                io::stdout().flush()?;
+                let mut tok = String::new();
+                io::stdin().read_line(&mut tok)?;
+                let tok = tok.trim().to_string();
+                if tok.is_empty() { eprintln!("❌ Batch commitment token cannot be empty"); return Ok(()); }
+                tok
+            } else {
+                String::new()
+            };
+
             println!("\n🚀 Sending {} coins to stealth recipient...", amount);
-            match wallet.send_to_stealth_address(&stealth, amount, &net).await {
+            match wallet.send_to_stealth_address_with_commitments(&stealth, amount, &net, batch_token).await {
                 Ok(outcome) => {
                     let total = outcome.spends.len();
                     println!("✅ Sent {} spend{}", total, if total == 1 { "" } else { "s" });

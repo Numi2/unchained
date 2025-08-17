@@ -86,6 +86,8 @@ const TOP_EPOCH_LEAVES: &str = "unchained/epoch_leaves/v1";       // payload: Ep
 const TOP_EPOCH_LEAVES_REQUEST: &str = "unchained/epoch_leaves_request/v1"; // payload: u64 epoch number
 const TOP_EPOCH_SELECTED_REQUEST: &str = "unchained/epoch_selected_request/v1"; // payload: u64 epoch number
 const TOP_EPOCH_SELECTED_RESPONSE: &str = "unchained/epoch_selected_response/v1"; // payload: SelectedIdsBundle
+const TOP_COMMITMENT_REQUEST: &str = "unchained/commitment_request/v1";
+const TOP_COMMITMENT_RESPONSE: &str = "unchained/commitment_response/v1";
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -345,11 +347,44 @@ pub struct SelectedIdsBundle {
     pub coin_ids: Vec<[u8; 32]>, // selected coin ids for this epoch
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentEntryReq { pub coin_id: [u8; 32], pub amount_le: u64 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentRequest {
+    pub request_id: [u8; 32],
+    pub recipient_addr: crate::crypto::Address,
+    pub entries: Vec<CommitmentEntryReq>,
+    pub memo: Option<String>,
+    pub expiry_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentEntryResp {
+    #[serde(with = "serde_big_array::BigArray")]
+    pub one_time_pk: [u8; crate::crypto::DILITHIUM3_PK_BYTES],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub kyber_ct: [u8; crate::crypto::KYBER768_CT_BYTES],
+    pub next_lock_hash: [u8; 32],
+    pub coin_id: [u8; 32],
+    pub amount_le: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentResponse {
+    pub request_id: [u8; 32],
+    pub recipient_addr: crate::crypto::Address,
+    pub entries: Vec<CommitmentEntryResp>,
+    pub sig: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
     proof_tx: broadcast::Sender<CoinProofResponse>,
     spend_tx: broadcast::Sender<Spend>,
+    commit_req_tx: broadcast::Sender<CommitmentRequest>,
+    commit_resp_tx: broadcast::Sender<CommitmentResponse>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
@@ -366,6 +401,8 @@ enum NetworkCommand {
     RequestCoinProof([u8; 32]),
     RequestEpochLeaves(u64),
     GossipEpochLeaves(EpochLeavesBundle),
+    GossipCommitmentRequest(CommitmentRequest),
+    GossipCommitmentResponse(CommitmentResponse),
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -432,6 +469,7 @@ pub async fn spawn(
         TOP_EPOCH_SELECTED_REQUEST, TOP_EPOCH_SELECTED_RESPONSE,
         TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
         TOP_PEER_ADDR,
+        TOP_COMMITMENT_REQUEST, TOP_COMMITMENT_RESPONSE,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -474,8 +512,10 @@ pub async fn spawn(
     let (spend_tx, _) = broadcast::channel(1024);
     let (anchor_tx, _) = broadcast::channel(256);
     let (proof_tx, _) = broadcast::channel(256);
+    let (commit_req_tx, _) = broadcast::channel(256);
+    let (commit_resp_tx, _) = broadcast::channel(256);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), commit_req_tx: commit_req_tx.clone(), commit_resp_tx: commit_resp_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -777,6 +817,8 @@ pub async fn spawn(
                                     NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
                                     NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
+                                    NetworkCommand::GossipCommitmentRequest(req) => (TOP_COMMITMENT_REQUEST, bincode::serialize(&req).ok()),
+                                    NetworkCommand::GossipCommitmentResponse(resp) => (TOP_COMMITMENT_RESPONSE, bincode::serialize(&resp).ok()),
                                 };
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
@@ -1483,6 +1525,14 @@ pub async fn spawn(
                                         }
                                     }
                                 },
+                                TOP_COMMITMENT_REQUEST => if let Ok(req) = bincode::deserialize::<CommitmentRequest>(&message.data) {
+                                    let _ = commit_req_tx.send(req);
+                                },
+                                TOP_COMMITMENT_RESPONSE => if let Ok(resp) = bincode::deserialize::<CommitmentResponse>(&message.data) {
+                                    let _ = commit_resp_tx.send(resp);
+                                },
+                                // Duplicate commitment handlers removed: requests are forwarded to subscribers,
+                                // and responses are broadcasted via commit_resp_tx above.
                                 _ => {}
                             }
                         },
@@ -1571,6 +1621,20 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::GossipCommitmentRequest(req) => {
+                            if let Ok(data) = bincode::serialize(req) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COMMITMENT_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
+                        NetworkCommand::GossipCommitmentResponse(resp) => {
+                            if let Ok(data) = bincode::serialize(resp) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COMMITMENT_RESPONSE), data).is_err() {
+                                    pending_commands.push_back(command);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1587,6 +1651,8 @@ impl Network {
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> { self.spend_tx.subscribe() }
+    pub fn commitment_request_subscribe(&self) -> broadcast::Receiver<CommitmentRequest> { self.commit_req_tx.subscribe() }
+    pub fn commitment_response_subscribe(&self) -> broadcast::Receiver<CommitmentResponse> { self.commit_resp_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
@@ -1595,6 +1661,8 @@ impl Network {
     pub async fn request_epoch_leaves(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochLeaves(epoch_num)); }
     // Note: We do not keep an explicit command variant; selected requests are sent directly when needed.
     pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) { let _ = self.command_tx.send(NetworkCommand::GossipEpochLeaves(bundle)); }
+    pub async fn request_commitments(&self, req: CommitmentRequest) { let _ = self.command_tx.send(NetworkCommand::GossipCommitmentRequest(req)); }
+    pub async fn gossip_commitment_response(&self, resp: CommitmentResponse) { let _ = self.command_tx.send(NetworkCommand::GossipCommitmentResponse(resp)); }
     
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {

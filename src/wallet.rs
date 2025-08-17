@@ -474,6 +474,57 @@ impl Wallet {
     }
 
     // ---------------------------------------------------------------------
+    // Receiver commitment token parsing (V3 hashlock)
+    // ---------------------------------------------------------------------
+    // Batch token is a base64-url encoded bincode of network::CommitmentResponse; we verify signature
+    // and convert entries into per-coin ReceiverLockCommitment records.
+    fn parse_batch_commitment_token(
+        token: &str,
+        recipient_dili_pk: &pqcrypto_dilithium::dilithium3::PublicKey,
+        expected_recipient_addr: &Address,
+    ) -> Result<std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment>> {
+        let s = token.trim().trim_matches('"').trim_matches('\'').trim_matches('`');
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+            .map_err(|_| anyhow!("Invalid batch commitment encoding"))?;
+        let resp: crate::network::CommitmentResponse = bincode::deserialize(&bytes)
+            .map_err(|_| anyhow!("Invalid batch commitment payload"))?;
+        if &resp.recipient_addr != expected_recipient_addr {
+            bail!("Batch commitment recipient mismatch");
+        }
+        // Verify signature over canonical bytes
+        let mut entries_sorted = resp.entries.clone();
+        entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
+        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32));
+        msg.extend_from_slice(b"commitment_response_v1");
+        msg.extend_from_slice(&resp.request_id);
+        msg.extend_from_slice(&resp.recipient_addr);
+        msg.extend_from_slice(&(entries_sorted.len() as u32).to_le_bytes());
+        for e in &entries_sorted {
+            msg.extend_from_slice(&e.coin_id);
+            msg.extend_from_slice(&e.amount_le.to_le_bytes());
+            msg.extend_from_slice(&e.one_time_pk);
+            msg.extend_from_slice(&e.kyber_ct);
+            msg.extend_from_slice(&e.next_lock_hash);
+        }
+        let sig = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&resp.sig)
+            .map_err(|_| anyhow!("Invalid batch commitment signature encoding"))?;
+        pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &msg, recipient_dili_pk)
+            .map_err(|_| anyhow!("Batch commitment signature verification failed"))?;
+        let mut map = std::collections::HashMap::new();
+        for e in resp.entries {
+            map.insert(e.coin_id, crate::transfer::ReceiverLockCommitment {
+                one_time_pk: e.one_time_pk,
+                kyber_ct: e.kyber_ct,
+                next_lock_hash: e.next_lock_hash,
+                amount_le: e.amount_le,
+            });
+        }
+        Ok(map)
+    }
+
+    // ---------------------------------------------------------------------
     // 🪙 UTXO helpers
     // ---------------------------------------------------------------------
     /// Returns all coins currently owned by this wallet that are **unspent**.
@@ -607,11 +658,12 @@ impl Wallet {
     }
 
     /// Sends stealth V3 hashlock spends to a recipient using a (possibly unsigned) stealth address string.
-    pub async fn send_to_stealth_address(
+    pub async fn send_to_stealth_address_with_commitments(
         &self,
         stealth_address_str: &str,
         amount: u64,
         network: &crate::network::NetHandle,
+        batch_commitment_token_or_empty: String,
     ) -> Result<SendOutcome> {
         let (_recipient_addr, recipient_dili_pk, recipient_kyber_pk) = Self::parse_and_verify_stealth_address(stealth_address_str)?;
         let store = self
@@ -619,9 +671,41 @@ impl Wallet {
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         let coins_to_spend = self.select_inputs(amount)?;
+        // Try automated P2P exchange if no offline token provided
+        let mut commitments_by_coin: std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment> = if batch_commitment_token_or_empty.is_empty() {
+            // Build and send commitment request
+            use crate::network::{CommitmentRequest, CommitmentEntryReq};
+            let mut req_entries = Vec::with_capacity(coins_to_spend.len());
+            for c in &coins_to_spend { req_entries.push(CommitmentEntryReq{ coin_id: c.id, amount_le: c.value }); }
+            let mut rng_tag = [0u8;32];
+            rand::rngs::OsRng.fill_bytes(&mut rng_tag);
+            let req = CommitmentRequest { request_id: rng_tag, recipient_addr: _recipient_addr, entries: req_entries, memo: None, expiry_unix_secs: None };
+            let mut sub = network.commitment_response_subscribe();
+            network.request_commitments(req.clone()).await;
+            // Wait with timeout
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv()).await
+                .map_err(|_| anyhow!("timeout waiting for receiver batch commitments"))??;
+            if resp.recipient_addr != _recipient_addr { return Err(anyhow!("batch commitment recipient mismatch")); }
+            if resp.entries.len() < coins_to_spend.len() { return Err(anyhow!("missing entries: expected {} got {}", coins_to_spend.len(), resp.entries.len())); }
+            // Verify signature and convert
+            let map = Self::parse_batch_commitment_token(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?),
+                &recipient_dili_pk,
+                &_recipient_addr,
+            )?;
+            map
+        } else {
+            // Offline fallback: parse provided token
+            Self::parse_batch_commitment_token(&batch_commitment_token_or_empty, &recipient_dili_pk, &_recipient_addr)?
+        };
         let mut spends = Vec::new();
 
         for coin in coins_to_spend {
+            let receiver_commitment = commitments_by_coin.remove(&coin.id)
+                .ok_or_else(|| anyhow!("missing entries for coin_id={} in batch commitment", hex::encode(coin.id)))?;
+            if receiver_commitment.amount_le != coin.value {
+                return Err(anyhow!("amount mismatch for coin_id={}", hex::encode(coin.id)));
+            }
             // Resolve epoch and proof (unchanged logic)
             let commit_epoch = store
                 .get_epoch_for_coin(&coin.id)?
@@ -736,8 +820,7 @@ impl Wallet {
                         &anchor_used,
                         proof_used.expect("proof must be present after local or network path"),
                         preimage,
-                        &recipient_dili_pk,
-                        &recipient_kyber_pk,
+                        &receiver_commitment,
                         coin.value,
                         &store.get_chain_id()?,
                     )?
@@ -762,6 +845,18 @@ impl Wallet {
             spends.push(spend);
         }
         Ok(SendOutcome { spends })
+    }
+
+    /// Deprecated wrapper: commitments are required for V3 hashlock sends.
+    pub async fn send_to_stealth_address(
+        &self,
+        _stealth_address_str: &str,
+        _amount: u64,
+        _network: &crate::network::NetHandle,
+    ) -> Result<SendOutcome> {
+        Err(anyhow!(
+            "Receiver commitments required. Use send_to_stealth_address_with_commitments(stealth_address, amount, network, tokens)"
+        ))
     }
 
     // (Legacy transfers listing removed)
