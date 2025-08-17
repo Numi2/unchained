@@ -8,6 +8,7 @@ use pqcrypto_dilithium::dilithium3::{
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
 use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
+use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
 use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
 use serde::{Serialize, Deserialize};
@@ -931,6 +932,73 @@ impl Wallet {
         }
 
         Ok(history)
+    }
+
+    /// Build a signed CommitmentResponse for a given request (receiver side).
+    /// The response is a batch commitment token that the payer can use offline.
+    pub fn build_commitment_response(&self, req: &crate::network::CommitmentRequest) -> Result<crate::network::CommitmentResponse> {
+        if req.recipient_addr != self.address { anyhow::bail!("recipient mismatch in request"); }
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let chain_id = store.get_chain_id()?;
+
+        let mut entries: Vec<crate::network::CommitmentEntryResp> = Vec::with_capacity(req.entries.len());
+        for e in &req.entries {
+            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&self.kyber_pk);
+            let value_tag = e.amount_le.to_le_bytes();
+            let seed = crate::crypto::stealth_seed_v1(
+                shared.as_bytes(),
+                self.pk.as_bytes(),
+                ct.as_bytes(),
+                &value_tag,
+                &chain_id,
+            );
+            let (ot_pk, _ot_sk) = crate::crypto::dilithium3_seeded_keypair(seed);
+
+            let s_next = crate::crypto::derive_next_lock_secret(
+                shared.as_bytes(),
+                ct.as_bytes(),
+                e.amount_le,
+                &e.coin_id,
+                &chain_id,
+            );
+            let next_lock_hash = crate::crypto::lock_hash(&s_next);
+
+            let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+            one_time_pk.copy_from_slice(ot_pk.as_bytes());
+            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
+            kyber_ct.copy_from_slice(ct.as_bytes());
+
+            entries.push(crate::network::CommitmentEntryResp {
+                one_time_pk,
+                kyber_ct,
+                next_lock_hash,
+                coin_id: e.coin_id,
+                amount_le: e.amount_le,
+            });
+        }
+
+        let mut entries_sorted = entries.clone();
+        entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
+        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32));
+        msg.extend_from_slice(b"commitment_response_v1");
+        msg.extend_from_slice(&req.request_id);
+        msg.extend_from_slice(&req.recipient_addr);
+        msg.extend_from_slice(&(entries_sorted.len() as u32).to_le_bytes());
+        for e in &entries_sorted {
+            msg.extend_from_slice(&e.coin_id);
+            msg.extend_from_slice(&e.amount_le.to_le_bytes());
+            msg.extend_from_slice(&e.one_time_pk);
+            msg.extend_from_slice(&e.kyber_ct);
+            msg.extend_from_slice(&e.next_lock_hash);
+        }
+        let sig = detached_sign(&msg, &self.sk);
+
+        Ok(crate::network::CommitmentResponse {
+            request_id: req.request_id,
+            recipient_addr: req.recipient_addr,
+            entries,
+            sig: sig.as_bytes().to_vec(),
+        })
     }
 }
 

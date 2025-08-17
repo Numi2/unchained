@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
 use anyhow;
+use base64::Engine;
 use std::io::{self, Write};
 
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
@@ -49,6 +50,20 @@ enum Cmd {
     History,
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
     RepairSpends,
+    /// Receiver: Listen for commitment requests and auto-respond with a signed batch token
+    ServeCommitments,
+    /// Receiver: Generate a single batch commitment token from a pasted request (base64-url)
+    MakeCommitmentToken {
+        #[arg(long)]
+        request_b64: String,
+    },
+    /// Sender: Build a base64 commitment request for offline exchange (paste to receiver)
+    MakeCommitmentRequest {
+        #[arg(long)]
+        stealth: String,
+        #[arg(long)]
+        amount: u64,
+    },
 }
 
 #[tokio::main]
@@ -648,6 +663,55 @@ async fn main() -> anyhow::Result<()> {
                 db.write_batch(batch)?;
             }
             println!("✅ Repair complete. Scanned: {}, deleted malformed: {}. Backup dir: {}", scanned, repaired, backup_dir);
+            return Ok(());
+        }
+        Some(Cmd::ServeCommitments) => {
+            println!("📡 Serving receiver commitments over P2P (auto-respond)");
+            let mut sub = net.commitment_request_subscribe();
+            loop {
+                match sub.recv().await {
+                    Ok(req) => {
+                        if req.recipient_addr != wallet.address() { continue; }
+                        match wallet.build_commitment_response(&req) {
+                            Ok(resp) => {
+                                let _ = net.gossip_commitment_response(resp).await;
+                                println!("↩️  Responded to commitment request {}", hex::encode(req.request_id));
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️  Failed to build commitment response: {}", e);
+                            }
+                        }
+                    }
+                    Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
+                }
+            }
+        }
+        Some(Cmd::MakeCommitmentToken { request_b64 }) => {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(request_b64)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(request_b64))
+                .map_err(|_| anyhow::anyhow!("Invalid base64 for request"))?;
+            let req: crate::network::CommitmentRequest = bincode::deserialize(&bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid request payload"))?;
+            let resp = wallet.build_commitment_response(&req)?;
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
+            println!("🔐 Batch commitment token (base64-url):\n{}", token);
+            return Ok(());
+        }
+        Some(Cmd::MakeCommitmentRequest { stealth, amount }) => {
+            // Parse recipient
+            let (recipient_addr, _dpk, _kpk) = wallet::Wallet::parse_and_verify_stealth_address(&stealth)?;
+            // Select inputs to cover amount
+            let coins = wallet.select_inputs(*amount)?;
+            use crate::network::{CommitmentRequest, CommitmentEntryReq};
+            let mut entries = Vec::with_capacity(coins.len());
+            for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
+            use rand::RngCore as _;
+            let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
+            let req = CommitmentRequest { request_id: rng_tag, recipient_addr, entries, memo: None, expiry_unix_secs: None };
+            let b = bincode::serialize(&req)?;
+            let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+            println!("📨 Commitment request (send to receiver):\n{}", s);
             return Ok(());
         }
         None => {
