@@ -294,8 +294,6 @@ pub fn create_pq_server_config(cert_der: Vec<u8>, private_key_der: Vec<u8>) -> R
     Ok(Arc::new(config))
 }
 
-<<<<<<< Current (Your changes)
-=======
 // -----------------------------------------------------------------------------
 // Signatureless spend helpers (BLAKE3 + Kyber)
 // -----------------------------------------------------------------------------
@@ -339,4 +337,3 @@ pub fn derive_genesis_lock_secret(dili_sk: &SecretKey, coin_id: &[u8;32], chain_
     *h.finalize().as_bytes()
 }
 
->>>>>>> Incoming (Background Agent changes)
