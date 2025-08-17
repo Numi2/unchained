@@ -20,6 +20,7 @@ jobs:
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      # (Optional) Keep OpenSSL install for other crates; liboqs will NOT use it.
       - name: Install OpenSSL
         shell: pwsh
         run: choco install openssl --no-progress -y
@@ -40,7 +41,6 @@ jobs:
             throw "OpenSSL install path not found"
           }
           $cryptoLib = Get-ChildItem -Path (Join-Path $prefix 'lib') -Recurse -Filter 'libcrypto.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
-          $sslLib    = Get-ChildItem -Path (Join-Path $prefix 'lib') -Recurse -Filter 'libssl.lib'    -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $cryptoLib) { throw "Could not find libcrypto.lib under $prefix" }
           if (-not (Test-Path (Join-Path $prefix 'include'))) { throw "Could not find OpenSSL include dir under $prefix" }
           $includeDir = Join-Path $prefix 'include'
@@ -48,23 +48,17 @@ jobs:
           echo "OPENSSL_ROOT_DIR=$prefix" >> $env:GITHUB_ENV
           echo "OPENSSL_DIR=$prefix" >> $env:GITHUB_ENV
           echo "OPENSSL_INCLUDE_DIR=$includeDir" >> $env:GITHUB_ENV
-          echo "OPENSSL_CRYPTO_LIBRARY=$($cryptoLib.FullName)" >> $env:GITHUB_ENV
-          if ($sslLib) { echo "OPENSSL_SSL_LIBRARY=$($sslLib.FullName)" >> $env:GITHUB_ENV }
           echo "OPENSSL_LIB_DIR=$($cryptoLib.DirectoryName)" >> $env:GITHUB_ENV
-          echo "CMAKE_PREFIX_PATH=$prefix" >> $env:GITHUB_ENV
           echo "Path=$env:Path;$prefix\bin" >> $env:GITHUB_ENV
-          echo "OPENSSL_USE_STATIC_LIBS=FALSE" >> $env:GITHUB_ENV
-          echo "LIB=$($cryptoLib.DirectoryName);$env:LIB;$libDir" >> $env:GITHUB_ENV
-          echo "LIBPATH=$($cryptoLib.DirectoryName);$env:LIBPATH;$libDir" >> $env:GITHUB_ENV
-          $modules = Join-Path $libDir 'ossl-modules'
-          if (Test-Path $modules) { echo "OPENSSL_MODULES=$modules" >> $env:GITHUB_ENV }
 
+      # CRITICAL: ensure liboqs builds WITHOUT OpenSSL and force a rebuild
       - name: Configure liboqs (disable OpenSSL backend)
         shell: pwsh
         run: |
-          echo "OQS_SYS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
+          echo "OQS_SYS_CMAKE_ARGS=-DOQS_USE_OPENSSL=OFF -DOQS_DIST_BUILD=ON" >> $env:GITHUB_ENV
           echo "OQS_USE_OPENSSL=OFF" >> $env:GITHUB_ENV
 
+      # Bump cache namespace so we don't reuse the OpenSSL-enabled liboqs
       - name: Cache cargo and target
         uses: actions/cache@v4
         with:
@@ -74,9 +68,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v3-noossl-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-
+            ${{ runner.os }}-cargo-v3-noossl-
+
+      # Also hard-clean the workspace to blow away any previously built liboqs
+      - name: Cargo clean
+        run: cargo clean
 
       - name: Build (release, static CRT)
         run: cargo build --locked --release
