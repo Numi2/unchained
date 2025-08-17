@@ -281,7 +281,7 @@ impl Spend {
         if let Some(preimage) = self.unlock_preimage {
             // V3 hashlock path
             // Determine expected previous lock hash
-            let expected_lock_hash = if let Some(prev_spend) = db.get::<Spend>("spend", &self.coin_id)? {
+            let expected_lock_hash = if let Some(prev_spend) = db.get_spend_tolerant(&self.coin_id)? {
                 if let Some(next_h) = prev_spend.next_lock_hash { next_h } else { return Err(anyhow!("Previous spend missing next_lock_hash")); }
             } else {
                 // Genesis lock hash stored in coin
@@ -297,14 +297,13 @@ impl Spend {
             if coin.lock_hash != [0u8;32] {
                 return Err(anyhow!("Hashlock enforced for this coin; signature-only spends are disabled"));
             }
-            if let Some(prev) = db.get::<Spend>("spend", &self.coin_id)? {
+            if let Some(prev) = db.get_spend_tolerant(&self.coin_id)? {
                 if prev.next_lock_hash.is_some() {
                     return Err(anyhow!("Hashlock chain in effect; signature-only spends are disabled"));
                 }
             }
             // V2 signature path (legacy)
-            let last_spend: Option<Spend> = db.get("spend", &self.coin_id)
-                .context("Failed to query last spend")?;
+            let last_spend: Option<Spend> = db.get_spend_tolerant(&self.coin_id)?;
 
             let sig = DetachedSignature::from_bytes(&self.sig)
                 .context("Invalid spend signature format")?;

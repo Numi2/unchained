@@ -200,7 +200,7 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     // Authorization: prefer V3 hashlock when present, else fallback to V2 signature path
     if let Some(preimage) = sp.unlock_preimage {
         // Determine expected previous lock hash
-        let expected_lock_hash = if let Ok(Some(prev_sp)) = db.get::<Spend>("spend", &sp.coin_id) {
+        let expected_lock_hash = if let Ok(Some(prev_sp)) = db.get_spend_tolerant(&sp.coin_id) {
             if let Some(h) = prev_sp.next_lock_hash { h } else { return Err("Previous spend missing next_lock_hash".into()); }
         } else {
             // Genesis lock hash stored in coin
@@ -219,7 +219,7 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
         };
         let mut verified_pk: Option<pqcrypto_dilithium::dilithium3::PublicKey> = None;
         if verified_pk.is_none() {
-            if let Ok(Some(prev_sp)) = db.get::<Spend>("spend", &sp.coin_id) {
+            if let Ok(Some(prev_sp)) = db.get_spend_tolerant(&sp.coin_id) {
                 if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&prev_sp.to.one_time_pk) {
                     if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
                         verified_pk = Some(pk);
@@ -1098,7 +1098,7 @@ pub async fn spawn(
                                         }
 
                                         // If we still have no spend for this coin, proactively request it once (helps catch-up cases)
-                                        if db.get::<Spend>("spend", &coin.id).ok().flatten().is_none() {
+                                        if db.get_spend_tolerant(&coin.id).ok().flatten().is_none() {
                                             let now = std::time::Instant::now();
                                             {
                                                 let mut map = RECENT_SPEND_REQS.lock().unwrap();
@@ -1227,7 +1227,7 @@ pub async fn spawn(
                                     }
                                 },
                                 TOP_SPEND_REQUEST => if let Ok(coin_id) = bincode::deserialize::<[u8;32]>(&message.data) {
-                                    if let Ok(Some(sp)) = db.get::<Spend>("spend", &coin_id) {
+                                    if let Ok(Some(sp)) = db.get_spend_tolerant(&coin_id) {
                                         if let Ok(data) = bincode::serialize(&Some(sp)) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
                                         }

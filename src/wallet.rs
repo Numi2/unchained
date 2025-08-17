@@ -549,7 +549,11 @@ impl Wallet {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 // If there is a V2 spend recorded, the current owner is the recipient of that spend
-                if let Some(sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
+                let v2_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("⚠️  Skipping malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
+                };
+                if let Some(sp) = v2_spend {
                     let chain_id = store.get_chain_id()?;
                     if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         utxos.push(coin);
@@ -610,8 +614,11 @@ impl Wallet {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
-                let v2: Option<crate::transfer::Spend> = store.get("spend", &coin.id)?;
-                if let Some(sp) = v2 {
+                let v2_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
+                };
+                if let Some(sp) = v2_spend {
                     let chain_id = store.get_chain_id()?;
                     if let Ok(_sk) = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
                         sum = sum.saturating_add(coin.value);
@@ -795,7 +802,11 @@ impl Wallet {
 
             // Determine spend auth path
             enum AuthPath { V2 { owner_pk: PublicKey, owner_sk: SecretKey }, V3 { preimage: [u8;32] } }
-            let path = if let Some(prev_sp) = store.get::<crate::transfer::Spend>("spend", &coin.id)? {
+            let prev_spend_opt: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
+            };
+            let path = if let Some(prev_sp) = prev_spend_opt {
                 // We are spending a previously received coin; use V3 hashlock by deriving preimage
                 let chain_id = store.get_chain_id()?;
                 let s = prev_sp.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id)

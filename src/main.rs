@@ -47,6 +47,8 @@ enum Cmd {
     },
     Balance,
     History,
+    /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
+    RepairSpends,
 }
 
 #[tokio::main]
@@ -612,6 +614,40 @@ async fn main() -> anyhow::Result<()> {
                     return Err(e);
                 }
             }
+            return Ok(());
+        }
+        Some(Cmd::RepairSpends) => {
+            println!("🛠️  Scanning 'spend' CF for malformed entries...");
+            let cf = db.db.cf_handle("spend").ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+            let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let backup_dir = format!("{}/backups_spend_repair/{}", cfg.storage.path, chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+            std::fs::create_dir_all(&backup_dir).ok();
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut scanned: u64 = 0;
+            let mut repaired: u64 = 0;
+            for item in iter {
+                if let Ok((k, v)) = item {
+                    scanned += 1;
+                    let valid = zstd::decode_all(&v[..])
+                        .ok()
+                        .and_then(|d| bincode::deserialize::<crate::transfer::Spend>(&d).ok())
+                        .or_else(|| bincode::deserialize::<crate::transfer::Spend>(&v[..]).ok())
+                        .is_some();
+                    if !valid {
+                        let key_hex = hex::encode(&k);
+                        let mut path = std::path::PathBuf::from(&backup_dir);
+                        path.push(format!("spend-{}.bin", key_hex));
+                        let _ = std::fs::write(&path, &v);
+                        batch.delete_cf(cf, &k);
+                        repaired += 1;
+                        println!("   - Deleted malformed spend key={} (backed up)", key_hex);
+                    }
+                }
+            }
+            if repaired > 0 {
+                db.write_batch(batch)?;
+            }
+            println!("✅ Repair complete. Scanned: {}, deleted malformed: {}. Backup dir: {}", scanned, repaired, backup_dir);
             return Ok(());
         }
         None => {

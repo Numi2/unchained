@@ -277,6 +277,33 @@ impl Store {
         }
     }
 
+    /// Specialized tolerant getter for `spend` CF that never errors on deserialization issues.
+    /// Returns Ok(None) when bytes are malformed instead of bailing.
+    pub fn get_spend_tolerant(&self, key: &[u8]) -> Result<Option<crate::transfer::Spend>> {
+        let handle = self.db.cf_handle("spend")
+            .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", "spend"))?;
+
+        match self.db.get_cf(handle, key)? {
+            Some(value) => {
+                // Try compressed then plain
+                if let Ok(decompressed) = zstd::decode_all(&value[..]) {
+                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
+                        return Ok(Some(sp));
+                    }
+                }
+                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&value[..]) {
+                    return Ok(Some(sp));
+                }
+                eprintln!(
+                    "\u{26a0}\u{fe0f}  Ignoring malformed spend record for key {}",
+                    hex::encode(key)
+                );
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Fetch raw bytes without attempting to deserialize
     pub fn get_raw_bytes(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let handle = self.db.cf_handle(cf)
@@ -350,7 +377,7 @@ impl Store {
         
         for coin in coins {
             // Check if coin is spent via V2 only
-            let v2_spent: Option<crate::transfer::Spend> = self.get("spend", &coin.id)?;
+            let v2_spent: Option<crate::transfer::Spend> = self.get_spend_tolerant(&coin.id)?;
             if v2_spent.is_none() { unspent_coins.push(coin); }
         }
         
