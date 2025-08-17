@@ -71,8 +71,8 @@ jobs:
       - name: Cargo clean
         run: cargo clean
 
-      - name: Build (release, static CRT)
-        run: cargo build --locked --release --verbose
+      - name: Build (release, static CRT, no-default-features)
+        run: cargo build --locked --release --verbose --no-default-features
         env:
           RUSTFLAGS: -C target-feature=+crt-static
           # Redundant env in the build step to guarantee oqs-sys sees them
