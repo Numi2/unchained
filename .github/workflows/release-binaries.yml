@@ -80,7 +80,7 @@ jobs:
       - name: Build (release, static CRT)
         run: cargo build --locked --release
         env:
-          RUSTFLAGS: '-C target-feature=+crt-static -L "native=${{ env.OPENSSL_LIB_DIR }}" -l dylib=libcrypto -l dylib=libssl'
+          RUSTFLAGS: -C target-feature=+crt-static
 
       - name: Smoke test executable
         shell: pwsh
