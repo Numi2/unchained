@@ -43,11 +43,7 @@ pub type Address = [u8; 32];
 // -----------------------------------------------------------------------------
 static UNIFIED_PASSPHRASE: OnceCell<Zeroizing<String>> = OnceCell::new();
 
-/// Obtain a single, unified pass-phrase for all sensitive at-rest keys.
-/// Source order:
-///   1) QUANTUM_PASSPHRASE env var
-///   2) Interactive prompt (only once per process)
-/// Non-interactive without env returns an error.
+
 pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<String>> {
     if let Some(existing) = UNIFIED_PASSPHRASE.get() {
         return Ok(existing.clone());
@@ -106,7 +102,7 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
 
 /// Deterministically generate a Dilithium3/ML-DSA-65 keypair from a 32-byte seed.
 /// Uses liboqs (ML-DSA-65) with a custom deterministic RNG fed by the seed so
-/// the output is reproducible across nodes.
+/// the output must be  reproducible across nodes.
 pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     // Preferred robust path: invoke helper binary to isolate RNG override.
     // Fallback to in-process override only if helper is missing or fails.
@@ -196,12 +192,6 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     let dili_sk = SecretKey::from_bytes(&sk_bytes).expect("invalid Dilithium3 secret key bytes");
     (dili_pk, dili_sk)
 }
-
-/// Deterministically derive a Dilithium3 keypair from a 32-byte seed.
-/// Uses the PQClean seed keypair API via the pqcrypto_dilithium FFI.
-// Deterministic Dilithium keygen from seed is not available in pqcrypto-dilithium 0.5.
-// We derive the stealth AEAD key deterministically via derive_stealth_seed and
-// keep OTP key generation using the library RNG.
 
 /// Compute a PQ-safe nullifier bound to a secret spend key and coin id.
 /// N = BLAKE3("nullifier_v2" || sk_bytes || coin_id)
