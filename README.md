@@ -12,7 +12,7 @@ Unchained is a blockchain designed for the next decades of cryptography. It comb
 You get a straightforward UTXO‑style system with private receiving, deterministic verification, and a gossip network that favors practicality over ceremony.
 
 ### Unchained 
-- Post‑quantum by default: we use Dilithium3 (ML‑DSA‑65) for addresses/signatures, Kyber768 (ML‑KEM) for private receiving, and BLAKE3 for fast hashing throughout.
+- Post‑quantum by default: Kyber768 (ML‑KEM) for private receiving, and BLAKE3 for fast hashing and domain‑separated derivations throughout.
 - Private by design: recipients get coins via stealth outputs; senders don’t reveal long‑term keys. Inclusion is proven via Merkle paths, not global scans.
 - Simple consensus: memory‑hard Argon2id PoW selects coins per epoch; every epoch commits a Merkle root. No heavy scripting, no fragile dependencies.
 - Efficient verification: compact proofs; local nodes verify inclusion, nullifier uniqueness, and commitments deterministically.
@@ -152,17 +152,19 @@ Anyone can verify a coin’s inclusion using a concise Merkle path against the a
 ### Memory‑hard PoW
 We use Argon2id with consensus‑locked lanes and tuned memory to make hardware advantage more costly. Difficulty and memory targets can retune over time to aim for a desired number of coins per epoch.
 
-### Addresses, signatures, and private receiving
-- Addresses are derived from Dilithium3 public keys (or ML‑DSA‑65 when available). The corresponding secret key stays encrypted at rest.
-- Private receiving uses Kyber768. A sender encapsulates a shared secret to the recipient’s Kyber public key and derives a one‑time Dilithium public key deterministically. This becomes the recipient’s per‑coin address.
-- The stealth output contains only what the recipient needs to recover the one‑time secret key, nothing that links to their long‑term identity.
+### Addresses and private receiving
+- A stealth address contains the recipient’s address and Kyber768 public key, encoded as a base64‑url string.
+- Private receiving uses Kyber768. A sender encapsulates a shared secret to the recipient’s Kyber public key and deterministically derives a one‑time per‑output key and lock secret for the next hop.
+- The stealth output contains what the recipient needs to recover the one‑time secret key and the next‑hop lock secret (via Kyber decapsulation), without linking to their long‑term identity.
 
-### Commitments and nullifiers
-- Commitments bind outputs to immutable data (e.g., the Kyber ciphertext) via BLAKE3, avoiding circular dependencies and keeping transactions minimal.
-- Double‑spend protection uses nullifiers derived from per‑spend secrets bound to each coin ID. Seeing the same nullifier twice means an attempted double spend and is rejected. Because nullifiers are one‑way BLAKE3 hashes, they don’t leak spend keys.
+### Commitments and nullifiers (hashlock transfers)
+- Commitments bind outputs to immutable data (the Kyber ciphertext) via BLAKE3, avoiding circular dependencies and keeping transactions minimal.
+- Ownership = knowledge of the current unlock preimage. The previous lock hash is `LOCK_HASH_prev = BLAKE3(unlock_preimage)`.
+- Uniqueness is enforced by a nullifier: `nf = BLAKE3("nfV3" || chain_id32 || coin_id32 || unlock_preimage32)`. The same `nf` cannot appear twice.
+- Each spend supplies `(unlock_preimage, next_lock_hash)`, where `next_lock_hash = BLAKE3(s_next)` and `s_next` is derived from Kyber decapsulation on the receiver side.
 
-### Privacy without global signatures on path
-Instead of embedding large signatures in every authorization path, Unchained relies on:
+### Privacy without signatures on the transfer path
+Transfers are authorized by providing the correct unlock preimage for the current lock (hashlock), not by signatures. The system relies on:
 - Kyber‑derived stealth outputs for receiver privacy,
 - BLAKE3 commitments for output integrity,
 - nullifiers for uniqueness,
@@ -189,7 +191,7 @@ You’ll see:
 
 ## Operating the wallet
 - Wallet secrets are encrypted at rest (XChaCha20‑Poly1305) with a key derived from your passphrase (Argon2id, high memory). Passphrases are prompted interactively; for non‑interactive runs, set `WALLET_PASSPHRASE`.
-- To receive, run `stealth-address` and share the base64‑url string. The node accepts addresses with or without embedded signatures.
+- To receive, run `stealth-address` and share the base64‑url string.
 - To send, run `send --stealth <ADDR> --amount <N>`. The coin leaves your balance when the spend is validated and applied; the recipient’s wallet will detect and show the coin deterministically.
 
 ---
@@ -219,8 +221,9 @@ Exposes Prometheus metrics (e.g., peer count, epoch height, mining timing, proof
 ---
 
 ## Security model (summary)
-- Signatures and addresses: Dilithium3/ML‑DSA‑65
 - Private receiving: Kyber768 (stealth outputs)
+- Authorization: hashlock preimage (ownership), next‑hop lock hash commitment
+- Nullifier: `BLAKE3("nfV3" || chain_id32 || coin_id32 || unlock_preimage32)`
 - Hashing: BLAKE3 with explicit domain separation
 - PoW: Argon2id (memory‑hard), lanes locked by consensus
 - Persistence: RocksDB with column families tuned for this workload

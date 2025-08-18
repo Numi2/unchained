@@ -51,10 +51,10 @@ pub fn spawn(
 
                 _ = sync_check_timer.tick() => {
                     // Regular fast check while we are still catching up
-                    let highest_seen = { sync_state.lock().unwrap().highest_seen_epoch };
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
                     if highest_seen > local_epoch {
                         // we are behind → mark unsynced
-                        { let mut st = sync_state.lock().unwrap(); st.synced = false; }
+                        if let Ok(mut st) = sync_state.lock() { st.synced = false; }
                         // Avoid hammering the same tip if we've just requested it very recently
                         let now = std::time::Instant::now();
                         let should_request = match last_tip_request {
@@ -77,16 +77,15 @@ pub fn spawn(
 
                 _ = idle_poll_timer.tick() => {
                     // Slower polling when fully synced to avoid spamming the network/logs
-                    let highest_seen = { sync_state.lock().unwrap().highest_seen_epoch };
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
                     if highest_seen == local_epoch && highest_seen > 0 {
                         // we are at tip and have actually synced with network → mark synced once
-                        {
-                            let mut st = sync_state.lock().unwrap();
+                        if let Ok(mut st) = sync_state.lock() {
                             if !st.synced {
                                 st.synced = true;
                                 println!("✅ Node is fully synced at epoch {}", local_epoch);
                             }
-                        } // Drop the mutex guard here
+                        }
                         net.request_latest_epoch().await;
                     } else if highest_seen == 0 {
                         if local_epoch > 0 {
@@ -96,11 +95,12 @@ pub fn spawn(
                                 net.request_latest_epoch().await;
                             } else {
                                 // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
-                                let mut st = sync_state.lock().unwrap();
-                                if !st.synced {
-                                    st.synced = true;
-                                    if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
-                                    println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                if let Ok(mut st) = sync_state.lock() {
+                                    if !st.synced {
+                                        st.synced = true;
+                                        if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                                        println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                    }
                                 }
                             }
                         } else {
@@ -196,12 +196,12 @@ async fn request_missing_epochs(
         let net_clone = net.clone();
         let sem_clone = semaphore.clone();
         let task = tokio::spawn(async move {
-            let _permit = sem_clone.acquire().await.unwrap();
+            let Ok(_permit) = sem_clone.acquire().await else { return; };
             net_clone.request_epoch(missing).await;
         });
         request_tasks.push(task);
     }
     for task in request_tasks {
-        task.await.ok();
+        let _ = task.await;
     }
 }

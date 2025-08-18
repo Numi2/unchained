@@ -16,8 +16,8 @@ use crate::consensus::{
     RETARGET_INTERVAL,
 };
 use std::sync::{Arc, Mutex};
-use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
-use pqcrypto_traits::kem::Ciphertext as _;
+// use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
+// use pqcrypto_traits::kem::Ciphertext as _;
 use libp2p::{
     gossipsub,
     identity, quic, swarm::SwarmEvent, PeerId, Swarm, Transport, Multiaddr,
@@ -172,89 +172,11 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
 
 #[allow(dead_code)]
 fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
-    // Mirror Spend::validate with String errors for network context;
-    // Allow chaining: do not reject just because a prior spend exists.
-    let coin: Coin = db.get("coin", &sp.coin_id).unwrap().ok_or("Referenced coin does not exist")?;
-    // Resolve anchor via coin->epoch mapping when validating spends
-    let anchor: Anchor = db.get_epoch_for_coin(&sp.coin_id)
-        .ok()
-        .flatten()
-        .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
-        .ok_or("Anchor not found for coin's committed epoch")?;
-    if anchor.merkle_root != sp.root { return Err("Merkle root mismatch".into()); }
-    // Enforce expected proof length from committed coin_count
-    let exp_len = crate::epoch::MerkleTree::expected_proof_len(anchor.coin_count);
-    if sp.proof.len() != exp_len { return Err("Merkle proof length mismatch".into()); }
-    let leaf = crate::coin::Coin::id_to_leaf_hash(&sp.coin_id);
-    if !crate::epoch::MerkleTree::verify_proof(&leaf, &sp.proof, &sp.root) { return Err("Invalid Merkle proof".into()); }
-
-    // Commitment check – must be H(kyber_ct)
-    let expected_commitment = crate::crypto::commitment_of_stealth_ct(&sp.to.kyber_ct);
-    if expected_commitment != sp.commitment { return Err("Commitment mismatch".into()); }
-
-    // Nullifier seen?
-    if db.get::<[u8;1]>("nullifier", &sp.nullifier).unwrap().is_some() {
-        return Err("Nullifier already seen (double spend)".into());
+    // Delegate to core validator for single source of truth
+    match sp.validate(db) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
-
-    // Authorization: prefer V3 hashlock when present, else fallback to V2 signature path
-    if let Some(preimage) = sp.unlock_preimage {
-        // Determine expected previous lock hash
-        let expected_lock_hash = if let Ok(Some(prev_sp)) = db.get_spend_tolerant(&sp.coin_id) {
-            if let Some(h) = prev_sp.next_lock_hash { h } else { return Err("Previous spend missing next_lock_hash".into()); }
-        } else {
-            // Genesis lock hash stored in coin
-            coin.lock_hash
-        };
-        // Check preimage matches
-        if crate::crypto::lock_hash(&preimage) != expected_lock_hash { return Err("Invalid hashlock preimage".into()); }
-        // Recompute V3 nullifier and compare
-        let exp_nf = crate::crypto::compute_nullifier_v3(&preimage, &sp.coin_id);
-        if exp_nf != sp.nullifier { return Err("Nullifier mismatch".into()); }
-    } else {
-        // V2 signature path
-        let sig = match pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&sp.sig) {
-            Ok(s) => s,
-            Err(_) => return Err("Invalid spend signature format".into()),
-        };
-        let mut verified_pk: Option<pqcrypto_dilithium::dilithium3::PublicKey> = None;
-        if verified_pk.is_none() {
-            if let Ok(Some(prev_sp)) = db.get_spend_tolerant(&sp.coin_id) {
-                if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&prev_sp.to.one_time_pk) {
-                    if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
-                        verified_pk = Some(pk);
-                    }
-                }
-            }
-        }
-        if verified_pk.is_none() && coin.creator_pk != [0u8; crate::crypto::DILITHIUM3_PK_BYTES] {
-            if let Ok(pk) = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&coin.creator_pk) {
-                if pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &sp.auth_bytes(), &pk).is_ok() {
-                    verified_pk = Some(pk);
-                }
-            }
-        }
-        let pk = match verified_pk { Some(p) => p, None => return Err("Invalid spend signature".into()) };
-
-        // Recompute public-key-based nullifier: H("unchained.nullifier.v2" || pk || coin_id)
-        let mut pre = Vec::with_capacity(24 + crate::crypto::DILITHIUM3_PK_BYTES + 32);
-        pre.extend_from_slice(b"unchained.nullifier.v2");
-        pre.extend_from_slice(pk.as_bytes());
-        pre.extend_from_slice(&sp.coin_id);
-        let expected_nullifier = crate::crypto::blake3_hash(&pre);
-        if sp.nullifier != expected_nullifier {
-            return Err("Nullifier mismatch".into());
-        }
-    }
-
-    // Basic sanity of `to`
-    if pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&sp.to.one_time_pk).is_err() {
-        return Err("Invalid one-time pk".into());
-    }
-    if pqcrypto_kyber::kyber768::Ciphertext::from_bytes(&sp.to.kyber_ct).is_err() {
-        return Err("Invalid Kyber ct".into());
-    }
-    Ok(())
 }
 
 fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
@@ -281,7 +203,10 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         if anchor.hash != expected { return Err("Anchor hash mismatch".into()); }
         return Ok(());
     }
-    let prev: Anchor = db.get("epoch", &(anchor.num - 1).to_le_bytes()).unwrap().ok_or(format!("Previous anchor #{} not found", anchor.num - 1))?;
+    let prev: Anchor = db
+        .get("epoch", &(anchor.num - 1).to_le_bytes())
+        .map_err(|e| e.to_string())?
+        .ok_or(format!("Previous anchor #{} not found", anchor.num - 1))?;
 
     // Deterministically compute expected consensus parameters for this height.
     let (exp_diff, exp_mem) = if anchor.num % RETARGET_INTERVAL == 0 {
@@ -366,6 +291,7 @@ pub struct CommitmentEntryResp {
     #[serde(with = "serde_big_array::BigArray")]
     pub kyber_ct: [u8; crate::crypto::KYBER768_CT_BYTES],
     pub next_lock_hash: [u8; 32],
+    pub commitment_id: [u8; 32],
     pub coin_id: [u8; 32],
     pub amount_le: u64,
 }
@@ -375,7 +301,6 @@ pub struct CommitmentResponse {
     pub request_id: [u8; 32],
     pub recipient_addr: crate::crypto::Address,
     pub entries: Vec<CommitmentEntryResp>,
-    pub sig: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -628,7 +553,7 @@ pub async fn spawn(
         }
         if chosen_chain.is_empty() { return; }
 
-        let seg_tip = chosen_chain.last().unwrap();
+        let Some(seg_tip) = chosen_chain.last() else { return; };
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
             net_log!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
@@ -636,17 +561,20 @@ pub async fn spawn(
         }
 
         // Adopt: overwrite epochs and latest pointer; reconcile per-epoch selected/leaves/coins
-        let epoch_cf      = db.db.cf_handle("epoch").expect("epoch CF");
-        let anchor_cf     = db.db.cf_handle("anchor").expect("anchor CF");
-        let sel_cf        = db.db.cf_handle("epoch_selected").expect("epoch_selected CF");
-        let leaves_cf     = db.db.cf_handle("epoch_leaves").expect("epoch_leaves CF");
-        let coin_cf       = db.db.cf_handle("coin").expect("coin CF");
-        let coin_epoch_cf = db.db.cf_handle("coin_epoch").expect("coin_epoch CF");
-        let spend_cf      = db.db.cf_handle("spend").expect("spend CF");
-        let nullifier_cf  = db.db.cf_handle("nullifier").expect("nullifier CF");
+        let (Some(epoch_cf), Some(anchor_cf), Some(sel_cf), Some(leaves_cf), Some(coin_cf), Some(coin_epoch_cf), Some(spend_cf), Some(nullifier_cf), Some(commitment_used_cf)) = (
+            db.db.cf_handle("epoch"),
+            db.db.cf_handle("anchor"),
+            db.db.cf_handle("epoch_selected"),
+            db.db.cf_handle("epoch_leaves"),
+            db.db.cf_handle("coin"),
+            db.db.cf_handle("coin_epoch"),
+            db.db.cf_handle("spend"),
+            db.db.cf_handle("nullifier"),
+            db.db.cf_handle("commitment_used"),
+        ) else { return; };
         let mut batch = WriteBatch::default();
 
-        let mut parent = resolved_parent.expect("parent must be set when chosen_chain is non-empty");
+        let mut parent = match resolved_parent { Some(p) => p, None => return };
         for alt in &chosen_chain {
             // 1) Overwrite anchor mappings for this epoch and advance latest
             let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return };
@@ -665,6 +593,15 @@ pub async fn spawn(
                     if let Ok(Some(sp)) = db.get::<crate::transfer::Spend>("spend", &id) {
                         batch.delete_cf(spend_cf, &id);
                         batch.delete_cf(nullifier_cf, &sp.nullifier);
+                        // Also roll back commitment_used marker deterministically if this was a V3 spend
+                        if sp.unlock_preimage.is_some() {
+                            if let Some(next_lock) = sp.next_lock_hash {
+                                if let Ok(chain_id) = db.get_chain_id() {
+                                    let cid = crate::crypto::commitment_id_v1(&sp.to.one_time_pk, &sp.to.kyber_ct, &next_lock, &sp.coin_id, sp.to.amount_le, &chain_id);
+                                    batch.delete_cf(commitment_used_cf, &cid);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -762,8 +699,7 @@ pub async fn spawn(
             return;
         }
         for alt in &chosen_chain { let _ = anchor_tx.send(alt.clone()); }
-        {
-            let mut st = sync_state.lock().unwrap();
+        if let Ok(mut st) = sync_state.lock() {
             st.highest_seen_epoch = seg_tip.num;
         }
         for alt in &chosen_chain {
@@ -775,7 +711,7 @@ pub async fn spawn(
         net_log!("🔁 Reorg adopted up to epoch {} (better cumulative work)", seg_tip.num);
     }
 
-    tokio::spawn(async move {
+    tokio::spawn(async move {       
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
@@ -783,8 +719,7 @@ pub async fn spawn(
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             net_log!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            {
-                                let mut set = connected_peers.lock().unwrap();
+                            if let Ok(mut set) = connected_peers.lock() {
                                 set.insert(peer_id);
                                 crate::metrics::PEERS.set(set.len() as i64);
                             }
@@ -830,8 +765,7 @@ pub async fn spawn(
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                             net_log!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
-                            {
-                                let mut set = connected_peers.lock().unwrap();
+                            if let Ok(mut set) = connected_peers.lock() {
                                 set.remove(&peer_id);
                                 crate::metrics::PEERS.set(set.len() as i64);
                             }
@@ -854,7 +788,7 @@ pub async fn spawn(
                                         }
                                         if addr.parse::<Multiaddr>().is_err() { continue; }
                                         db.store_peer_addr(&addr).ok();
-                                        if connected_peers.lock().unwrap().len() < net_cfg.max_peers as usize {
+                                        if connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize {
                                             if let Ok(m) = addr.parse::<Multiaddr>() { let _ = swarm.dial(m); }
                                         }
                                     }
@@ -862,8 +796,7 @@ pub async fn spawn(
                                 TOP_ANCHOR => if let Ok( a) = bincode::deserialize::<Anchor>(&message.data) {
                                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                                         if a.num == latest.num && a.hash == latest.hash {
-                                            {
-                                                let mut st = sync_state.lock().unwrap();
+                                            if let Ok(mut st) = sync_state.lock() {
                                                 if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                 st.peer_confirmed_tip = true;
                                             }
@@ -875,8 +808,7 @@ pub async fn spawn(
                                     }
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
-                                            {
-                                                let mut st = sync_state.lock().unwrap();
+                                            if let Ok(mut st) = sync_state.lock() {
                                                 if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                 st.peer_confirmed_tip = true;
                                             }
@@ -954,8 +886,7 @@ pub async fn spawn(
                                                             net_log!("ℹ️ Unable to reconstruct selected set for adopted epoch {} (root/count mismatch)", a.num);
                                                             // Ask peers for the authoritative sorted leaves so we can serve proofs
                                                             let now = std::time::Instant::now();
-                                                            {
-                                                                let mut map = RECENT_LEAVES_REQS.lock().unwrap();
+                                                            if let Ok(mut map) = RECENT_LEAVES_REQS.lock() {
                                                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                                 if !map.contains_key(&a.num) {
                                                                     if let Ok(bytes) = bincode::serialize(&a.num) {
@@ -994,23 +925,24 @@ pub async fn spawn(
                                             let entry = orphan_anchors.entry(a.num).or_default();
                                             if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
                                             
-                                            let mut state = sync_state.lock().unwrap();
-                                            if a.num > state.highest_seen_epoch {
-                                                state.highest_seen_epoch = a.num;
+                                            if let Ok(mut state) = sync_state.lock() {
+                                                if a.num > state.highest_seen_epoch {
+                                                    state.highest_seen_epoch = a.num;
+                                                }
+                                                state.peer_confirmed_tip = true;
                                             }
-                                            state.peer_confirmed_tip = true;
                                             if a.num > 0 {
                                                 let now = std::time::Instant::now();
-                                                {
-                                                    let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
                                                 }
                                                 let prev_epoch = a.num - 1;
-                                                let mut map = RECENT_EPOCH_REQS.lock().unwrap();
-                                                if !map.contains_key(&prev_epoch) {
-                                                    if let Ok(bytes) = bincode::serialize(&prev_epoch) {
-                                                        let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                        map.insert(prev_epoch, now);
+                                                if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                                                    if !map.contains_key(&prev_epoch) {
+                                                        if let Ok(bytes) = bincode::serialize(&prev_epoch) {
+                                                            let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                            map.insert(prev_epoch, now);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1023,24 +955,23 @@ pub async fn spawn(
                                                 if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
                                                 if a.num > 0 {
                                                     let now = std::time::Instant::now();
-                                                    {
-                                                        let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                                                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
                                                     }
                                                     let start = a.num.saturating_sub(REORG_BACKFILL);
                                                     let end = a.num - 1;
-                                                    let mut map = RECENT_EPOCH_REQS.lock().unwrap();
-                                                    for n in start..=end {
-                                                        if !map.contains_key(&n) {
-                                                            if let Ok(bytes) = bincode::serialize(&n) {
-                                                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                                map.insert(n, now);
+                                                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                                                        for n in start..=end {
+                                                            if !map.contains_key(&n) {
+                                                                if let Ok(bytes) = bincode::serialize(&n) {
+                                                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
+                                                                    map.insert(n, now);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
-                                                {
-                                                    let mut st = sync_state.lock().unwrap();
+                                                if let Ok(mut st) = sync_state.lock() {
                                                     if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                     st.peer_confirmed_tip = true;
                                                 }
@@ -1100,8 +1031,7 @@ pub async fn spawn(
                                         // If we still have no spend for this coin, proactively request it once (helps catch-up cases)
                                         if db.get_spend_tolerant(&coin.id).ok().flatten().is_none() {
                                             let now = std::time::Instant::now();
-                                            {
-                                                let mut map = RECENT_SPEND_REQS.lock().unwrap();
+                                            if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                 if !map.contains_key(&coin.id) {
                                                     if let Ok(data) = bincode::serialize(&coin.id) {
@@ -1191,8 +1121,7 @@ pub async fn spawn(
                                                 pending_spend_deadline.insert(coin_id, std::time::Instant::now());
                                                 // Dedup spend fetch requests
                                                 let now = std::time::Instant::now();
-                                                {
-                                                    let mut map = RECENT_SPEND_REQS.lock().unwrap();
+                                                if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                     if !map.contains_key(&coin_id) {
                                                         // Ask peers for their latest spend for this coin
@@ -1209,8 +1138,7 @@ pub async fn spawn(
                                                 pending_spend_deadline.insert(coin_id, std::time::Instant::now());
                                                 // Deduplicate coin fetch requests
                                                 let now = std::time::Instant::now();
-                                                {
-                                                    let mut map = RECENT_COIN_REQS.lock().unwrap();
+                                                if let Ok(mut map) = RECENT_COIN_REQS.lock() {
                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                     if !map.contains_key(&coin_id) {
                                                         if let Ok(data) = bincode::serialize(&coin_id) {
@@ -1289,8 +1217,7 @@ pub async fn spawn(
                                                     pending_spend_deadline.insert(coin_id, std::time::Instant::now());
                                                     // Ask peers for their latest spend for this coin
                                                     let now = std::time::Instant::now();
-                                                    {
-                                                        let mut map = RECENT_SPEND_REQS.lock().unwrap();
+                                                    if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                         if !map.contains_key(&coin_id) {
                                                             if let Ok(data) = bincode::serialize(&coin_id) {
@@ -1304,8 +1231,7 @@ pub async fn spawn(
                                                     pending_spends.entry(coin_id).or_default().push(sp);
                                                     pending_spend_deadline.insert(coin_id, std::time::Instant::now());
                                                     let now = std::time::Instant::now();
-                                                    {
-                                                        let mut map = RECENT_COIN_REQS.lock().unwrap();
+                                                    if let Ok(mut map) = RECENT_COIN_REQS.lock() {
                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                         if !map.contains_key(&coin_id) {
                                                             if let Ok(data) = bincode::serialize(&coin_id) {
@@ -1378,11 +1304,12 @@ pub async fn spawn(
                                 },
                                 TOP_COIN_PROOF_REQUEST => if let Ok(req) = bincode::deserialize::<CoinProofRequest>(&message.data) {
                                     let now = std::time::Instant::now();
-                                    {
-                                        let mut map = RECENT_PROOF_REQS.lock().unwrap();
+                                    if let Ok(mut map) = RECENT_PROOF_REQS.lock() {
                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                         if map.contains_key(&req.coin_id) { continue; }
                                         map.insert(req.coin_id, now);
+                                    } else {
+                                        eprintln!("proof-req dedup map mutex poisoned; proceeding without dedup");
                                     }
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &req.coin_id) {
                                         if let Ok(Some(epoch_num)) = db.get_epoch_for_coin(&coin.id) {
@@ -1543,17 +1470,17 @@ pub async fn spawn(
                     match &command {
                         NetworkCommand::RequestEpoch(n) => {
                             let now = std::time::Instant::now();
-                            {
-                                let mut map = RECENT_EPOCH_REQS.lock().unwrap();
+                            if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
                             }
-                            let mut map = RECENT_EPOCH_REQS.lock().unwrap();
-                            if !map.contains_key(n) {
-                                if let Ok(data) = bincode::serialize(n) {
-                                    if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), data).is_err() {
-                                        pending_commands.push_back(command);
-                                    } else {
-                                        map.insert(*n, now);
+                            if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                                if !map.contains_key(n) {
+                                    if let Ok(data) = bincode::serialize(n) {
+                                        if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), data).is_err() {
+                                            pending_commands.push_back(command);
+                                        } else {
+                                            map.insert(*n, now);
+                                        }
                                     }
                                 }
                             }
@@ -1666,6 +1593,6 @@ impl Network {
     
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {
-        self.connected_peers.lock().unwrap().len()
+        self.connected_peers.lock().map(|s| s.len()).unwrap_or(0)
     }
 }

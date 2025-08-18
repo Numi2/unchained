@@ -28,3 +28,6 @@ Thumbs.db
 # Temporary files
 tmp
 tmp.rs 
+ 
+# Frontend build output
+ui-dist/

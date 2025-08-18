@@ -66,9 +66,9 @@ impl Miner {
         // Wait until node is marked synced by main/sync services
         loop {
             let (synced, highest, local) = {
-                let st = self.sync_state.lock().unwrap();
+                let (synced, highest) = self.sync_state.lock().map(|st| (st.synced, st.highest_seen_epoch)).unwrap_or((false, 0));
                 let local = self.db.get::<Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
-                (st.synced, st.highest_seen_epoch, local)
+                (synced, highest, local)
             };
 
             if synced {
@@ -159,8 +159,7 @@ impl Miner {
                             self.consecutive_failures = 0;
                             
                             // Update sync state to reflect the new epoch
-                            {
-                                let mut st = self.sync_state.lock().unwrap();
+                            if let Ok(mut st) = self.sync_state.lock() {
                                 if anchor.num > st.highest_seen_epoch {
                                     st.highest_seen_epoch = anchor.num;
                                     println!("📊 Updated sync state: highest_seen_epoch = {}", st.highest_seen_epoch);

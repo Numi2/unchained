@@ -24,7 +24,15 @@ fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
 }
 
 #[derive(Parser)]
-#[command(author, version, about = "unchained Node v0.3 (Post-Quantum Hardened)")]
+#[command(
+    author,
+    version,
+    about = "Unchained blockchain node and wallet CLI (Post‑Quantum Hardened)",
+    long_about = "Run an Unchained node: mine, sync, and send hashlock transfers with Kyber stealth receiving.\n\
+\nSending accepts a single receiver code (stealth address or batch token). Use flags for automation or run interactively for a guided flow.",
+    help_template = "{name} {version}\n{about}\n\nUSAGE:\n  {usage}\n\nOPTIONS:\n{options}\n\nCOMMANDS:\n{subcommands}\n\n{after-help}",
+    after_help = "Examples:\n  unchained stealth-address\n  unchained send --to <STEALTH_ADDR> --amount 100\n  unchained send  # guided flow\n  unchained make-commitment-request --stealth <STEALTH_ADDR> --amount 100\n  unchained serve-commitments\n"
+)]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: String,
@@ -39,6 +47,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Start mining and block production (runs epoch manager and miners)
     Mine,
     /// Print the local libp2p peer ID and exit
     PeerId,
@@ -49,21 +58,23 @@ enum Cmd {
             #[arg(long)]
             coin_id: String,
         },
-        /// Serve a simple HTTP endpoint to fetch proofs by coin_id
-        ProofServer {
-            #[arg(long, default_value = "127.0.0.1:9090")]
-            bind: String,
-        },
+    /// Send coins to a receiver code (stealth address or batch token)
     Send {
-        /// Use interactive mode (prompts for stealth address and amount)
+        /// Receiver code (base64-url): a stealth address or a batch token; if omitted, a guided flow starts
         #[arg(long)]
-        stealth: bool,
+        to: Option<String>,
+        /// Amount to send; required when --to is provided
+        #[arg(long)]
+        amount: Option<u64>,
+        /// Receiver batch token (base64-url) for offline exchange; optional when --to is used (we auto-fetch if absent)
+        #[arg(long)]
+        batch_token: Option<String>,
     },
     Balance,
     History,
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
     RepairSpends,
-    /// Receiver: Listen for commitment requests and auto-respond with a signed batch token
+    /// Receiver: Listen for commitment requests and auto-respond with a batch token
     ServeCommitments,
     /// Receiver: Generate a single batch commitment token from a pasted request (base64-url)
     MakeCommitmentToken {
@@ -76,6 +87,11 @@ enum Cmd {
         stealth: String,
         #[arg(long)]
         amount: u64,
+    },
+    /// Debug: Inspect a commitment request and compare with local wallet address
+    InspectRequest {
+        #[arg(long)]
+        request_b64: String,
     },
 }
 
@@ -221,22 +237,21 @@ async fn main() -> anyhow::Result<()> {
             let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
             let mut synced = false;
             for attempt in 0..max_attempts {
-                let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
-                let peer_confirmed = sync_state.lock().unwrap().peer_confirmed_tip;
+                let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                let peer_confirmed = sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
                 let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
                 let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
 
                 // When bootstrap peers are configured, require a peer-confirmed tip before declaring sync
                 if highest_seen > 0 && local_epoch >= highest_seen && (cfg.net.bootstrap.is_empty() || peer_confirmed) {
                     println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
-                    { let mut st = sync_state.lock().unwrap(); st.synced = true; }
+                    if let Ok(mut st) = sync_state.lock() { st.synced = true; }
                     synced = true;
                     break;
                 }
                 if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
                     println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
-                    {
-                        let mut st = sync_state.lock().unwrap();
+                    if let Ok(mut st) = sync_state.lock() {
                         st.synced = true;
                         if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
                     }
@@ -260,7 +275,13 @@ async fn main() -> anyhow::Result<()> {
                     cfg.net.sync_timeout_secs
                 );
                 if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                    let mut st = sync_state.lock().unwrap();
+                    let mut st = match sync_state.lock() { 
+                        Ok(g) => g, 
+                        Err(_) => { 
+                            println!("⚠️ sync_state poisoned, proceeding without updating flags"); 
+                            return Ok(()); 
+                        } 
+                    };
                     // Only auto-proceed without peer confirmation if no bootstrap peers are configured
                     if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
                         st.synced = true;
@@ -319,324 +340,146 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Cmd::ProofServer { bind }) => {
-            // HTTPS server over rustls (aws-lc provider, PQ/hybrid TLS1.3)
-            use hyper::{Body, Request as HRequest, Response as HResponse, Method, StatusCode};
-            use hyper::service::service_fn;
-            use std::net::SocketAddr;
-            use tokio_rustls::TlsAcceptor;
-            use tokio::net::TcpListener;
-            use hyper::server::conn::Http;
-            let addr: SocketAddr = bind.parse().map_err(|e| anyhow::anyhow!("invalid bind {}: {}", bind, e))?;
-            let net_clone = net.clone();
-            let auth_token = std::env::var("PROOF_SERVER_TOKEN").ok();
-            let rate = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, (std::time::Instant, u32)>::new()));
-
-            // Self-signed cert for local serving
-            let (_cert_der, _key_der) = crypto::generate_self_signed_cert(&libp2p::identity::Keypair::generate_ed25519())?;
-            let tls_cfg = crypto::create_pq_server_config(_cert_der, _key_der)?;
-            let acceptor = TlsAcceptor::from(tls_cfg.clone());
-            let listener = TcpListener::bind(addr).await?;
-            println!("🔐 Proof server (TLS) listening on https://{}", bind);
-
-            loop {
-                let (stream, peer_addr) = listener.accept().await?;
-                let acceptor = acceptor.clone();
-                let net = net_clone.clone();
-                let auth = auth_token.clone();
-                let rate = rate.clone();
-                tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("TLS accept error: {}", e);
-                            return;
-                        }
-                    };
-                    let service = service_fn(move |req: HRequest<Body>| {
-                        let net = net.clone();
-                        let auth = auth.clone();
-                        let rate = rate.clone();
-                        let remote_ip = peer_addr.ip().to_string();
-                        async move {
-                            // Auth
-                            if let Some(token) = &auth {
-                                let ok = req.headers().get("x-auth-token").and_then(|v| v.to_str().ok()) == Some(token.as_str());
-                                if !ok {
-                                    return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::UNAUTHORIZED).body(Body::from("unauthorized"))?);
-                                }
-                            }
-                            // Simple per-IP rate limit: 5 req / 10s window.
-                            {
-                                let mut map = rate.lock().await;
-                                let now = std::time::Instant::now();
-                                let entry = map.entry(remote_ip.clone()).or_insert((now, 0));
-                                if now.duration_since(entry.0) > std::time::Duration::from_secs(10) { *entry = (now, 0); }
-                                entry.1 += 1;
-                                if entry.1 > 5 { return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::TOO_MANY_REQUESTS).body(Body::from("rate limit"))?); }
-                            }
-
-                            if req.method() == Method::GET && req.uri().path().starts_with("/proof/") {
-                                let coin_hex = req.uri().path().trim_start_matches("/proof/");
-                                let bytes = match hex::decode(coin_hex) { Ok(b) => b, Err(_) => vec![] };
-                                if bytes.len() != 32 {
-                                    return Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("bad coin id"))?);
-                                }
-                                let mut id = [0u8; 32]; id.copy_from_slice(&bytes);
-
-                                let mut sub = net.proof_subscribe();
-                                let start = std::time::Instant::now();
-                                net.request_coin_proof(id).await;
-                                // Await response or timeout
-                                let resp = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv()).await;
-                                match resp {
-                                    Ok(Ok(r)) if r.coin.id == id => {
-                                        let leaf = crate::coin::Coin::id_to_leaf_hash(&r.coin.id);
-                                        let ok = crate::epoch::MerkleTree::verify_proof(&leaf, &r.proof, &r.anchor.merkle_root);
-                                        let ms = start.elapsed().as_millis() as f64;
-                                        crate::metrics::PROOF_LATENCY_MS.observe(ms);
-                                        let body = serde_json::to_vec(&serde_json::json!({
-                                            "ok": ok, "response": {
-                                                "coin": hex::encode(r.coin.id),
-                                                "epoch": r.anchor.num,
-                                                "merkle_root": hex::encode(r.anchor.merkle_root),
-                                                "proof_len": r.proof.len()
-                                            }
-                                        }))?;
-                                        Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::OK).header("Content-Type", "application/json").body(Body::from(body))?)
-                                    }
-                                    Ok(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::BAD_REQUEST).body(Body::from("mismatch"))?),
-                                    Err(_) => Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::GATEWAY_TIMEOUT).body(Body::from("timeout"))?),
-                                }
-                            } else {
-                                Ok::<_, anyhow::Error>(HResponse::builder().status(StatusCode::NOT_FOUND).body(Body::from("not found"))?)
-                            }
-                        }
-                    });
-                    if let Err(e) = Http::new().serve_connection(tls_stream, service).await {
-                        eprintln!("HTTP serve error: {}", e);
-                    }
-                });
-            }
-        }
-        Some(Cmd::Send { stealth: _ }) => {
-            // Enable quiet network logging for interactive send
-            network::set_quiet_logging(true);
-            
-            // Give a moment for quiet logging to take effect and clear any pending output
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            
-            // Clear screen or add visual separation
-            println!("\n\n\n");
-            println!("{}", "=".repeat(60));
-            println!("💰 Interactive Send Command");
-            println!("{}", "=".repeat(60));
-            println!();
-            
-            // Pause network activity during interactive input
-            println!("⏸️  Pausing network activity for clean input...");
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            
-            // Prompt for stealth address
-            println!("📤 Enter recipient's stealth address:");
-            println!("   (You can paste a long base64-encoded address)");
-            println!("   Or type 'file:' followed by a filename to read from file");
-            println!("   Or type 'test' to use the test address from test_stealth_address.txt");
-            print!("   Address: ");
-            io::stdout().flush()?;
-            
-            // Use a more robust input method for long addresses
-            println!("   💡 For very long addresses, consider using:");
-            println!("      - 'test' to use the test address");
-            println!("      - 'file:filename' to read from a file");
-            println!("      - Or paste the address in chunks (press Enter after each chunk)");
-            println!();
-            
-            let mut stealth = String::new();
-            let mut chunk_count = 0;
-            
-            loop {
-                chunk_count += 1;
-                print!("   Address chunk {}: ", chunk_count);
+        Some(Cmd::Send { to, amount, batch_token }) => {
+            let net = net.clone();
+            let (stealth, amount, batch_token) = if let (Some(addr), Some(amt)) = (to, amount) {
+                (addr.trim().to_string(), *amt, batch_token.clone().unwrap_or_default())
+            } else {
+                // Fallback to interactive flow
+                // Enable quiet network logging for interactive send
+                network::set_quiet_logging(true);
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                println!("\n\n\n");
+                println!("{}", "=".repeat(60));
+                println!("💰 Guided Send (interactive)");
+                println!("{}", "=".repeat(60));
+                println!("This walkthrough has 3 short steps:");
+                println!("  1) Paste the receiver code (stealth address or a batch token)");
+                println!("  2) Enter the amount to send");
+                println!("  3) Build and broadcast the spend(s) — commitments are fetched automatically");
+                println!();
+                println!("⏸️  Pausing network activity for clean input...");
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                // Prompt for stealth address (reuse existing interactive UI)
+                println!("STEP 1/3 — Receiver code");
+                println!("📤 Paste the receiver code and press Enter.");
+                println!("   The receiver code can be either: \n   • a stealth address (base64‑url), or\n   • a batch token (base64‑url) they generated for this payment.");
+                println!("   Tips:\n   • Paste in chunks if needed.\n   • Or type 'file:/path/to/code.txt' to load from file\n   • Or type 'test' to use 'test_stealth_address.txt'.");
+                print!("   Address: ");
                 io::stdout().flush()?;
-                
-                let mut chunk = String::new();
-                io::stdin().read_line(&mut chunk)?;
-                let chunk = chunk.trim();
-                
-                if chunk.is_empty() {
-                    if chunk_count == 1 {
-                        eprintln!("   ❌ Address cannot be empty");
-                        return Ok(());
-                    }
-                    break; // Empty line means we're done
-                }
-                
-                stealth.push_str(chunk);
-                
-                // If this looks like a complete address (ends with typical base64 padding), or if user wants to stop
-                if chunk.ends_with("==") || chunk.ends_with("=") || chunk.len() < 100 {
-                    print!("   ✅ Address appears complete. Press Enter to continue or type 'more' to add more: ");
+                let mut stealth = String::new();
+                let mut chunk_count = 0;
+                loop {
+                    chunk_count += 1;
+                    print!("   Address chunk {} (leave empty to finish): ", chunk_count);
                     io::stdout().flush()?;
-                    let mut continue_input = String::new();
-                    io::stdin().read_line(&mut continue_input)?;
-                    if continue_input.trim() != "more" {
+                    let mut chunk = String::new();
+                    io::stdin().read_line(&mut chunk)?;
+                    let chunk = chunk.trim();
+                    if chunk.is_empty() {
+                        if chunk_count == 1 { eprintln!("   ❌ Address cannot be empty"); return Ok(()); }
                         break;
                     }
-                }
-                
-                println!("   📝 Chunk {} added ({} chars total)", chunk_count, stealth.len());
-            }
-            
-            let stealth = stealth.trim().to_string();
-            // Be tolerant to accidental surrounding quotes/backticks
-            let stealth = stealth.trim_matches('"').trim_matches('\'').trim_matches('`').to_string();
-            
-            let stealth = if stealth == "test" {
-                match std::fs::read_to_string("test_stealth_address.txt") {
-                    Ok(content) => content.trim().to_string(),
-                    Err(e) => {
-                        eprintln!("❌ Failed to read test file 'test_stealth_address.txt': {}", e);
-                        return Ok(());
+                    stealth.push_str(chunk);
+                    if chunk.ends_with("==") || chunk.ends_with("=") || chunk.len() < 100 {
+                        print!("   ✅ Address appears complete. Press Enter to continue, or type 'more' to add more: ");
+                        io::stdout().flush()?;
+                        let mut c = String::new();
+                        io::stdin().read_line(&mut c)?;
+                        if c.trim() != "more" { break; }
                     }
+                    println!("   📝 Added chunk {} ({} chars total)", chunk_count, stealth.len());
                 }
-            } else if stealth.starts_with("file:") {
-                let filename = &stealth[5..].trim();
-                // Tolerate quoted filenames like file:"/path" or file:'/path'
-                let filename = filename.trim_matches('"').trim_matches('\'').trim_matches('`');
-                match std::fs::read_to_string(filename) {
-                    Ok(content) => content.trim().to_string(),
-                    Err(e) => {
-                        eprintln!("❌ Failed to read file '{}': {}", filename, e);
-                        return Ok(());
-                    }
-                }
-            } else {
-                stealth
-            };
-            
-            if stealth.is_empty() {
-                eprintln!("❌ Stealth address cannot be empty");
-                return Ok(());
-            }
-            
-            // Validate stealth address format (should be base64-url safe; tolerate padding '=')
-            if !stealth.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=') {
-                eprintln!("❌ Invalid stealth address format. Expected base64-url safe characters only.");
-                return Ok(());
-            }
-            
-            println!("   ✅ Address length: {} characters", stealth.len());
-            
-            // Ask if user wants to save this address for future use
-            print!("   💾 Save this address to a file for future use? (y/N): ");
-            io::stdout().flush()?;
-            let mut save_choice = String::new();
-            io::stdin().read_line(&mut save_choice)?;
-            let save_choice = save_choice.trim().to_lowercase();
-            
-            if save_choice == "y" || save_choice == "yes" {
-                print!("   📁 Enter filename to save address: ");
-                io::stdout().flush()?;
-                let mut filename = String::new();
-                io::stdin().read_line(&mut filename)?;
-                let filename = filename.trim();
-                
-                if !filename.is_empty() {
-                    match std::fs::write(filename, &stealth) {
-                        Ok(_) => println!("   ✅ Address saved to '{}'", filename),
-                        Err(e) => eprintln!("   ❌ Failed to save address: {}", e),
-                    }
-                }
-            }
-            
-            println!();
-            
-            // Prompt for amount
-            print!("💰 Enter amount to send: ");
-            io::stdout().flush()?;
-            let mut amount_str = String::new();
-            io::stdin().read_line(&mut amount_str)?;
-            let amount_str = amount_str.trim();
-            
-            let amount = match amount_str.parse::<u64>() {
-                Ok(amt) => amt,
-                Err(_) => {
-                    eprintln!("❌ Invalid amount. Please enter a valid number.");
+                let stealth = stealth.trim().trim_matches('"').trim_matches('\'').trim_matches('`').to_string();
+                let stealth = if stealth == "test" {
+                    std::fs::read_to_string("test_stealth_address.txt").map(|s| s.trim().to_string()).unwrap_or_default()
+                } else if stealth.starts_with("file:") {
+                    let filename = stealth[5..].trim().trim_matches('"').trim_matches('\'').trim_matches('`').to_string();
+                    std::fs::read_to_string(&filename).map(|s| s.trim().to_string()).unwrap_or_default()
+                } else { stealth };
+                if stealth.is_empty() { eprintln!("❌ Stealth address cannot be empty"); return Ok(()); }
+                if !stealth.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=') {
+                    eprintln!("❌ Invalid code format. Expected base64-url safe characters only.");
                     return Ok(());
                 }
-            };
-            
-            if amount == 0 {
-                eprintln!("❌ Amount must be greater than 0");
-                return Ok(());
-            }
-            
-            println!();
-            
-            // Confirm the transaction
-            println!("📋 Transaction Summary:");
-            println!("  Recipient: {}", stealth);
-            println!("  Amount: {} coins", amount);
-            println!();
-            print!("✅ Press Enter to confirm and send, or Ctrl+C to cancel: ");
-            io::stdout().flush()?;
-            
-            let mut confirm = String::new();
-            io::stdin().read_line(&mut confirm)?;
-            
-            // Determine the inputs so we can request receiver commitments per coin
-            let _selected_inputs = match wallet.select_inputs(amount) {
-                Ok(v) => v,
-                Err(e) => { eprintln!("❌ Input selection failed: {}", e); return Err(e); }
-            };
-            // Auto P2P attempt first; fallback to QR/paste if timeout or no peers
-            let mut batch_token = String::new();
-            {
-                // Build a request immediately so we can render QR if needed
-                let coins = wallet.select_inputs(amount)?;
-                use crate::network::{CommitmentRequest, CommitmentEntryReq};
-                let mut entries = Vec::with_capacity(coins.len());
-                for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
-                use rand::RngCore as _;
-                let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
-                let req = CommitmentRequest { request_id: rng_tag, recipient_addr: wallet.address(), entries, memo: None, expiry_unix_secs: None };
-
-                // Try network request if any peers connected
-                let mut used_network = false;
-                if net.peer_count() > 0 {
-                    let mut sub = net.commitment_response_subscribe();
-                    net.request_commitments(req.clone()).await;
-                    if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(12), sub.recv()).await {
-                        if resp.recipient_addr == wallet.address() && resp.entries.len() >= coins.len() {
-                            batch_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
-                            used_network = true;
+                println!("   ✅ Code accepted ({} characters)", stealth.len());
+                println!();
+                println!("STEP 2/3 — Amount");
+                print!("💰 Enter amount to send: "); io::stdout().flush()?;
+                let mut amount_str = String::new(); io::stdin().read_line(&mut amount_str)?;
+                let amount: u64 = amount_str.trim().parse().map_err(|_| anyhow::anyhow!("invalid amount"))?;
+                if amount == 0 { eprintln!("❌ Amount must be greater than 0"); return Ok(()); }
+                // Build or request batch token interactively
+                let mut token = String::new();
+                {
+                    println!("\nAuto‑obtaining receiver commitments (if needed)");
+                    println!("   If your receiver code was a batch token, we will use it directly.\n   Otherwise, we'll request commitments over P2P for up to 12 seconds, with an offline QR fallback.");
+                    let coins = wallet.select_inputs(amount)?;
+                    use crate::network::{CommitmentRequest, CommitmentEntryReq};
+                    let mut entries = Vec::with_capacity(coins.len());
+                    for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
+                    use rand::RngCore as _;
+                    let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
+                    // Try interpret the code as a batch token first
+                    let mut parsed_token = String::new();
+                    let mut recipient_addr_opt: Option<crate::crypto::Address> = None;
+                    if base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stealth.as_str()).is_ok() || base64::engine::general_purpose::URL_SAFE.decode(stealth.as_str()).is_ok() {
+                        parsed_token = stealth.clone();
+                        if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(parsed_token.as_str())
+                            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parsed_token.as_str())) {
+                            if let Ok(resp) = bincode::deserialize::<crate::network::CommitmentResponse>(&bytes) {
+                                recipient_addr_opt = Some(resp.recipient_addr);
+                                // Directly use this token
+                                token = parsed_token;
+                            }
                         }
                     }
+                    let recipient_addr = if let Some(a) = recipient_addr_opt { a } else {
+                        let (a, _k) = wallet::Wallet::parse_stealth_address(&stealth)?; a
+                    };
+                    let req = CommitmentRequest { request_id: rng_tag, recipient_addr, entries, memo: None, expiry_unix_secs: None };
+                    let mut used_network = false;
+                    if net.peer_count() > 0 {
+                        println!("   ⏳ Requesting commitments from peers (12s timeout)...");
+                        let mut sub = net.commitment_response_subscribe();
+                        net.request_commitments(req.clone()).await;
+                        if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(12), sub.recv()).await {
+                            if resp.recipient_addr == recipient_addr && resp.entries.len() >= coins.len() {
+                                println!("   ✅ Received {} commitment entries from receiver", resp.entries.len());
+                                token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
+                                used_network = true;
+                            }
+                        }
+                    }
+                    if !used_network {
+                        let req_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&req)?);
+                        println!("   📱 No P2P response yet — using offline exchange.");
+                        println!("   Show this QR to the receiver so they can generate a batch token:");
+                        if let Err(e) = print_qr_to_terminal(&req_b64) { eprintln!("(QR unavailable: {})", e); }
+                        match copy_to_clipboard(&req_b64) { Ok(()) => println!("   📋 Copied request to clipboard"), Err(_) => eprintln!("   (clipboard unavailable)") }
+                        println!("\n   Or share this code if QR is not convenient:\n   {}\n", req_b64);
+                        print!("🔒 Paste the receiver's batch token here and press Enter: "); io::stdout().flush()?;
+                        let mut tok = String::new(); io::stdin().read_line(&mut tok)?; token = tok.trim().to_string();
+                    }
                 }
-                if !used_network {
-                    // Show QR of the request and copy to clipboard
-                    let req_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&req)?);
-                    println!("\n📱 Receiver offline? Scan this request QR or share this code:");
-                    if let Err(e) = print_qr_to_terminal(&req_b64) { eprintln!("(QR unavailable: {})", e); }
-                    if let Err(_e) = copy_to_clipboard(&req_b64) { eprintln!("(clipboard unavailable)"); }
-                    println!("\nRequest: {}\n", req_b64);
-                    print!("🔒 Paste the receiver's batch token here: ");
-                    io::stdout().flush()?;
-                    let mut tok = String::new();
-                    io::stdin().read_line(&mut tok)?;
-                    batch_token = tok.trim().to_string();
-                }
-            }
+                (stealth, amount, token)
+            };
 
-            println!("\n🚀 Sending {} coins to stealth recipient...", amount);
-            match wallet.send_to_stealth_address_with_commitments(&stealth, amount, &net, batch_token).await {
+            // Non-interactive send execution (or interactive result)
+            println!("\nSTEP 4/4 — Build and broadcast");
+            println!("   Preparing spends and submitting to the network...");
+            let outcome = wallet
+                .send_to_stealth_address_with_commitments(&stealth, amount, &net, batch_token)
+                .await;
+            match outcome {
                 Ok(outcome) => {
                     let total = outcome.spends.len();
-                    println!("✅ Sent {} spend{}", total, if total == 1 { "" } else { "s" });
+                    println!("✅ Done. Built and broadcast {} spend{}", total, if total == 1 { "" } else { "s" });
                     for (i, s) in outcome.spends.iter().enumerate() {
-                        println!("  Spend {}: coin {} -> commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
+                        println!("   • Spend {}: coin {} → commitment {}", i + 1, hex::encode(s.coin_id), hex::encode(s.commitment));
                     }
+                    println!("\nYou can watch for confirmations in the logs or with 'unchained history'.");
                 }
                 Err(e) => {
                     eprintln!("❌ Send failed: {}", e);
@@ -732,6 +575,14 @@ async fn main() -> anyhow::Result<()> {
                             }
                             Err(e) => {
                                 eprintln!("⚠️  Failed to build commitment response: {}", e);
+                                if e.to_string().contains("recipient mismatch") {
+                                    eprintln!(
+                                        "   expected recipient={}, request recipient={}",
+                                        hex::encode(wallet.address()),
+                                        hex::encode(req.recipient_addr)
+                                    );
+                                    eprintln!("   Hint: re-export stealth address from THIS wallet and share it with the sender.");
+                                }
                             }
                         }
                     }
@@ -746,14 +597,41 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|_| anyhow::anyhow!("Invalid base64 for request"))?;
             let req: crate::network::CommitmentRequest = bincode::deserialize(&bytes)
                 .map_err(|_| anyhow::anyhow!("Invalid request payload"))?;
-            let resp = wallet.build_commitment_response(&req)?;
+            let resp = match wallet.build_commitment_response(&req) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("❌ Could not build commitment token: {}", e);
+                    if e.to_string().contains("recipient mismatch") {
+                        eprintln!(
+                            "   expected recipient={}, request recipient={}",
+                            hex::encode(wallet.address()),
+                            hex::encode(req.recipient_addr)
+                        );
+                        eprintln!("   Fix: export stealth address from THIS wallet and have the sender retry with that address.");
+                    }
+                    return Err(e);
+                }
+            };
             let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
             println!("🔐 Batch commitment token (base64-url):\n{}", token);
             return Ok(());
         }
+        Some(Cmd::InspectRequest { request_b64 }) => {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(request_b64)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(request_b64))
+                .map_err(|_| anyhow::anyhow!("Invalid base64 for request"))?;
+            let req: crate::network::CommitmentRequest = bincode::deserialize(&bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid request payload"))?;
+            println!("Request recipient: {}", hex::encode(req.recipient_addr));
+            println!("Local wallet addr: {}", hex::encode(wallet.address()));
+            println!("Equal? {}", if req.recipient_addr == wallet.address() { "yes" } else { "no" });
+            println!("Entries: {}", req.entries.len());
+            return Ok(());
+        }
         Some(Cmd::MakeCommitmentRequest { stealth, amount }) => {
             // Parse recipient
-            let (recipient_addr, _dpk, _kpk) = wallet::Wallet::parse_and_verify_stealth_address(&stealth)?;
+            let (recipient_addr, _kpk) = wallet::Wallet::parse_stealth_address(&stealth)?;
             // Select inputs to cover amount
             let coins = wallet.select_inputs(*amount)?;
             use crate::network::{CommitmentRequest, CommitmentEntryReq};
@@ -790,21 +668,20 @@ async fn main() -> anyhow::Result<()> {
                 let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
                 let mut synced = false;
                 for attempt in 0..max_attempts {
-                    let highest_seen = sync_state.lock().unwrap().highest_seen_epoch;
-                    let peer_confirmed = sync_state.lock().unwrap().peer_confirmed_tip;
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                    let peer_confirmed = sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
                     let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
                     let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
 
                     if highest_seen > 0 && local_epoch >= highest_seen && (cfg.net.bootstrap.is_empty() || peer_confirmed) {
                         println!("✅ Synchronization complete. Local epoch is {}.", local_epoch);
-                        { let mut st = sync_state.lock().unwrap(); st.synced = true; }
+                        if let Ok(mut st) = sync_state.lock() { st.synced = true; }
                         synced = true;
                         break;
                     }
                     if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
                         println!("✅ No peers responded; proceeding with local chain at epoch {}.", local_epoch);
-                        {
-                            let mut st = sync_state.lock().unwrap();
+                        if let Ok(mut st) = sync_state.lock() {
                             st.synced = true;
                             if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
                         }
@@ -828,7 +705,13 @@ async fn main() -> anyhow::Result<()> {
                         cfg.net.sync_timeout_secs
                     );
                     if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                        let mut st = sync_state.lock().unwrap();
+                        let mut st = match sync_state.lock() { 
+                            Ok(g) => g, 
+                            Err(_) => { 
+                                eprintln!("sync_state mutex poisoned during timeout fallback"); 
+                                return Ok(()); 
+                            } 
+                        };
                         if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
                             st.synced = true;
                         }

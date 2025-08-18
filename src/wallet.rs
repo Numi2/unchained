@@ -3,13 +3,12 @@ use crate::{
     crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, KYBER768_PK_BYTES, KYBER768_SK_BYTES},
 };
 use pqcrypto_dilithium::dilithium3::{
-    PublicKey, SecretKey, DetachedSignature, verify_detached_signature, detached_sign,
+    PublicKey, SecretKey,
 };
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
 use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
 use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
-use pqcrypto_traits::sign::DetachedSignature as _;
 use base64::Engine;
 use serde::{Serialize, Deserialize};
 
@@ -20,6 +19,13 @@ pub struct StealthAddressDoc {
     dili_pk: Vec<u8>,
     kyber_pk: Vec<u8>,
     sig: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct StealthAddressDocV2 {
+    version: u8,
+    recipient_addr: Address,
+    kyber_pk: Vec<u8>,
 }
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
@@ -308,23 +314,16 @@ impl Wallet {
     // { version: u8=1, recipient_addr: [u8;32], dili_pk: [u8;DILITHIUM3_PK_BYTES], kyber_pk: [u8;crypto::KYBER768_PK_BYTES], sig: Dilithium sig over ("stealth_addr_v1" || addr || kyber_pk) }
 
     pub fn export_stealth_address(&self) -> String {
-        let mut to_sign = Vec::with_capacity(16 + 32 + self.kyber_pk.as_bytes().len());
-        to_sign.extend_from_slice(b"stealth_addr_v1");
-        to_sign.extend_from_slice(&self.address);
-        to_sign.extend_from_slice(self.kyber_pk.as_bytes());
-        let sig = detached_sign(&to_sign, &self.sk);
-        let doc = StealthAddressDoc {
-            version: 1,
+        let doc = StealthAddressDocV2 {
+            version: 2,
             recipient_addr: self.address,
-            dili_pk: self.pk.as_bytes().to_vec(),
             kyber_pk: self.kyber_pk.as_bytes().to_vec(),
-            sig: sig.as_bytes().to_vec(),
         };
-        let bytes = bincode::serialize(&doc).expect("serialize stealth address");
+        let bytes = bincode::serialize(&doc).expect("serialize stealth address v2");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, PublicKey, KyberPk)> {
+    pub fn parse_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
         // Be tolerant to surrounding whitespace and accidental padding from clipboard
         let s = addr_str.trim();
         // Strip common accidental wrappers
@@ -337,151 +336,38 @@ impl Wallet {
             Err(_) => base64::engine::general_purpose::URL_SAFE.decode(s)
                 .map_err(|_| anyhow!("Invalid stealth address encoding"))?,
         };
-        let doc: StealthAddressDoc = bincode::deserialize(&bytes)
-            .map_err(|_| anyhow!("Invalid stealth address payload"))?;
-        if doc.version != 1 { bail!("Unsupported stealth address version"); }
-        let dili_pk = PublicKey::from_bytes(&doc.dili_pk)
-            .map_err(|_| anyhow!("Invalid Dilithium PK in stealth address"))?;
-        let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
-            .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
-        // Compute expected recipient address from Dilithium PK for self-consistency
-        let computed_addr = crypto::address_from_pk(&dili_pk);
-        let mut to_verify = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
-        to_verify.extend_from_slice(b"stealth_addr_v1");
-        to_verify.extend_from_slice(&doc.recipient_addr);
-        to_verify.extend_from_slice(&doc.kyber_pk);
-        let sig = match DetachedSignature::from_bytes(&doc.sig) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("⚠️  Stealth address contains an invalid signature encoding. Proceeding without verification (UNSIGNED MODE).");
-                return Ok((computed_addr, dili_pk, kyber_pk));
-            }
-        };
-        // Primary verification (current format)
-        if verify_detached_signature(&sig, &to_verify, &dili_pk).is_ok() {
-            // Enforce self-consistency: derive address from Dilithium PK
-            return Ok((computed_addr, dili_pk, kyber_pk));
+        // Try V2 (Kyber-only) then fallback to V1 (legacy)
+        if let Ok(doc2) = bincode::deserialize::<StealthAddressDocV2>(&bytes) {
+            if doc2.version != 2 { bail!("Unsupported stealth address version"); }
+            let kyber_pk = KyberPk::from_bytes(&doc2.kyber_pk)
+                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
+            // Recipient address is provided directly; no Dilithium in address anymore
+            Ok((doc2.recipient_addr, kyber_pk))
+        } else if let Ok(doc1) = bincode::deserialize::<StealthAddressDoc>(&bytes) {
+            if doc1.version != 1 { bail!("Unsupported stealth address version"); }
+            let dili_pk = PublicKey::from_bytes(&doc1.dili_pk)
+                .map_err(|_| anyhow!("Invalid Dilithium PK in stealth address (v1)"))?;
+            let kyber_pk = KyberPk::from_bytes(&doc1.kyber_pk)
+                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address (v1)"))?;
+            let computed_addr = crypto::address_from_pk(&dili_pk);
+            Ok((computed_addr, kyber_pk))
+        } else {
+            bail!("Invalid stealth address payload");
         }
-        // Backward-compat permutations (best-effort)
-        let mut tried_ok = false;
-        let try_parts = |parts: &[&[u8]]| -> bool {
-            let total: usize = parts.iter().map(|p| p.len()).sum();
-            let mut msg = Vec::with_capacity(total);
-            for p in parts { msg.extend_from_slice(p); }
-            verify_detached_signature(&sig, &msg, &dili_pk).is_ok()
-        };
-        const PREFIXES: [&[u8]; 6] = [
-            b"stealth_addr_v1",
-            b"stealth_addr_v1|",
-            b"stealth-address-v1",
-            b"stealth.addr.v1",
-            b"stealth.v1",
-            b"unchained-stealth-v1|mlkem768|mldsa65",
-        ];
-        for prefix in PREFIXES.iter() {
-            if try_parts(&[prefix, &doc.recipient_addr, &doc.kyber_pk]) { tried_ok = true; break; }
-            if try_parts(&[prefix, &computed_addr, &doc.kyber_pk]) { tried_ok = true; break; }
-            if try_parts(&[prefix, &doc.kyber_pk, &doc.recipient_addr]) { tried_ok = true; break; }
-            if try_parts(&[prefix, &doc.kyber_pk, &computed_addr]) { tried_ok = true; break; }
-            if try_parts(&[prefix, &doc.dili_pk, &doc.kyber_pk]) { tried_ok = true; break; }
-            if try_parts(&[prefix, &doc.kyber_pk]) { tried_ok = true; break; }
-        }
-        if !tried_ok && (try_parts(&[&doc.recipient_addr, &doc.kyber_pk])
-            || try_parts(&[&computed_addr, &doc.kyber_pk])
-            || try_parts(&[&doc.kyber_pk, &doc.recipient_addr])
-            || try_parts(&[&doc.kyber_pk, &computed_addr])
-            || try_parts(&[&doc.dili_pk, &doc.kyber_pk])
-            || try_parts(&[&doc.kyber_pk, &doc.dili_pk])) {
-            tried_ok = true;
-        }
-        if !tried_ok {
-            if let Ok(msg) = bincode::serialize(&(doc.version, doc.recipient_addr, doc.kyber_pk.clone())) {
-                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
-            }
-        }
-        if !tried_ok {
-            if let Ok(msg) = bincode::serialize(&(doc.recipient_addr, doc.kyber_pk.clone())) {
-                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
-            }
-        }
-        if !tried_ok {
-            if let Ok(msg) = bincode::serialize(&(computed_addr, doc.kyber_pk.clone())) {
-                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
-            }
-        }
-        if !tried_ok {
-            if let Ok(msg) = bincode::serialize(&(doc.dili_pk.clone(), doc.kyber_pk.clone())) {
-                if verify_detached_signature(&sig, &msg, &dili_pk).is_ok() { tried_ok = true; }
-            }
-        }
-        if !tried_ok {
-            if let Ok(doc_bytes) = bincode::serialize(&(doc.version, doc.recipient_addr, doc.dili_pk.clone(), doc.kyber_pk.clone())) {
-                if verify_detached_signature(&sig, &doc_bytes, &dili_pk).is_ok() { tried_ok = true; }
-                if !tried_ok {
-                    let mut with_prefix = Vec::with_capacity(24 + doc_bytes.len());
-                    with_prefix.extend_from_slice(b"stealth_addr_doc_v1");
-                    with_prefix.extend_from_slice(&doc_bytes);
-                    if verify_detached_signature(&sig, &with_prefix, &dili_pk).is_ok() { tried_ok = true; }
-                }
-                if !tried_ok {
-                    let digest = crate::crypto::blake3_hash(&doc_bytes);
-                    if verify_detached_signature(&sig, &digest, &dili_pk).is_ok() { tried_ok = true; }
-                }
-            }
-        }
-        if !tried_ok {
-            let mut m = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
-            m.extend_from_slice(b"stealth_addr_v1");
-            m.extend_from_slice(&doc.recipient_addr);
-            m.extend_from_slice(&doc.kyber_pk);
-            let d = crate::crypto::blake3_hash(&m);
-            if verify_detached_signature(&sig, &d, &dili_pk).is_ok() { tried_ok = true; }
-        }
-        if !tried_ok {
-            let mut m = Vec::with_capacity(32 + 32 + doc.kyber_pk.len());
-            m.extend_from_slice(b"unchained-stealth-v1|mlkem768|mldsa65");
-            m.extend_from_slice(&doc.recipient_addr);
-            m.extend_from_slice(&doc.kyber_pk);
-            let d = crate::crypto::blake3_hash(&m);
-            if verify_detached_signature(&sig, &d, &dili_pk).is_ok() { tried_ok = true; }
-        }
-        if tried_ok {
-            return Ok((computed_addr, dili_pk, kyber_pk));
-        }
+    }
 
-        // As a last resort, attempt liboqs verification when enabled
-        #[cfg(feature = "liboqs")]
-        {
-            let mut msg = Vec::with_capacity(16 + 32 + doc.kyber_pk.len());
-            msg.extend_from_slice(b"stealth_addr_v1");
-            msg.extend_from_slice(&doc.recipient_addr);
-            msg.extend_from_slice(&doc.kyber_pk);
-            oqs::init();
-            if let Ok(sigv) = oqs::sig::Sig::new(oqs::sig::Algorithm::Dilithium3) {
-                if let (Some(pk), Some(s)) = (sigv.public_key_from_bytes(&doc.dili_pk), sigv.signature_from_bytes(&doc.sig)) {
-                    if sigv.verify(&msg, &s, &pk).is_ok() { return Ok((computed_addr, dili_pk, kyber_pk)); }
-                }
-            }
-            if let Ok(sigv) = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65) {
-                if let (Some(pk), Some(s)) = (sigv.public_key_from_bytes(&doc.dili_pk), sigv.signature_from_bytes(&doc.sig)) {
-                    if sigv.verify(&msg, &s, &pk).is_ok() { return Ok((computed_addr, dili_pk, kyber_pk)); }
-                }
-            }
-        }
-
-        // UNSIGNED MODE: accept parsed keys without signature verification
-        eprintln!("⚠️  Accepting stealth address without Dilithium verification. This is UNSIGNED and less secure.");
-        Ok((computed_addr, dili_pk, kyber_pk))
+    /// Backward-compatible wrapper; signature verification removed. Prefer `parse_stealth_address`.
+    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
+        Self::parse_stealth_address(addr_str)
     }
 
     // ---------------------------------------------------------------------
     // Receiver commitment token parsing (V3 hashlock)
     // ---------------------------------------------------------------------
-    // Batch token is a base64-url encoded bincode of network::CommitmentResponse; we verify signature
+    // Batch token is a base64-url encoded bincode of network::CommitmentResponse (unsigned)
     // and convert entries into per-coin ReceiverLockCommitment records.
     fn parse_batch_commitment_token(
         token: &str,
-        recipient_dili_pk: &pqcrypto_dilithium::dilithium3::PublicKey,
         expected_recipient_addr: &Address,
     ) -> Result<std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment>> {
         let s = token.trim().trim_matches('"').trim_matches('\'').trim_matches('`');
@@ -494,10 +380,10 @@ impl Wallet {
         if &resp.recipient_addr != expected_recipient_addr {
             bail!("Batch commitment recipient mismatch");
         }
-        // Verify signature over canonical bytes
+        // Build canonical bytes for potential future verification (currently unsigned)
         let mut entries_sorted = resp.entries.clone();
         entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
-        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32));
+        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32 + 32));
         msg.extend_from_slice(b"commitment_response_v1");
         msg.extend_from_slice(&resp.request_id);
         msg.extend_from_slice(&resp.recipient_addr);
@@ -508,17 +394,15 @@ impl Wallet {
             msg.extend_from_slice(&e.one_time_pk);
             msg.extend_from_slice(&e.kyber_ct);
             msg.extend_from_slice(&e.next_lock_hash);
+            msg.extend_from_slice(&e.commitment_id);
         }
-        let sig = pqcrypto_dilithium::dilithium3::DetachedSignature::from_bytes(&resp.sig)
-            .map_err(|_| anyhow!("Invalid batch commitment signature encoding"))?;
-        pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &msg, recipient_dili_pk)
-            .map_err(|_| anyhow!("Batch commitment signature verification failed"))?;
         let mut map = std::collections::HashMap::new();
         for e in resp.entries {
             map.insert(e.coin_id, crate::transfer::ReceiverLockCommitment {
                 one_time_pk: e.one_time_pk,
                 kyber_ct: e.kyber_ct,
                 next_lock_hash: e.next_lock_hash,
+                commitment_id: e.commitment_id,
                 amount_le: e.amount_le,
             });
         }
@@ -644,8 +528,9 @@ impl Wallet {
         let mut selected = Vec::new();
         let mut total = 0u64;
         for coin in coins.into_iter().rev() { // start with largest
+            let v = coin.value;
             selected.push(coin);
-            total += selected.last().unwrap().value;
+            total = total.saturating_add(v);
             if total >= amount { break; }
         }
         if total < amount {
@@ -673,18 +558,35 @@ impl Wallet {
         network: &crate::network::NetHandle,
         batch_commitment_token_or_empty: String,
     ) -> Result<SendOutcome> {
-        let (_recipient_addr, recipient_dili_pk, recipient_kyber_pk) = Self::parse_and_verify_stealth_address(stealth_address_str)?;
+        // Accept either a stealth address OR, when provided, derive recipient from batch token
+        let mut parsed_recipient_addr: Option<Address> = None;
+        if let Ok((addr, _k)) = Self::parse_stealth_address(stealth_address_str) {
+            parsed_recipient_addr = Some(addr);
+        } else if !batch_commitment_token_or_empty.is_empty() {
+            // Try parse token header to discover recipient address
+            let s = batch_commitment_token_or_empty.trim().trim_matches('"').trim_matches('\'').trim_matches('`');
+            if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s)) {
+                if let Ok(resp) = bincode::deserialize::<crate::network::CommitmentResponse>(&bytes) {
+                    parsed_recipient_addr = Some(resp.recipient_addr);
+                }
+            }
+        }
+        let _recipient_addr = parsed_recipient_addr.ok_or_else(|| anyhow!("Invalid receiver input: provide a stealth address or a valid batch token"))?;
         let store = self
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        let coins_to_spend = self.select_inputs(amount)?;
+        // We'll decide the exact coins to spend based on the commitment source to avoid selection mismatches.
+        let mut coins_to_spend: Vec<crate::coin::Coin> = Vec::new();
         // Try automated P2P exchange if no offline token provided
         let mut commitments_by_coin: std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment> = if batch_commitment_token_or_empty.is_empty() {
-            // Build and send commitment request
+            // Build request from a single, deterministic selection and REUSE it for spends
             use crate::network::{CommitmentRequest, CommitmentEntryReq};
-            let mut req_entries = Vec::with_capacity(coins_to_spend.len());
-            for c in &coins_to_spend { req_entries.push(CommitmentEntryReq{ coin_id: c.id, amount_le: c.value }); }
+            let coins_for_request = self.select_inputs(amount)?;
+            let mut req_entries = Vec::with_capacity(coins_for_request.len());
+            for c in &coins_for_request { req_entries.push(CommitmentEntryReq{ coin_id: c.id, amount_le: c.value }); }
             let mut rng_tag = [0u8;32];
             rand::rngs::OsRng.fill_bytes(&mut rng_tag);
             let req = CommitmentRequest { request_id: rng_tag, recipient_addr: _recipient_addr, entries: req_entries, memo: None, expiry_unix_secs: None };
@@ -694,17 +596,31 @@ impl Wallet {
             let resp = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv()).await
                 .map_err(|_| anyhow!("timeout waiting for receiver batch commitments"))??;
             if resp.recipient_addr != _recipient_addr { return Err(anyhow!("batch commitment recipient mismatch")); }
-            if resp.entries.len() < coins_to_spend.len() { return Err(anyhow!("missing entries: expected {} got {}", coins_to_spend.len(), resp.entries.len())); }
-            // Verify signature and convert
+            if resp.entries.len() < coins_for_request.len() { return Err(anyhow!("missing entries: expected {} got {}", coins_for_request.len(), resp.entries.len())); }
+            // Convert response entries (unsigned)
             let map = Self::parse_batch_commitment_token(
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?),
-                &recipient_dili_pk,
                 &_recipient_addr,
             )?;
+            // Reuse the exact selection we requested
+            coins_to_spend = coins_for_request;
             map
         } else {
-            // Offline fallback: parse provided token
-            Self::parse_batch_commitment_token(&batch_commitment_token_or_empty, &recipient_dili_pk, &_recipient_addr)?
+            // Offline or pre-fetched token: parse provided token
+            let map = Self::parse_batch_commitment_token(&batch_commitment_token_or_empty, &_recipient_addr)?;
+            // Derive coins_to_spend directly from the token's coin IDs to avoid reselection mismatches
+            let available = self.list_unspent()?;
+            let mut by_id: std::collections::HashMap<[u8;32], crate::coin::Coin> = std::collections::HashMap::with_capacity(available.len());
+            for c in available { by_id.insert(c.id, c); }
+            for coin_id in map.keys() {
+                if let Some(c) = by_id.get(coin_id) {
+                    coins_to_spend.push(c.clone());
+                }
+            }
+            if coins_to_spend.is_empty() {
+                return Err(anyhow!("No matching unspent inputs found for provided batch token"));
+            }
+            map
         };
         let mut spends = Vec::new();
 
@@ -801,8 +717,8 @@ impl Wallet {
                 }
             }
 
-            // Determine spend auth path
-            enum AuthPath { V2 { owner_pk: PublicKey, owner_sk: SecretKey }, V3 { preimage: [u8;32] } }
+            // Determine spend auth path with enforced V3 and auto-upgrade for legacy
+            enum AuthPath { V3 { preimage: [u8;32] } }
             let prev_spend_opt: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
@@ -813,39 +729,56 @@ impl Wallet {
                 let s = prev_sp.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id)
                     .context("Failed to derive lock secret for previous spend")?;
                 AuthPath::V3 { preimage: s }
-            } else if coin.lock_hash == [0u8;32] {
-                // Pre-V3 coin without lock_hash committed: fallback to V2 signature path
-                // Owner is genesis creator (us)
-                AuthPath::V2 { owner_pk: self.pk.clone(), owner_sk: self.sk.clone() }
-            } else {
+            } else if coin.lock_hash != [0u8;32] {
                 // Genesis V3 path for newly mined coin
                 let chain_id = store.get_chain_id()?;
                 let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
+                AuthPath::V3 { preimage: s0 }
+            } else {
+                // Legacy coin: perform automatic V2 self-upgrade to install first V3 lock, then spend via V3
+                let chain_id = store.get_chain_id()?;
+                let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
+                let next_lock_hash = crate::crypto::lock_hash(&s0);
+                // Build a self-upgrade V2 spend with embedded next_lock_hash
+                let mut proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
+                let upgrade_spend = crate::transfer::Spend::create_v2_with_next_lock(
+                    coin.id,
+                    &anchor_used,
+                    std::mem::take(&mut proof_vec),
+                    &self.pk,
+                    &self.sk,
+                    &self.pk,
+                    &self.kyber_pk,
+                    coin.value,
+                    Some(next_lock_hash),
+                    &chain_id,
+                )?;
+                upgrade_spend.validate(&store)?;
+                upgrade_spend.apply(&store)?;
+                // Gossip upgrade quietly
+                crate::metrics::LEGACY_UPGRADES.inc();
+                eprintln!("[upgrade] Performed legacy→V3 upgrade for coin {}", hex::encode(coin.id));
+                network.gossip_spend(&upgrade_spend).await;
+                // Best-effort short wait until visible
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    if let Ok(Some(_seen)) = store.get_spend_tolerant(&coin.id) { break; }
+                    if std::time::Instant::now() >= deadline { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
                 AuthPath::V3 { preimage: s0 }
             };
 
             // Build and broadcast spend according to path
             let spend = match path {
                 AuthPath::V3 { preimage } => {
+                    let proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
                     crate::transfer::Spend::create_hashlock(
                         coin.id,
                         &anchor_used,
-                        proof_used.expect("proof must be present after local or network path"),
+                        proof_vec,
                         preimage,
                         &receiver_commitment,
-                        coin.value,
-                        &store.get_chain_id()?,
-                    )?
-                }
-                AuthPath::V2 { owner_pk, owner_sk } => {
-                    crate::transfer::Spend::create(
-                        coin.id,
-                        &anchor_used,
-                        proof_used.expect("proof must be present after local or network path"),
-                        &owner_pk,
-                        &owner_sk,
-                        &recipient_dili_pk,
-                        &recipient_kyber_pk,
                         coin.value,
                         &store.get_chain_id()?,
                     )?
@@ -853,6 +786,7 @@ impl Wallet {
             };
             spend.validate(&store)?;
             spend.apply(&store)?;
+            crate::metrics::V3_SENDS.inc();
             network.gossip_spend(&spend).await;
             spends.push(spend);
         }
@@ -962,6 +896,23 @@ impl Wallet {
                 &chain_id,
             );
             let next_lock_hash = crate::crypto::lock_hash(&s_next);
+            // Deterministic commitment id bound to cryptographic fields and chain id
+            let commitment_id = crate::crypto::commitment_id_v1(
+                &{
+                    let mut tmp = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+                    tmp.copy_from_slice(ot_pk.as_bytes());
+                    tmp
+                },
+                &{
+                    let mut tmp = [0u8; crate::crypto::KYBER768_CT_BYTES];
+                    tmp.copy_from_slice(ct.as_bytes());
+                    tmp
+                },
+                &next_lock_hash,
+                &e.coin_id,
+                e.amount_le,
+                &chain_id,
+            );
 
             let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
             one_time_pk.copy_from_slice(ot_pk.as_bytes());
@@ -972,6 +923,7 @@ impl Wallet {
                 one_time_pk,
                 kyber_ct,
                 next_lock_hash,
+                commitment_id,
                 coin_id: e.coin_id,
                 amount_le: e.amount_le,
             });
@@ -979,7 +931,7 @@ impl Wallet {
 
         let mut entries_sorted = entries.clone();
         entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
-        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32));
+        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32 + 32));
         msg.extend_from_slice(b"commitment_response_v1");
         msg.extend_from_slice(&req.request_id);
         msg.extend_from_slice(&req.recipient_addr);
@@ -990,14 +942,12 @@ impl Wallet {
             msg.extend_from_slice(&e.one_time_pk);
             msg.extend_from_slice(&e.kyber_ct);
             msg.extend_from_slice(&e.next_lock_hash);
+            msg.extend_from_slice(&e.commitment_id);
         }
-        let sig = detached_sign(&msg, &self.sk);
-
         Ok(crate::network::CommitmentResponse {
             request_id: req.request_id,
             recipient_addr: req.recipient_addr,
             entries,
-            sig: sig.as_bytes().to_vec(),
         })
     }
 }

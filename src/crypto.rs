@@ -293,10 +293,11 @@ pub fn lock_hash(preimage: &[u8]) -> [u8; 32] {
     *Hasher::new_derive_key("unchained.lock.v1").update(preimage).finalize().as_bytes()
 }
 
-/// Compute nullifier for signatureless spend: N = BLAKE3("unchained.nullifier.v3" || coin_id || preimage)
-pub fn compute_nullifier_v3(preimage: &[u8], coin_id: &[u8; 32]) -> [u8; 32] {
+/// Compute nullifier for signatureless spend: N = BLAKE3("unchained.nullifier.v3" || chain_id32 || coin_id || preimage)
+pub fn compute_nullifier_v3(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u8; 32]) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(b"unchained.nullifier.v3");
+    h.update(chain_id32);
     h.update(coin_id);
     h.update(preimage);
     *h.finalize().as_bytes()
@@ -323,6 +324,27 @@ pub fn derive_genesis_lock_secret(dili_sk: &SecretKey, coin_id: &[u8;32], chain_
     h.update(b"unchained.lockseed.genesis.v1");
     h.update(dili_sk.as_bytes());
     h.update(coin_id);
+    h.update(chain_id32);
+    *h.finalize().as_bytes()
+}
+
+/// Deterministic commitment identifier derived from receiver commitment fields.
+/// commitment_id = BLAKE3("commitment_id_v1" || one_time_pk || kyber_ct || next_lock_hash || coin_id || amount_le || chain_id32)
+pub fn commitment_id_v1(
+    one_time_pk: &[u8; DILITHIUM3_PK_BYTES],
+    kyber_ct: &[u8; KYBER768_CT_BYTES],
+    next_lock_hash: &[u8; 32],
+    coin_id: &[u8; 32],
+    amount_le: u64,
+    chain_id32: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(b"commitment_id_v1");
+    h.update(one_time_pk);
+    h.update(kyber_ct);
+    h.update(next_lock_hash);
+    h.update(coin_id);
+    h.update(&amount_le.to_le_bytes());
     h.update(chain_id32);
     *h.finalize().as_bytes()
 }

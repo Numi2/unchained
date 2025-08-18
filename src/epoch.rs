@@ -58,7 +58,10 @@ pub fn calculate_retarget(
             return (cfg.target_leading_zeros, mining_cfg.mem_kib);
         }
         
-        let last_anchor = recent_anchors.last().unwrap();
+        let last_anchor = match recent_anchors.last() {
+            Some(a) => a,
+            None => return (cfg.target_leading_zeros, mining_cfg.mem_kib),
+        };
         let total_coins: u64 = recent_anchors.iter().map(|a| a.coin_count as u64).sum();
         let num_anchors = recent_anchors.len() as u64;
 
@@ -312,7 +315,7 @@ impl Manager {
                     _ = ticker.tick() => {
                         // When bootstrap peers are configured, avoid producing epochs until we have a peer-confirmed tip.
                         if !self.net_cfg.bootstrap.is_empty() {
-                            let peer_confirmed = { self.sync_state.lock().unwrap().peer_confirmed_tip };
+                            let peer_confirmed = self.sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
                             if !peer_confirmed {
                                 self.net.request_latest_epoch().await;
                                 // Also fast-forward our cursor to network-observed latest if we have it

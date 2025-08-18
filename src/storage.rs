@@ -97,6 +97,7 @@ impl Store {
             "anchor",
             "spend",
             "nullifier",
+            "commitment_used",
             "otp_sk",
             "otp_index",
             "peers",

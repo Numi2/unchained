@@ -87,7 +87,10 @@ fn calculate_retarget_params(recent_anchors: &[Anchor]) -> Params {
         return GENESIS_PARAMS;
     }
 
-    let last = recent_anchors.last().unwrap();
+    let last = match recent_anchors.last() {
+        Some(a) => a,
+        None => return GENESIS_PARAMS,
+    };
     let last_params = params_from_anchor(last);
 
     // Average coins/epoch in window (fixed-point)

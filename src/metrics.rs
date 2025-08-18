@@ -29,14 +29,15 @@ impl LogBus {
     }
 
     fn push(&self, line: String) {
-        let mut buf = self.buffer.lock().unwrap();
-        if buf.len() == LOG_BUFFER_CAPACITY { buf.pop_front(); }
-        buf.push_back(line.clone());
+        if let Ok(mut buf) = self.buffer.lock() {
+            if buf.len() == LOG_BUFFER_CAPACITY { buf.pop_front(); }
+            buf.push_back(line.clone());
+        }
         let _ = self.tx.send(line);
     }
 
     fn snapshot(&self) -> Vec<String> {
-        self.buffer.lock().unwrap().iter().cloned().collect()
+        self.buffer.lock().map(|b| b.iter().cloned().collect()).unwrap_or_default()
     }
 }
 
@@ -108,6 +109,8 @@ pub static ORPHAN_BUFFER_LEN: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("uncha
 pub static VALIDATION_FAIL_ANCHOR: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_validation_failures_anchor_total", "Count of invalid anchors received").unwrap());
 pub static VALIDATION_FAIL_COIN: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_validation_failures_coin_total", "Count of invalid coin candidates received").unwrap());
 pub static VALIDATION_FAIL_TRANSFER: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_validation_failures_transfer_total", "Count of invalid transfers received").unwrap());
+pub static V3_SENDS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_v3_sends_total", "Count of V3 hashlock sends").unwrap());
+pub static LEGACY_UPGRADES: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_legacy_upgrades_total", "Count of legacy coins auto-upgraded to V3").unwrap());
 pub static DB_WRITE_FAILS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_db_write_failures_total", "Database write failures").unwrap());
 pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_pruned_candidates_total", "Total candidate entries pruned").unwrap());
 pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_selection_threshold_u64", "Threshold (first 8 bytes of pow_hash) for last selected coin").unwrap());
