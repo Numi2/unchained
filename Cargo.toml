@@ -21,7 +21,7 @@ rpassword = "7"
 atty = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 pqcrypto-dilithium = "0.5.0"
-pqcrypto-traits = "0.3"
+pqcrypto-traits = "0.3.5"
 libp2p = { git = "https://github.com/guorong009/rust-libp2p", branch = "prefer-post-quantum", default-features = false, features = ["quic", "tokio", "gossipsub", "macros"] }
 rocksdb = "0.21"
 prometheus = "0.13"
@@ -59,13 +59,10 @@ hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, feat
 hickory-proto = "=0.25.0-alpha.4"
 hickory-client = "=0.25.0-alpha.4"
 zeroize = "1.8.1"
-oqs = { version = "0.11", optional = true }
-oqs-sys = { version = "0.11", optional = true }
+# liboqs removed; no runtime oqs dependency
 
 [features]
-# Enable liboqs usage (for deterministic ML-DSA-65 keygen and compatibility checks)
-liboqs = ["dep:oqs", "dep:oqs-sys"]
-default = ["liboqs"]
+default = []
 
 [[bin]]
 name = "unchained"
@@ -75,10 +72,7 @@ path = "src/main.rs"
 name = "inspect_db"
 path = "src/bin/inspect_db.rs"
 
-[[bin]]
-name = "oqs_dili_seeded"
-path = "src/bin/oqs_dili_seeded.rs"
-required-features = ["liboqs"]
+
 
 [dev-dependencies]
 tempfile = "3.8"

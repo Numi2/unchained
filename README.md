@@ -74,13 +74,21 @@ unchained -- peer-id
 unchained -- stealth-address
 
 # Send coins to a recipient’s stealth address
-unchained send --stealth <STEALTH_ADDR> --amount 1
+unchained send --stealth <Address> --amount 1
 
 # Check your balance and address
 unchained balance
 
 # Show simple transaction history
 unchained history
+
+# P2P: Send a short message (2 msgs / 24h outbound limit)
+unchained msg-send --text "Hello from Unchained"
+
+# P2P: Listen for incoming messages on the limited topic
+unchained msg-listen           # run until Ctrl+C
+unchained msg-listen --once    # exit after the first message
+unchained msg-listen --count 5 # exit after 5 messages
 ```
 Tip: add `--quiet-net` to suppress routine gossip logs.
 
@@ -110,7 +118,7 @@ If you run behind a firewall/NAT, forward the UDP QUIC port from your `config.to
 - The recipient’s wallet deterministically recognizes and decrypts the new output; the coin appears in their balance.
 - Anyone can verify inclusion using a compact Merkle proof without revealing wallet secrets.
 
-Stealth addresses may include a signature, but the node does not require it. The important part is the recipient’s public keys that enable private output derivation.
+The important part is the recipient’s public keys that enable private output derivation.
 
 ---
 
@@ -123,19 +131,7 @@ Edit `config.toml` (shipped in the repo). Key sections:
   - `bootstrap`: optional list of peer multiaddrs to join a network
   - `public_ip`: advertise a public IP if you’re behind NAT
 
-- `[storage]`: RocksDB path
-  - If relative, the node uses `~/.unchained/unchained_data`
 
-- `[epoch]`: epoch duration, coin cap per epoch
-  - `seconds`: epoch length
-  - `max_coins_per_epoch`: maximum coin selections per epoch
-
-- `[mining]`: memory‑hard PoW parameters
-  - `mem_kib` bounds, `workers`, `heartbeat_interval_secs`
-
-- `[metrics]`: Prometheus exporter bind address
-
-After editing, run `unchained` (or `mine`) to use your settings.
 
 ---
 
@@ -204,10 +200,12 @@ You’ll see:
 
 You can print your Peer ID with `peer-id` and share a multiaddr if `net.public_ip` is configured.
 
----
-
-## Metrics
-Exposes Prometheus metrics (e.g., peer count, epoch height, mining timing, proofs served). Configure the bind address in `[metrics]` and scrape from your Prometheus server.
+### P2P messages (24h-limited topic)
+- Use `msg-send` to publish a short text message to the public 24h‑limited gossip topic.
+  - Outbound is restricted to 2 messages per 24 hours per node.
+- Use `msg-listen` to stream incoming messages; they print as simple text lines.
+- The node also enforces an inbound limit of 2 messages per 24 hours per peer.
+- This is meant for lightweight coordination or testing messages; do not rely on it for durable storage.
 
 ---
 
@@ -228,4 +226,3 @@ Exposes Prometheus metrics (e.g., peer count, epoch height, mining timing, proof
 - PoW: Argon2id (memory‑hard), lanes locked by consensus
 - Persistence: RocksDB with column families tuned for this workload
 
-The goal is a small, understandable codebase that stays useful in a post‑quantum world while remaining practical for everyday use.

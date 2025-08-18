@@ -2,28 +2,27 @@
 // Copyright 2025 The Unchained Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stealth transfer implementation (V2 + V3 hashlock).
+//! Stealth transfer implementation (V3 hashlock only).
 
 use serde::{Serialize, Deserialize};
 use serde_big_array::BigArray;
 use anyhow::{Result, Context, anyhow};
 
 use crate::crypto::{
-    Address, blake3_hash, address_from_pk,
-    DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, DILITHIUM3_SIG_BYTES,
+    Address, address_from_pk,
+    DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES,
     KYBER768_CT_BYTES as KYBER_CT_BYTES,
     commitment_of_stealth_ct, stealth_seed_v1, dilithium3_seeded_keypair,
     lock_hash as compute_lock_hash, compute_nullifier_v3, derive_next_lock_secret, commitment_id_v1,
 };
 use pqcrypto_dilithium::dilithium3::{
-    PublicKey as DiliPk, SecretKey as DiliSk, DetachedSignature,
-    detached_sign, verify_detached_signature,
+    PublicKey as DiliPk, SecretKey as DiliSk,
 };
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 
 use pqcrypto_kyber::kyber768::{
-    PublicKey as KyberPk, SecretKey as KyberSk, Ciphertext as KyberCt,
-    encapsulate, decapsulate,
+    SecretKey as KyberSk, Ciphertext as KyberCt,
+    decapsulate,
 };
 use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
 
@@ -89,7 +88,7 @@ impl StealthOutput {
 }
 // (Legacy V1 transfer has been fully removed.)
 
-// ------------ Spend-key-blinded nullifier (V2) + Hashlock (V3) ------------
+// ------------ V3 Hashlock Spend ------------
 
 /// Receiver-supplied lock commitment for V3 hashlock spends.
 /// The receiver generates `kyber_ct` (encapsulated to their own Kyber PK), decapsulates to get
@@ -118,11 +117,8 @@ pub struct Spend {
     pub proof: Vec<([u8; 32], bool)>,
     /// Stealth output commitment for the new recipient
     pub commitment: [u8; 32],
-    /// Nullifier (V2: H("unchained.nullifier.v2" || pk || coin_id); V3: H("unchained.nullifier.v3" || coin_id || unlock_preimage))
+    /// Nullifier (V3: H("unchained.nullifier.v3" || coin_id || unlock_preimage))
     pub nullifier: [u8; 32],
-    /// Dilithium3 signature by the current owner sk over auth_bytes() (unused in V3, zeroed)
-    #[serde(with = "BigArray")]
-    pub sig: [u8; DILITHIUM3_SIG_BYTES],
     /// The actual stealth output (one-time pk + enc payload)
     pub to: StealthOutput,
     /// Hashlock unlock preimage (V3). When present, enables signatureless spends.
@@ -146,110 +142,6 @@ impl Spend {
             v.extend_from_slice(&nh);
         }
         v
-    }
-
-    /// Construct a spend (legacy V2 signature-based path).
-    /// NOTE: The nullifier is derived from the PUBLIC current owner key + coin_id (not SK),
-    /// so validators can recompute and enforce uniqueness.
-    pub fn create(
-        coin_id: [u8; 32],
-        anchor: &crate::epoch::Anchor,
-        proof: Vec<([u8; 32], bool)>,
-        current_owner_pk: &DiliPk,
-        current_owner_sk: &DiliSk,
-        recipient_dili_pk: &DiliPk,
-        recipient_kyber_pk: &KyberPk,
-        amount: u64,
-        chain_id32: &[u8; 32],
-    ) -> Result<Self> {
-        let (shared, ct) = encapsulate(recipient_kyber_pk);
-        let commitment = commitment_of_stealth_ct(ct.as_bytes());
-        let value_tag = amount.to_le_bytes();
-        let chain_id = chain_id32;
-        let seed = stealth_seed_v1(shared.as_bytes(), recipient_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id);
-        let (ot_pk, _ot_sk) = dilithium3_seeded_keypair(seed);
-
-        let mut to = StealthOutput {
-            one_time_pk: [0u8; DILITHIUM3_PK_BYTES],
-            kyber_ct: [0u8; KYBER_CT_BYTES],
-            amount_le: amount,
-        };
-        to.one_time_pk.copy_from_slice(ot_pk.as_bytes());
-        to.kyber_ct.copy_from_slice(ct.as_bytes());
-
-        // Nullifier (public-key-based): H("unchained.nullifier.v2" || owner_pk || coin_id)
-        let mut pre = Vec::with_capacity(24 + DILITHIUM3_PK_BYTES + 32);
-        pre.extend_from_slice(b"unchained.nullifier.v2");
-        pre.extend_from_slice(current_owner_pk.as_bytes());
-        pre.extend_from_slice(&coin_id);
-        let nullifier = blake3_hash(&pre);
-
-        let mut spend = Spend {
-            coin_id,
-            root: anchor.merkle_root,
-            proof,
-            commitment,
-            nullifier,
-            sig: [0u8; DILITHIUM3_SIG_BYTES],
-            to,
-            unlock_preimage: None,
-            next_lock_hash: None,
-        };
-        let sig = detached_sign(&spend.auth_bytes(), current_owner_sk);
-        spend.sig.copy_from_slice(sig.as_bytes());
-        Ok(spend)
-    }
-
-    /// Construct a V2 signature-based spend but embed an optional `next_lock_hash` to initialize a V3 chain.
-    /// This is used exclusively for legacy self-upgrades.
-    pub fn create_v2_with_next_lock(
-        coin_id: [u8; 32],
-        anchor: &crate::epoch::Anchor,
-        proof: Vec<([u8; 32], bool)>,
-        current_owner_pk: &DiliPk,
-        current_owner_sk: &DiliSk,
-        recipient_dili_pk: &DiliPk,
-        recipient_kyber_pk: &KyberPk,
-        amount: u64,
-        next_lock_hash: Option<[u8;32]>,
-        chain_id32: &[u8; 32],
-    ) -> Result<Self> {
-        let (shared, ct) = encapsulate(recipient_kyber_pk);
-        let commitment = commitment_of_stealth_ct(ct.as_bytes());
-        let value_tag = amount.to_le_bytes();
-        let seed = stealth_seed_v1(shared.as_bytes(), recipient_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
-        let (ot_pk, _ot_sk) = dilithium3_seeded_keypair(seed);
-
-        let mut to = StealthOutput {
-            one_time_pk: [0u8; DILITHIUM3_PK_BYTES],
-            kyber_ct: [0u8; KYBER_CT_BYTES],
-            amount_le: amount,
-        };
-        to.one_time_pk.copy_from_slice(ot_pk.as_bytes());
-        to.kyber_ct.copy_from_slice(ct.as_bytes());
-
-        // Nullifier (public-key-based): H("unchained.nullifier.v2" || owner_pk || coin_id)
-        let mut pre = Vec::with_capacity(24 + DILITHIUM3_PK_BYTES + 32);
-        pre.extend_from_slice(b"unchained.nullifier.v2");
-        pre.extend_from_slice(current_owner_pk.as_bytes());
-        pre.extend_from_slice(&coin_id);
-        let nullifier = blake3_hash(&pre);
-
-        let mut spend = Spend {
-            coin_id,
-            root: anchor.merkle_root,
-            proof,
-            commitment,
-            nullifier,
-            sig: [0u8; DILITHIUM3_SIG_BYTES],
-            to,
-            unlock_preimage: None,
-            next_lock_hash,
-        };
-        // Sign over auth bytes (which include next_lock_hash when present)
-        let sig = detached_sign(&spend.auth_bytes(), current_owner_sk);
-        spend.sig.copy_from_slice(sig.as_bytes());
-        Ok(spend)
     }
 
     /// Construct a signatureless hashlock-based spend (V3) using a receiver-supplied commitment.
@@ -298,14 +190,13 @@ impl Spend {
             proof,
             commitment,
             nullifier,
-            sig: [0u8; DILITHIUM3_SIG_BYTES], // unused
             to,
             unlock_preimage: Some(unlock_preimage),
             next_lock_hash: Some(next_lock_hash),
         })
     }
 
-    /// Validate spend statelessly + against DB: proof, uniqueness, signature OR hashlock, commitment, nullifier.
+    /// Validate spend statelessly + against DB: proof, uniqueness, hashlock, commitment, nullifier.
     /// Note: A spend is chainable. The presence of a prior spend means the last owner
     /// is defined by that spend's one-time key or hashlock state.
     pub fn validate(&self, db: &crate::storage::Store) -> Result<()> {
@@ -345,61 +236,26 @@ impl Spend {
             return Err(anyhow!("Nullifier already seen (double spend)"));
         }
 
-        // 6) Authorization: prefer V3 hashlock when present, else fallback to V2 signature (legacy-first-spend only)
-        if let Some(preimage) = self.unlock_preimage {
-            // V3 hashlock path
-            // Determine expected previous lock hash
-            let expected_lock_hash = if let Some(prev_spend) = db.get_spend_tolerant(&self.coin_id)? {
-                if let Some(next_h) = prev_spend.next_lock_hash { next_h } else { return Err(anyhow!("Previous spend missing next_lock_hash")); }
-            } else {
-                // Genesis lock hash stored in coin
-                coin.lock_hash
-            };
-            // Check preimage matches
-            if compute_lock_hash(&preimage) != expected_lock_hash { return Err(anyhow!("Invalid hashlock preimage")); }
-            // Recompute nullifier (V3)
-            let chain_id = db.get_chain_id()?;
-            let exp_nf = compute_nullifier_v3(&preimage, &self.coin_id, &chain_id);
-            if exp_nf != self.nullifier { return Err(anyhow!("Nullifier mismatch")); }
-            // Enforce one-time use of receiver commitment via deterministic commitment_id
-            let next_lock = self.next_lock_hash.ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
-            let cid = commitment_id_v1(&self.to.one_time_pk, &self.to.kyber_ct, &next_lock, &self.coin_id, self.to.amount_le, &chain_id);
-            if db.get::<[u8;1]>("commitment_used", &cid)?.is_some() {
-                return Err(anyhow!("Receiver commitment already used"));
-            }
+        // 6) Authorization: require V3 hashlock
+        let preimage = self.unlock_preimage.ok_or_else(|| anyhow!("V3 hashlock preimage required"))?;
+        // Determine expected previous lock hash
+        let expected_lock_hash = if let Some(prev_spend) = db.get_spend_tolerant(&self.coin_id)? {
+            prev_spend.next_lock_hash.ok_or_else(|| anyhow!("Previous spend missing next_lock_hash"))?
         } else {
-            // V2 signature path (legacy) – allowed only for legacy-first-spend when coin has no lock_hash and no prior spend exists
-            if coin.lock_hash != [0u8;32] {
-                return Err(anyhow!("V2 not allowed after V3-init (coin has lock_hash)"));
-            }
-            let last_spend: Option<Spend> = db.get_spend_tolerant(&self.coin_id)?;
-            if last_spend.is_some() {
-                return Err(anyhow!("V2 not allowed after first spend exists"));
-            }
-
-            let sig = DetachedSignature::from_bytes(&self.sig)
-                .context("Invalid spend signature format")?;
-
-            let mut verified_pk: Option<DiliPk> = None;
-            // No prior spend exists by gate above; verify against coin.creator_pk only
-            if verified_pk.is_none() && coin.creator_pk != [0u8; DILITHIUM3_PK_BYTES] {
-                if let Ok(pk) = DiliPk::from_bytes(&coin.creator_pk) {
-                    if verify_detached_signature(&sig, &self.auth_bytes(), &pk).is_ok() {
-                        verified_pk = Some(pk);
-                    }
-                }
-            }
-            let pk = verified_pk.ok_or_else(|| anyhow!("Invalid spend signature"))?;
-
-            // Recompute and enforce public-key-based nullifier
-            let mut pre = Vec::with_capacity(24 + DILITHIUM3_PK_BYTES + 32);
-            pre.extend_from_slice(b"unchained.nullifier.v2");
-            pre.extend_from_slice(pk.as_bytes());
-            pre.extend_from_slice(&self.coin_id);
-            let expected_nullifier = blake3_hash(&pre);
-            if self.nullifier != expected_nullifier {
-                return Err(anyhow!("Nullifier mismatch"));
-            }
+            // Genesis lock hash stored in coin
+            coin.lock_hash
+        };
+        // Check preimage matches
+        if compute_lock_hash(&preimage) != expected_lock_hash { return Err(anyhow!("Invalid hashlock preimage")); }
+        // Recompute nullifier (V3)
+        let chain_id = db.get_chain_id()?;
+        let exp_nf = compute_nullifier_v3(&preimage, &self.coin_id, &chain_id);
+        if exp_nf != self.nullifier { return Err(anyhow!("Nullifier mismatch")); }
+        // Enforce one-time use of receiver commitment via deterministic commitment_id
+        let next_lock = self.next_lock_hash.ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
+        let cid = commitment_id_v1(&self.to.one_time_pk, &self.to.kyber_ct, &next_lock, &self.coin_id, self.to.amount_le, &chain_id);
+        if db.get::<[u8;1]>("commitment_used", &cid)?.is_some() {
+            return Err(anyhow!("Receiver commitment already used"));
         }
 
         // 7) Basic sanity of `to` (strict size checks before parsing)
@@ -407,9 +263,6 @@ impl Spend {
         if self.to.kyber_ct.len() != KYBER_CT_BYTES { return Err(anyhow!("Invalid Kyber ct length")); }
         let _ = DiliPk::from_bytes(&self.to.one_time_pk).context("Invalid one-time pk")?;
         let _ = KyberCt::from_bytes(&self.to.kyber_ct).context("Invalid Kyber ct")?;
-
-        // 8) Optional: enforce commitment_id one-time use if present in V3 receiver commitment path
-        // Commitment_id one-time use is enforced above when unlock_preimage is present
 
         Ok(())
     }

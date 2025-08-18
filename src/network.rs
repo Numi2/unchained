@@ -88,6 +88,37 @@ const TOP_EPOCH_SELECTED_REQUEST: &str = "unchained/epoch_selected_request/v1"; 
 const TOP_EPOCH_SELECTED_RESPONSE: &str = "unchained/epoch_selected_response/v1"; // payload: SelectedIdsBundle
 const TOP_COMMITMENT_REQUEST: &str = "unchained/commitment_request/v1";
 const TOP_COMMITMENT_RESPONSE: &str = "unchained/commitment_response/v1";
+const TOP_RATE_LIMITED: &str = "unchained/limited_24h/v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitedMessage {
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TopicQuota {
+    window_start: Instant,
+    message_count: u32,
+}
+
+impl TopicQuota {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self { window_start: Instant::now(), message_count: 0 }
+    }
+
+    #[allow(dead_code)]
+    fn check(&mut self, window_secs: u64, max_messages: u32) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) > std::time::Duration::from_secs(window_secs) {
+            self.window_start = now;
+            self.message_count = 0;
+        }
+        self.message_count += 1;
+        self.message_count <= max_messages
+    }
+}
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -310,6 +341,7 @@ pub struct Network {
     spend_tx: broadcast::Sender<Spend>,
     commit_req_tx: broadcast::Sender<CommitmentRequest>,
     commit_resp_tx: broadcast::Sender<CommitmentResponse>,
+    rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
@@ -319,6 +351,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipSpend(Spend),
+    GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
     RequestSpend([u8;32]),
     RequestCoin([u8; 32]),
@@ -395,6 +428,7 @@ pub async fn spawn(
         TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
         TOP_PEER_ADDR,
         TOP_COMMITMENT_REQUEST, TOP_COMMITMENT_RESPONSE,
+        TOP_RATE_LIMITED,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -439,8 +473,9 @@ pub async fn spawn(
     let (proof_tx, _) = broadcast::channel(256);
     let (commit_req_tx, _) = broadcast::channel(256);
     let (commit_resp_tx, _) = broadcast::channel(256);
+    let (rate_limited_tx, _) = broadcast::channel(64);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), commit_req_tx: commit_req_tx.clone(), commit_resp_tx: commit_resp_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), commit_req_tx: commit_req_tx.clone(), commit_resp_tx: commit_resp_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -450,6 +485,9 @@ pub async fn spawn(
     let mut pending_spend_deadline: HashMap<[u8;32], std::time::Instant> = HashMap::new();
     // Pending coin-proof requests we could not answer immediately (awaiting leaves/coins)
     let mut pending_proof_requests: HashMap<[u8;32], std::time::Instant> = HashMap::new();
+    // Per-topic quotas for the custom rate-limited topic
+    let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
+    let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -745,6 +783,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                     NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
+                                    NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
@@ -774,10 +813,24 @@ pub async fn spawn(
                             let Some(peer_id) = message.source else { continue };
                             let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            let rate_limit_exempt = topic_str == TOP_ANCHOR;
+                            let rate_limit_exempt = topic_str == TOP_ANCHOR || topic_str == TOP_RATE_LIMITED;
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
                             match topic_str {
+                                TOP_RATE_LIMITED => {
+                                    if let Ok(msg) = bincode::deserialize::<RateLimitedMessage>(&message.data) {
+                                        // enforce per-sender quota: 2 messages per 24h per peer
+                                        let entry = inbound_quota.entry(peer_id).or_insert((std::time::Instant::now(), 0));
+                                        let now = std::time::Instant::now();
+                                        if now.duration_since(entry.0) > std::time::Duration::from_secs(24 * 60 * 60) {
+                                            *entry = (now, 0);
+                                        }
+                                        entry.1 += 1;
+                                        if entry.1 <= 2 {
+                                            let _ = rate_limited_tx.send(msg);
+                                        }
+                                    }
+                                },
                                 TOP_PEER_ADDR => if net_cfg.peer_exchange {
                                     if let Ok(addr) = bincode::deserialize::<String>(&message.data) {
                                         if !addr.starts_with("/ip4/") || !addr.contains("/udp/") || !addr.contains("/quic-v1/") { continue; }
@@ -1114,8 +1167,8 @@ pub async fn spawn(
                                         }
                                         Err(e) => {
                                             let es = e.clone();
-                                            // If signature fails, we may be missing the predecessor spend; buffer and request latest
-                                            if es.contains("Invalid spend signature") {
+                                            // If authorization fails, we may be missing the predecessor spend; buffer and request latest
+                                            if es.contains("Invalid spend signature") || es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
                                                 let coin_id = sp.coin_id;
                                                 pending_spends.entry(coin_id).or_default().push(sp);
                                                 pending_spend_deadline.insert(coin_id, std::time::Instant::now());
@@ -1211,7 +1264,7 @@ pub async fn spawn(
                                             }
                                             Err(e) => {
                                                 let es = e.clone();
-                                                if es.contains("Invalid spend signature") {
+                                                if es.contains("Invalid spend signature") || es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
                                                     let coin_id = sp.coin_id;
                                                     pending_spends.entry(coin_id).or_default().push(sp);
                                                     pending_spend_deadline.insert(coin_id, std::time::Instant::now());
@@ -1562,6 +1615,29 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::GossipRateLimited(m) => {
+                            // enforce 2 messages per 24 hours for outbound from this node
+                            let (start, count) = outbound_quota;
+                            let now = std::time::Instant::now();
+                            let mut start_mut = start;
+                            let mut count_mut = count;
+                            if now.duration_since(start_mut) > std::time::Duration::from_secs(24 * 60 * 60) {
+                                start_mut = now;
+                                count_mut = 0;
+                            }
+                            if count_mut < 2 {
+                                if let Ok(data) = bincode::serialize(m) {
+                                    if swarm.behaviour_mut().publish(IdentTopic::new(TOP_RATE_LIMITED), data).is_err() {
+                                        pending_commands.push_back(command);
+                                    } else {
+                                        count_mut += 1;
+                                    }
+                                }
+                            } else {
+                                eprintln!("⚠️  Rate limit exceeded for topic {} (2 msgs/24h). Dropping message.", TOP_RATE_LIMITED);
+                            }
+                            outbound_quota = (start_mut, count_mut);
+                        }
                     }
                 }
             }
@@ -1574,12 +1650,14 @@ impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &CoinCandidate) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
     pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
+    pub async fn gossip_rate_limited(&self, msg: RateLimitedMessage) { let _ = self.command_tx.send(NetworkCommand::GossipRateLimited(msg)); }
     pub async fn request_spend(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestSpend(id)); }
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> { self.spend_tx.subscribe() }
     pub fn commitment_request_subscribe(&self) -> broadcast::Receiver<CommitmentRequest> { self.commit_req_tx.subscribe() }
     pub fn commitment_response_subscribe(&self) -> broadcast::Receiver<CommitmentResponse> { self.commit_resp_tx.subscribe() }
+    pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> { self.rate_limited_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }

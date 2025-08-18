@@ -298,14 +298,12 @@ impl Wallet {
     // Removed direct secret key accessor; use sign() instead
 
     /// Signs a message using the wallet's secret key, returning the detached signature.
-    pub fn sign(&self, message: &[u8]) -> pqcrypto_dilithium::dilithium3::DetachedSignature {
-        pqcrypto_dilithium::dilithium3::detached_sign(message, &self.sk)
-    }
+    #[allow(dead_code)]
+    pub fn sign(&self, _message: &[u8]) { /* signatures removed in V3 */ }
 
     /// Verifies a message/signature pair using the wallet's public key.
-    pub fn verify(&self, message: &[u8], signature: &pqcrypto_dilithium::dilithium3::DetachedSignature) -> bool {
-        pqcrypto_dilithium::dilithium3::verify_detached_signature(signature, message, &self.pk).is_ok()
-    }
+    #[allow(dead_code)]
+    pub fn verify(&self, _message: &[u8], _signature: &()) -> bool { false }
 
     // ---------------------------------------------------------------------
     // Stealth Address: authenticated Kyber key distribution
@@ -735,37 +733,9 @@ impl Wallet {
                 let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
                 AuthPath::V3 { preimage: s0 }
             } else {
-                // Legacy coin: perform automatic V2 self-upgrade to install first V3 lock, then spend via V3
+                // Legacy coin without lock_hash: derive genesis lock and proceed via V3 directly
                 let chain_id = store.get_chain_id()?;
                 let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
-                let next_lock_hash = crate::crypto::lock_hash(&s0);
-                // Build a self-upgrade V2 spend with embedded next_lock_hash
-                let mut proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
-                let upgrade_spend = crate::transfer::Spend::create_v2_with_next_lock(
-                    coin.id,
-                    &anchor_used,
-                    std::mem::take(&mut proof_vec),
-                    &self.pk,
-                    &self.sk,
-                    &self.pk,
-                    &self.kyber_pk,
-                    coin.value,
-                    Some(next_lock_hash),
-                    &chain_id,
-                )?;
-                upgrade_spend.validate(&store)?;
-                upgrade_spend.apply(&store)?;
-                // Gossip upgrade quietly
-                crate::metrics::LEGACY_UPGRADES.inc();
-                eprintln!("[upgrade] Performed legacy→V3 upgrade for coin {}", hex::encode(coin.id));
-                network.gossip_spend(&upgrade_spend).await;
-                // Best-effort short wait until visible
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                loop {
-                    if let Ok(Some(_seen)) = store.get_spend_tolerant(&coin.id) { break; }
-                    if std::time::Instant::now() >= deadline { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
                 AuthPath::V3 { preimage: s0 }
             };
 
@@ -834,11 +804,9 @@ impl Wallet {
                 // Compute transfer_hash for display as H(auth_bytes)
                 let tx_hash = crypto::blake3_hash(&spend.auth_bytes());
 
-                // Outgoing
+                // Outgoing (approximate): compare prev_owner_addr; counterparty from one_time_pk bytes
                 if prev_owner_addr == self.address {
-                    // Counterparty is recipient address derived from one_time_pk
-                    let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&spend.to.one_time_pk)?;
-                    let recipient_addr = crypto::address_from_pk(&pk);
+                    let recipient_addr = crypto::blake3_hash(&spend.to.one_time_pk);
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,

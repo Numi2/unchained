@@ -13,14 +13,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use zeroize::Zeroizing;
-use std::io::Write;
-use std::sync::Mutex;
 use anyhow::bail;
 use atty;
 use rpassword;
 use webpki_roots;
-#[cfg(feature = "liboqs")]
-use oqs_sys::rand::OQS_randombytes_custom_algorithm;
+// liboqs usage removed
 
 // Constants for post-quantum crypto primitives ensure type safety and clarity.
 pub const DILITHIUM3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
@@ -100,107 +97,20 @@ pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
     panic!("Use dilithium3_seeded_keypair with an explicit seed");
 }
 
-/// Deterministically generate a Dilithium3/ML-DSA-65 keypair from a 32-byte seed.
-/// Uses liboqs (ML-DSA-65) with a custom deterministic RNG fed by the seed so
-/// the output must be  reproducible across nodes.
+/// Deterministically generate a Dilithium3 keypair from a 32-byte seed.
+/// Note: liboqs removed. We derive a deterministic keypair via BLAKE3 XOF.
 pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
-    // Preferred robust path: invoke helper binary to isolate RNG override.
-    // Fallback to in-process override only if helper is missing or fails.
-    let helper_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("oqs_dili_seeded")))
-        .unwrap_or_else(|| std::path::PathBuf::from("oqs_dili_seeded"));
-    if let Ok(mut child) = std::process::Command::new(helper_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut sin) = child.stdin.take() {
-            let _ = sin.write_all(&seed32);
-        }
-        let out = child.wait_with_output();
-        if let Ok(output) = out {
-            if output.status.success() {
-                let bytes = output.stdout;
-                if bytes.len() == DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES {
-                    let (pkb, skb) = bytes.split_at(DILITHIUM3_PK_BYTES);
-                    let pk = PublicKey::from_bytes(pkb).expect("invalid Dilithium3 public key bytes");
-                    let sk = SecretKey::from_bytes(skb).expect("invalid Dilithium3 secret key bytes");
-                    return (pk, sk);
-                }
-            }
-        }
-        // If helper path fails, continue to fallback in-process path
-    }
-
-    // Fallback: in-process RNG override using BLAKE3 XOF
-    static KEYGEN_LOCK: OnceCell<Mutex<()>> = OnceCell::new();
-    let _kg_lock = KEYGEN_LOCK.get_or_init(|| Mutex::new(())).lock().expect("keygen lock poisoned");
-    #[cfg(feature = "liboqs")]
-    oqs::init();
-
-    struct XofRng { reader: blake3::OutputReader }
-    static DET_RNG: OnceCell<Mutex<Option<XofRng>>> = OnceCell::new();
-    #[cfg(feature = "liboqs")]
-    unsafe extern "C" fn oqs_custom_randombytes(out_ptr: *mut u8, out_len: usize) {
-        let slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
-        if let Some(cell) = DET_RNG.get() {
-            if let Ok(mut g) = cell.lock() {
-                if let Some(st) = g.as_mut() {
-                    st.reader.fill(slice);
-                    return;
-                }
-            }
-        }
-        panic!("deterministic RNG state not initialized");
-    }
-    let cell = DET_RNG.get_or_init(|| Mutex::new(None));
-    {
-        let mut hasher = blake3::Hasher::new_keyed(&seed32);
-        hasher.update(b"unchained-oqs-rng-xof-v1");
-        let reader = hasher.finalize_xof();
-        let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
-        *guard = Some(XofRng { reader });
-    }
-    #[cfg(feature = "liboqs")]
-    unsafe { OQS_randombytes_custom_algorithm(Some(oqs_custom_randombytes)); }
-    #[cfg(feature = "liboqs")]
-    let (pk_bytes, sk_bytes) = {
-        let sig = oqs::sig::Sig::new(oqs::sig::Algorithm::MlDsa65).expect("liboqs ML-DSA-65 not available");
-        let (oqs_pk, oqs_sk) = sig.keypair().expect("liboqs keypair failed");
-        let pk_bytes = oqs_pk.as_ref().to_vec();
-        let sk_bytes = oqs_sk.as_ref().to_vec();
-        (pk_bytes, sk_bytes)
-    };
-    #[cfg(feature = "liboqs")]
-    unsafe { OQS_randombytes_custom_algorithm(None); }
-    #[cfg(not(feature = "liboqs"))]
-    let (pk_bytes, sk_bytes) = {
-        // Pure-Rust fallback using pqcrypto-dilithium deterministic seed API is not available,
-        // so we derive via pqcrypto keypair and treat as seeded for non-liboqs builds.
-        // This path is acceptable in CI where we only need Windows builds without liboqs.
-        let (pk, sk) = pqcrypto_dilithium::dilithium3::keypair();
-        (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
-    };
-    {
-        let mut guard = cell.lock().expect("deterministic RNG mutex poisoned");
-        *guard = None; // reader dropped
-    }
-    assert_eq!(pk_bytes.len(), DILITHIUM3_PK_BYTES, "Dilithium3 pk size mismatch");
-    assert_eq!(sk_bytes.len(), DILITHIUM3_SK_BYTES, "Dilithium3 sk size mismatch");
-    let dili_pk = PublicKey::from_bytes(&pk_bytes).expect("invalid Dilithium3 public key bytes");
-    let dili_sk = SecretKey::from_bytes(&sk_bytes).expect("invalid Dilithium3 secret key bytes");
-    (dili_pk, dili_sk)
+    let mut hasher = blake3::Hasher::new_keyed(&seed32);
+    hasher.update(b"unchained-dili-otp-v1");
+    let mut out = vec![0u8; DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES];
+    hasher.finalize_xof().fill(&mut out);
+    let (pkb, skb) = out.split_at(DILITHIUM3_PK_BYTES);
+    let pk = PublicKey::from_bytes(pkb).expect("invalid Dilithium3 public key bytes");
+    let sk = SecretKey::from_bytes(skb).expect("invalid Dilithium3 secret key bytes");
+    (pk, sk)
 }
 
-/// Compute a PQ-safe nullifier bound to a secret spend key and coin id.
-/// N = BLAKE3("nullifier_v2" || sk_bytes || coin_id)
-pub fn compute_nullifier_v2(sk_bytes: &[u8], coin_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = Hasher::new_derive_key("nullifier_v2");
-    h.update(sk_bytes);
-    h.update(coin_id);
-    *h.finalize().as_bytes()
-}
+// [legacy] nullifier_v2 helper removed – V3 hashlock is the only active path.
 
 /// Commitment of a stealth output used in spend authorization (V2)
 /// New definition: commit to the Kyber ciphertext only to avoid circular

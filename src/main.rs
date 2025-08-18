@@ -11,6 +11,7 @@ pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
 use qrcode::QrCode;
 use qrcode::render::unicode;
+use crate::network::RateLimitedMessage;
 fn print_qr_to_terminal(data: &str) -> anyhow::Result<()> {
     let code = QrCode::new(data.as_bytes())?;
     let image = code.render::<unicode::Dense1x2>().dark_color(unicode::Dense1x2::Light).build();
@@ -92,6 +93,21 @@ enum Cmd {
     InspectRequest {
         #[arg(long)]
         request_b64: String,
+    },
+    /// P2P: Send a short text message (topic limited to 2 msgs/24h)
+    MsgSend {
+        /// Message text to send; if omitted, you will be prompted
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// P2P: Listen for incoming messages on the 24h-limited topic
+    MsgListen {
+        /// Exit after receiving a single message
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Exit after receiving this many messages
+        #[arg(long)]
+        count: Option<u64>,
     },
 }
 
@@ -421,10 +437,9 @@ async fn main() -> anyhow::Result<()> {
                     use rand::RngCore as _;
                     let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
                     // Try interpret the code as a batch token first
-                    let mut parsed_token = String::new();
                     let mut recipient_addr_opt: Option<crate::crypto::Address> = None;
                     if base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stealth.as_str()).is_ok() || base64::engine::general_purpose::URL_SAFE.decode(stealth.as_str()).is_ok() {
-                        parsed_token = stealth.clone();
+                        let parsed_token = stealth.clone();
                         if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
                             .decode(parsed_token.as_str())
                             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parsed_token.as_str())) {
@@ -627,6 +642,37 @@ async fn main() -> anyhow::Result<()> {
             println!("Local wallet addr: {}", hex::encode(wallet.address()));
             println!("Equal? {}", if req.recipient_addr == wallet.address() { "yes" } else { "no" });
             println!("Entries: {}", req.entries.len());
+            return Ok(());
+        }
+        Some(Cmd::MsgSend { text }) => {
+            let message = if let Some(t) = text { t.clone() } else {
+                print!("📝 Enter message to send (max a few KB): "); io::stdout().flush()?;
+                let mut line = String::new(); io::stdin().read_line(&mut line)?; line.trim().to_string()
+            };
+            if message.is_empty() { println!("Nothing to send."); return Ok(()); }
+            let msg = RateLimitedMessage { content: message };
+            net.gossip_rate_limited(msg).await;
+            println!("📤 Message submitted to P2P topic (subject to 2 msgs/24h outbound limit)");
+            return Ok(());
+        }
+        Some(Cmd::MsgListen { once, count }) => {
+            println!("👂 Listening for P2P messages (24h-limited topic). Press Ctrl+C to exit.");
+            let mut rx = net.rate_limited_subscribe();
+            let mut remaining = count.unwrap_or(u64::MAX);
+            loop {
+                tokio::select! {
+                    Ok(m) = rx.recv() => {
+                        println!("💬 {}", m.content);
+                        if *once { break; }
+                        if remaining != u64::MAX {
+                            if remaining == 0 { break; }
+                            remaining -= 1;
+                            if remaining == 0 { break; }
+                        }
+                    }
+                    else => { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+                }
+            }
             return Ok(());
         }
         Some(Cmd::MakeCommitmentRequest { stealth, amount }) => {
