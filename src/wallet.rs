@@ -392,7 +392,7 @@ impl Wallet {
                 };
                 if let Some(sp) = recorded_spend {
                     let chain_id = store.get_chain_id()?;
-                    if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
+                    if sp.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         utxos.push(coin);
                     }
                     continue;
@@ -419,10 +419,10 @@ impl Wallet {
         let coin: Option<crate::coin::Coin> = store.get("coin", &spend.coin_id)?;
         if let Some(coin) = coin {
             let chain_id = store.get_chain_id()?;
-            if let Ok(sk) = spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
-                // Persist OTP SK for this output (idempotent)
+            if spend.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
+                // Persist OTP marker (no SK to store since we use opaque OTP bytes)
                 let pk_hash = crate::crypto::blake3_hash(&spend.to.one_time_pk);
-                store.put_otp_sk_if_absent(&pk_hash, sk.as_bytes())?;
+                // keep index for compatibility with earlier flows
                 store.put_otp_index(&coin.id, &pk_hash)?;
                 // Invariants: coin exists; spending updates are already recorded under CFs
                 // Nothing to write here; scanning functions will reflect ownership.
@@ -457,7 +457,7 @@ impl Wallet {
                 };
                 if let Some(sp) = recorded_spend {
                     let chain_id = store.get_chain_id()?;
-                    if let Ok(_sk) = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
+                    if sp.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         sum = sum.saturating_add(coin.value);
                     }
                     continue;
@@ -536,7 +536,7 @@ impl Wallet {
                 &value_tag,
                 &chain_id,
             );
-            let (ot_pk, _ot_sk) = crate::crypto::dilithium3_seeded_keypair(seed);
+            let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
             // View tag for receiver filtering
             let vt = crate::crypto::view_tag(shared.as_bytes());
             // Derive the receiver's next-hop lock secret and hash from Kyber context
@@ -549,7 +549,7 @@ impl Wallet {
             );
             let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
             let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-            one_time_pk.copy_from_slice(ot_pk.as_bytes());
+            one_time_pk.copy_from_slice(&ot_pk_bytes);
             let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
             kyber_ct.copy_from_slice(ct.as_bytes());
             let receiver_commitment = crate::transfer::ReceiverLockCommitment {
@@ -741,7 +741,7 @@ impl Wallet {
 
                 // Incoming (to me)? If we can recover the one-time SK via canonical KDF, it's ours.
                 let chain_id = store.get_chain_id()?;
-                if let Ok(_sk) = spend.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
+                if spend.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,

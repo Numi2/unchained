@@ -30,6 +30,7 @@ use libp2p::gossipsub::{
 use bincode;
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::time::Instant;
+use std::str::FromStr;
 use tokio::sync::{broadcast, mpsc};
 use hex;
 use std::fs;
@@ -381,7 +382,7 @@ pub async fn spawn(
         gs,
         peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(std::time::Duration::from_secs(20))
+            .with_idle_connection_timeout(std::time::Duration::from_secs(120))
     );
     
     let mut port = net_cfg.listen_port;
@@ -692,10 +693,22 @@ pub async fn spawn(
     }
 
     tokio::spawn(async move {       
+        // Track peers being dialed to avoid duplicate concurrent dials
+        let mut dialing_peers: HashSet<PeerId> = HashSet::new();
+        // Track time of last dial attempt per peer for TTL de-duplication
+        let mut recent_peer_dials: HashMap<PeerId, Instant> = HashMap::new();
+        // Rate-limit self address advertisement to avoid connect storms
+        const PEER_ADDR_ADVERTISE_MIN_SECS: u64 = 60;
+        const PEER_DIAL_DEDUP_SECS: u64 = 30;
+        let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
                     match event {
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            if let Some(pid) = peer_id { dialing_peers.remove(&pid); }
+                            eprintln!("⚠️  Outgoing connection error: {:?}", error);
+                        },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             net_log!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
@@ -703,6 +716,8 @@ pub async fn spawn(
                                 set.insert(peer_id);
                                 crate::metrics::PEERS.set(set.len() as i64);
                             }
+                            // Clear dialing-in-progress marker on success
+                            dialing_peers.remove(&peer_id);
                             // After connecting, exchange external address (if enabled)
                             if net_cfg.peer_exchange {
                                 let to_advertise = if let Some(public_ip) = net_cfg.public_ip.clone() {
@@ -717,8 +732,12 @@ pub async fn spawn(
                                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
                                         }
                                     }
-                                    if let Ok(data) = bincode::serialize(&addr) {
-                                        try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                    // Rate-limit our advertisement to avoid causing reciprocal dial storms
+                                    if Instant::now().duration_since(last_peer_addr_advertise) > std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS) {
+                                        if let Ok(data) = bincode::serialize(&addr) {
+                                            try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                        }
+                                        last_peer_addr_advertise = Instant::now();
                                     }
                                 }
                             }
@@ -753,6 +772,8 @@ pub async fn spawn(
                                 set.remove(&peer_id);
                                 crate::metrics::PEERS.set(set.len() as i64);
                             }
+                            // Allow re-dial in the future
+                            dialing_peers.remove(&peer_id);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let Some(peer_id) = message.source else { continue };
@@ -780,14 +801,32 @@ pub async fn spawn(
                                     if let Ok(addr) = bincode::deserialize::<String>(&message.data) {
                                         if !addr.starts_with("/ip4/") || !addr.contains("/udp/") || !addr.contains("/quic-v1/") { continue; }
                                         let Some(id_str) = addr.split("/p2p/").last() else { continue };
-                                        if id_str == swarm.local_peer_id().to_string() { continue; }
+                                        let Ok(remote_pid) = PeerId::from_str(id_str) else { continue };
+                                        if remote_pid == *swarm.local_peer_id() { continue; }
                                         if let Some(ip_str) = addr.split('/').nth(3) {
                                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
                                         }
                                         if addr.parse::<Multiaddr>().is_err() { continue; }
                                         db.store_peer_addr(&addr).ok();
-                                        if connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize {
-                                            if let Ok(m) = addr.parse::<Multiaddr>() { let _ = swarm.dial(m); }
+                                        // Avoid redundant dials or dialing above capacity
+                                        let already_connected = connected_peers.lock().map(|s| s.contains(&remote_pid)).unwrap_or(false);
+                                        if already_connected || dialing_peers.contains(&remote_pid) { continue; }
+                                        let under_cap = connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize;
+                                        if !under_cap { continue; }
+                                        // TTL de-dup on dials
+                                        let now = Instant::now();
+                                        recent_peer_dials.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PEER_DIAL_DEDUP_SECS));
+                                        if recent_peer_dials.contains_key(&remote_pid) { continue; }
+                                        if let Ok(m) = addr.parse::<Multiaddr>() {
+                                            match swarm.dial(m) {
+                                                Ok(()) => {
+                                                    dialing_peers.insert(remote_pid);
+                                                    recent_peer_dials.insert(remote_pid, now);
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("❌ Failed to dial advertised peer {}: {}", id_str, e);
+                                                }
+                                            }
                                         }
                                     }
                                 },

@@ -12,13 +12,13 @@ use crate::crypto::{
     Address, address_from_pk,
     DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES,
     KYBER768_CT_BYTES as KYBER_CT_BYTES,
-    commitment_of_stealth_ct, stealth_seed_v1, dilithium3_seeded_keypair,
+    commitment_of_stealth_ct, stealth_seed_v1,
     derive_next_lock_secret, commitment_id_v1,
 };
 use pqcrypto_dilithium::dilithium3::{
-    PublicKey as DiliPk, SecretKey as DiliSk,
+    PublicKey as DiliPk,
 };
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+use pqcrypto_traits::sign::{PublicKey as _};
 
 use pqcrypto_kyber::kyber768::{
     SecretKey as KyberSk, Ciphertext as KyberCt,
@@ -26,7 +26,7 @@ use pqcrypto_kyber::kyber768::{
 };
 use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
 
-// use subtle::ConstantTimeEq;  // not needed; using fully-qualified call
+use subtle::ConstantTimeEq;
 
 // ------------ Stealth Output ------------
 
@@ -46,7 +46,7 @@ pub struct StealthOutput {
 }
 
 impl StealthOutput {
-    /// Deterministic bytes used inside signatures/commitments.
+    /// Deterministic bytes used inside commitments.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(
             DILITHIUM3_PK_BYTES + KYBER_CT_BYTES + 12 + (DILITHIUM3_SK_BYTES + 16),
@@ -58,9 +58,10 @@ impl StealthOutput {
         v
     }
 
-    /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver identity.
+    /// Check if this output is intended for the receiver by reproducing the
+    /// Kyber-bound one-time public bytes using deterministic hashing.
     /// Tries address-bound seed first (new), then falls back to legacy PK-bound seed for compatibility.
-    pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, chain_id32: &[u8;32]) -> Result<DiliSk> {
+    pub fn is_for_receiver(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, chain_id32: &[u8;32]) -> Result<()> {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
         let shared = decapsulate(&ct, kyber_sk);
@@ -72,19 +73,13 @@ impl StealthOutput {
         // Bind stealth seed to receiver address (stable identity) rather than raw Dilithium PK bytes
         let receiver_addr = address_from_pk(receiver_dili_pk);
         let seed_addr = stealth_seed_v1(shared.as_bytes(), &receiver_addr, ct.as_bytes(), &value_tag, chain_id32);
-        let (derived_pk_addr, derived_sk_addr) = dilithium3_seeded_keypair(seed_addr);
-        if subtle::ConstantTimeEq::ct_eq(derived_pk_addr.as_bytes(), &self.one_time_pk).unwrap_u8() == 1 {
-            let sk = DiliSk::from_bytes(derived_sk_addr.as_bytes()).context("Invalid Dilithium3 SK bytes")?;
-            return Ok(sk);
-        }
+        let pk_bytes_addr = crate::crypto::derive_one_time_pk_bytes(seed_addr);
+        if pk_bytes_addr.as_slice().ct_eq(&self.one_time_pk[..]).unwrap_u8() == 1 { return Ok(()); }
         // Legacy fallback: derive using receiver Dilithium PK bytes
         let seed_legacy = stealth_seed_v1(shared.as_bytes(), receiver_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
-        let (derived_pk_legacy, derived_sk_legacy) = dilithium3_seeded_keypair(seed_legacy);
-        if subtle::ConstantTimeEq::ct_eq(derived_pk_legacy.as_bytes(), &self.one_time_pk).unwrap_u8() == 1 {
-            let sk = DiliSk::from_bytes(derived_sk_legacy.as_bytes()).context("Invalid Dilithium3 SK bytes")?;
-            return Ok(sk);
-        }
-        Err(anyhow!("Derived OTP pk mismatch"))
+        let pk_bytes_legacy = crate::crypto::derive_one_time_pk_bytes(seed_legacy);
+        if pk_bytes_legacy.as_slice().ct_eq(&self.one_time_pk[..]).unwrap_u8() == 1 { return Ok(()); }
+        Err(anyhow!("Derived OTP bytes mismatch"))
     }
 
     /// Recipient derives the lock secret for next-hop ownership using Kyber shared secret and context.
@@ -294,7 +289,7 @@ impl Spend {
         // 7) Basic sanity of `to` (strict size checks before parsing)
         if self.to.one_time_pk.len() != DILITHIUM3_PK_BYTES { return Err(anyhow!("Invalid one-time pk length")); }
         if self.to.kyber_ct.len() != KYBER_CT_BYTES { return Err(anyhow!("Invalid Kyber ct length")); }
-        let _ = DiliPk::from_bytes(&self.to.one_time_pk).context("Invalid one-time pk")?;
+        // Do not parse one_time_pk as a real Dilithium key; it's opaque bytes bound to Kyber
         let _ = KyberCt::from_bytes(&self.to.kyber_ct).context("Invalid Kyber ct")?;
 
         Ok(())

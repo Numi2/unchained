@@ -110,6 +110,18 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
     (pk, sk)
 }
 
+/// Derive deterministic one-time "public key" bytes from a 32-byte seed.
+/// This avoids relying on Dilithium's randomized key generation and keeps
+/// stealth outputs Kyber-bound. The produced bytes are fixed-size and
+/// opaque; they MUST NOT be interpreted as a real Dilithium key.
+pub fn derive_one_time_pk_bytes(seed32: [u8; 32]) -> [u8; DILITHIUM3_PK_BYTES] {
+    let mut hasher = blake3::Hasher::new_keyed(&seed32);
+    hasher.update(b"unchained-otp-bytes.v1");
+    let mut out = [0u8; DILITHIUM3_PK_BYTES];
+    hasher.finalize_xof().fill(&mut out);
+    out
+}
+
 // [legacy] nullifier_v2 helper removed – V3 hashlock is the only active path.
 
 /// Commitment of a stealth output used in spend authorization (V3)
