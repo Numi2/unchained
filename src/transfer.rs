@@ -59,6 +59,7 @@ impl StealthOutput {
     }
 
     /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver identity.
+    /// Tries address-bound seed first (new), then falls back to legacy PK-bound seed for compatibility.
     pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, chain_id32: &[u8;32]) -> Result<DiliSk> {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
@@ -70,15 +71,20 @@ impl StealthOutput {
         let value_tag = self.amount_le.to_le_bytes();
         // Bind stealth seed to receiver address (stable identity) rather than raw Dilithium PK bytes
         let receiver_addr = address_from_pk(receiver_dili_pk);
-        let seed = stealth_seed_v1(shared.as_bytes(), &receiver_addr, ct.as_bytes(), &value_tag, chain_id32);
-        let (derived_pk, derived_sk) = dilithium3_seeded_keypair(seed);
-        // Constant-time compare
-        if subtle::ConstantTimeEq::ct_eq(derived_pk.as_bytes(), &self.one_time_pk).unwrap_u8() != 1 {
-            return Err(anyhow!("Derived OTP pk mismatch"));
+        let seed_addr = stealth_seed_v1(shared.as_bytes(), &receiver_addr, ct.as_bytes(), &value_tag, chain_id32);
+        let (derived_pk_addr, derived_sk_addr) = dilithium3_seeded_keypair(seed_addr);
+        if subtle::ConstantTimeEq::ct_eq(derived_pk_addr.as_bytes(), &self.one_time_pk).unwrap_u8() == 1 {
+            let sk = DiliSk::from_bytes(derived_sk_addr.as_bytes()).context("Invalid Dilithium3 SK bytes")?;
+            return Ok(sk);
         }
-        let sk = DiliSk::from_bytes(derived_sk.as_bytes())
-            .context("Invalid Dilithium3 SK bytes")?;
-        Ok(sk)
+        // Legacy fallback: derive using receiver Dilithium PK bytes
+        let seed_legacy = stealth_seed_v1(shared.as_bytes(), receiver_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
+        let (derived_pk_legacy, derived_sk_legacy) = dilithium3_seeded_keypair(seed_legacy);
+        if subtle::ConstantTimeEq::ct_eq(derived_pk_legacy.as_bytes(), &self.one_time_pk).unwrap_u8() == 1 {
+            let sk = DiliSk::from_bytes(derived_sk_legacy.as_bytes()).context("Invalid Dilithium3 SK bytes")?;
+            return Ok(sk);
+        }
+        Err(anyhow!("Derived OTP pk mismatch"))
     }
 
     /// Recipient derives the lock secret for next-hop ownership using Kyber shared secret and context.
@@ -212,8 +218,9 @@ impl Spend {
     /// is defined by that spend's one-time key or hashlock state.
     pub fn validate(&self, db: &crate::storage::Store) -> Result<()> {
 
-        // 1) Coin exists
-        let coin: crate::coin::Coin = db.get("coin", &self.coin_id)
+        // 1) Coin exists (use tolerant decoder for legacy formats)
+        let coin: crate::coin::Coin = db
+            .get_coin(&self.coin_id)
             .context("Failed to query coin")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
