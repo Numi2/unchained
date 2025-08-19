@@ -94,30 +94,7 @@ pub struct RateLimitedMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TopicQuota {
-    window_start: Instant,
-    message_count: u32,
-}
-
-impl TopicQuota {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self { window_start: Instant::now(), message_count: 0 }
-    }
-
-    #[allow(dead_code)]
-    fn check(&mut self, window_secs: u64, max_messages: u32) -> bool {
-        let now = Instant::now();
-        if now.duration_since(self.window_start) > std::time::Duration::from_secs(window_secs) {
-            self.window_start = now;
-            self.message_count = 0;
-        }
-        self.message_count += 1;
-        self.message_count <= max_messages
-    }
-}
+// Removed unused TopicQuota
 
 #[derive(Debug, Clone)]
 struct PeerScore {
@@ -174,7 +151,6 @@ impl PeerScore {
     }
 }
 
-#[allow(dead_code)]
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
     // Use committing epoch if known; fallback to legacy anchor lookup by hash
     let anchor: Anchor = db.get_epoch_for_coin(&coin.id)
@@ -200,7 +176,6 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
     // Delegate to core validator for single source of truth
     match sp.validate(db) {
@@ -741,6 +716,9 @@ pub async fn spawn(
                                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
                                         }
                                     }
+                                    if let Ok(data) = bincode::serialize(&addr) {
+                                        try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                    }
                                 }
                             }
                             let mut still_pending = VecDeque::new();
@@ -1030,6 +1008,7 @@ pub async fn spawn(
                                                             batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
                                                             let _ = db.db.write(batch);
                                                         }
+                                                        let _ = spend_tx.send(q.clone());
                                                         made_progress = true;
                                                     } else {
                                                         remaining.push(q);
@@ -1091,6 +1070,7 @@ pub async fn spawn(
                                                 batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]);
                                                 let _ = db.db.write(batch);
                                             }
+                                            let _ = spend_tx.send(sp.clone());
                                             // Hard invariant: after a confirmed spend is processed, coin must exist
                                             if db.get::<Coin>("coin", &sp.coin_id).ok().flatten().is_none() {
                                                 eprintln!("❌ Invariant violated: spend applied but coin missing: {}", hex::encode(sp.coin_id));
@@ -1113,6 +1093,7 @@ pub async fn spawn(
                                                                 batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
                                                                 let _ = db.db.write(batch);
                                                             }
+                                                            let _ = spend_tx.send(q.clone());
                                                             made_progress = true;
                                                         } else {
                                                             remaining.push(q);
@@ -1195,6 +1176,7 @@ pub async fn spawn(
                                                     batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]);
                                                     let _ = db.db.write(batch);
                                                 }
+                                                let _ = spend_tx.send(sp.clone());
                                                 // Try apply any buffered successors now that base is present
                                                 if let Some(mut queued) = pending_spends.remove(&sp.coin_id) {
                                                     let mut made_progress = true;
@@ -1211,6 +1193,7 @@ pub async fn spawn(
                                                                     batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
                                                                     let _ = db.db.write(batch);
                                                                 }
+                                                                let _ = spend_tx.send(q.clone());
                                                                 made_progress = true;
                                                             } else {
                                                                 remaining.push(q);
@@ -1467,6 +1450,29 @@ pub async fn spawn(
                                                     try_publish_gossip(&mut swarm, TOP_EPOCH_SELECTED_RESPONSE, data, "epoch-selected");
                                                 }
                                             }
+                                        }
+                                    }
+                                },
+                                TOP_EPOCH_SELECTED_RESPONSE => if let Ok(bundle) = bincode::deserialize::<SelectedIdsBundle>(&message.data) {
+                                    if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes()) {
+                                        if anchor.merkle_root != bundle.merkle_root { continue; }
+                                        if anchor.coin_count as usize != bundle.coin_ids.len() { continue; }
+                                        let mut leaves: Vec<[u8;32]> = bundle.coin_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                                        leaves.sort();
+                                        let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
+                                        if computed_root != anchor.merkle_root { continue; }
+                                        if let (Some(sel_cf), Some(leaves_cf)) = (db.db.cf_handle("epoch_selected"), db.db.cf_handle("epoch_leaves")) {
+                                            let mut batch = rocksdb::WriteBatch::default();
+                                            for coin_id in &bundle.coin_ids {
+                                                let mut key = Vec::with_capacity(8 + 32);
+                                                key.extend_from_slice(&bundle.epoch_num.to_le_bytes());
+                                                key.extend_from_slice(coin_id);
+                                                batch.put_cf(sel_cf, &key, &[]);
+                                            }
+                                            if let Ok(bytes) = bincode::serialize(&leaves) {
+                                                batch.put_cf(leaves_cf, &bundle.epoch_num.to_le_bytes(), &bytes);
+                                            }
+                                            let _ = db.db.write(batch);
                                         }
                                     }
                                 },

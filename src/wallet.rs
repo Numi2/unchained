@@ -510,7 +510,7 @@ impl Wallet {
         receiver_paycode: &str,
         amount: u64,
         network: &crate::network::NetHandle,
-        s_bytes: &[u8],
+        _s_bytes: &[u8],
     ) -> Result<SendOutcome> {
         // Accept either a stealth address OR, when provided, derive recipient from batch token
         // Parse paycode (chain-bound Kyber PK + short routing secret). For now accept stealth address V2 as paycode surrogate.
@@ -539,9 +539,15 @@ impl Wallet {
             let (ot_pk, _ot_sk) = crate::crypto::dilithium3_seeded_keypair(seed);
             // View tag for receiver filtering
             let vt = crate::crypto::view_tag(shared.as_bytes());
-            // Derive preimage p from chain_id, coin_id, amount, ss, and spend-note s
-            let p = crate::crypto::compute_preimage_v1(&chain_id, &coin.id, coin.value, shared.as_bytes(), s_bytes);
-            let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &p);
+            // Derive the receiver's next-hop lock secret and hash from Kyber context
+            let s_next = crate::crypto::derive_next_lock_secret(
+                shared.as_bytes(),
+                ct.as_bytes(),
+                coin.value,
+                &coin.id,
+                &chain_id,
+            );
+            let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
             let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
             one_time_pk.copy_from_slice(ot_pk.as_bytes());
             let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
@@ -640,29 +646,30 @@ impl Wallet {
                 }
             }
 
-            // Determine spend auth path with enforced V3 and auto-upgrade for legacy
-            enum AuthPath { V3 { preimage: [u8;32] } }
-            // New path: we already computed p for this spend above
-            let path = AuthPath::V3 { preimage: p };
-
-            // Build and broadcast spend according to path
-            let spend = match path {
-                AuthPath::V3 { preimage } => {
-                    let proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
-                    let mut sp = crate::transfer::Spend::create_hashlock(
-                        coin.id,
-                        &anchor_used,
-                        proof_vec,
-                        preimage,
-                        &receiver_commitment,
-                        coin.value,
-                        &store.get_chain_id()?,
-                    )?;
-                    // Attach view tag into `to`
-                    sp.to.view_tag = Some(vt);
-                    sp
-                }
+            // Determine correct unlock preimage for the coin being spent (genesis or previous spend)
+            let unlock_preimage = if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
+                // Previous spend exists: derive the previously committed next-lock secret
+                prev_spend
+                    .to
+                    .derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id)?
+            } else {
+                // Genesis: derive s0 from our long-term secret key
+                self.compute_genesis_lock_secret(&coin.id, &chain_id)
             };
+
+            // Build and broadcast spend (V3 hashlock)
+            let proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
+            let mut spend = crate::transfer::Spend::create_hashlock(
+                coin.id,
+                &anchor_used,
+                proof_vec,
+                unlock_preimage,
+                &receiver_commitment,
+                coin.value,
+                &store.get_chain_id()?,
+            )?;
+            // Attach view tag into `to`
+            spend.to.view_tag = Some(vt);
             spend.validate(&store)?;
             spend.apply(&store)?;
             crate::metrics::V3_SENDS.inc();

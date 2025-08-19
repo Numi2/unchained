@@ -330,7 +330,7 @@ impl Miner {
                     // Compute genesis lock for this coin deterministically from our Dilithium SK
                     let chain_id = self.db.get_chain_id()?;
                     let s0 = self.wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
-                    let lock_hash = crate::crypto::lock_hash(&s0);
+                    let lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &s0);
                     let candidate = CoinCandidate::new(
                         anchor.hash,
                         nonce,

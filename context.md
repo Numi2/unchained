@@ -1,7 +1,7 @@
 ## Unchained: Epoch-based, PoW-minted, PQ-secure blockchain
 
 ### Goal and high-level model
-Unchained divides time into fixed-length epochs. Miners generate self-contained coins via memory-hard PoW during an epoch. At the epoch boundary the network finalizes an anchor that commits to the set of selected coins via a Merkle root. Each coin can be verified independently using its epoch anchor and a Merkle proof, enabling light verification and efficient sync.
+Unchained divides time into fixed-length epochs. Miners generate self-contained coins via memory-hard PoW during an epoch. At the epoch boundary the network finalizes an anchor that commits to the set of selected coins via a Merkle aroot. Each coin can be verified independently using its epoch anchor and a Merkle proof, enabling light verification and efficient sync.
 
 ### Consensus primitives
 - **Epochs**: Fixed seconds per epoch from config. Anchors form a chain: each new anchor commits to the previous anchor hash and to the Merkle root of selected coin IDs for the epoch that just ended.
@@ -80,10 +80,10 @@ Sync:
 - A coin is independently verifiable with a certificate `{coin, anchor, merkle_proof}`. Leaf = BLAKE3(coin_id). Proof order encodes sibling position.
 - Build-time: Merkle utilities in `src/epoch.rs` and pre-stored `epoch_leaves` speed proof building.
 - Request/response: `coin_proof_request`/`coin_proof_response` gossip topics.
-- Proof server: async HTTP (Hyper) endpoint `GET /proof/<coin_id_hex>` with optional `x-auth-token` auth and per-IP rate limiting. It requests the proof on gossip, waits for response (timeout), verifies, and returns JSON `{ ok, response }`. Default bind `127.0.0.1:9090`.
+
 
 ### Wallet and security
-- Wallet uses Dilithium3 keys; address = BLAKE3(public key) (domain-keyed) → 32-byte `Address`.
+- address = BLAKE3(public key) (domain-keyed) → 32-byte `Address`.
 - At-rest encryption: XChaCha20-Poly1305, key derived via Argon2id with strong parameters (default: 256 MiB, time_cost=3, lanes=1); keying material is wiped after use.
 - Non-interactive mode requires `WALLET_PASSPHRASE` (fails fast if missing). Interactive uses hidden prompt.
 - Peer identity is persisted in `peer_identity.key` and set to `0600` permissions on Unix.
@@ -96,53 +96,6 @@ Sync:
 - `mining.enabled`, `mining.mem_kib`, `mining.min_mem_kib`, `mining.max_mem_kib`
 - `metrics.bind`
 
-Notes:
-- Unknown config keys are warned and ignored. If `storage.path` is relative, it resolves to `${HOME}/.unchained/unchained_data`.
-
-### Metrics (Prometheus)
-- `unchained_peer_count` (gauge) – libp2p peers
-- `unchained_epoch_height` (gauge) – latest epoch
-- `unchained_candidate_coins` (gauge) – in-epoch buffer size (local)
-- `unchained_selected_coins` (gauge) – selected count at finalization
-- `unchained_orphan_buffer_len` (gauge) – buffered orphan anchors
-- `unchained_coin_proofs_served_total` (counter)
-- `unchained_coin_proof_latency_ms` (histogram)
-- `unchained_validation_failures_anchor_total` (counter)
-- `unchained_validation_failures_coin_total` (counter)
-- `unchained_validation_failures_transfer_total` (counter)
-- `unchained_db_write_failures_total` (counter)
-- `unchained_pruned_candidates_total` (counter)
-- `unchained_selection_threshold_u64` (gauge)
-
-### CLI
-- `unchained --mine` – start mining (or enabled by config)
-- `unchained --proof --coin-id <hex32>` – request and verify a proof; blocks up to 30s
-- `unchained --proof-server --bind <addr:port>` – start HTTP proof API (default `127.0.0.1:9090`); set `PROOF_SERVER_TOKEN` for simple auth
-- `unchained --send --to <addr_hex32> --amount <u64>` – send transfers (1-value coins)
-- `unchained --balance` – display wallet balance
-- `unchained --history` – display wallet transfer history
-
-### Validation rules (non-obvious, consensus-critical)
-- PoW lanes are fixed to 1 in both mining and validation; any deviation is invalid.
-- Difficulty is leading zero bytes (coarse). All nodes must treat difficulty as byte count.
-- Coin ID excludes `pow_hash` and only depends on `(epoch_hash, nonce, creator_address)`.
-- A coin binds to the previous anchor’s hash, not the new anchor.
-
-### Performance considerations
-- Candidate CF uses prefix keys for O(prefix) scans and pruning by prefix.
-- `epoch_leaves` stores sorted leaves for faster proofs.
-- RocksDB tuned for throughput: WAL-based durability, higher buffers, fewer fsyncs, moderate compaction.
-
-### Security and DoS resistance
-- Gossip-level validation is strict in code paths; rate limiting and per-peer failure scoring used.
-- Proof request deduplication guards against spam; HTTP API offers header-token auth and IP rate limiting.
-- Wallet passphrase handling is safe for headless deployments.
-
-### Limitations and roadmap
-- Difficulty byte-steps are coarse; future work may switch to target-based difficulty for finer control.
-- Transfers currently allow only the first spend per coin (no chain of spends or fees yet). A UTXO fee market and multi-hop spend history are natural extensions.
-- Pubsub validation can be hardened further with stricter modes and quotas per topic and byte rate.
-- Additional metrics: selection threshold (Nth PoW hash), DB latencies, full mempool stats (if implemented).
 
 ### File guide (selected)
 - `src/main.rs` – CLI entry, service orchestration, proof server
@@ -152,11 +105,4 @@ Notes:
 - `src/storage.rs` – RocksDB store, CF layout, candidate prefix keys, leaves storage
 - `src/transfer.rs` – transfers, signatures (Dilithium3), validation/apply
 - `src/wallet.rs` – encrypted wallet, passphrase rules, UTXO helpers
-- `src/metrics.rs` – Prometheus registry and gauges/counters
-
-### Deployment notes
-- Provide `WALLET_PASSPHRASE` in the environment for headless nodes; secure file permissions.
-- Expose QUIC port and optionally the proof API port; protect the proof API via `PROOF_SERVER_TOKEN` or reverse proxy auth.
-- Use durable disks for `storage.path` and monitor metrics for health. If `storage.path` is relative, state is stored at `${HOME}/.unchained/unchained_data`.
-
 

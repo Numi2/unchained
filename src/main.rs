@@ -272,12 +272,6 @@ async fn main() -> anyhow::Result<()> {
             }
 
             miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
-            println!(
-                "⛏️  Mining started (workers: {}, mem_kib: {}, heartbeat_secs: {})",
-                cfg.mining.workers,
-                cfg.mining.mem_kib,
-                cfg.mining.heartbeat_interval_secs
-            );
         }
         Some(Cmd::PeerId) => {
             let id = network::peer_id_string()?;
@@ -643,12 +637,6 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 miner::spawn(cfg.mining.clone(), db.clone(), net.clone(), wallet.clone(), coin_tx, shutdown_tx.subscribe(), sync_state.clone());
-                println!(
-                    "⛏️  Mining started (workers: {}, mem_kib: {}, heartbeat_secs: {})",
-                    cfg.mining.workers,
-                    cfg.mining.mem_kib,
-                    cfg.mining.heartbeat_interval_secs
-                );
             }
         }
     }
