@@ -36,6 +36,17 @@ fn main() -> anyhow::Result<()> {
     } else {
         println!("❌ No epochs found in database");
     }
+
+    // Print genesis anchor for cross-node comparison
+    if let Ok(Some(genesis)) = db.get::<Anchor>("epoch", &0u64.to_le_bytes()) {
+        println!("\n🌱 Genesis:");
+        println!("   Difficulty: {}", genesis.difficulty);
+        println!("   Memory: {} KiB", genesis.mem_kib);
+        println!("   Merkle root: {}", hex::encode(genesis.merkle_root));
+        println!("   Hash: {}", hex::encode(genesis.hash));
+    } else {
+        println!("\n🌱 Genesis anchor not present in this DB");
+    }
     
     // Count total coins from epoch metadata
     let mut coin_count_from_epochs = 0;

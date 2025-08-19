@@ -669,6 +669,8 @@ pub async fn spawn(
                     alt.coin_count,
                     selected_ids.len()
                 );
+                // Request authoritative sorted leaves so we can serve proofs and backfill indices
+                let _ = command_tx.send(NetworkCommand::RequestEpochLeaves(alt.num));
             }
 
             // Advance parent
@@ -987,9 +989,16 @@ pub async fn spawn(
                                         },
                                         Err(e) => {
                                             if e.contains("hash mismatch") {
-                                                net_log!("🔀 Alternate fork anchor at height {} (hash mismatch) – buffering for reorg", a.num);
                                                 let entry = orphan_anchors.entry(a.num).or_default();
-                                                if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
+                                                let is_new = !entry.iter().any(|x| x.hash == a.hash);
+                                                if is_new {
+                                                    net_log!(
+                                                        "🔀 Alternate fork anchor at height {} (hash mismatch) from {} – buffering for reorg",
+                                                        a.num,
+                                                        peer_id
+                                                    );
+                                                    entry.push(a.clone());
+                                                }
                                                 if a.num > 0 {
                                                     let now = std::time::Instant::now();
                                                     if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
@@ -1014,7 +1023,7 @@ pub async fn spawn(
                                                 }
                                                 attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
                                             } else {
-                                                println!("❌ Anchor validation failed: {}", e);
+                                                net_log!("❌ Anchor validation from {} failed: {}", peer_id, e);
                                                 crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
                                                 score.record_validation_failure();
                                             }
