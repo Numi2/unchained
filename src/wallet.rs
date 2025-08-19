@@ -359,53 +359,7 @@ impl Wallet {
         Self::parse_stealth_address(addr_str)
     }
 
-    // ---------------------------------------------------------------------
-    // Receiver commitment token parsing (V3 hashlock)
-    // ---------------------------------------------------------------------
-    // Batch token is a base64-url encoded bincode of network::CommitmentResponse (unsigned)
-    // and convert entries into per-coin ReceiverLockCommitment records.
-    fn parse_batch_commitment_token(
-        token: &str,
-        expected_recipient_addr: &Address,
-    ) -> Result<std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment>> {
-        let s = token.trim().trim_matches('"').trim_matches('\'').trim_matches('`');
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s)
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
-            .map_err(|_| anyhow!("Invalid batch commitment encoding"))?;
-        let resp: crate::network::CommitmentResponse = bincode::deserialize(&bytes)
-            .map_err(|_| anyhow!("Invalid batch commitment payload"))?;
-        if &resp.recipient_addr != expected_recipient_addr {
-            bail!("Batch commitment recipient mismatch");
-        }
-        // Build canonical bytes for potential future verification (currently unsigned)
-        let mut entries_sorted = resp.entries.clone();
-        entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
-        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32 + 32));
-        msg.extend_from_slice(b"commitment_response_v1");
-        msg.extend_from_slice(&resp.request_id);
-        msg.extend_from_slice(&resp.recipient_addr);
-        msg.extend_from_slice(&(entries_sorted.len() as u32).to_le_bytes());
-        for e in &entries_sorted {
-            msg.extend_from_slice(&e.coin_id);
-            msg.extend_from_slice(&e.amount_le.to_le_bytes());
-            msg.extend_from_slice(&e.one_time_pk);
-            msg.extend_from_slice(&e.kyber_ct);
-            msg.extend_from_slice(&e.next_lock_hash);
-            msg.extend_from_slice(&e.commitment_id);
-        }
-        let mut map = std::collections::HashMap::new();
-        for e in resp.entries {
-            map.insert(e.coin_id, crate::transfer::ReceiverLockCommitment {
-                one_time_pk: e.one_time_pk,
-                kyber_ct: e.kyber_ct,
-                next_lock_hash: e.next_lock_hash,
-                commitment_id: e.commitment_id,
-                amount_le: e.amount_le,
-            });
-        }
-        Ok(map)
-    }
+    // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
     // ---------------------------------------------------------------------
     // 🪙 UTXO helpers
@@ -548,86 +502,57 @@ impl Wallet {
         Err(anyhow!("send_transfer(Address, ...) is deprecated. Use send_to_stealth_address(stealth_address, amount, network)"))
     }
 
-    /// Sends stealth V3 hashlock spends to a recipient using a (possibly unsigned) stealth address string.
-    pub async fn send_to_stealth_address_with_commitments(
+    /// Sends stealth V3 hashlock spends to a recipient using a stealth address or paycode.
+    /// Commitment gossip is removed. The caller must provide an OOB spend note `s_bytes` (opaque secret)
+    /// and a receiver paycode containing receiver Kyber PK and routing tag.
+    pub async fn send_with_paycode_and_note(
         &self,
-        stealth_address_str: &str,
+        receiver_paycode: &str,
         amount: u64,
         network: &crate::network::NetHandle,
-        batch_commitment_token_or_empty: String,
+        s_bytes: &[u8],
     ) -> Result<SendOutcome> {
         // Accept either a stealth address OR, when provided, derive recipient from batch token
-        let mut parsed_recipient_addr: Option<Address> = None;
-        if let Ok((addr, _k)) = Self::parse_stealth_address(stealth_address_str) {
-            parsed_recipient_addr = Some(addr);
-        } else if !batch_commitment_token_or_empty.is_empty() {
-            // Try parse token header to discover recipient address
-            let s = batch_commitment_token_or_empty.trim().trim_matches('"').trim_matches('\'').trim_matches('`');
-            if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(s)
-                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s)) {
-                if let Ok(resp) = bincode::deserialize::<crate::network::CommitmentResponse>(&bytes) {
-                    parsed_recipient_addr = Some(resp.recipient_addr);
-                }
-            }
-        }
-        let _recipient_addr = parsed_recipient_addr.ok_or_else(|| anyhow!("Invalid receiver input: provide a stealth address or a valid batch token"))?;
+        // Parse paycode (chain-bound Kyber PK + short routing secret). For now accept stealth address V2 as paycode surrogate.
+        let (_recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(receiver_paycode)
+            .context("Invalid receiver paycode")?;
         let store = self
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        // We'll decide the exact coins to spend based on the commitment source to avoid selection mismatches.
-        let mut coins_to_spend: Vec<crate::coin::Coin> = Vec::new();
-        // Try automated P2P exchange if no offline token provided
-        let mut commitments_by_coin: std::collections::HashMap<[u8;32], crate::transfer::ReceiverLockCommitment> = if batch_commitment_token_or_empty.is_empty() {
-            // Build request from a single, deterministic selection and REUSE it for spends
-            use crate::network::{CommitmentRequest, CommitmentEntryReq};
-            let coins_for_request = self.select_inputs(amount)?;
-            let mut req_entries = Vec::with_capacity(coins_for_request.len());
-            for c in &coins_for_request { req_entries.push(CommitmentEntryReq{ coin_id: c.id, amount_le: c.value }); }
-            let mut rng_tag = [0u8;32];
-            rand::rngs::OsRng.fill_bytes(&mut rng_tag);
-            let req = CommitmentRequest { request_id: rng_tag, recipient_addr: _recipient_addr, entries: req_entries, memo: None, expiry_unix_secs: None };
-            let mut sub = network.commitment_response_subscribe();
-            network.request_commitments(req.clone()).await;
-            // Wait with timeout
-            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv()).await
-                .map_err(|_| anyhow!("timeout waiting for receiver batch commitments"))??;
-            if resp.recipient_addr != _recipient_addr { return Err(anyhow!("batch commitment recipient mismatch")); }
-            if resp.entries.len() < coins_for_request.len() { return Err(anyhow!("missing entries: expected {} got {}", coins_for_request.len(), resp.entries.len())); }
-            // Convert response entries (unsigned)
-            let map = Self::parse_batch_commitment_token(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?),
-                &_recipient_addr,
-            )?;
-            // Reuse the exact selection we requested
-            coins_to_spend = coins_for_request;
-            map
-        } else {
-            // Offline or pre-fetched token: parse provided token
-            let map = Self::parse_batch_commitment_token(&batch_commitment_token_or_empty, &_recipient_addr)?;
-            // Derive coins_to_spend directly from the token's coin IDs to avoid reselection mismatches
-            let available = self.list_unspent()?;
-            let mut by_id: std::collections::HashMap<[u8;32], crate::coin::Coin> = std::collections::HashMap::with_capacity(available.len());
-            for c in available { by_id.insert(c.id, c); }
-            for coin_id in map.keys() {
-                if let Some(c) = by_id.get(coin_id) {
-                    coins_to_spend.push(c.clone());
-                }
-            }
-            if coins_to_spend.is_empty() {
-                return Err(anyhow!("No matching unspent inputs found for provided batch token"));
-            }
-            map
-        };
+        // Select inputs locally; no receiver commitment exchange over network
+        let mut coins_to_spend: Vec<crate::coin::Coin> = self.select_inputs(amount)?;
         let mut spends = Vec::new();
 
         for coin in coins_to_spend {
-            let receiver_commitment = commitments_by_coin.remove(&coin.id)
-                .ok_or_else(|| anyhow!("missing entries for coin_id={} in batch commitment", hex::encode(coin.id)))?;
-            if receiver_commitment.amount_le != coin.value {
-                return Err(anyhow!("amount mismatch for coin_id={}", hex::encode(coin.id)));
-            }
+            // Locally construct receiver lock commitment from paycode and OOB note
+            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let chain_id = store.get_chain_id()?;
+            let value_tag = coin.value.to_le_bytes();
+            let seed = crate::crypto::stealth_seed_v1(
+                shared.as_bytes(),
+                self.pk.as_bytes(),
+                ct.as_bytes(),
+                &value_tag,
+                &chain_id,
+            );
+            let (ot_pk, _ot_sk) = crate::crypto::dilithium3_seeded_keypair(seed);
+            // View tag for receiver filtering
+            let vt = crate::crypto::view_tag(shared.as_bytes());
+            // Derive preimage p from chain_id, coin_id, amount, ss, and spend-note s
+            let p = crate::crypto::compute_preimage_v1(&chain_id, &coin.id, coin.value, shared.as_bytes(), s_bytes);
+            let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &p);
+            let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+            one_time_pk.copy_from_slice(ot_pk.as_bytes());
+            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
+            kyber_ct.copy_from_slice(ct.as_bytes());
+            let receiver_commitment = crate::transfer::ReceiverLockCommitment {
+                one_time_pk,
+                kyber_ct,
+                next_lock_hash,
+                commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, &chain_id),
+                amount_le: coin.value,
+            };
             // Resolve epoch and proof (unchanged logic)
             let commit_epoch = store
                 .get_epoch_for_coin(&coin.id)?
@@ -721,29 +646,14 @@ impl Wallet {
                 Ok(v) => v,
                 Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
             };
-            let path = if let Some(prev_sp) = prev_spend_opt {
-                // We are spending a previously received coin; use V3 hashlock by deriving preimage
-                let chain_id = store.get_chain_id()?;
-                let s = prev_sp.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id)
-                    .context("Failed to derive lock secret for previous spend")?;
-                AuthPath::V3 { preimage: s }
-            } else if coin.lock_hash != [0u8;32] {
-                // Genesis V3 path for newly mined coin
-                let chain_id = store.get_chain_id()?;
-                let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
-                AuthPath::V3 { preimage: s0 }
-            } else {
-                // Legacy coin without lock_hash: derive genesis lock and proceed via V3 directly
-                let chain_id = store.get_chain_id()?;
-                let s0 = self.compute_genesis_lock_secret(&coin.id, &chain_id);
-                AuthPath::V3 { preimage: s0 }
-            };
+            // New path: we already computed p for this spend above
+            let path = AuthPath::V3 { preimage: p };
 
             // Build and broadcast spend according to path
-            let spend = match path {
+            let mut spend = match path {
                 AuthPath::V3 { preimage } => {
                     let proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
-                    crate::transfer::Spend::create_hashlock(
+                    let mut sp = crate::transfer::Spend::create_hashlock(
                         coin.id,
                         &anchor_used,
                         proof_vec,
@@ -751,7 +661,10 @@ impl Wallet {
                         &receiver_commitment,
                         coin.value,
                         &store.get_chain_id()?,
-                    )?
+                    )?;
+                    // Attach view tag into `to`
+                    sp.to.view_tag = Some(vt);
+                    sp
                 }
             };
             spend.validate(&store)?;
@@ -763,17 +676,7 @@ impl Wallet {
         Ok(SendOutcome { spends })
     }
 
-    /// Deprecated wrapper: commitments are required for V3 hashlock sends.
-    pub async fn send_to_stealth_address(
-        &self,
-        _stealth_address_str: &str,
-        _amount: u64,
-        _network: &crate::network::NetHandle,
-    ) -> Result<SendOutcome> {
-        Err(anyhow!(
-            "Receiver commitments required. Use send_to_stealth_address_with_commitments(stealth_address, amount, network, tokens)"
-        ))
-    }
+    // Deprecated wrappers removed; use send_with_paycode_and_note
 
     // (Legacy transfers listing removed)
 
@@ -836,87 +739,9 @@ impl Wallet {
         Ok(history)
     }
 
-    /// Build a signed CommitmentResponse for a given request (receiver side).
-    /// The response is a batch commitment token that the payer can use offline.
-    pub fn build_commitment_response(&self, req: &crate::network::CommitmentRequest) -> Result<crate::network::CommitmentResponse> {
-        if req.recipient_addr != self.address { anyhow::bail!("recipient mismatch in request"); }
-        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
-        let chain_id = store.get_chain_id()?;
-
-        let mut entries: Vec<crate::network::CommitmentEntryResp> = Vec::with_capacity(req.entries.len());
-        for e in &req.entries {
-            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&self.kyber_pk);
-            let value_tag = e.amount_le.to_le_bytes();
-            let seed = crate::crypto::stealth_seed_v1(
-                shared.as_bytes(),
-                self.pk.as_bytes(),
-                ct.as_bytes(),
-                &value_tag,
-                &chain_id,
-            );
-            let (ot_pk, _ot_sk) = crate::crypto::dilithium3_seeded_keypair(seed);
-
-            let s_next = crate::crypto::derive_next_lock_secret(
-                shared.as_bytes(),
-                ct.as_bytes(),
-                e.amount_le,
-                &e.coin_id,
-                &chain_id,
-            );
-            let next_lock_hash = crate::crypto::lock_hash(&s_next);
-            // Deterministic commitment id bound to cryptographic fields and chain id
-            let commitment_id = crate::crypto::commitment_id_v1(
-                &{
-                    let mut tmp = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-                    tmp.copy_from_slice(ot_pk.as_bytes());
-                    tmp
-                },
-                &{
-                    let mut tmp = [0u8; crate::crypto::KYBER768_CT_BYTES];
-                    tmp.copy_from_slice(ct.as_bytes());
-                    tmp
-                },
-                &next_lock_hash,
-                &e.coin_id,
-                e.amount_le,
-                &chain_id,
-            );
-
-            let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-            one_time_pk.copy_from_slice(ot_pk.as_bytes());
-            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-            kyber_ct.copy_from_slice(ct.as_bytes());
-
-            entries.push(crate::network::CommitmentEntryResp {
-                one_time_pk,
-                kyber_ct,
-                next_lock_hash,
-                commitment_id,
-                coin_id: e.coin_id,
-                amount_le: e.amount_le,
-            });
-        }
-
-        let mut entries_sorted = entries.clone();
-        entries_sorted.sort_by(|a,b| a.coin_id.cmp(&b.coin_id));
-        let mut msg = Vec::with_capacity(32 + 32 + 4 + entries_sorted.len() * (32 + 8 + crate::crypto::DILITHIUM3_PK_BYTES + crate::crypto::KYBER768_CT_BYTES + 32 + 32));
-        msg.extend_from_slice(b"commitment_response_v1");
-        msg.extend_from_slice(&req.request_id);
-        msg.extend_from_slice(&req.recipient_addr);
-        msg.extend_from_slice(&(entries_sorted.len() as u32).to_le_bytes());
-        for e in &entries_sorted {
-            msg.extend_from_slice(&e.coin_id);
-            msg.extend_from_slice(&e.amount_le.to_le_bytes());
-            msg.extend_from_slice(&e.one_time_pk);
-            msg.extend_from_slice(&e.kyber_ct);
-            msg.extend_from_slice(&e.next_lock_hash);
-            msg.extend_from_slice(&e.commitment_id);
-        }
-        Ok(crate::network::CommitmentResponse {
-            request_id: req.request_id,
-            recipient_addr: req.recipient_addr,
-            entries,
-        })
+    /// Commitment response builder removed.
+    pub fn build_commitment_response(&self, _req: &()) -> Result<()> {
+        anyhow::bail!("commitment flow removed")
     }
 }
 

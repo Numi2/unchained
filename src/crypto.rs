@@ -198,12 +198,12 @@ pub fn create_pq_server_config(cert_der: Vec<u8>, private_key_der: Vec<u8>) -> R
 // Signatureless spend helpers (BLAKE3 + Kyber)
 // -----------------------------------------------------------------------------
 
-/// Compute the lock hash H_lock = BLAKE3_k("unchained.lock.v1", preimage)
+/// Legacy: Compute the lock hash H_lock = BLAKE3_k("unchained.lock.v1", preimage)
 pub fn lock_hash(preimage: &[u8]) -> [u8; 32] {
     *Hasher::new_derive_key("unchained.lock.v1").update(preimage).finalize().as_bytes()
 }
 
-/// Compute nullifier for signatureless spend: N = BLAKE3("unchained.nullifier.v3" || chain_id32 || coin_id || preimage)
+/// Legacy: Compute nullifier for signatureless spend: N = BLAKE3("unchained.nullifier.v3" || chain_id32 || coin_id || preimage)
 pub fn compute_nullifier_v3(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u8; 32]) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(b"unchained.nullifier.v3");
@@ -211,6 +211,63 @@ pub fn compute_nullifier_v3(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u
     h.update(coin_id);
     h.update(preimage);
     *h.finalize().as_bytes()
+}
+
+// New derivations (nf/lh/pre/vt) with explicit domains and arguments
+
+/// Compute preimage p for a payment: p = BLAKE3("pre" || chain_id32 || coin_id || amount_le || lp(ss)||ss || lp(s)||s)
+pub fn compute_preimage_v1(
+    chain_id32: &[u8; 32],
+    coin_id: &[u8; 32],
+    amount_le: u64,
+    shared_secret: &[u8],
+    note_s: &[u8],
+ ) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"pre");
+    h.update(chain_id32);
+    h.update(coin_id);
+    h.update(&amount_le.to_le_bytes());
+    h.update(&lp(shared_secret.len()));
+    h.update(shared_secret);
+    h.update(&lp(note_s.len()));
+    h.update(note_s);
+    *h.finalize().as_bytes()
+}
+
+/// Compute lock hash from preimage: lh = BLAKE3("lh" || chain_id32 || coin_id || lp(p)||p)
+pub fn lock_hash_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"lh");
+    h.update(chain_id32);
+    h.update(coin_id);
+    h.update(&lp(preimage.len()));
+    h.update(preimage);
+    *h.finalize().as_bytes()
+}
+
+/// Compute nullifier from preimage: nf = BLAKE3("nf" || chain_id32 || coin_id || lp(p)||p)
+pub fn nullifier_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"nf");
+    h.update(chain_id32);
+    h.update(coin_id);
+    h.update(&lp(preimage.len()));
+    h.update(preimage);
+    *h.finalize().as_bytes()
+}
+
+/// View tag (1 byte) for receiver-side filtering: vt = BLAKE3("vt" || lp(ss)||ss)[0]
+pub fn view_tag(shared_secret: &[u8]) -> u8 {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"vt");
+    h.update(&lp(shared_secret.len()));
+    h.update(shared_secret);
+    h.finalize().as_bytes()[0]
 }
 
 /// Derive the next lock preimage from Kyber shared secret and context.

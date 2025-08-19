@@ -59,41 +59,23 @@ enum Cmd {
             #[arg(long)]
             coin_id: String,
         },
-    /// Send coins to a receiver code (stealth address or batch token)
+    /// Send coins to a receiver paycode with an OOB spend note
     Send {
-        /// Receiver code (base64-url): a stealth address or a batch token; if omitted, a guided flow starts
+        /// Receiver paycode (base64-url): contains chain_id binding, receiver Kyber PK, and routing tag
         #[arg(long)]
-        to: Option<String>,
-        /// Amount to send; required when --to is provided
+        paycode: String,
+        /// Amount to send
         #[arg(long)]
-        amount: Option<u64>,
-        /// Receiver batch token (base64-url) for offline exchange; optional when --to is used (we auto-fetch if absent)
+        amount: u64,
+        /// OOB spend note secret `s` as hex or base64-url; if omitted, a random 32-byte secret is generated and printed
         #[arg(long)]
-        batch_token: Option<String>,
+        note: Option<String>,
     },
     Balance,
     History,
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
     RepairSpends,
-    /// Receiver: Listen for commitment requests and auto-respond with a batch token
-    ServeCommitments,
-    /// Receiver: Generate a single batch commitment token from a pasted request (base64-url)
-    MakeCommitmentToken {
-        #[arg(long)]
-        request_b64: String,
-    },
-    /// Sender: Build a base64 commitment request for offline exchange (paste to receiver)
-    MakeCommitmentRequest {
-        #[arg(long)]
-        stealth: String,
-        #[arg(long)]
-        amount: u64,
-    },
-    /// Debug: Inspect a commitment request and compare with local wallet address
-    InspectRequest {
-        #[arg(long)]
-        request_b64: String,
-    },
+    // Commitment request/response tooling removed
     /// P2P: Send a short text message (topic limited to 2 msgs/24h)
     MsgSend {
         /// Message text to send; if omitted, you will be prompted
@@ -205,25 +187,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Auto-serve receiver commitments if configured
-    if cfg.wallet.auto_serve_commitments {
-        let net_clone = net.clone();
-        let wallet_clone = wallet.clone();
-        tokio::spawn(async move {
-            let mut sub = net_clone.commitment_request_subscribe();
-            loop {
-                match sub.recv().await {
-                    Ok(req) => {
-                        if req.recipient_addr != wallet_clone.address() { continue; }
-                        if let Ok(resp) = wallet_clone.build_commitment_response(&req) {
-                            let _ = net_clone.gossip_commitment_response(resp).await;
-                        }
-                    }
-                    Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
-                }
-            }
-        });
-    }
+    // Commitment auto-serve removed
 
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -356,10 +320,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Cmd::Send { to, amount, batch_token }) => {
+        Some(Cmd::Send { paycode, amount, note }) => {
             let net = net.clone();
-            let (stealth, amount, batch_token) = if let (Some(addr), Some(amt)) = (to, amount) {
-                (addr.trim().to_string(), *amt, batch_token.clone().unwrap_or_default())
+            let (stealth, amount, batch_token) = if true {
+                // New non-interactive path handled below. Keep interactive flow for now but deprecated.
+                (paycode.trim().to_string(), *amount, String::new())
             } else {
                 // Fallback to interactive flow
                 // Enable quiet network logging for interactive send
@@ -431,44 +396,29 @@ async fn main() -> anyhow::Result<()> {
                     println!("\nAuto‑obtaining receiver commitments (if needed)");
                     println!("   If your receiver code was a batch token, we will use it directly.\n   Otherwise, we'll request commitments over P2P for up to 12 seconds, with an offline QR fallback.");
                     let coins = wallet.select_inputs(amount)?;
-                    use crate::network::{CommitmentRequest, CommitmentEntryReq};
-                    let mut entries = Vec::with_capacity(coins.len());
-                    for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
+                    // commitment request/response flow removed
                     use rand::RngCore as _;
                     let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
                     // Try interpret the code as a batch token first
                     let mut recipient_addr_opt: Option<crate::crypto::Address> = None;
                     if base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stealth.as_str()).is_ok() || base64::engine::general_purpose::URL_SAFE.decode(stealth.as_str()).is_ok() {
                         let parsed_token = stealth.clone();
-                        if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        if let Ok(_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
                             .decode(parsed_token.as_str())
                             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parsed_token.as_str())) {
-                            if let Ok(resp) = bincode::deserialize::<crate::network::CommitmentResponse>(&bytes) {
-                                recipient_addr_opt = Some(resp.recipient_addr);
-                                // Directly use this token
-                                token = parsed_token;
-                            }
+                            // legacy batch token removed
                         }
                     }
                     let recipient_addr = if let Some(a) = recipient_addr_opt { a } else {
                         let (a, _k) = wallet::Wallet::parse_stealth_address(&stealth)?; a
                     };
-                    let req = CommitmentRequest { request_id: rng_tag, recipient_addr, entries, memo: None, expiry_unix_secs: None };
                     let mut used_network = false;
                     if net.peer_count() > 0 {
                         println!("   ⏳ Requesting commitments from peers (12s timeout)...");
-                        let mut sub = net.commitment_response_subscribe();
-                        net.request_commitments(req.clone()).await;
-                        if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(12), sub.recv()).await {
-                            if resp.recipient_addr == recipient_addr && resp.entries.len() >= coins.len() {
-                                println!("   ✅ Received {} commitment entries from receiver", resp.entries.len());
-                                token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
-                                used_network = true;
-                            }
-                        }
+                        // removed
                     }
                     if !used_network {
-                        let req_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&req)?);
+                        let req_b64 = "<commitment flow removed>".to_string();
                         println!("   📱 No P2P response yet — using offline exchange.");
                         println!("   Show this QR to the receiver so they can generate a batch token:");
                         if let Err(e) = print_qr_to_terminal(&req_b64) { eprintln!("(QR unavailable: {})", e); }
@@ -484,9 +434,17 @@ async fn main() -> anyhow::Result<()> {
             // Non-interactive send execution (or interactive result)
             println!("\nSTEP 4/4 — Build and broadcast");
             println!("   Preparing spends and submitting to the network...");
-            let outcome = wallet
-                .send_to_stealth_address_with_commitments(&stealth, amount, &net, batch_token)
-                .await;
+            // Execute new send using paycode and OOB note
+            use rand::RngCore;
+            let s_bytes: Vec<u8> = if let Some(n) = note {
+                let t = n.trim();
+                if let Ok(b) = hex::decode(t.trim_start_matches("0x")) { b } else if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t) { b } else { anyhow::bail!("Invalid note encoding; use hex or base64-url") }
+            } else {
+                let mut s = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut s);
+                println!("🔑 Generated random spend note s: {}", hex::encode(s));
+                s.to_vec()
+            };
+            let outcome: anyhow::Result<wallet::SendOutcome> = wallet.send_with_paycode_and_note(&stealth, amount, &net, &s_bytes).await;
             match outcome {
                 Ok(outcome) => {
                     let total = outcome.spends.len();
@@ -576,74 +534,7 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Repair complete. Scanned: {}, deleted malformed: {}. Backup dir: {}", scanned, repaired, backup_dir);
             return Ok(());
         }
-        Some(Cmd::ServeCommitments) => {
-            println!("📡 Serving receiver commitments over P2P (auto-respond)");
-            let mut sub = net.commitment_request_subscribe();
-            loop {
-                match sub.recv().await {
-                    Ok(req) => {
-                        if req.recipient_addr != wallet.address() { continue; }
-                        match wallet.build_commitment_response(&req) {
-                            Ok(resp) => {
-                                let _ = net.gossip_commitment_response(resp).await;
-                                println!("↩️  Responded to commitment request {}", hex::encode(req.request_id));
-                            }
-                            Err(e) => {
-                                eprintln!("⚠️  Failed to build commitment response: {}", e);
-                                if e.to_string().contains("recipient mismatch") {
-                                    eprintln!(
-                                        "   expected recipient={}, request recipient={}",
-                                        hex::encode(wallet.address()),
-                                        hex::encode(req.recipient_addr)
-                                    );
-                                    eprintln!("   Hint: re-export stealth address from THIS wallet and share it with the sender.");
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
-                }
-            }
-        }
-        Some(Cmd::MakeCommitmentToken { request_b64 }) => {
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(request_b64)
-                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(request_b64))
-                .map_err(|_| anyhow::anyhow!("Invalid base64 for request"))?;
-            let req: crate::network::CommitmentRequest = bincode::deserialize(&bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid request payload"))?;
-            let resp = match wallet.build_commitment_response(&req) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("❌ Could not build commitment token: {}", e);
-                    if e.to_string().contains("recipient mismatch") {
-                        eprintln!(
-                            "   expected recipient={}, request recipient={}",
-                            hex::encode(wallet.address()),
-                            hex::encode(req.recipient_addr)
-                        );
-                        eprintln!("   Fix: export stealth address from THIS wallet and have the sender retry with that address.");
-                    }
-                    return Err(e);
-                }
-            };
-            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(&resp)?);
-            println!("🔐 Batch commitment token (base64-url):\n{}", token);
-            return Ok(());
-        }
-        Some(Cmd::InspectRequest { request_b64 }) => {
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(request_b64)
-                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(request_b64))
-                .map_err(|_| anyhow::anyhow!("Invalid base64 for request"))?;
-            let req: crate::network::CommitmentRequest = bincode::deserialize(&bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid request payload"))?;
-            println!("Request recipient: {}", hex::encode(req.recipient_addr));
-            println!("Local wallet addr: {}", hex::encode(wallet.address()));
-            println!("Equal? {}", if req.recipient_addr == wallet.address() { "yes" } else { "no" });
-            println!("Entries: {}", req.entries.len());
-            return Ok(());
-        }
+        // commitment commands removed
         Some(Cmd::MsgSend { text }) => {
             let message = if let Some(t) = text { t.clone() } else {
                 print!("📝 Enter message to send (max a few KB): "); io::stdout().flush()?;
@@ -675,22 +566,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::MakeCommitmentRequest { stealth, amount }) => {
-            // Parse recipient
-            let (recipient_addr, _kpk) = wallet::Wallet::parse_stealth_address(&stealth)?;
-            // Select inputs to cover amount
-            let coins = wallet.select_inputs(*amount)?;
-            use crate::network::{CommitmentRequest, CommitmentEntryReq};
-            let mut entries = Vec::with_capacity(coins.len());
-            for c in &coins { entries.push(CommitmentEntryReq { coin_id: c.id, amount_le: c.value }); }
-            use rand::RngCore as _;
-            let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
-            let req = CommitmentRequest { request_id: rng_tag, recipient_addr, entries, memo: None, expiry_unix_secs: None };
-            let b = bincode::serialize(&req)?;
-            let s = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-            println!("📨 Commitment request (send to receiver):\n{}", s);
-            return Ok(());
-        }
+        // commitment request removed
         None => {
             // No command specified, start mining if enabled
             if cfg.mining.enabled {

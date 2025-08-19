@@ -13,7 +13,7 @@ use crate::crypto::{
     DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES,
     KYBER768_CT_BYTES as KYBER_CT_BYTES,
     commitment_of_stealth_ct, stealth_seed_v1, dilithium3_seeded_keypair,
-    lock_hash as compute_lock_hash, compute_nullifier_v3, derive_next_lock_secret, commitment_id_v1,
+    derive_next_lock_secret, commitment_id_v1,
 };
 use pqcrypto_dilithium::dilithium3::{
     PublicKey as DiliPk, SecretKey as DiliSk,
@@ -40,6 +40,9 @@ pub struct StealthOutput {
     pub kyber_ct: [u8; KYBER_CT_BYTES],
     // Amount (little-endian on wire as u64)
     pub amount_le: u64,
+    /// Optional 1-byte view tag for cheap receiver-side filtering
+    #[serde(default)]
+    pub view_tag: Option<u8>,
 }
 
 impl StealthOutput {
@@ -51,6 +54,7 @@ impl StealthOutput {
         v.extend_from_slice(&self.one_time_pk);
         v.extend_from_slice(&self.kyber_ct);
         v.extend_from_slice(&self.amount_le.to_le_bytes());
+        if let Some(vt) = self.view_tag { v.push(vt); }
         v
     }
 
@@ -59,6 +63,10 @@ impl StealthOutput {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
         let shared = decapsulate(&ct, kyber_sk);
+        // View tag check if present (cheap early filter)
+        if let Some(vt) = self.view_tag {
+            if crate::crypto::view_tag(shared.as_bytes()) != vt { return Err(anyhow!("View tag mismatch")); }
+        }
         let value_tag = self.amount_le.to_le_bytes();
         let seed = stealth_seed_v1(shared.as_bytes(), receiver_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
         let (derived_pk, derived_sk) = dilithium3_seeded_keypair(seed);
@@ -175,12 +183,13 @@ impl Spend {
             one_time_pk: [0u8; DILITHIUM3_PK_BYTES],
             kyber_ct: [0u8; KYBER_CT_BYTES],
             amount_le: amount,
+            view_tag: None,
         };
         to.one_time_pk.copy_from_slice(&receiver_commitment.one_time_pk);
         to.kyber_ct.copy_from_slice(&receiver_commitment.kyber_ct);
 
-        // Nullifier (V3): H("unchained.nullifier.v3" || chain_id32 || coin_id || unlock_preimage)
-        let nullifier = compute_nullifier_v3(&unlock_preimage, &coin_id, chain_id32);
+        // Nullifier (V3 updated): nf = BLAKE3("nf" || chain_id || coin_id || p)
+        let nullifier = crate::crypto::nullifier_from_preimage(chain_id32, &coin_id, &unlock_preimage);
         // Next-hop lock hash provided by receiver
         let next_lock_hash = receiver_commitment.next_lock_hash;
 
@@ -228,6 +237,8 @@ impl Spend {
         // 4) Commitment check – must be H(kyber_ct)
         let expected_commitment = crate::crypto::commitment_of_stealth_ct(&self.to.kyber_ct);
         if expected_commitment != self.commitment { return Err(anyhow!("Commitment mismatch")); }
+        // 4b) Amount must match the committed coin value (no splits/merges in spend path)
+        if self.to.amount_le != coin.value { return Err(anyhow!("Amount mismatch with coin value")); }
 
         // 5) Nullifier unseen (DB collision check)
         if db.get::<[u8; 1]>("nullifier", &self.nullifier)
@@ -246,10 +257,10 @@ impl Spend {
             coin.lock_hash
         };
         // Check preimage matches
-        if compute_lock_hash(&preimage) != expected_lock_hash { return Err(anyhow!("Invalid hashlock preimage")); }
-        // Recompute nullifier (V3)
         let chain_id = db.get_chain_id()?;
-        let exp_nf = compute_nullifier_v3(&preimage, &self.coin_id, &chain_id);
+        if crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage) != expected_lock_hash { return Err(anyhow!("Invalid hashlock preimage")); }
+        // Recompute nullifier using new derivation from preimage
+        let exp_nf = crate::crypto::nullifier_from_preimage(&chain_id, &self.coin_id, &preimage);
         if exp_nf != self.nullifier { return Err(anyhow!("Nullifier mismatch")); }
         // Enforce one-time use of receiver commitment via deterministic commitment_id
         let next_lock = self.next_lock_hash.ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
