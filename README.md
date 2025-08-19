@@ -1,6 +1,6 @@
 ## Unchained
 
-### A post‑quantum, privacy‑preserving proof‑of‑work chain you can run today
+### A post‑quantum, privacy‑preserving proof‑of‑work chain you can run today but is still in heavy development -- I tend to push to prod 
 
 Unchained is a blockchain designed for the next decades of cryptography. It combines:
 - memory‑hard Argon2id proof‑of‑work,
