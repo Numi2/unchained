@@ -712,8 +712,8 @@ impl Wallet {
         for item in iter {
             let (_k, value) = item?;
             if let Ok(spend) = bincode::deserialize::<crate::transfer::Spend>(&value) {
-                // Determine previous owner address
-                let coin = match store.get::<crate::coin::Coin>("coin", &spend.coin_id)? {
+                // Determine previous owner address (tolerant coin decoding for legacy formats)
+                let coin = match store.get_coin(&spend.coin_id)? {
                     Some(c) => c,
                     None => {
                         // Reorg or partial data: skip this spend in history view
