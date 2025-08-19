@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Send { paycode, amount, note }) => {
             let net = net.clone();
-            let (stealth, amount, batch_token) = if true {
+            let (stealth, amount, _batch_token) = if true {
                 // New non-interactive path handled below. Keep interactive flow for now but deprecated.
                 (paycode.trim().to_string(), *amount, String::new())
             } else {
@@ -395,12 +395,12 @@ async fn main() -> anyhow::Result<()> {
                 {
                     println!("\nAuto‑obtaining receiver commitments (if needed)");
                     println!("   If your receiver code was a batch token, we will use it directly.\n   Otherwise, we'll request commitments over P2P for up to 12 seconds, with an offline QR fallback.");
-                    let coins = wallet.select_inputs(amount)?;
+                    let _coins = wallet.select_inputs(amount)?;
                     // commitment request/response flow removed
                     use rand::RngCore as _;
                     let mut rng_tag = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_tag);
                     // Try interpret the code as a batch token first
-                    let mut recipient_addr_opt: Option<crate::crypto::Address> = None;
+                    let recipient_addr_opt: Option<crate::crypto::Address> = None;
                     if base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stealth.as_str()).is_ok() || base64::engine::general_purpose::URL_SAFE.decode(stealth.as_str()).is_ok() {
                         let parsed_token = stealth.clone();
                         if let Ok(_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -409,10 +409,10 @@ async fn main() -> anyhow::Result<()> {
                             // legacy batch token removed
                         }
                     }
-                    let recipient_addr = if let Some(a) = recipient_addr_opt { a } else {
+                    let _recipient_addr = if let Some(a) = recipient_addr_opt { a } else {
                         let (a, _k) = wallet::Wallet::parse_stealth_address(&stealth)?; a
                     };
-                    let mut used_network = false;
+                    let used_network = false;
                     if net.peer_count() > 0 {
                         println!("   ⏳ Requesting commitments from peers (12s timeout)...");
                         // removed

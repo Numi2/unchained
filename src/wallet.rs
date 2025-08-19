@@ -521,7 +521,7 @@ impl Wallet {
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         // Select inputs locally; no receiver commitment exchange over network
-        let mut coins_to_spend: Vec<crate::coin::Coin> = self.select_inputs(amount)?;
+        let coins_to_spend: Vec<crate::coin::Coin> = self.select_inputs(amount)?;
         let mut spends = Vec::new();
 
         for coin in coins_to_spend {
@@ -642,15 +642,11 @@ impl Wallet {
 
             // Determine spend auth path with enforced V3 and auto-upgrade for legacy
             enum AuthPath { V3 { preimage: [u8;32] } }
-            let prev_spend_opt: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
-                Ok(v) => v,
-                Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
-            };
             // New path: we already computed p for this spend above
             let path = AuthPath::V3 { preimage: p };
 
             // Build and broadcast spend according to path
-            let mut spend = match path {
+            let spend = match path {
                 AuthPath::V3 { preimage } => {
                     let proof_vec = proof_used.clone().ok_or_else(|| anyhow!("missing proof after local or network path"))?;
                     let mut sp = crate::transfer::Spend::create_hashlock(
