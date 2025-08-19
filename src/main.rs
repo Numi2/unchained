@@ -91,6 +91,10 @@ enum Cmd {
         #[arg(long)]
         count: Option<u64>,
     },
+    /// Re-gossip all spends from local DB (sender-side recovery)
+    ReplaySpends,
+    /// Rescan local spends against this wallet (receiver-side recovery)
+    RescanWallet,
 }
 
 #[tokio::main]
@@ -558,6 +562,34 @@ async fn main() -> anyhow::Result<()> {
                     else => { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
                 }
             }
+            return Ok(());
+        }
+        Some(Cmd::ReplaySpends) => {
+            let cf = db.db.cf_handle("spend").ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+            let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let mut replayed = 0u64;
+            for item in iter {
+                let (_k, v) = item?;
+                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                    net.gossip_spend(&sp).await;
+                    replayed += 1;
+                }
+            }
+            println!("✅ Re-gossiped {} spends", replayed);
+            return Ok(());
+        }
+        Some(Cmd::RescanWallet) => {
+            let cf = db.db.cf_handle("spend").ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+            let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let mut scanned = 0u64;
+            for item in iter {
+                let (_k, v) = item?;
+                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                    let _ = wallet.scan_spend_for_me(&sp);
+                    scanned += 1;
+                }
+            }
+            println!("✅ Rescanned {} spends for this wallet", scanned);
             return Ok(());
         }
         // commitment request removed
