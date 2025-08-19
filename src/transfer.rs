@@ -265,12 +265,25 @@ impl Spend {
             // Genesis lock hash stored in coin
             coin.lock_hash
         };
-        // Check preimage matches
+        // Check preimage matches (new scheme first, then legacy fallback). If no lock was committed (legacy), skip.
         let chain_id = db.get_chain_id()?;
-        if crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage) != expected_lock_hash { return Err(anyhow!("Invalid hashlock preimage")); }
-        // Recompute nullifier using new derivation from preimage
-        let exp_nf = crate::crypto::nullifier_from_preimage(&chain_id, &self.coin_id, &preimage);
-        if exp_nf != self.nullifier { return Err(anyhow!("Nullifier mismatch")); }
+        if expected_lock_hash != [0u8; 32] {
+            let lh_new = crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
+            if lh_new != expected_lock_hash {
+                let lh_legacy = crate::crypto::lock_hash(&preimage);
+                if lh_legacy != expected_lock_hash {
+                    return Err(anyhow!("Invalid hashlock preimage"));
+                }
+            }
+        }
+        // Recompute nullifier from preimage (accept both new and legacy schemes)
+        let exp_nf_new = crate::crypto::nullifier_from_preimage(&chain_id, &self.coin_id, &preimage);
+        if exp_nf_new != self.nullifier {
+            let exp_nf_legacy = crate::crypto::compute_nullifier_v3(&preimage, &self.coin_id, &chain_id);
+            if exp_nf_legacy != self.nullifier {
+                return Err(anyhow!("Nullifier mismatch"));
+            }
+        }
         // Enforce one-time use of receiver commitment via deterministic commitment_id
         let next_lock = self.next_lock_hash.ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
         let cid = commitment_id_v1(&self.to.one_time_pk, &self.to.kyber_ct, &next_lock, &self.coin_id, self.to.amount_le, &chain_id);

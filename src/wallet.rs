@@ -668,6 +668,21 @@ impl Wallet {
                 coin.value,
                 &store.get_chain_id()?,
             )?;
+            // Mainnet compatibility: if the coin's previous lock used legacy hashing, switch nullifier to legacy too
+            let expected_lock = if let Some(prev) = store.get_spend_tolerant(&coin.id)? {
+                prev.next_lock_hash.ok_or_else(|| anyhow!("Previous spend missing next_lock_hash"))?
+            } else {
+                coin.lock_hash
+            };
+            let chain_id_for_nf = store.get_chain_id()?;
+            let lh_new = crate::crypto::lock_hash_from_preimage(&chain_id_for_nf, &coin.id, &unlock_preimage);
+            if lh_new != expected_lock {
+                let lh_legacy = crate::crypto::lock_hash(&unlock_preimage);
+                if lh_legacy == expected_lock {
+                    // Recompute nullifier using legacy scheme to stay compatible with mainnet
+                    spend.nullifier = crate::crypto::compute_nullifier_v3(&unlock_preimage, &coin.id, &chain_id_for_nf);
+                }
+            }
             // Attach view tag into `to`
             spend.to.view_tag = Some(vt);
             spend.validate(&store)?;
