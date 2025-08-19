@@ -294,6 +294,7 @@ pub struct Network {
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
+    GossipCoinLegacy(Vec<u8>),
     GossipSpend(Spend),
     GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
@@ -726,6 +727,7 @@ pub async fn spawn(
                                 let (t, data) = match &cmd {
                                     NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                     NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                                    NetworkCommand::GossipCoinLegacy(bytes) => (TOP_COIN, Some(bytes.clone())),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
@@ -1038,7 +1040,7 @@ pub async fn spawn(
                                                 }
                                             }
                                         }
-                                    } else if let Ok(cand) = bincode::deserialize::<CoinCandidate>(&message.data) {
+                                    } else if let Ok(cand) = crate::coin::decode_candidate(&message.data) {
                                         if validate_coin_candidate(&cand, &db).is_ok() {
                                             let key = Store::candidate_key(&cand.epoch_hash, &cand.id);
                                             db.put("coin_candidate", &key, &cand).ok();
@@ -1516,6 +1518,11 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::GossipCoinLegacy(bytes) => {
+                            if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes.clone()).is_err() {
+                                pending_commands.push_back(command);
+                            }
+                        }
                         NetworkCommand::GossipSpend(sp) => {
                             if let Ok(data) = bincode::serialize(sp) {
                                 if swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND), data).is_err() {
@@ -1599,7 +1606,15 @@ pub async fn spawn(
 
 impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
-    pub async fn gossip_coin(&self, c: &CoinCandidate) { let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone())); }
+    pub async fn gossip_coin(&self, c: &CoinCandidate) {
+        // Gossip the new-format candidate
+        let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone()));
+        // Also gossip a legacy-compatible payload so older peers can ingest it
+        let legacy = c.to_v1_compat();
+        if let Ok(bytes) = bincode::serialize(&legacy) {
+            let _ = self.command_tx.send(NetworkCommand::GossipCoinLegacy(bytes));
+        }
+    }
     pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
     pub async fn gossip_rate_limited(&self, msg: RateLimitedMessage) { let _ = self.command_tx.send(NetworkCommand::GossipRateLimited(msg)); }
     pub async fn request_spend(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestSpend(id)); }

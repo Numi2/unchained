@@ -412,7 +412,7 @@ impl Store {
         let mut coins = Vec::new();
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = bincode::deserialize::<crate::coin::CoinCandidate>(&value) {
+            if let Ok(coin) = crate::coin::decode_candidate(&value) {
                 coins.push(coin);
             }
         }
@@ -438,7 +438,7 @@ impl Store {
             let (k, v) = item?;
             if k.len() < 64 { continue; }
             if &k[0..32] != prefix { break; }
-            if let Ok(coin) = bincode::deserialize::<crate::coin::CoinCandidate>(&v) {
+            if let Ok(coin) = crate::coin::decode_candidate(&v) {
                 coins.push(coin);
             }
         }

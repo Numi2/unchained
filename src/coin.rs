@@ -36,6 +36,17 @@ pub struct CoinCandidate {
     pub pow_hash: [u8; 32],
 }
 
+/// Backward-compat struct for legacy coin candidates (no creator_pk/lock_hash fields)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CoinCandidateV1Compat {
+    pub id: [u8; 32],
+    pub value: u64,
+    pub epoch_hash: [u8; 32],
+    pub nonce: u64,
+    pub creator_address: Address,
+    pub pow_hash: [u8; 32],
+}
+
 /// Backward-compat struct for legacy confirmed coins that included pow_hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CoinV1Compat {
@@ -104,6 +115,18 @@ impl CoinCandidate {
     pub fn into_confirmed(self) -> Coin {
         Coin { id: self.id, value: self.value, epoch_hash: self.epoch_hash, nonce: self.nonce, creator_address: self.creator_address, creator_pk: self.creator_pk, lock_hash: self.lock_hash }
     }
+
+    /// Convert to legacy candidate format for wire compatibility with older nodes
+    pub fn to_v1_compat(&self) -> CoinCandidateV1Compat {
+        CoinCandidateV1Compat {
+            id: self.id,
+            value: self.value,
+            epoch_hash: self.epoch_hash,
+            nonce: self.nonce,
+            creator_address: self.creator_address,
+            pow_hash: self.pow_hash,
+        }
+    }
 }
 
 /// Decodes a confirmed coin from bytes, supporting legacy encoding with pow_hash.
@@ -133,6 +156,26 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, bincode::Error> {
                 creator_address: v1.creator_address,
                 creator_pk: [0u8; DILITHIUM3_PK_BYTES],
                 lock_hash: [0u8; 32],
+            })
+        }
+    }
+}
+
+/// Tolerant decoder for `CoinCandidate` supporting legacy wire format.
+pub fn decode_candidate(bytes: &[u8]) -> Result<CoinCandidate, bincode::Error> {
+    match bincode::deserialize::<CoinCandidate>(bytes) {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            let v1: CoinCandidateV1Compat = bincode::deserialize(bytes)?;
+            Ok(CoinCandidate {
+                id: v1.id,
+                value: v1.value,
+                epoch_hash: v1.epoch_hash,
+                nonce: v1.nonce,
+                creator_address: v1.creator_address,
+                creator_pk: [0u8; DILITHIUM3_PK_BYTES],
+                lock_hash: [0u8; 32],
+                pow_hash: v1.pow_hash,
             })
         }
     }
