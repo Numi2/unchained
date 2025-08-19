@@ -4,7 +4,7 @@
 
 //! Network layer for Unchained.
 //! V1 transfers are deprecated: no gossip or requests for V1 are produced or accepted.
-//! Spends are gossiped/served. Supports V2 (signature) and V3 (hashlock).
+//! Spends are gossiped/served using the V3 hashlock flow only.
 
 use crate::{
     storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Spend, crypto, config, sync::SyncState,
@@ -1168,7 +1168,7 @@ pub async fn spawn(
                                         Err(e) => {
                                             let es = e.clone();
                                             // If authorization fails, we may be missing the predecessor spend; buffer and request latest
-                                            if es.contains("Invalid spend signature") || es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
+                                            if es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
                                                 let coin_id = sp.coin_id;
                                                 pending_spends.entry(coin_id).or_default().push(sp);
                                                 pending_spend_deadline.insert(coin_id, std::time::Instant::now());
@@ -1264,7 +1264,7 @@ pub async fn spawn(
                                             }
                                             Err(e) => {
                                                 let es = e.clone();
-                                                if es.contains("Invalid spend signature") || es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
+                                                if es.contains("Invalid hashlock preimage") || es.contains("Previous spend missing next_lock_hash") {
                                                     let coin_id = sp.coin_id;
                                                     pending_spends.entry(coin_id).or_default().push(sp);
                                                     pending_spend_deadline.insert(coin_id, std::time::Instant::now());

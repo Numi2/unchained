@@ -377,9 +377,9 @@ impl Store {
         let mut unspent_coins = Vec::new();
         
         for coin in coins {
-            // Check if coin is spent via V2 only
-            let v2_spent: Option<crate::transfer::Spend> = self.get_spend_tolerant(&coin.id)?;
-            if v2_spent.is_none() { unspent_coins.push(coin); }
+            // Check if coin is spent (V3 chain)
+            let recorded_spend: Option<crate::transfer::Spend> = self.get_spend_tolerant(&coin.id)?;
+            if recorded_spend.is_none() { unspent_coins.push(coin); }
         }
         
         Ok(unspent_coins)

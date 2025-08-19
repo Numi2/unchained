@@ -112,8 +112,8 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
 
 // [legacy] nullifier_v2 helper removed – V3 hashlock is the only active path.
 
-/// Commitment of a stealth output used in spend authorization (V2)
-/// New definition: commit to the Kyber ciphertext only to avoid circular
+/// Commitment of a stealth output used in spend authorization (V3)
+/// Definition: commit to the Kyber ciphertext only to avoid circular
 /// dependencies when deriving the one-time key deterministically.
 pub fn commitment_of_stealth_ct(kyber_ct_bytes: &[u8]) -> [u8; 32] {
     blake3_hash(kyber_ct_bytes)

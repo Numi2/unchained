@@ -412,9 +412,9 @@ impl Wallet {
     // ---------------------------------------------------------------------
     /// Returns all coins currently owned by this wallet that are **unspent**.
     /// Rules:
-    /// - Exclude coins that already have a V2 spend recorded
-    /// - If no legacy transfer exists: creator still owns it (creator_address == self.address)
-    /// - If a legacy transfer exists: we own it if we can recover the one-time SK from its stealth output
+    /// - Exclude coins that already have a recorded spend (V3 hashlock chain)
+    /// - If no spend exists: creator still owns it (creator_address == self.address)
+    /// - For received spends: we own it if we can recover the one-time SK from its stealth output
     pub fn list_unspent(&self) -> Result<Vec<crate::coin::Coin>> {
         let store = self
             ._db
@@ -431,12 +431,12 @@ impl Wallet {
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                // If there is a V2 spend recorded, the current owner is the recipient of that spend
-                let v2_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
+                // If there is a spend recorded, the current owner is the recipient of that spend
+                let recorded_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
                     Ok(v) => v,
                     Err(e) => { eprintln!("⚠️  Skipping malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
                 };
-                if let Some(sp) = v2_spend {
+                if let Some(sp) = recorded_spend {
                     let chain_id = store.get_chain_id()?;
                     if sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         utxos.push(coin);
@@ -479,8 +479,8 @@ impl Wallet {
         Ok(())
     }
 
-    /// Sum of `value` across all coins where current owner is this wallet
-    /// Prefers V2 spends chain when present; otherwise uses legacy transfer.
+    /// Sum of `value` across all coins where current owner is this wallet.
+    /// Prefers recorded spends when present; otherwise uses genesis ownership.
     pub fn balance(&self) -> Result<u64> {
         let store = self
             ._db
@@ -496,12 +496,12 @@ impl Wallet {
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                // If there is a V2 spend recorded, the owner is the recipient of the spend's stealth
-                let v2_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
+                // If there is a spend recorded, the owner is the recipient of the spend's stealth
+                let recorded_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
                     Ok(v) => v,
                     Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
                 };
-                if let Some(sp) = v2_spend {
+                if let Some(sp) = recorded_spend {
                     let chain_id = store.get_chain_id()?;
                     if let Ok(_sk) = sp.to.try_recover_one_time_sk(&self.kyber_sk, &self.pk, &chain_id) {
                         sum = sum.saturating_add(coin.value);
