@@ -514,7 +514,7 @@ impl Wallet {
     ) -> Result<SendOutcome> {
         // Accept either a stealth address OR, when provided, derive recipient from batch token
         // Parse paycode (chain-bound Kyber PK + short routing secret). For now accept stealth address V2 as paycode surrogate.
-        let (_recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(receiver_paycode)
+        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(receiver_paycode)
             .context("Invalid receiver paycode")?;
         let store = self
             ._db
@@ -531,7 +531,7 @@ impl Wallet {
             let value_tag = coin.value.to_le_bytes();
             let seed = crate::crypto::stealth_seed_v1(
                 shared.as_bytes(),
-                self.pk.as_bytes(),
+                &recipient_addr,
                 ct.as_bytes(),
                 &value_tag,
                 &chain_id,

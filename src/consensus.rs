@@ -12,7 +12,7 @@ pub struct Params {
 
 // ---------- Consensus constants (v1) ----------
 pub const GENESIS_PARAMS: Params = Params {
-    difficulty: 2,
+    difficulty: 1,
     mem_kib: 16_192,
 };
 

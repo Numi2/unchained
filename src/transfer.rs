@@ -58,7 +58,7 @@ impl StealthOutput {
         v
     }
 
-    /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver Dilithium PK.
+    /// Recipient tries to recover the one-time secret key using their Kyber SK and receiver identity.
     pub fn try_recover_one_time_sk(&self, kyber_sk: &KyberSk, receiver_dili_pk: &DiliPk, chain_id32: &[u8;32]) -> Result<DiliSk> {
         let ct = KyberCt::from_bytes(&self.kyber_ct)
             .context("Invalid Kyber ciphertext")?;
@@ -68,7 +68,9 @@ impl StealthOutput {
             if crate::crypto::view_tag(shared.as_bytes()) != vt { return Err(anyhow!("View tag mismatch")); }
         }
         let value_tag = self.amount_le.to_le_bytes();
-        let seed = stealth_seed_v1(shared.as_bytes(), receiver_dili_pk.as_bytes(), ct.as_bytes(), &value_tag, chain_id32);
+        // Bind stealth seed to receiver address (stable identity) rather than raw Dilithium PK bytes
+        let receiver_addr = address_from_pk(receiver_dili_pk);
+        let seed = stealth_seed_v1(shared.as_bytes(), &receiver_addr, ct.as_bytes(), &value_tag, chain_id32);
         let (derived_pk, derived_sk) = dilithium3_seeded_keypair(seed);
         // Constant-time compare
         if subtle::ConstantTimeEq::ct_eq(derived_pk.as_bytes(), &self.one_time_pk).unwrap_u8() != 1 {

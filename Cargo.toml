@@ -72,6 +72,10 @@ path = "src/main.rs"
 name = "inspect_db"
 path = "src/bin/inspect_db.rs"
 
+[[bin]]
+name = "wallet_cf"
+path = "src/bin/wallet_cf.rs"
+
 
 
 [dev-dependencies]
