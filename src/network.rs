@@ -64,7 +64,9 @@ fn try_publish_gossip(
 ) {
     if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
         let es = e.to_string();
-        let is_insufficient = es.contains("InsufficientPeers") || es.contains("InsufficientPeersForTopic");
+        let is_insufficient = es.contains("InsufficientPeers")
+            || es.contains("InsufficientPeersForTopic")
+            || es.contains("NoPeersSubscribedToTopic");
         if !is_insufficient {
             eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
@@ -355,7 +357,7 @@ pub async fn spawn(
         .mesh_outbound_min(1)
         .mesh_n(6)
         .mesh_n_high(12)
-        .flood_publish(false)
+        .flood_publish(true)
         .max_transmit_size(2 * 1024 * 1024) // 2 MiB cap
         .build()?;
         
