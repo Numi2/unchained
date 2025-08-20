@@ -6,7 +6,7 @@ const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
 // Back-off parameters to avoid spamming the same missing tip repeatedly when reorg
 // cannot proceed due to unavailable fork parents.
 const TIP_REQUEST_BACKOFF_MS: u64 = 1500;
-const SYNC_CHECK_INTERVAL_SECS: u64 = 1;
+const SYNC_CHECK_INTERVAL_SECS: u64 = 2;
 // When fully synced, only poll peers for the latest epoch every this many seconds
 const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
 

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Network layer for Unchained.
-//! V1 transfers are deprecated: no gossip or requests for V1 are produced or accepted.
 //! Spends are gossiped/served using the V3 hashlock flow only.
 
 use crate::{
@@ -1196,6 +1195,11 @@ pub async fn spawn(
                                                         map.insert(coin_id, now);
                                                     }
                                                 }
+                                            } else if es.contains("Anchor not found") || es.contains("coin->epoch index") {
+                                                let coin_id = sp.coin_id;
+                                                pending_spends.entry(coin_id).or_default().push(sp);
+                                                pending_spend_deadline.insert(coin_id, std::time::Instant::now());
+                                                let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
                                             } else {
                                                 crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
                                                 score.record_validation_failure();
@@ -1291,6 +1295,11 @@ pub async fn spawn(
                                                             map.insert(coin_id, now);
                                                         }
                                                     }
+                                                } else if es.contains("Anchor not found") || es.contains("coin->epoch index") {
+                                                    let coin_id = sp.coin_id;
+                                                    pending_spends.entry(coin_id).or_default().push(sp);
+                                                    pending_spend_deadline.insert(coin_id, std::time::Instant::now());
+                                                    let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
                                                 } else {
                                                     crate::metrics::VALIDATION_FAIL_TRANSFER.inc();
                                                     score.record_validation_failure();

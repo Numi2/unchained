@@ -219,15 +219,21 @@ impl Spend {
             .context("Failed to query coin")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // 2) Anchor exists and root matches (use the epoch that COMMITTED this coin)
-        let commit_epoch = db
+        // 2) Anchor exists and root matches (prefer committed epoch index; tolerate missing index by falling back to anchor-by-hash)
+        let anchor: crate::epoch::Anchor = if let Some(commit_epoch) = db
             .get_epoch_for_coin(&self.coin_id)
             .context("Failed to query coin->epoch mapping")?
-            .ok_or_else(|| anyhow!("Missing coin->epoch index for committed coin"))?;
-        let anchor: crate::epoch::Anchor = db
-            .get("epoch", &commit_epoch.to_le_bytes())
-            .context("Failed to query committing anchor by epoch number")?
-            .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?;
+        {
+            db
+                .get("epoch", &commit_epoch.to_le_bytes())
+                .context("Failed to query committing anchor by epoch number")?
+                .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?
+        } else {
+            db
+                .get("anchor", &coin.epoch_hash)
+                .context("Failed to query committing anchor by hash")?
+                .ok_or_else(|| anyhow!("Anchor not found for coin's epoch hash"))?
+        };
         if anchor.merkle_root != self.root { return Err(anyhow!("Merkle root mismatch")); }
 
         // 3) Proof verifies
