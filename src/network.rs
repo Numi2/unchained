@@ -721,11 +721,14 @@ pub async fn spawn(
                             dialing_peers.remove(&peer_id);
                             // After connecting, exchange external address (if enabled)
                             if net_cfg.peer_exchange {
-                                let to_advertise = if let Some(public_ip) = net_cfg.public_ip.clone() {
-                                    Some(format!("/ip4/{}/udp/{}/quic-v1/p2p/{}", public_ip, port, swarm.local_peer_id()))
-                                } else {
-                                    swarm.external_addresses().next().map(|a| format!("{}/p2p/{}", a, swarm.local_peer_id()))
-                                };
+                                // Prefer observed external addresses learned from peers; fallback to configured public_ip
+                                let to_advertise = swarm
+                                    .external_addresses()
+                                    .next()
+                                    .map(|a| format!("{}/p2p/{}", a, swarm.local_peer_id()))
+                                    .or_else(|| net_cfg.public_ip.clone().map(|ip|
+                                        format!("/ip4/{}/udp/{}/quic-v1/p2p/{}", ip, port, swarm.local_peer_id())
+                                    ));
                                 if let Some(addr) = to_advertise {
                                     let ok_public = addr.starts_with("/ip4/") && addr.contains("/udp/") && addr.contains("/quic-v1/");
                                     if ok_public {
