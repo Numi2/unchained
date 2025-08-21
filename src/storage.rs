@@ -101,6 +101,7 @@ impl Store {
             "otp_sk",
             "otp_index",
             "peers",
+            "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
         ];
         
         // Configure column family options with sane production defaults

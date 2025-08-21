@@ -185,6 +185,8 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        // FIXED: Process any pending spend scans that were waiting for coins
+                        let _ = wallet_clone.process_pending_spend_scans();
                     }
                 }
             }

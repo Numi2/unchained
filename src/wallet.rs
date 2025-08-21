@@ -429,28 +429,89 @@ impl Wallet {
                 // Log once for visibility
                 println!("📥 Detected incoming spend for me: coin {} value {}", hex::encode(coin.id), coin.value);
             }
+        } else {
+            // FIXED: Coin not yet available - try scanning without coin context first
+            // This handles the race condition where spends arrive before their coins
+            let chain_id = store.get_chain_id()?;
+            if spend.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
+                // Mark this spend as potentially ours for later confirmation when coin arrives
+                let spend_marker = format!("pending_spend:{}", hex::encode(spend.coin_id));
+                store.put("wallet_scan_pending", spend_marker.as_bytes(), &[1u8])?;
+                println!("📥 Detected incoming spend for me (coin pending): coin {} (will confirm when coin syncs)", hex::encode(spend.coin_id));
+            }
         }
+        Ok(())
+    }
+
+    /// Process any pending spend scans that were waiting for coins to arrive.
+    /// This should be called whenever new coins are synchronized.
+    pub fn process_pending_spend_scans(&self) -> Result<()> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+
+        // Get all pending spend markers
+        if let Some(pending_cf) = store.db.cf_handle("wallet_scan_pending") {
+            let iter = store.db.iterator_cf(pending_cf, rocksdb::IteratorMode::Start);
+            let mut processed_markers = Vec::new();
+            
+            for item in iter {
+                if let Ok((key, _value)) = item {
+                    if let Ok(key_str) = String::from_utf8(key.to_vec()) {
+                        if let Some(coin_id_hex) = key_str.strip_prefix("pending_spend:") {
+                            if let Ok(coin_id_bytes) = hex::decode(coin_id_hex) {
+                                if coin_id_bytes.len() == 32 {
+                                    let mut coin_id = [0u8; 32];
+                                    coin_id.copy_from_slice(&coin_id_bytes);
+                                    
+                                    // Check if coin now exists
+                                    if let Ok(Some(_coin)) = store.get::<crate::coin::Coin>("coin", &coin_id) {
+                                        // Coin is now available - try to rescan the spend
+                                        if let Ok(Some(spend)) = store.get_spend_tolerant(&coin_id) {
+                                            let _ = self.scan_spend_for_me(&spend);
+                                            processed_markers.push(key.to_vec());
+                                            println!("✅ Confirmed pending spend for coin {} now that coin is available", coin_id_hex);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Clean up processed markers
+            for marker in processed_markers {
+                let _ = store.db.delete_cf(pending_cf, &marker);
+            }
+        }
+        
         Ok(())
     }
 
     /// Sum of `value` across all coins where current owner is this wallet.
     /// Prefers recorded spends when present; otherwise uses genesis ownership.
+    /// Additionally, credits pending incoming spends even if the coin record hasn't synced yet.
     pub fn balance(&self) -> Result<u64> {
         let store = self
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
 
-        let cf = store
+        let cf_coin = store
             .db
             .cf_handle("coin")
             .ok_or_else(|| anyhow!("'coin' column family missing"))?;
-        let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let iter = store.db.iterator_cf(cf_coin, rocksdb::IteratorMode::Start);
+
         let mut sum: u64 = 0;
+        let mut counted: std::collections::HashSet<[u8;32]> = std::collections::HashSet::new();
+
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
-                // If there is a spend recorded, the owner is the recipient of the spend's stealth
+                // If there is a spend recorded, the owner is the recipient of that spend
                 let recorded_spend: Option<crate::transfer::Spend> = match store.get_spend_tolerant(&coin.id) {
                     Ok(v) => v,
                     Err(e) => { eprintln!("⚠️  Ignoring malformed spend record for coin {}: {}", hex::encode(coin.id), e); None }
@@ -459,15 +520,37 @@ impl Wallet {
                     let chain_id = store.get_chain_id()?;
                     if sp.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                         sum = sum.saturating_add(coin.value);
+                        counted.insert(coin.id);
                     }
                     continue;
                 }
                 // Else genesis owner is the creator
                 if coin.creator_address == self.address {
                     sum = sum.saturating_add(coin.value);
+                    counted.insert(coin.id);
                 }
             }
         }
+
+        // Credit any incoming spends to me whose coins have not been observed yet
+        if let Some(cf_spend) = store.db.cf_handle("spend") {
+            let iter_sp = store.db.iterator_cf(cf_spend, rocksdb::IteratorMode::Start);
+            for item in iter_sp {
+                let (_k, v) = item?;
+                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                    if counted.contains(&sp.coin_id) { continue; }
+                    // Only count if this spend is addressed to me
+                    let chain_id = store.get_chain_id()?;
+                    if sp.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
+                        // Prefer coin.value if available; else fall back to spend's embedded amount
+                        let add_value = if let Some(coin) = store.get::<crate::coin::Coin>("coin", &sp.coin_id)? { coin.value } else { sp.to.amount_le };
+                        sum = sum.saturating_add(add_value);
+                        counted.insert(sp.coin_id);
+                    }
+                }
+            }
+        }
+
         Ok(sum)
     }
 
