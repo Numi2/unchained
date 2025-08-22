@@ -47,7 +47,7 @@ seconds = 222
 
 [mining]
 # Enable mining by default
-enabled = false
+enabled = true
 
 # Miner runtime tuning (does not change consensus)
 # Heartbeat interval in seconds (more frequent for network stability)

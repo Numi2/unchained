@@ -117,6 +117,7 @@ pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| IntGauge::new(
 pub static MINING_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_attempts_total", "Total mining attempts (nonces tried)").unwrap());
 pub static MINING_FOUND: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_solutions_total", "Total found PoW solutions").unwrap());
 pub static MINING_HASH_TIME_MS: Lazy<Histogram> = Lazy::new(|| Histogram::new("unchained_mining_hash_time_ms", "Argon2 PoW hashing time per attempt (ms)"));
+pub static ALT_FORK_EVENTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_alt_fork_events_total", "Count of alternate fork anchor events (hash mismatch) observed").unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // Initialize some defaults

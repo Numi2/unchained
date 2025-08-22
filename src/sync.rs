@@ -1,4 +1,5 @@
 use crate::{storage::Store, epoch::Anchor, network::NetHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 
@@ -9,6 +10,16 @@ const TIP_REQUEST_BACKOFF_MS: u64 = 1500;
 const SYNC_CHECK_INTERVAL_SECS: u64 = 2;
 // When fully synced, only poll peers for the latest epoch every this many seconds
 const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
+
+// Routine sync logs are noisy; gate behind a static flag disabled by default.
+static ALLOW_ROUTINE_SYNC: AtomicBool = AtomicBool::new(false);
+macro_rules! sync_routine {
+    ($($arg:tt)*) => {
+        if ALLOW_ROUTINE_SYNC.load(Ordering::Relaxed) { println!($($arg)*); }
+    };
+}
+#[allow(unused_imports)]
+use sync_routine;
 
 #[derive(Debug)]
 pub struct SyncState {
@@ -64,13 +75,13 @@ pub fn spawn(
                         if should_request {
                             // Ask peers for the latest epoch so we can catch up quickly
                             net.request_latest_epoch().await;
-                            println!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
+                            sync_routine!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
                             request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
                             last_tip_request = Some((highest_seen, now));
                         }
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
-                            println!("📊 Local epoch updated to: {}", local_epoch);
+                            sync_routine!("📊 Local epoch updated to: {}", local_epoch);
                         }
                     }
                 }
@@ -80,18 +91,13 @@ pub fn spawn(
                     let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
                     if highest_seen == local_epoch && highest_seen > 0 {
                         // we are at tip and have actually synced with network → mark synced once
-                        if let Ok(mut st) = sync_state.lock() {
-                            if !st.synced {
-                                st.synced = true;
-                                println!("✅ Node is fully synced at epoch {}", local_epoch);
-                            }
-                        }
+                        if let Ok(mut st) = sync_state.lock() { if !st.synced { st.synced = true; sync_routine!("✅ Node is fully synced at epoch {}", local_epoch); } }
                         net.request_latest_epoch().await;
                     } else if highest_seen == 0 {
                         if local_epoch > 0 {
                             if has_bootstrap {
                                 // With bootstrap configured, do not self-declare synced; keep polling peers.
-                                println!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
+                                sync_routine!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
                                 net.request_latest_epoch().await;
                             } else {
                                 // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
@@ -99,7 +105,7 @@ pub fn spawn(
                                     if !st.synced {
                                         st.synced = true;
                                         if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
-                                        println!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                        sync_routine!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
                                     }
                                 }
                             }
@@ -190,7 +196,7 @@ async fn request_missing_epochs(
         return;
     }
 
-    println!("📥 Requesting epochs {} to {}", start_epoch, target_epoch);
+    sync_routine!("📥 Requesting epochs {} to {}", start_epoch, target_epoch);
     let mut request_tasks = Vec::new();
     for missing in start_epoch..=target_epoch {
         let net_clone = net.clone();

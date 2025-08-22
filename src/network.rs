@@ -55,6 +55,19 @@ macro_rules! net_log {
 #[allow(unused_imports)]
 use net_log;
 
+// Routine network logs (informational chatter) — always suppressed by default.
+// Enable only for debugging by toggling ALLOW_ROUTINE_NET to true.
+static ALLOW_ROUTINE_NET: AtomicBool = AtomicBool::new(false);
+macro_rules! net_routine {
+    ($($arg:tt)*) => {
+        if ALLOW_ROUTINE_NET.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+#[allow(unused_imports)]
+use net_routine;
+
 #[allow(dead_code)]
 fn try_publish_gossip(
     swarm: &mut Swarm<Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>>,
@@ -443,9 +456,29 @@ pub async fn spawn(
     static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const EPOCH_REQ_DEDUP_SECS: u64 = 5;
+    // Deduplicate and throttle responses to latest-epoch requests
+    static RECENT_LATEST_REQS: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> = Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
+    const LATEST_REQ_DEDUP_SECS: u64 = 3; // per-peer TTL for duplicate latest requests at same height
+    const LATEST_GLOBAL_THROTTLE_MS: u64 = 500; // minimum gap between our latest responses
     const PENDING_SPEND_TTL_SECS: u64 = 15;
     const PENDING_PROOF_TTL_SECS: u64 = 30;
     const REORG_BACKFILL: u64 = 16; // proactively backfill up to 16 predecessors on hash mismatch
+    // Global aggregation cadence for alt-fork summaries
+    const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
+    // Throttle noisy reorg logs (per-height)
+    const REORG_LOG_THROTTLE_SECS: u64 = 10;
+    static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    
+    // Aggregate alternate-fork events per height and periodically emit a summary
+    struct AltForkAgg {
+        first_seen: std::time::Instant,     
+        last_emit: std::time::Instant,
+        peers: std::collections::HashSet<String>,
+        hashes: std::collections::HashSet<[u8;32]>,
+    }
+    static ALT_FORK_AGG: Lazy<Mutex<std::collections::HashMap<u64, AltForkAgg>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
     // Attempt to reorg to a better chain using buffered anchors.
     fn attempt_reorg(
@@ -473,7 +506,7 @@ pub async fn spawn(
         let first_height = if orphan_anchors.get(&h).is_some() { h } else { h + 1 };
         if first_height > max_buf_height { return; }
         let fork_height = first_height.saturating_sub(1);
-        net_log!("🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
+        net_routine!("🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
             first_height,
             max_buf_height,
             (max_buf_height - first_height + 1),
@@ -489,9 +522,32 @@ pub async fn spawn(
             for a in alts_at_fork { parent_candidates.push(a.clone()); }
         }
         if parent_candidates.is_empty() {
-            net_log!("⛔ Reorg: missing fork anchor at height {} (local and alternates)", fork_height);
+            // Throttle log spam per-fork height
+            let now = std::time::Instant::now();
+            let mut allow_log = true;
+            if let Ok(mut map) = LAST_MISSING_FORK_LOGS.lock() {
+                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                if let Some(last) = map.get(&fork_height) {
+                    if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                }
+                if allow_log { map.insert(fork_height, now); }
+            }
+            if allow_log {
+                net_routine!("⛔ Reorg: missing fork anchor at height {} (local and alternates)", fork_height);
+            }
+            // Pre-deduplicate epoch requests before enqueuing
             let start = fork_height.saturating_sub(REORG_BACKFILL);
-            for n in start..=fork_height { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+            if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+            }
+            if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                for n in start..=fork_height {
+                    if !map.contains_key(&n) {
+                        let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                        map.insert(n, now);
+                    }
+                }
+            }
             return;
         }
 
@@ -523,13 +579,44 @@ pub async fn spawn(
                 chosen_chain.push(next.clone());
                 current_parents = vec![next];
             } else {
-                net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", height);
+                // Throttle log spam per height
+                let now = std::time::Instant::now();
+                let mut allow_log = true;
+                if let Ok(mut map) = LAST_MISMATCH_LOGS.lock() {
+                    map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                    if let Some(last) = map.get(&height) {
+                        if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                    }
+                    if allow_log { map.insert(height, now); }
+                }
+                if allow_log {
+                    net_routine!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", height);
+                }
+                // Pre-deduplicate epoch requests before enqueuing
                 if height > 0 {
                     let start = fork_height.saturating_sub(REORG_BACKFILL);
                     let end = height - 1;
-                    for n in start..=end { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                    }
+                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                        for n in start..=end {
+                            if !map.contains_key(&n) {
+                                let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                                map.insert(n, now);
+                            }
+                        }
+                    }
+                } else {
+                    // height == 0: ensure at least fork point is requested
+                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
+                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                        if !map.contains_key(&fork_height) {
+                            let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
+                            map.insert(fork_height, now);
+                        }
+                    }
                 }
-                let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
                 return;
             }
         }
@@ -537,7 +624,7 @@ pub async fn spawn(
 
         let Some(seg_tip) = chosen_chain.last() else { return; };
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
-            net_log!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
+            net_routine!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
             return;
         }
@@ -846,9 +933,7 @@ pub async fn spawn(
                                             continue;
                                         }
                                     }
-                                    if score.check_rate_limit() {
-                                        net_log!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id);
-                                    }
+                                    if score.check_rate_limit() { net_routine!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id); }
                                     match validate_anchor(&a, &db) {
                                         Ok(()) => {
                                             if let Ok(mut st) = sync_state.lock() {
@@ -947,7 +1032,7 @@ pub async fn spawn(
                                                 if existing.hash != a.hash {
                                                     let entry = orphan_anchors.entry(a.num).or_default();
                                                     if !entry.iter().any(|x| x.hash == a.hash) {
-                                                        net_log!("🔀 Buffered alternate anchor at height {} (valid but not adopted)", a.num);
+                                                        net_routine!("🔀 Buffered alternate anchor at height {} (valid but not adopted)", a.num);
                                                         entry.push(a.clone());
                                                     }
                                                 }
@@ -996,11 +1081,42 @@ pub async fn spawn(
                                                 let entry = orphan_anchors.entry(a.num).or_default();
                                                 let is_new = !entry.iter().any(|x| x.hash == a.hash);
                                                 if is_new {
-                                                    net_log!(
-                                                        "🔀 Alternate fork anchor at height {} (hash mismatch) from {} – buffering for reorg",
-                                                        a.num,
-                                                        peer_id
-                                                    );
+                                                    // Aggregate per-height unique peers and hashes; emit summary at throttle interval
+                                                    let now = std::time::Instant::now();
+                                                    if let Ok(mut agg) = ALT_FORK_AGG.lock() {
+                                                        use std::collections::hash_map::Entry as HMEntry;
+                                                        match agg.entry(a.num) {
+                                                            HMEntry::Occupied(mut o) => {
+                                                                let v = o.get_mut();
+                                                                v.peers.insert(peer_id.to_string());
+                                                                v.hashes.insert(a.hash);
+                                                                if now.duration_since(v.last_emit) >= std::time::Duration::from_secs(ALT_FORK_LOG_THROTTLE_SECS) {
+                                                                    net_routine!(
+                                                                        "🔀 Alt-fork @{}: {} unique peers, {} unique hashes observed – buffering for reorg",
+                                                                        a.num,
+                                                                        v.peers.len(),
+                                                                        v.hashes.len(),
+                                                                    );
+                                                                    crate::metrics::ALT_FORK_EVENTS.inc();
+                                                                    v.last_emit = now;
+                                                                }
+                                                            }
+                                                            HMEntry::Vacant(v) => {
+                                                                let mut peers = std::collections::HashSet::new();
+                                                                peers.insert(peer_id.to_string());
+                                                                let mut hashes = std::collections::HashSet::new();
+                                                                hashes.insert(a.hash);
+                                                                v.insert(AltForkAgg { first_seen: now, last_emit: now, peers, hashes });
+                                                                net_routine!(
+                                                                    "🔀 Alt-fork @{}: {} unique peers, {} unique hashes observed – buffering for reorg",
+                                                                    a.num,
+                                                                    1,
+                                                                    1,
+                                                                );
+                                                                crate::metrics::ALT_FORK_EVENTS.inc();
+                                                            }
+                                                        }
+                                                    }
                                                     entry.push(a.clone());
                                                 }
                                                 if a.num > 0 {
@@ -1020,6 +1136,11 @@ pub async fn spawn(
                                                             }
                                                         }
                                                     }
+                                                }
+                                                // Periodically clean up stale aggregation to bound memory
+                                                if let Ok(mut agg) = ALT_FORK_AGG.lock() {
+                                                    let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(60);
+                                                    agg.retain(|_, v| v.first_seen >= cutoff);
                                                 }
                                                 if let Ok(mut st) = sync_state.lock() {
                                                     if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
@@ -1315,30 +1436,50 @@ pub async fn spawn(
                                 },
                                 TOP_LATEST_REQUEST => if let Ok(()) = bincode::deserialize::<()>(&message.data) {
                                     let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                                    if score.check_rate_limit() {
-                                        net_log!("📨 Received latest epoch request from peer: {}", peer_id);
-                                    }
+                                    let allow_log = score.check_rate_limit();
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", b"latest") {
-                                        if score.check_rate_limit() {
-                                            net_log!("📤 Sending latest epoch {} to peer", anchor.num);
+                                        let now = std::time::Instant::now();
+                                        // Per-peer TTL dedup for same-latest-height requests
+                                        let mut skip_due_to_dedup = false;
+                                        if let Ok(mut map) = RECENT_LATEST_REQS.lock() {
+                                            map.retain(|_, (t, _)| now.duration_since(*t) < std::time::Duration::from_secs(LATEST_REQ_DEDUP_SECS));
+                                            if let Some((last_t, last_epoch)) = map.get(&peer_id) {
+                                                if *last_epoch == anchor.num && now.duration_since(*last_t) < std::time::Duration::from_secs(LATEST_REQ_DEDUP_SECS) {
+                                                    skip_due_to_dedup = true;
+                                                }
+                                            }
+                                            if !skip_due_to_dedup { map.insert(peer_id, (now, anchor.num)); }
                                         }
+                                        if skip_due_to_dedup { continue; }
+
+                                        // Global throttle to avoid spamming network-wide anchor gossip
+                                        let mut throttled = false;
+                                        if let Ok(mut last) = LAST_LATEST_ANNOUNCE.lock() {
+                                            if now.duration_since(*last) < std::time::Duration::from_millis(LATEST_GLOBAL_THROTTLE_MS) {
+                                                throttled = true;
+                                            } else {
+                                                *last = now;
+                                            }
+                                        }
+
+                                        if allow_log { net_routine!("📨 Received latest epoch request from peer: {}", peer_id); }
+                                        if throttled { continue; }
+                                        if allow_log { net_routine!("📤 Sending latest epoch {} to peer", anchor.num); }
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
                                     } else {
-                                        net_log!("⚠️  No latest epoch found to send");
+                                        if allow_log { net_routine!("⚠️  No latest epoch found to send"); }
                                     }
                                 },
                                 TOP_EPOCH_REQUEST => if let Ok(n) = bincode::deserialize::<u64>(&message.data) {
-                                    net_log!("📨 Received request for epoch {} from peer: {}", n, peer_id);
+                                    net_routine!("📨 Received request for epoch {} from peer: {}", n, peer_id);
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                        net_log!("📤 Sending epoch {} to peer", n);
+                                        net_routine!("📤 Sending epoch {} to peer", n);
                                         if let Ok(data) = bincode::serialize(&anchor) {
                                             swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
-                                    } else {
-                                        net_log!("⚠️  Epoch {} not found", n);
-                                    }
+                                    } else { net_routine!("⚠️  Epoch {} not found", n); }
                                 },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
