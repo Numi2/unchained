@@ -2,6 +2,7 @@ use crate::{storage::Store, epoch::Anchor, network::NetHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
+use tokio::sync::mpsc;
 
 const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
 // Back-off parameters to avoid spamming the same missing tip repeatedly when reorg
@@ -177,6 +178,125 @@ pub fn spawn(
         }
         println!("✅ Sync task shutdown complete");
     });
+}
+
+// --- Headers-first skeleton sync: bounded pipeline scaffolding ---
+#[derive(Debug, Clone)]
+struct RangeTask { start: u64, count: u32 }
+
+#[derive(Debug, Clone)]
+struct HeaderSegment { headers: Vec<Anchor> }
+
+pub async fn spawn_headers_skeleton(
+    db: Arc<Store>,
+    net: NetHandle,
+    mut shutdown_rx: Receiver<()>,
+) {
+    let (range_tx, range_rx) = mpsc::channel::<RangeTask>(256);
+    let (seg_tx, mut seg_rx) = mpsc::channel::<HeaderSegment>(64);
+    let _workers = 3usize;
+
+    // Fetch workers
+    {
+        let netc = net.clone();
+        let mut range_rx_c = range_rx;
+        let _seg_tx_c = seg_tx.clone();
+        let db_for_req = db.clone();
+        task::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(task) = range_rx_c.recv() => {
+                        netc.request_epoch_headers_range(task.start, task.count).await;
+                        // Persist highest_requested cursor
+                        if let Ok((mut highest_req, highest_stored)) = db_for_req.get_headers_cursor() {
+                            if task.start.saturating_add(task.count as u64).saturating_sub(1) > highest_req {
+                                highest_req = task.start.saturating_add(task.count as u64).saturating_sub(1);
+                                let _ = db_for_req.put_headers_cursor(highest_req, highest_stored);
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+    }
+
+    // Inbound header batches → enqueue segments (producer)
+    let mut headers_rx = net.headers_subscribe();
+    let seg_tx_producer = seg_tx.clone();
+    task::spawn(async move {
+        loop {
+            tokio::select! {
+                Ok(batch) = headers_rx.recv() => {
+                    crate::metrics::HEADERS_BATCH_RECV.inc();
+                    let _ = seg_tx_producer.send(HeaderSegment { headers: batch.headers }).await;
+                },
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    });
+
+    // Segment consumer: validate, fork-choice, store, update cursor
+    let db_headers = db.clone();
+    task::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(seg) = seg_rx.recv() => {
+                    let mut ok = true;
+                    for (idx, a) in seg.headers.iter().enumerate() {
+                        if idx == 0 {
+                            if a.num > 0 {
+                                if let Ok(Some(prev)) = db_headers.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                    let mut h = blake3::Hasher::new();
+                                    h.update(&a.merkle_root); h.update(&prev.hash);
+                                    let recomputed = *h.finalize().as_bytes();
+                                    if recomputed != a.hash { ok = false; break; }
+                                    let expected = Anchor::expected_work_for_difficulty(a.difficulty);
+                                    if a.cumulative_work != prev.cumulative_work.saturating_add(expected) { ok = false; break; }
+                                }
+                            }
+                        } else {
+                            let prev = &seg.headers[idx-1];
+                            if a.num != prev.num + 1 { ok = false; break; }
+                            let mut h = blake3::Hasher::new();
+                            h.update(&a.merkle_root); h.update(&prev.hash);
+                            if *h.finalize().as_bytes() != a.hash { ok = false; break; }
+                            let expected = Anchor::expected_work_for_difficulty(a.difficulty);
+                            if a.cumulative_work != prev.cumulative_work.saturating_add(expected) { ok = false; break; }
+                        }
+                    }
+                    if !ok { crate::metrics::HEADERS_INVALID.inc(); continue; }
+
+                    let current_best = db_headers.get::<Anchor>("epoch", b"latest").ok().flatten();
+                    if let Some(last) = seg.headers.last() {
+                        if last.is_better_chain(&current_best) {
+                            for a in &seg.headers {
+                                if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                crate::metrics::HEADERS_ANCHORS_STORED.inc();
+                            }
+                            if let Some(tip) = seg.headers.last() {
+                                if db_headers.put("epoch", b"latest", tip).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                let (highest_req, mut highest_stored) = db_headers.get_headers_cursor().unwrap_or((0,0));
+                                if tip.num > highest_stored { highest_stored = tip.num; let _ = db_headers.put_headers_cursor(highest_req, highest_stored); }
+                            }
+                        }
+                    }
+                },
+                else => break,
+            }
+        }
+    });
+
+    // Seed ranges based on cursor
+    let (_req, stored) = db.get_headers_cursor().unwrap_or((0,0));
+    let start = if stored == 0 { 0 } else { stored + 1 };
+    // Request a wider window to saturate network
+    let mut s = start;
+    for _ in 0..8u32 { // 8 ranges in flight
+        let _ = range_tx.send(RangeTask{ start: s, count: 512 }).await;
+        s = s.saturating_add(512);
+    }
 }
 
 async fn request_missing_epochs(

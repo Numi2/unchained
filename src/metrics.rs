@@ -118,6 +118,14 @@ pub static MINING_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unc
 pub static MINING_FOUND: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_mining_solutions_total", "Total found PoW solutions").unwrap());
 pub static MINING_HASH_TIME_MS: Lazy<Histogram> = Lazy::new(|| Histogram::new("unchained_mining_hash_time_ms", "Argon2 PoW hashing time per attempt (ms)"));
 pub static ALT_FORK_EVENTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_alt_fork_events_total", "Count of alternate fork anchor events (hash mismatch) observed").unwrap());
+pub static COMPACT_EPOCHS_SENT: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_epochs_sent_total", "Compact epochs gossiped").unwrap());
+pub static COMPACT_EPOCHS_RECV: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_epochs_received_total", "Compact epochs received").unwrap());
+pub static COMPACT_TX_REQ: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_tx_requests_total", "GetTxn requests sent").unwrap());
+pub static COMPACT_TX_RESP: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_tx_responses_total", "Txn responses received").unwrap());
+pub static HEADERS_BATCH_RECV: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_batches_received_total", "Header batches received").unwrap());
+pub static HEADERS_ANCHORS_STORED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_anchors_stored_total", "Anchors stored from header batches").unwrap());
+pub static HEADERS_INVALID: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_invalid_total", "Invalid anchors in header batches").unwrap());
+pub static COMPACT_FALLBACKS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_fallbacks_total", "Fallbacks to full bodies due to high missing %").unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // Initialize some defaults

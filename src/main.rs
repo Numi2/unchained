@@ -212,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 coin_rx,
                 shutdown_tx.subscribe(),
                 sync_state.clone(),
+                cfg.compact.clone(),
             );
             epoch_mgr.spawn_loop();
 
@@ -257,23 +258,21 @@ async fn main() -> anyhow::Result<()> {
             }
             if !synced {
                 println!(
-                    "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+                    "⚠️  Could not sync with network after {}s.",
                     cfg.net.sync_timeout_secs
                 );
-                if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                    let mut st = match sync_state.lock() { 
-                        Ok(g) => g, 
-                        Err(_) => { 
-                            println!("⚠️ sync_state poisoned, proceeding without updating flags"); 
-                            return Ok(()); 
-                        } 
-                    };
-                    // Only auto-proceed without peer confirmation if no bootstrap peers are configured
-                    if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
-                        st.synced = true;
+                // Only allow starting as a new chain when there are no bootstrap peers and no network view
+                let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
+                    if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                        if let Ok(mut st) = sync_state.lock() {
+                            st.synced = true;
+                            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                        }
+                        println!("✅ Proceeding with local chain at epoch {}.", latest.num);
                     }
-                    if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-                    println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+                } else {
+                    println!("⛔ Sync not achieved; mining remains disabled until local >= network tip.");
                 }
             }
 
@@ -607,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
                     coin_rx,
                     shutdown_tx.subscribe(),
                     sync_state.clone(),
+                    cfg.compact.clone(),
                 );
                 epoch_mgr.spawn_loop();
 
@@ -651,22 +651,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if !synced {
                     println!(
-                        "⚠️  Could not sync with network after {}s. Starting as a new chain.",
+                        "⚠️  Could not sync with network after {}s.",
                         cfg.net.sync_timeout_secs
                     );
-                    if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                        let mut st = match sync_state.lock() { 
-                            Ok(g) => g, 
-                            Err(_) => { 
-                                eprintln!("sync_state mutex poisoned during timeout fallback"); 
-                                return Ok(()); 
-                            } 
-                        };
-                        if cfg.net.bootstrap.is_empty() || st.peer_confirmed_tip {
-                            st.synced = true;
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                    if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
+                        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                            if let Ok(mut st) = sync_state.lock() {
+                                st.synced = true;
+                                if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
+                            }
+                            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
                         }
-                        if st.highest_seen_epoch == 0 { st.highest_seen_epoch = latest.num; }
-                        println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+                    } else {
+                        println!("⛔ Sync not achieved; mining remains disabled until local >= network tip.");
                     }
                 }
 

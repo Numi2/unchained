@@ -12,6 +12,8 @@ pub struct Config {
     pub mining: Mining,
     pub metrics: Metrics,
     #[serde(default)]
+    pub compact: Compact,
+    #[serde(default)]
     pub wallet: WalletCfg,
 }
 
@@ -110,6 +112,31 @@ pub struct Metrics {
     pub bind: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct Compact {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default = "default_compact_prefill_count")]
+    pub prefill_count: u32,
+    /// Currently fixed at 8 in wire format; reserved for future tuning
+    #[serde(default = "default_compact_short_id_len")]
+    pub short_id_len: u8,
+    /// If missing > max_missing_pct, fall back to legacy requests
+    #[serde(default = "default_compact_max_missing_pct")]
+    pub max_missing_pct: u8,
+}
+
+impl Default for Compact {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            prefill_count: default_compact_prefill_count(),
+            short_id_len: default_compact_short_id_len(),
+            max_missing_pct: default_compact_max_missing_pct(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WalletCfg {
     #[serde(default = "default_auto_serve_commitments")]
@@ -153,6 +180,11 @@ fn default_max_validation_failures_per_peer() -> u32 { 10 }
 fn default_peer_ban_duration_secs() -> u64 { 3600 }
 fn default_rate_limit_window_secs() -> u64 { 60 }
 fn default_max_messages_per_window() -> u32 { 100 }
+
+// Compact defaults
+fn default_compact_prefill_count() -> u32 { 4 }
+fn default_compact_short_id_len() -> u8 { 8 }
+fn default_compact_max_missing_pct() -> u8 { 20 }
 
 
 /// Read the TOML file at `p` and deserialize into `Config`.

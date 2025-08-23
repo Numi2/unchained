@@ -102,6 +102,7 @@ impl Store {
             "otp_index",
             "peers",
             "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
+            "meta",                 // miscellaneous metadata (e.g., cursors)
         ];
         
         // Configure column family options with sane production defaults
@@ -675,6 +676,29 @@ impl Store {
     pub fn get_epoch_for_coin(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
         if let Some(n) = self.get_coin_epoch(coin_id)? { return Ok(Some(n)); }
         self.find_coin_epoch_via_scan(coin_id)
+    }
+
+    /// Persist headers sync cursor (highest requested and highest stored header heights)
+    pub fn put_headers_cursor(&self, highest_requested: u64, highest_stored: u64) -> Result<()> {
+        let cf = self.db.cf_handle("meta").ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&highest_requested.to_le_bytes());
+        buf[8..].copy_from_slice(&highest_stored.to_le_bytes());
+        self.db.put_cf(cf, b"headers_cursor", &buf)?;
+        Ok(())
+    }
+
+    /// Load headers sync cursor; returns (highest_requested, highest_stored)
+    pub fn get_headers_cursor(&self) -> Result<(u64, u64)> {
+        let cf = self.db.cf_handle("meta").ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
+        if let Some(v) = self.db.get_cf(cf, b"headers_cursor")? {
+            if v.len() == 16 {
+                let mut a=[0u8;8]; a.copy_from_slice(&v[..8]);
+                let mut b=[0u8;8]; b.copy_from_slice(&v[8..]);
+                return Ok((u64::from_le_bytes(a), u64::from_le_bytes(b)));
+            }
+        }
+        Ok((0,0))
     }
 
     /// Convenience: fetch anchor by epoch number

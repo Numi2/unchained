@@ -242,6 +242,7 @@ pub struct Manager {
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     shutdown_rx: broadcast::Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
+    compact_cfg: crate::config::Compact,
 }
 impl Manager {
     pub fn new(
@@ -252,9 +253,10 @@ impl Manager {
         coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
         shutdown_rx: broadcast::Receiver<()>,
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
+        compact_cfg: crate::config::Compact,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state }
+        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg }
     }
 
     pub fn spawn_loop(mut self) {
@@ -524,7 +526,30 @@ impl Manager {
                         } else {
                             crate::metrics::EPOCH_HEIGHT.set(current_epoch as i64);
                             crate::metrics::SELECTED_COINS.set(selected_ids.len() as i64);
+                            // Gossip legacy anchor
                             self.net.gossip_anchor(&anchor).await;
+                            // Also gossip compact epoch if enabled
+                            if self.compact_cfg.enable {
+                                // Build a compact message opportunistically: prefill first entries
+                                let prefill_n = self.compact_cfg.prefill_count.min(selected.len() as u32);
+                                let mut prefilled: Vec<(u32, crate::coin::Coin)> = Vec::new();
+                                for (i, cand) in selected.iter().take(prefill_n as usize).enumerate() {
+                                    prefilled.push((i as u32, cand.clone().into_confirmed()));
+                                }
+                                // Short IDs: first 8 bytes of BLAKE3(coin_id). Low collision rate in practice.
+                                let mut short_ids: Vec<[u8;8]> = Vec::with_capacity(selected.len());
+                                for cand in &selected {
+                                    let mut hasher = blake3::Hasher::new();
+                                    hasher.update(&cand.id);
+                                    let full = *hasher.finalize().as_bytes();
+                                    let mut short = [0u8;8];
+                                    short.copy_from_slice(&full[..8]);
+                                    short_ids.push(short);
+                                }
+                                let compact = crate::network::CompactEpoch { anchor: anchor.clone(), short_ids, prefilled };
+                                self.net.gossip_compact_epoch(compact).await;
+                                crate::metrics::COMPACT_EPOCHS_SENT.inc();
+                            }
                             // Also gossip sorted leaves to help peers serve proofs deterministically
                             let bundle = crate::network::EpochLeavesBundle { epoch_num: current_epoch, merkle_root, leaves: leaves.clone() };
                             self.net.gossip_epoch_leaves(bundle).await;

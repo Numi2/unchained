@@ -62,3 +62,11 @@ max_mining_attempts = 200000
 [metrics]
 # Optional – leave out to use the default "0.0.0.0:9100"
 bind = "0.0.0.0:9100"
+
+[compact]
+# Enable compact epoch relay (experimental)
+enable = true
+# Number of prefilled coins to include (helps cold peers)
+prefill_count = 4
+# Maximum allowed missing percentage before falling back
+max_missing_pct = 20

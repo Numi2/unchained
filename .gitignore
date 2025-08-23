@@ -5,6 +5,10 @@ node_kyber.enc
 context.md
 data/
 test_stealth_address.txt
+.test_stealth_address.txt
+.test_chain_data
+.cargo
+aucition.md
 # Blockchain data
 blockchain_data/
 node_kyber.enc
@@ -21,6 +25,10 @@ target/
 # OS files
 .DS_Store
 Thumbs.db
+notes.md
+config.send-test.tom
+y
+
 
 # Logs
 *.log
@@ -31,3 +39,10 @@ tmp.rs
  
 # Frontend build output
 ui-dist/
+todayswork.md
+rust3
+rustyy.txt
+vr3.md
+pq_identity.enc
+node_kyber.enc
+peer_identity.key
