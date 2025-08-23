@@ -95,6 +95,18 @@ enum Cmd {
     ReplaySpends,
     /// Rescan local spends against this wallet (receiver-side recovery)
     RescanWallet,
+    /// Export all anchors into a compressed snapshot file
+    ExportAnchors {
+        /// Output file path (e.g. anchors_snapshot.zst)
+        #[arg(long)]
+        out: String,
+    },
+    /// Import anchors from a compressed snapshot file
+    ImportAnchors {
+        /// Input snapshot file path
+        #[arg(long)]
+        input: String,
+    },
 }
 
 #[tokio::main]
@@ -152,6 +164,27 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => return Err(anyhow::anyhow!("failed to open database")),
     };
     println!("🗄️  Database opened at '{}'", cfg.storage.path);
+
+    // Auto-import anchors snapshot if DB is empty (no genesis) and a co-located snapshot file exists
+    if db.get::<epoch::Anchor>("epoch", &0u64.to_le_bytes())?.is_none() {
+        // Try well-known relative filenames next to config or working directory
+        let candidates = [
+            "anchors_snapshot.zst",
+            "anchors_snapshot.bin",
+        ];
+        for cand in candidates.iter() {
+            if std::path::Path::new(cand).exists() {
+                match db.import_anchors_snapshot(cand) {
+                    Ok(n) if n > 0 => {
+                        println!("📥 Imported {} anchors from '{}'", n, cand);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("⚠️  Snapshot import from '{}' failed: {}", cand, e),
+                }
+            }
+        }
+    }
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
@@ -531,6 +564,16 @@ async fn main() -> anyhow::Result<()> {
                 db.write_batch(batch)?;
             }
             println!("✅ Repair complete. Scanned: {}, deleted malformed: {}. Backup dir: {}", scanned, repaired, backup_dir);
+            return Ok(());
+        }
+        Some(Cmd::ExportAnchors { out }) => {
+            let written = db.export_anchors_snapshot(out)?;
+            println!("✅ Exported {} anchors to {}", written, out);
+            return Ok(());
+        }
+        Some(Cmd::ImportAnchors { input }) => {
+            let added = db.import_anchors_snapshot(input)?;
+            println!("✅ Imported {} anchors from {}", added, input);
             return Ok(());
         }
         // commitment commands removed

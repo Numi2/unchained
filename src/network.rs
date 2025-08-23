@@ -362,7 +362,7 @@ pub struct Network {
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
-    GossipCoinLegacy(Vec<u8>),
+    
     GossipSpend(Spend),
     GossipCompactEpoch(CompactEpoch),
     GossipRateLimited(RateLimitedMessage),
@@ -764,15 +764,21 @@ pub async fn spawn(
             return;
         }
 
-        // Try to assemble a valid alternate branch from first_height..=max_buf_height
+        // Try to assemble a valid alternate branch from first_height..=max_buf_height using BFS across candidates
         let mut chosen_chain: Vec<Anchor> = Vec::new();
         let mut resolved_parent: Option<Anchor> = None;
-        let mut current_parents = parent_candidates;
+        let parent_hashes: std::collections::HashSet<[u8; 32]> = parent_candidates.iter().map(|p| p.hash).collect();
+        let mut back: std::collections::HashMap<[u8; 32], [u8; 32]> = std::collections::HashMap::new(); // child.hash -> parent.hash
+        let mut node_by_hash: std::collections::HashMap<[u8; 32], Anchor> = std::collections::HashMap::new();
+        for p in &parent_candidates { node_by_hash.insert(p.hash, p.clone()); }
+        let mut frontier: Vec<Anchor> = parent_candidates.clone();
+        let mut last_frontier: Vec<Anchor> = Vec::new();
+        let mut advanced = false;
         for height in first_height..=max_buf_height {
             let Some(cands) = orphan_anchors.get(&height) else { break; };
             if cands.is_empty() { break; }
-            let mut linked: Option<(Anchor, Anchor)> = None; // (next, parent)
-            'parent_loop: for p in &current_parents {
+            let mut next_frontier: Vec<Anchor> = Vec::new();
+            for p in &frontier {
                 for alt in cands {
                     let expected_work = Anchor::expected_work_for_difficulty(alt.difficulty);
                     let expected_cum = p.cumulative_work.saturating_add(expected_work);
@@ -782,57 +788,58 @@ pub async fn spawn(
                     hsh.update(&p.hash);
                     let recomputed = *hsh.finalize().as_bytes();
                     if alt.hash == recomputed {
-                        linked = Some((alt.clone(), p.clone()));
-                        break 'parent_loop;
+                        // Link p -> alt
+                        if !back.contains_key(&alt.hash) { back.insert(alt.hash, p.hash); }
+                        next_frontier.push(alt.clone());
                     }
                 }
             }
-            if let Some((next, p)) = linked {
-                if resolved_parent.is_none() { resolved_parent = Some(p); }
-                chosen_chain.push(next.clone());
-                current_parents = vec![next];
-            } else {
-                // Throttle log spam per height
-                let now = std::time::Instant::now();
-                let mut allow_log = true;
-                if let Ok(mut map) = LAST_MISMATCH_LOGS.lock() {
-                    map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
-                    if let Some(last) = map.get(&height) {
-                        if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
-                    }
-                    if allow_log { map.insert(height, now); }
-                }
-                if allow_log {
-                    net_routine!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", height);
-                }
-                // Pre-deduplicate epoch requests before enqueuing
-                if height > 0 {
-                    let start = fork_height.saturating_sub(REORG_BACKFILL);
-                    let end = height - 1;
-                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
-                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
-                    }
-                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
-                        for n in start..=end {
-                            if !map.contains_key(&n) {
-                                let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
-                                map.insert(n, now);
-                            }
-                        }
-                    }
-                } else {
-                    // height == 0: ensure at least fork point is requested
-                    if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
-                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
-                        if !map.contains_key(&fork_height) {
-                            let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
-                            map.insert(fork_height, now);
-                        }
-                    }
-                }
-                return;
+            if next_frontier.is_empty() {
+                break;
             }
+            // Deduplicate by hash to prevent frontier explosion
+            let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            let mut deduped: Vec<Anchor> = Vec::new();
+            for a in next_frontier {
+                if seen.insert(a.hash) {
+                    node_by_hash.insert(a.hash, a.clone());
+                    deduped.push(a);
+                }
+            }
+            last_frontier = deduped.clone();
+            frontier = deduped;
+            advanced = true;
         }
+        if !advanced {
+            net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", first_height);
+            if first_height > 0 {
+                let start = fork_height.saturating_sub(REORG_BACKFILL);
+                let end = first_height - 1;
+                for n in start..=end { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+            }
+            let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
+            return;
+        }
+
+        // Choose the best reachable tip from the last successful frontier
+        let Some(seg_tip) = last_frontier.iter().max_by_key(|a| a.cumulative_work).cloned() else { return };
+
+        // Reconstruct the chosen chain from seg_tip back to one of the parents
+        let mut chain_rev: Vec<Anchor> = Vec::new();
+        let mut cur = seg_tip.clone();
+        chain_rev.push(cur.clone());
+        while let Some(prev_hash) = back.get(&cur.hash) {
+            if parent_hashes.contains(prev_hash) {
+                resolved_parent = node_by_hash.get(prev_hash).cloned();
+                break;
+            }
+            if let Some(prev) = node_by_hash.get(prev_hash).cloned() {
+                chain_rev.push(prev.clone());
+                cur = prev;
+            } else { break; }
+        }
+        chain_rev.reverse();
+        chosen_chain = chain_rev;
         if chosen_chain.is_empty() { return; }
 
         let Some(seg_tip) = chosen_chain.last() else { return; };
@@ -1053,7 +1060,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                     NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
                                     NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                    NetworkCommand::GossipCoinLegacy(bytes) => (TOP_COIN, Some(bytes.clone())),
+                                    
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
@@ -1573,12 +1580,21 @@ pub async fn spawn(
                                                 let mut remaining: Vec<Spend> = Vec::new();
                                                 for q in queued.drain(..) {
                                                     if validate_spend(&q, &db).is_ok() {
+                                                        let seen = db.get::<[u8;1]>("nullifier", &q.nullifier).ok().flatten().is_some();
                                                         if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
                                                             let mut batch = rocksdb::WriteBatch::default();
                                                             if let Ok(bytes) = bincode::serialize(&q) {
                                                                 batch.put_cf(sp_cf, &q.coin_id, &bytes);
                                                             }
-                                                            batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
+                                                            if !seen { batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]); }
+                                                            if q.unlock_preimage.is_some() {
+                                                                if let Some(next_lock) = q.next_lock_hash {
+                                                                    if let (Some(cid_cf), Ok(chain_id)) = (db.db.cf_handle("commitment_used"), db.get_chain_id()) {
+                                                                        let cid = crate::crypto::commitment_id_v1(&q.to.one_time_pk, &q.to.kyber_ct, &next_lock, &q.coin_id, q.to.amount_le, &chain_id);
+                                                                        batch.put_cf(cid_cf, &cid, &[1u8;1]);
+                                                                    }
+                                                                }
+                                                            }
                                                             let _ = db.db.write(batch);
                                                         }
                                                         let _ = spend_tx.send(q.clone());
@@ -1635,12 +1651,22 @@ pub async fn spawn(
 
                                     match validate_spend(&sp, &db) {
                                         Ok(()) => {
+                                            let seen = db.get::<[u8;1]>("nullifier", &sp.nullifier).ok().flatten().is_some();
+                                            if seen { continue; }
                                             if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
                                                 let mut batch = rocksdb::WriteBatch::default();
                                                 if let Ok(bytes) = bincode::serialize(&sp) {
                                                     batch.put_cf(sp_cf, &sp.coin_id, &bytes);
                                                 }
                                                 batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]);
+                                                if sp.unlock_preimage.is_some() {
+                                                    if let Some(next_lock) = sp.next_lock_hash {
+                                                        if let (Some(cid_cf), Ok(chain_id)) = (db.db.cf_handle("commitment_used"), db.get_chain_id()) {
+                                                            let cid = crate::crypto::commitment_id_v1(&sp.to.one_time_pk, &sp.to.kyber_ct, &next_lock, &sp.coin_id, sp.to.amount_le, &chain_id);
+                                                            batch.put_cf(cid_cf, &cid, &[1u8;1]);
+                                                        }
+                                                    }
+                                                }
                                                 let _ = db.db.write(batch);
                                             }
                                             let _ = spend_tx.send(sp.clone());
@@ -1658,12 +1684,21 @@ pub async fn spawn(
                                                     let mut remaining: Vec<Spend> = Vec::new();
                                                     for q in queued.drain(..) {
                                                         if validate_spend(&q, &db).is_ok() {
+                                                            let seen = db.get::<[u8;1]>("nullifier", &q.nullifier).ok().flatten().is_some();
                                                             if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
                                                                 let mut batch = rocksdb::WriteBatch::default();
                                                                 if let Ok(bytes) = bincode::serialize(&q) {
                                                                     batch.put_cf(sp_cf, &q.coin_id, &bytes);
                                                                 }
-                                                                batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
+                                                                if !seen { batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]); }
+                                                                if q.unlock_preimage.is_some() {
+                                                                    if let Some(next_lock) = q.next_lock_hash {
+                                                                        if let (Some(cid_cf), Ok(chain_id)) = (db.db.cf_handle("commitment_used"), db.get_chain_id()) {
+                                                                            let cid = crate::crypto::commitment_id_v1(&q.to.one_time_pk, &q.to.kyber_ct, &next_lock, &q.coin_id, q.to.amount_le, &chain_id);
+                                                                            batch.put_cf(cid_cf, &cid, &[1u8;1]);
+                                                                        }
+                                                                    }
+                                                                }
                                                                 let _ = db.db.write(batch);
                                                             }
                                                             let _ = spend_tx.send(q.clone());
@@ -1746,12 +1781,21 @@ pub async fn spawn(
                                     if let Some(sp) = resp {
                                         match validate_spend(&sp, &db) {
                                             Ok(()) => {
+                                                let seen = db.get::<[u8;1]>("nullifier", &sp.nullifier).ok().flatten().is_some();
                                                 if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
                                                     let mut batch = rocksdb::WriteBatch::default();
                                                     if let Ok(bytes) = bincode::serialize(&sp) {
                                                         batch.put_cf(sp_cf, &sp.coin_id, &bytes);
                                                     }
-                                                    batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]);
+                                                    if !seen { batch.put_cf(nf_cf, &sp.nullifier, &[1u8;1]); }
+                                                    if sp.unlock_preimage.is_some() {
+                                                        if let Some(next_lock) = sp.next_lock_hash {
+                                                            if let (Some(cid_cf), Ok(chain_id)) = (db.db.cf_handle("commitment_used"), db.get_chain_id()) {
+                                                                let cid = crate::crypto::commitment_id_v1(&sp.to.one_time_pk, &sp.to.kyber_ct, &next_lock, &sp.coin_id, sp.to.amount_le, &chain_id);
+                                                                batch.put_cf(cid_cf, &cid, &[1u8;1]);
+                                                            }
+                                                        }
+                                                    }
                                                     let _ = db.db.write(batch);
                                                 }
                                                 let _ = spend_tx.send(sp.clone());
@@ -2163,11 +2207,7 @@ pub async fn spawn(
                                 }
                             }
                         }
-                        NetworkCommand::GossipCoinLegacy(bytes) => {
-                            if swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), bytes.clone()).is_err() {
-                                pending_commands.push_back(command);
-                            }
-                        }
+                        
                         NetworkCommand::GossipSpend(sp) => {
                             if let Ok(data) = bincode::serialize(sp) {
                                 if swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND), data).is_err() {
@@ -2252,13 +2292,8 @@ pub async fn spawn(
 impl Network {
     pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
     pub async fn gossip_coin(&self, c: &CoinCandidate) {
-        // Gossip the new-format candidate
+        // Gossip the new-format candidate only (V3-only)
         let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone()));
-        // Also gossip a legacy-compatible payload so older peers can ingest it
-        let legacy = c.to_v1_compat();
-        if let Ok(bytes) = bincode::serialize(&legacy) {
-            let _ = self.command_tx.send(NetworkCommand::GossipCoinLegacy(bytes));
-        }
     }
     pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
     pub async fn gossip_compact_epoch(&self, compact: CompactEpoch) { let _ = self.command_tx.send(NetworkCommand::GossipCompactEpoch(compact)); }

@@ -29,6 +29,10 @@ pub const KYBER768_CT_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN
 pub const KYBER768_PK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_PUBLICKEYBYTES;
 pub const KYBER768_SK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_SECRETKEYBYTES;
 
+/// Size of opaque one-time public key bytes used in V3 signatureless transfers.
+/// This is intentionally decoupled from Dilithium key sizes even if currently equal.
+pub const OTP_PK_BYTES: usize = DILITHIUM3_PK_BYTES;
+
 /// A 32-byte address, derived from a BLAKE3 hash of a public key.
 /// This provides a fixed-size, user-friendly identifier.
 pub type Address = [u8; 32];
@@ -63,6 +67,15 @@ pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<Stri
 pub fn address_from_pk(pk: &PublicKey) -> Address {
     *Hasher::new_derive_key("unchained-address")
         .update(pk.as_bytes())
+        .finalize()
+        .as_bytes()
+}
+
+/// Compute an Address directly from arbitrary public bytes (e.g., opaque one-time key bytes).
+/// Uses the same domain as `address_from_pk` to remain consistent across address derivations.
+pub fn address_from_bytes(bytes: &[u8]) -> Address {
+    *Hasher::new_derive_key("unchained-address")
+        .update(bytes)
         .finalize()
         .as_bytes()
 }
@@ -114,10 +127,10 @@ pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
 /// This avoids relying on Dilithium's randomized key generation and keeps
 /// stealth outputs Kyber-bound. The produced bytes are fixed-size and
 /// opaque; they MUST NOT be interpreted as a real Dilithium key.
-pub fn derive_one_time_pk_bytes(seed32: [u8; 32]) -> [u8; DILITHIUM3_PK_BYTES] {
+pub fn derive_one_time_pk_bytes(seed32: [u8; 32]) -> [u8; OTP_PK_BYTES] {
     let mut hasher = blake3::Hasher::new_keyed(&seed32);
     hasher.update(b"unchained-otp-bytes.v1");
-    let mut out = [0u8; DILITHIUM3_PK_BYTES];
+    let mut out = [0u8; OTP_PK_BYTES];
     hasher.finalize_xof().fill(&mut out);
     out
 }
@@ -140,6 +153,24 @@ pub fn stealth_seed_v1(ss: &[u8], recv_dili_pk_bytes: &[u8], kyber_ct_bytes: &[u
     h.update(b"unchained-stealth-v1|mlkem768|mldsa65");
     h.update(&lp(ss.len()));          h.update(ss);
     h.update(&lp(recv_dili_pk_bytes.len())); h.update(recv_dili_pk_bytes);
+    h.update(&lp(kyber_ct_bytes.len()));     h.update(kyber_ct_bytes);
+    h.update(&lp(value_tag.len()));   h.update(value_tag);
+    h.update(chain_id32);
+    let out = h.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&out.as_bytes()[..32]);
+    seed
+}
+
+/// V3: Length-prefixed stealth seed derivation bound to chain id using Kyber only.
+/// TAG = "unchained-stealth-v3|mlkem768"
+/// seed32 = BLAKE3(TAG || lp(ss)||ss || lp(receiver_binding)||receiver_binding || lp(ct)||ct || lp(value_tag)||value_tag || chain_id32)
+pub fn stealth_seed_v3(ss: &[u8], receiver_binding: &[u8], kyber_ct_bytes: &[u8], value_tag: &[u8], chain_id32: &[u8; 32]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"unchained-stealth-v3|mlkem768");
+    h.update(&lp(ss.len()));          h.update(ss);
+    h.update(&lp(receiver_binding.len())); h.update(receiver_binding);
     h.update(&lp(kyber_ct_bytes.len()));     h.update(kyber_ct_bytes);
     h.update(&lp(value_tag.len()));   h.update(value_tag);
     h.update(chain_id32);
@@ -296,6 +327,30 @@ pub fn derive_next_lock_secret(shared: &[u8], kyber_ct_bytes: &[u8], amount_le: 
     *h.finalize().as_bytes()
 }
 
+/// Derive the next lock preimage including an out-of-band note binding.
+/// This strengthens unlinkability and prevents replay across contexts by
+/// binding to the Kyber ciphertext, value, coin id, chain id, and an
+/// application-provided secret note.
+pub fn derive_next_lock_secret_with_note(
+    shared: &[u8],
+    kyber_ct_bytes: &[u8],
+    amount_le: u64,
+    coin_id: &[u8;32],
+    chain_id32: &[u8;32],
+    note_s: &[u8],
+) -> [u8;32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"unchained.locksecret.v2|mlkem768");
+    h.update(&lp(shared.len())); h.update(shared);
+    h.update(&lp(kyber_ct_bytes.len())); h.update(kyber_ct_bytes);
+    h.update(&amount_le.to_le_bytes());
+    h.update(coin_id);
+    h.update(chain_id32);
+    h.update(&lp(note_s.len())); h.update(note_s);
+    *h.finalize().as_bytes()
+}
+
 /// Derive the genesis lock secret deterministically from Dilithium SK, coin id and chain id.
 /// s0 = BLAKE3("unchained.lockseed.genesis.v1" || sk_bytes || coin_id || chain_id)
 pub fn derive_genesis_lock_secret(dili_sk: &SecretKey, coin_id: &[u8;32], chain_id32: &[u8;32]) -> [u8;32] {
@@ -310,7 +365,7 @@ pub fn derive_genesis_lock_secret(dili_sk: &SecretKey, coin_id: &[u8;32], chain_
 /// Deterministic commitment identifier derived from receiver commitment fields.
 /// commitment_id = BLAKE3("commitment_id_v1" || one_time_pk || kyber_ct || next_lock_hash || coin_id || amount_le || chain_id32)
 pub fn commitment_id_v1(
-    one_time_pk: &[u8; DILITHIUM3_PK_BYTES],
+    one_time_pk: &[u8; OTP_PK_BYTES],
     kyber_ct: &[u8; KYBER768_CT_BYTES],
     next_lock_hash: &[u8; 32],
     coin_id: &[u8; 32],
@@ -328,3 +383,10 @@ pub fn commitment_id_v1(
     *h.finalize().as_bytes()
 }
 
+/// Legacy nullifier wrapper for clarity. Uses the pre-image direct domain.
+#[inline]
+pub fn compute_nullifier_legacy(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u8; 32]) -> [u8; 32] {
+    compute_nullifier_v3(preimage, coin_id, chain_id32)
+}
+
+    

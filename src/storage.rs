@@ -716,6 +716,129 @@ impl Store {
         Ok(count)
     }
 
+    /// Export all known anchors (by epoch number) into a compressed snapshot file.
+    /// Returns the number of anchors written.
+    pub fn export_anchors_snapshot(&self, out_path: &str) -> Result<usize> {
+        use std::io::Write as _;
+
+        let epoch_cf = self.db.cf_handle("epoch")
+            .ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
+        let iter = self.db.iterator_cf(epoch_cf, rocksdb::IteratorMode::Start);
+
+        let mut anchors: Vec<crate::epoch::Anchor> = Vec::new();
+        for item in iter {
+            let (k, v) = item?;
+            // Only include keys that are exactly 8 bytes (epoch number). Skip the "latest" marker and others.
+            if k.len() != 8 { continue; }
+            // Tolerant decode: try zstd first, then plain bincode
+            let anchor: crate::epoch::Anchor = if let Ok(decompressed) = zstd::decode_all(&v[..]) {
+                match bincode::deserialize(&decompressed) {
+                    Ok(a) => a,
+                    Err(_) => match bincode::deserialize(&v[..]) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    },
+                }
+            } else {
+                match bincode::deserialize(&v[..]) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                }
+            };
+            anchors.push(anchor);
+        }
+        // Sort by epoch number to make snapshot deterministic
+        anchors.sort_by_key(|a| a.num);
+        if anchors.is_empty() {
+            anyhow::bail!("No anchors found to export");
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct AnchorsSnapshotV1 {
+            chain_id: [u8; 32],
+            anchors: Vec<crate::epoch::Anchor>,
+        }
+
+        let chain_id = anchors.first().map(|a| a.hash)
+            .ok_or_else(|| anyhow::anyhow!("Missing genesis anchor in snapshot export"))?;
+        let snapshot = AnchorsSnapshotV1 { chain_id, anchors };
+
+        let raw = bincode::serialize(&snapshot)
+            .context("Failed to serialize anchors snapshot")?;
+        let mut encoder = zstd::Encoder::new(Vec::new(), 10)
+            .context("Failed to create zstd encoder")?;
+        encoder.write_all(&raw).context("Failed to write snapshot to encoder")?;
+        let compressed = encoder.finish().context("Failed to finalize zstd compression")?;
+        std::fs::write(out_path, compressed)
+            .with_context(|| format!("Failed to write snapshot file to '{}'", out_path))?;
+
+        Ok(snapshot.anchors.len())
+    }
+
+    /// Import anchors from a compressed snapshot file. Missing anchors are inserted;
+    /// existing anchors are left untouched. Returns the number of anchors inserted.
+    pub fn import_anchors_snapshot(&self, path: &str) -> Result<u64> {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct AnchorsSnapshotV1 {
+            chain_id: [u8; 32],
+            anchors: Vec<crate::epoch::Anchor>,
+        }
+
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read snapshot file '{}'", path))?;
+        // Try zstd then plain
+        let data = match zstd::decode_all(&bytes[..]) {
+            Ok(d) => d,
+            Err(_) => bytes,
+        };
+        let snapshot: AnchorsSnapshotV1 = bincode::deserialize(&data)
+            .context("Failed to deserialize anchors snapshot (expected AnchorsSnapshotV1)")?;
+
+        // If DB already has a genesis, ensure chain id matches
+        if let Ok(Some(existing_genesis)) = self.get::<crate::epoch::Anchor>("epoch", &0u64.to_le_bytes()) {
+            if existing_genesis.hash != snapshot.chain_id {
+                anyhow::bail!("Snapshot chain_id does not match existing database genesis");
+            }
+        }
+
+        let mut inserted: u64 = 0;
+        let mut batch = WriteBatch::default();
+
+        let epoch_cf = self.db.cf_handle("epoch").ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
+        let anchor_cf = self.db.cf_handle("anchor").ok_or_else(|| anyhow::anyhow!("'anchor' column family missing"))?;
+
+        let mut highest_num: Option<u64> = None;
+        for a in snapshot.anchors.iter() {
+            let key = a.num.to_le_bytes();
+            let exists = match self.db.get_cf(epoch_cf, &key) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => return Err(e.into()),
+            };
+            if !exists {
+                let ser = bincode::serialize(a).context("Failed to serialize anchor for import")?;
+                batch.put_cf(epoch_cf, key, &ser);
+                batch.put_cf(anchor_cf, &a.hash, &ser);
+                inserted += 1;
+            }
+            highest_num = Some(highest_num.map_or(a.num, |h| h.max(a.num)));
+        }
+
+        // Update latest pointer if we imported any anchors
+        if inserted > 0 {
+            if let Some(h) = highest_num {
+                if let Some(v) = self.get_raw_bytes("epoch", &h.to_le_bytes())? {
+                    batch.put_cf(epoch_cf, b"latest", &v);
+                }
+            }
+            self.write_batch(batch)?;
+        }
+
+        Ok(inserted)
+    }
+
     /// Gets statistics about the database
     pub fn get_stats(&self) -> Result<DatabaseStats> {
         let coin_count = self.coin_count()?;

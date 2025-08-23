@@ -1,6 +1,6 @@
 use crate::{
     storage::Store,
-    crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, KYBER768_PK_BYTES, KYBER768_SK_BYTES},
+    crypto::{self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, KYBER768_PK_BYTES, KYBER768_SK_BYTES, OTP_PK_BYTES},
 };
 use pqcrypto_dilithium::dilithium3::{
     PublicKey, SecretKey,
@@ -12,6 +12,23 @@ use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberShar
 use base64::Engine;
 use serde::{Serialize, Deserialize};
 
+// V3 format
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct StealthAddressDocV3 {
+    version: u8,
+    recipient_addr: Address,
+    kyber_pk: Vec<u8>,
+}
+
+// Legacy V2 format (Kyber-only)
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct StealthAddressDocV2 {
+    version: u8,
+    recipient_addr: Address,
+    kyber_pk: Vec<u8>,
+}
+
+// Legacy V1 format (Dilithium+Kyber with signature)
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StealthAddressDoc {
     version: u8,
@@ -19,13 +36,6 @@ pub struct StealthAddressDoc {
     dili_pk: Vec<u8>,
     kyber_pk: Vec<u8>,
     sig: Vec<u8>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct StealthAddressDocV2 {
-    version: u8,
-    recipient_addr: Address,
-    kyber_pk: Vec<u8>,
 }
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
@@ -312,8 +322,8 @@ impl Wallet {
     // { version: u8=1, recipient_addr: [u8;32], dili_pk: [u8;DILITHIUM3_PK_BYTES], kyber_pk: [u8;crypto::KYBER768_PK_BYTES], sig: Dilithium sig over ("stealth_addr_v1" || addr || kyber_pk) }
 
     pub fn export_stealth_address(&self) -> String {
-        let doc = StealthAddressDocV2 {
-            version: 2,
+        let doc = StealthAddressDocV3 {
+            version: 3,
             recipient_addr: self.address,
             kyber_pk: self.kyber_pk.as_bytes().to_vec(),
         };
@@ -334,30 +344,33 @@ impl Wallet {
             Err(_) => base64::engine::general_purpose::URL_SAFE.decode(s)
                 .map_err(|_| anyhow!("Invalid stealth address encoding"))?,
         };
-        // Try V2 (Kyber-only) then fallback to V1 (legacy)
+        // Try V3, then V2, then V1 legacy for DB compatibility
+        if let Ok(doc3) = bincode::deserialize::<StealthAddressDocV3>(&bytes) {
+            if doc3.version != 3 { bail!("Unsupported stealth address version"); }
+            let kyber_pk = KyberPk::from_bytes(&doc3.kyber_pk)
+                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
+            return Ok((doc3.recipient_addr, kyber_pk));
+        }
         if let Ok(doc2) = bincode::deserialize::<StealthAddressDocV2>(&bytes) {
             if doc2.version != 2 { bail!("Unsupported stealth address version"); }
             let kyber_pk = KyberPk::from_bytes(&doc2.kyber_pk)
-                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
-            // Recipient address is provided directly; no Dilithium in address anymore
-            Ok((doc2.recipient_addr, kyber_pk))
-        } else if let Ok(doc1) = bincode::deserialize::<StealthAddressDoc>(&bytes) {
+                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address (v2)"))?;
+            return Ok((doc2.recipient_addr, kyber_pk));
+        }
+        if let Ok(doc1) = bincode::deserialize::<StealthAddressDoc>(&bytes) {
             if doc1.version != 1 { bail!("Unsupported stealth address version"); }
             let dili_pk = PublicKey::from_bytes(&doc1.dili_pk)
                 .map_err(|_| anyhow!("Invalid Dilithium PK in stealth address (v1)"))?;
             let kyber_pk = KyberPk::from_bytes(&doc1.kyber_pk)
                 .map_err(|_| anyhow!("Invalid Kyber PK in stealth address (v1)"))?;
             let computed_addr = crypto::address_from_pk(&dili_pk);
-            Ok((computed_addr, kyber_pk))
-        } else {
-            bail!("Invalid stealth address payload");
+            return Ok((computed_addr, kyber_pk));
         }
+        bail!("Invalid stealth address payload")
     }
 
     /// Backward-compatible wrapper; signature verification removed. Prefer `parse_stealth_address`.
-    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
-        Self::parse_stealth_address(addr_str)
-    }
+    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> { Self::parse_stealth_address(addr_str) }
 
     // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
@@ -612,7 +625,7 @@ impl Wallet {
             let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
             let chain_id = store.get_chain_id()?;
             let value_tag = coin.value.to_le_bytes();
-            let seed = crate::crypto::stealth_seed_v1(
+            let seed = crate::crypto::stealth_seed_v3(
                 shared.as_bytes(),
                 &recipient_addr,
                 ct.as_bytes(),
@@ -623,15 +636,16 @@ impl Wallet {
             // View tag for receiver filtering
             let vt = crate::crypto::view_tag(shared.as_bytes());
             // Derive the receiver's next-hop lock secret and hash from Kyber context
-            let s_next = crate::crypto::derive_next_lock_secret(
+            let s_next = crate::crypto::derive_next_lock_secret_with_note(
                 shared.as_bytes(),
                 ct.as_bytes(),
                 coin.value,
                 &coin.id,
                 &chain_id,
+                _s_bytes,
             );
             let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
-            let mut one_time_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+            let mut one_time_pk = [0u8; OTP_PK_BYTES];
             one_time_pk.copy_from_slice(&ot_pk_bytes);
             let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
             kyber_ct.copy_from_slice(ct.as_bytes());
@@ -731,10 +745,8 @@ impl Wallet {
 
             // Determine correct unlock preimage for the coin being spent (genesis or previous spend)
             let unlock_preimage = if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
-                // Previous spend exists: derive the previously committed next-lock secret
-                prev_spend
-                    .to
-                    .derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id)?
+                // Previous spend exists: derive the previously committed next-lock secret (V3 only)
+                prev_spend.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id, _s_bytes)?
             } else {
                 // Genesis: derive s0 from our long-term secret key
                 self.compute_genesis_lock_secret(&coin.id, &chain_id)
@@ -751,21 +763,7 @@ impl Wallet {
                 coin.value,
                 &store.get_chain_id()?,
             )?;
-            // Mainnet compatibility: if the coin's previous lock used legacy hashing, switch nullifier to legacy too
-            let expected_lock = if let Some(prev) = store.get_spend_tolerant(&coin.id)? {
-                prev.next_lock_hash.ok_or_else(|| anyhow!("Previous spend missing next_lock_hash"))?
-            } else {
-                coin.lock_hash
-            };
-            let chain_id_for_nf = store.get_chain_id()?;
-            let lh_new = crate::crypto::lock_hash_from_preimage(&chain_id_for_nf, &coin.id, &unlock_preimage);
-            if lh_new != expected_lock {
-                let lh_legacy = crate::crypto::lock_hash(&unlock_preimage);
-                if lh_legacy == expected_lock {
-                    // Recompute nullifier using legacy scheme to stay compatible with mainnet
-                    spend.nullifier = crate::crypto::compute_nullifier_v3(&unlock_preimage, &coin.id, &chain_id_for_nf);
-                }
-            }
+            // V3 only: nullifier derived from preimage domain; fail if mismatch later in validate
             // Attach view tag into `to`
             spend.to.view_tag = Some(vt);
             spend.validate(&store)?;
@@ -805,12 +803,17 @@ impl Wallet {
                 };
                 let prev_owner_addr = coin.creator_address;
 
-                // Compute transfer_hash for display as H(auth_bytes)
-                let tx_hash = crypto::blake3_hash(&spend.auth_bytes());
+                // Compute transfer_hash for display from stable fields only (no signatures in V3)
+                let mut txh = Vec::with_capacity(32 + 32 + 32 + spend.to.canonical_bytes().len());
+                txh.extend_from_slice(&spend.root);
+                txh.extend_from_slice(&spend.nullifier);
+                txh.extend_from_slice(&spend.commitment);
+                txh.extend_from_slice(&spend.to.canonical_bytes());
+                let tx_hash = crypto::blake3_hash(&txh);
 
                 // Outgoing (approximate): compare prev_owner_addr; counterparty from one_time_pk bytes
                 if prev_owner_addr == self.address {
-                    let recipient_addr = crypto::blake3_hash(&spend.to.one_time_pk);
+                    let recipient_addr = crypto::address_from_bytes(&spend.to.one_time_pk);
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,
