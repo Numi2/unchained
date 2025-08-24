@@ -442,7 +442,7 @@ pub async fn spawn(
         .mesh_n(12)
         .mesh_n_high(102)
         .flood_publish(true)
-        .max_transmit_size(12 * 1024 * 1024) // 2 MiB cap
+        .max_transmit_size(8 * 1024 * 1024) // 8 MiB cap
         .build()?;
         
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
@@ -522,6 +522,7 @@ pub async fn spawn(
     let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
     const MAX_ORPHAN_ANCHORS: usize = 1024;
+    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 2048; // only buffer orphans within this distance of local tip
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate coin fetch requests when we receive spends for unknown coins
@@ -1310,9 +1311,19 @@ pub async fn spawn(
                                             }
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
-                                            net_log!("⏳ Buffering orphan anchor for epoch {}", a.num);
-                                            let entry = orphan_anchors.entry(a.num).or_default();
-                                            if !entry.iter().any(|x| x.hash == a.hash) { entry.push(a.clone()); }
+                                            // Only buffer orphans near our local tip; skip when we don't have a tip yet
+                                            let mut allow_buffer = false;
+                                            if let Ok(Some(lat)) = db.get::<Anchor>("epoch", b"latest") {
+                                                let dist = if a.num >= lat.num { a.num - lat.num } else { lat.num - a.num };
+                                                if dist <= ORPHAN_BUFFER_TIP_WINDOW { allow_buffer = true; }
+                                            }
+                                            if allow_buffer {
+                                                let entry = orphan_anchors.entry(a.num).or_default();
+                                                if !entry.iter().any(|x| x.hash == a.hash) {
+                                                    entry.push(a.clone());
+                                                    net_routine!("⏳ Buffered orphan anchor for epoch {}", a.num);
+                                                }
+                                            }
                                             
                                             if let Ok(mut state) = sync_state.lock() {
                                                 if a.num > state.highest_seen_epoch {
