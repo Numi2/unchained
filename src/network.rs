@@ -93,7 +93,8 @@ fn try_publish_gossip(
         let is_insufficient = es.contains("InsufficientPeers")
             || es.contains("InsufficientPeersForTopic")
             || es.contains("NoPeersSubscribedToTopic");
-        if context == "epoch-leaves" && es.contains("AllQueuesFull") { return; }
+        // Treat temporary queue saturation as benign for noisy contexts
+        if (context == "epoch-leaves" || context == "epoch-leaves-req") && es.contains("AllQueuesFull") { return; }
         if !is_insufficient {
             eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
@@ -521,8 +522,8 @@ pub async fn spawn(
     let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
-    const MAX_ORPHAN_ANCHORS: usize = 1024;
-    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 2048; // only buffer orphans within this distance of local tip
+    const MAX_ORPHAN_ANCHORS: usize = 2048;
+    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 1024; // only buffer orphans within this distance of local tip
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate coin fetch requests when we receive spends for unknown coins
@@ -531,19 +532,19 @@ pub async fn spawn(
     
     static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    const EPOCH_REQ_DEDUP_SECS: u64 = 5;
+    const EPOCH_REQ_DEDUP_SECS: u64 = 8;
     // Deduplicate and throttle responses to latest-epoch requests
     static RECENT_LATEST_REQS: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> = Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
-    const LATEST_REQ_DEDUP_SECS: u64 = 3; // per-peer TTL for duplicate latest requests at same height
-    const LATEST_GLOBAL_THROTTLE_MS: u64 = 500; // minimum gap between our latest responses
+    const LATEST_REQ_DEDUP_SECS: u64 = 8; // per-peer TTL for duplicate latest requests at same height
+    const LATEST_GLOBAL_THROTTLE_MS: u64 = 1000; // minimum gap between our latest responses
     const PENDING_SPEND_TTL_SECS: u64 = 15;
     const PENDING_PROOF_TTL_SECS: u64 = 30;
     const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on hash mismatch
     // Global aggregation cadence for alt-fork summaries
     const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
     // Throttle noisy reorg logs (per-height)
-    const REORG_LOG_THROTTLE_SECS: u64 = 10;
+    const REORG_LOG_THROTTLE_SECS: u64 = 30;
     static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     
@@ -2089,32 +2090,38 @@ pub async fn spawn(
                                         leaves.sort();
                                         let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                         if computed_root != anchor.merkle_root { continue; }
-                                        // Persist leaves for proof serving
-                                        if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
-                                            net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
-                                             // Try to serve any pending coin-proof requests that belong to this epoch
-                                             let now = std::time::Instant::now();
-                                             pending_proof_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PENDING_PROOF_TTL_SECS));
-                                             let mut satisfied: Vec<[u8;32]> = Vec::new();
-                                             for (coin_id, _) in pending_proof_requests.iter() {
-                                                 if let Ok(Some(coin)) = db.get::<Coin>("coin", coin_id) {
-                                                     if db.get_epoch_for_coin(&coin.id).ok().flatten() == Some(anchor.num) {
-                                                         let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-                                                         if leaves.binary_search(&target_leaf).is_ok() {
-                                                             if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
-                                                                 let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
-                                                                 if let Ok(data) = bincode::serialize(&resp) {
-                                                                     swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
-                                                                     crate::metrics::PROOFS_SERVED.inc();
-                                                                     satisfied.push(*coin_id);
-                                                                 }
-                                                             }
-                                                         }
-                                                     }
-                                                 }
-                                             }
-                                             for id in satisfied { pending_proof_requests.remove(&id); }
+                                        // Persist leaves for proof serving only if not already stored identically
+                                        let already_have_same = match db.get_epoch_leaves(bundle.epoch_num) {
+                                            Ok(Some(existing)) => existing == leaves,
+                                            _ => false,
+                                        };
+                                        if !already_have_same {
+                                            if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
+                                                net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
+                                            }
                                         }
+                                        // Try to serve any pending coin-proof requests that belong to this epoch
+                                        let now = std::time::Instant::now();
+                                        pending_proof_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PENDING_PROOF_TTL_SECS));
+                                        let mut satisfied: Vec<[u8;32]> = Vec::new();
+                                        for (coin_id, _) in pending_proof_requests.iter() {
+                                            if let Ok(Some(coin)) = db.get::<Coin>("coin", coin_id) {
+                                                if db.get_epoch_for_coin(&coin.id).ok().flatten() == Some(anchor.num) {
+                                                    let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                    if leaves.binary_search(&target_leaf).is_ok() {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
+                                                            let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                            if let Ok(data) = bincode::serialize(&resp) {
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                crate::metrics::PROOFS_SERVED.inc();
+                                                                satisfied.push(*coin_id);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        for id in satisfied { pending_proof_requests.remove(&id); }
                                     }
                                 },
                                 TOP_EPOCH_LEAVES_REQUEST => if let Ok(epoch_num) = bincode::deserialize::<u64>(&message.data) {
@@ -2164,6 +2171,22 @@ pub async fn spawn(
                                         leaves.sort();
                                         let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                         if computed_root != anchor.merkle_root { continue; }
+                                        // Deduplicate: skip writing if both leaves and selected IDs already match
+                                        let mut skip_write = false;
+                                        let leaves_match = match db.get_epoch_leaves(bundle.epoch_num) {
+                                            Ok(Some(existing)) => existing == leaves,
+                                            _ => false,
+                                        };
+                                        if leaves_match {
+                                            if let Ok(existing_ids) = db.get_selected_coin_ids_for_epoch(bundle.epoch_num) {
+                                                if existing_ids.len() == bundle.coin_ids.len() {
+                                                    let a: std::collections::HashSet<[u8;32]> = std::collections::HashSet::from_iter(existing_ids.into_iter());
+                                                    let b: std::collections::HashSet<[u8;32]> = std::collections::HashSet::from_iter(bundle.coin_ids.iter().copied());
+                                                    if a == b { skip_write = true; }
+                                                }
+                                            }
+                                        }
+                                        if skip_write { continue; }
                                         if let (Some(sel_cf), Some(leaves_cf)) = (db.db.cf_handle("epoch_selected"), db.db.cf_handle("epoch_leaves")) {
                                             let mut batch = rocksdb::WriteBatch::default();
                                             for coin_id in &bundle.coin_ids {
