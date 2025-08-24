@@ -32,7 +32,7 @@ use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StealthOutput {
-    // One-time Dilithium3 public key (public, used as recipient address)
+    // One-time public bytes (opaque, used for recipient addressing). Do not parse as Dilithium key.
     #[serde(with = "BigArray")]
     pub one_time_pk: [u8; OTP_PK_BYTES],
     // Kyber768 ciphertext so recipient can derive the shared secret
@@ -91,8 +91,9 @@ impl StealthOutput {
     
 
     /// Compute the recipient Address-like hash from the opaque one-time public bytes.
+    /// Uses blake3_hash over the one-time public bytes; does not parse as a Dilithium key.
     pub fn recipient_address(&self) -> Result<Address> {
-        Ok(crate::crypto::address_from_bytes(&self.one_time_pk))
+        Ok(crate::crypto::blake3_hash(&self.one_time_pk))
     }
 }
 // (Legacy V1 transfer has been fully removed.)
@@ -101,7 +102,7 @@ impl StealthOutput {
 
 /// Receiver-supplied lock commitment for V3 hashlock spends.
 /// The receiver generates `kyber_ct` (encapsulated to their own Kyber PK), decapsulates to get
-/// the shared secret, derives the one-time Dilithium key deterministically using `stealth_seed_v1`,
+/// the shared secret, derives the one-time public bytes deterministically using `stealth_seed_v1`,
 /// and computes the next-hop lock preimage `s_next` using `derive_next_lock_secret`.
 /// The receiver shares only commitment values: `one_time_pk`, `kyber_ct`, `next_lock_hash`, and
 /// the bound `amount_le`. The sender never learns `s_next`.

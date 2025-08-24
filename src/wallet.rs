@@ -813,7 +813,7 @@ impl Wallet {
 
                 // Outgoing (approximate): compare prev_owner_addr; counterparty from one_time_pk bytes
                 if prev_owner_addr == self.address {
-                    let recipient_addr = crypto::address_from_bytes(&spend.to.one_time_pk);
+                    let recipient_addr = crypto::blake3_hash(&spend.to.one_time_pk);
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,

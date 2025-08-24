@@ -226,3 +226,31 @@ You can print your Peer ID with `peer-id` and share a multiaddr if `net.public_i
 - PoW: Argon2id (memory‑hard), lanes locked by consensus
 - Persistence: RocksDB with column families tuned for this workload
 
+-----
+
+How the transfers/ `lock_hash`  on code level:
+
+
+
+- Paycode generation
+  - `unchained stealth-address` prints a base64 doc with `recipient_addr` and Kyber PK (`wallet.export_stealth_address()`).
+- Sending with paycode
+  - `unchained send --paycode <code> --amount 2` calls `wallet.send_with_paycode_and_note(...)`.
+  - The paycode is parsed to `(recipient_addr, receiver_kyber_pk)`.
+  - Inputs are selected to cover the requested amount (`select_inputs(2)`). Since each coin has `value = 1` (`CoinCandidate::new` hardcodes 1), exactly two coins are chosen.
+  - For each input coin:
+    - Encapsulate to receiver’s Kyber PK → derive `shared`, `ct`.
+    - Derive deterministic OTP bytes and view tag; compute `next_lock_hash`.
+    - Build `ReceiverLockCommitment` and a V3 hashlock `Spend` with `commitment = H(kyber_ct)`.
+    - Enforce `commitment_id_v1` deterministically and mark it used in `apply()`.
+    - Nullifier is checked with new-or-legacy scheme.
+    - `spend.apply(&store)` updates sender’s local DB immediately, then gossips.
+- Balances update correctly
+  - Sender (wallet 2): After local `apply()`, the coins now have a recorded spend not addressed to the sender, so they are excluded from `wallet.balance()` → decreased by 2.
+  - Receiver (wallet 1): On spend gossip, `scan_spend_for_me()` confirms with `is_for_receiver()` and indexes. `wallet.balance()`:
+    - If the coin is present, it credits `coin.value` for spends addressed to receiver.
+    - If coin not yet synced, it still credits from `spend.to.amount_le` via the spend CF fallback.
+    - Result: increased by 2.
+
+- Preconditions: wallet 2 has ≥ 2 unspent coins; nodes are reasonably synced; network accepts the spends.
+- Multiple coins are sent as multiple spends (no change output or merging), which matches value=1 coin model.

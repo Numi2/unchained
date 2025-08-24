@@ -93,6 +93,7 @@ fn try_publish_gossip(
         let is_insufficient = es.contains("InsufficientPeers")
             || es.contains("InsufficientPeersForTopic")
             || es.contains("NoPeersSubscribedToTopic");
+        if context == "epoch-leaves" && es.contains("AllQueuesFull") { return; }
         if !is_insufficient {
             eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
@@ -386,6 +387,8 @@ enum NetworkCommand {
     RequestCoinProof([u8; 32]),
     RequestEpochTxn(EpochGetTxn),
     RequestEpochLeaves(u64),
+    // Send epoch-selected request for a specific epoch (queued + retried)
+    RequestEpochSelected(u64),
     GossipEpochLeaves(EpochLeavesBundle),
     // removed commitment gossip
 }
@@ -436,7 +439,7 @@ pub async fn spawn(
         .validation_mode(gossipsub::ValidationMode::Strict)
         .mesh_n_low(2)
         .mesh_outbound_min(1)
-        .mesh_n(6)
+        .mesh_n(12)
         .mesh_n_high(102)
         .flood_publish(true)
         .max_transmit_size(12 * 1024 * 1024) // 2 MiB cap
@@ -1096,6 +1099,7 @@ pub async fn spawn(
                                     NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
                                     NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
+                                    NetworkCommand::RequestEpochSelected(epoch) => (TOP_EPOCH_SELECTED_REQUEST, bincode::serialize(&epoch).ok()),
                                     NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
                                     NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                                     // commitment gossip removed
@@ -1645,9 +1649,8 @@ pub async fn spawn(
                                             if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                 if !map.contains_key(&coin.id) {
-                                                    if let Ok(data) = bincode::serialize(&coin.id) {
-                                                        try_publish_gossip(&mut swarm, TOP_SPEND_REQUEST, data, "spend-req");
-                                                    }
+                                                    // Route via queue for retry/backoff
+                                                    let _ = command_tx.send(NetworkCommand::RequestSpend(coin.id));
                                                     map.insert(coin.id, now);
                                                 }
                                             }
@@ -1756,10 +1759,8 @@ pub async fn spawn(
                                                 if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                     if !map.contains_key(&coin_id) {
-                                                        // Ask peers for their latest spend for this coin
-                                                        if let Ok(data) = bincode::serialize(&coin_id) {
-                                                            try_publish_gossip(&mut swarm, TOP_SPEND_REQUEST, data, "spend-req");
-                                                        }
+                                                        // Ask peers via queue for retry/backoff
+                                                        let _ = command_tx.send(NetworkCommand::RequestSpend(coin_id));
                                                         map.insert(coin_id, now);
                                                     }
                                                 }
@@ -1773,9 +1774,7 @@ pub async fn spawn(
                                                 if let Ok(mut map) = RECENT_COIN_REQS.lock() {
                                                     map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                     if !map.contains_key(&coin_id) {
-                                                        if let Ok(data) = bincode::serialize(&coin_id) {
-                                                            try_publish_gossip(&mut swarm, TOP_COIN_REQUEST, data, "coin-req");
-                                                        }
+                                                        let _ = command_tx.send(NetworkCommand::RequestCoin(coin_id));
                                                         map.insert(coin_id, now);
                                                     }
                                                 }
@@ -1985,15 +1984,13 @@ pub async fn spawn(
                                                         // Construct a minimal confirmed Coin using stored selection and known creator later via gossip
                                                         // We cannot reconstruct creator_pk; skip reconstruction here.
                                                         // Ask peers for selected ids as a hint to prompt them to gossip the coin to us
-                                                        if let Ok(bytes) = bincode::serialize(&epoch_num) {
-                                                            try_publish_gossip(&mut swarm, TOP_EPOCH_SELECTED_REQUEST, bytes, "epoch-selected-req");
-                                                        }
+                                                        // Route via queue for retry/backoff instead of direct publish
+                                                        let _ = command_tx.send(NetworkCommand::RequestEpochSelected(epoch_num));
                                                     }
                                                 }
                                                 // Send a proof request; peers serving proofs include the Coin in the response
-                                                if let Ok(req) = bincode::serialize(&CoinProofRequest{ coin_id: id }) {
-                                                    try_publish_gossip(&mut swarm, TOP_COIN_PROOF_REQUEST, req, "coin-proof-req");
-                                                }
+                                                // Send via queue to benefit from retry
+                                                let _ = command_tx.send(NetworkCommand::RequestCoinProof(id));
                                             }
                                         }
                                     }
@@ -2198,6 +2195,7 @@ pub async fn spawn(
                             NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
                             NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
                             NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
+                            NetworkCommand::RequestEpochSelected(epoch) => (TOP_EPOCH_SELECTED_REQUEST, bincode::serialize(&epoch).ok()),
                             NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
                             NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                         };
@@ -2211,6 +2209,23 @@ pub async fn spawn(
                 },
                 Some(command) = command_rx.recv() => {
                     match &command {
+                        NetworkCommand::RequestEpochSelected(epoch_num) => {
+                            // Dedup: avoid spamming same epoch within short window
+                            let now = std::time::Instant::now();
+                            if let Ok(mut map) = RECENT_LEAVES_REQS.lock() {
+                                // Reuse leaves-req map to dedup epoch selected-requests with same TTL
+                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                                if !map.contains_key(epoch_num) {
+                                    if let Ok(data) = bincode::serialize(epoch_num) {
+                                        if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_SELECTED_REQUEST), data).is_err() {
+                                            pending_commands.push_back(command);
+                                        } else {
+                                            map.insert(*epoch_num, now);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         NetworkCommand::RequestEpoch(n) => {
                             let now = std::time::Instant::now();
                             if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
@@ -2370,6 +2385,7 @@ impl Network {
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }
     pub async fn request_coin_proof(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoinProof(id)); }
+    pub async fn request_epoch_selected(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochSelected(epoch_num)); }
     pub async fn request_epoch_txn(&self, epoch_hash: [u8;32], indexes: Vec<u32>) {
         let req = EpochGetTxn { epoch_hash, indexes };
         let _ = self.command_tx.send(NetworkCommand::RequestEpochTxn(req));

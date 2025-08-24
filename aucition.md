@@ -1,4 +1,4 @@
-Here’s the simplest viable path: a non-custodial CLOB with atomic, hashlock-based settlement. No new scripting language. One small consensus change.
+a non-custodial CLOB with atomic, hashlock-based settlement. 
 
 Goal
 
