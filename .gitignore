@@ -9,10 +9,17 @@ test_stealth_address.txt
 .test_chain_data
 .cargo
 aucition.md
+config.send-test.toml
+
+decode_coins
+paycode.txt
+v3.md
+
 # Blockchain data
 blockchain_data/
 node_kyber.enc
 pq_identity.enc
+
 # Build artifacts
 target/
 **/*.rs.bk
@@ -21,22 +28,19 @@ target/
 .vscode/
 .idea/
 
-
 # OS files
 .DS_Store
 Thumbs.db
 notes.md
-config.send-test.tom
 y
-
 
 # Logs
 *.log
 
 # Temporary files
 tmp
-tmp.rs 
- 
+tmp.rs
+
 # Frontend build output
 ui-dist/
 todayswork.md
@@ -46,3 +50,4 @@ vr3.md
 pq_identity.enc
 node_kyber.enc
 peer_identity.key
+unchained-run.bat

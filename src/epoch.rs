@@ -506,8 +506,25 @@ impl Manager {
                             if let Err(e) = self.anchor_tx.send(anchor) {
                                 eprintln!("⚠️  Failed to broadcast anchor: {}", e);
                             }
-                            // Prune old candidates (keep only those for the NEW parent, i.e., current anchor hash)
-                            let _ = self.db.prune_old_candidates(&hash);
+                            // Prune candidates but keep a safety window of recent epoch hashes to support reorgs
+                            if let Some(latest) = self.db.get::<Anchor>("epoch", b"latest").ok().flatten() {
+                                let mut keep: Vec<[u8;32]> = Vec::new();
+                                // Keep the new parent (current hash) and recent window of parents
+                                keep.push(hash);
+                                // Walk back up to 127 previous anchors (total ~128 hashes kept)
+                                let mut n = latest.num;
+                                let mut walked: u64 = 0;
+                                while walked < 127 {
+                                    if n == 0 { break; }
+                                    if let Ok(Some(a)) = self.db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                                        keep.push(a.hash);
+                                    } else { break; }
+                                    if n == 0 { break; }
+                                    n = n.saturating_sub(1);
+                                    walked += 1;
+                                }
+                                let _ = self.db.prune_candidates_keep_hashes(&keep.iter().collect::<Vec<_>>().iter().map(|h| **h).collect::<Vec<[u8;32]>>());
+                            }
                             buffer.clear();
                             current_epoch += 1;
                         }
@@ -517,4 +534,56 @@ impl Manager {
             println!("✅ Epoch manager shutdown complete");
         });
     }
+}
+
+/// Select candidates for a specific epoch based on parent anchor and capacity
+/// This function is used during reorgs to reconstruct the selected set
+pub fn select_candidates_for_epoch(
+    db: &crate::storage::Store,
+    parent: &Anchor,
+    cap: usize,
+    _buffer: Option<&std::collections::HashSet<[u8; 32]>>,
+) -> (Vec<crate::coin::CoinCandidate>, usize) {
+    // Collect all candidates for this epoch based on parent anchor hash
+    let candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    };
+
+    // Enforce PoW difficulty from the parent anchor before selection
+    let mut selected: Vec<crate::coin::CoinCandidate> = if parent.difficulty > 0 {
+        candidates
+            .into_iter()
+            .filter(|c| c.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0))
+            .collect()
+    } else {
+        candidates
+    };
+
+    let total_candidates = selected.len();
+
+    // Select up to cap by smallest pow_hash, tie-break by coin_id for determinism
+    if selected.len() > cap {
+        if cap == 0 {
+            selected.clear();
+        } else {
+            // Partial select the k smallest to avoid full sort on large candidate sets
+            let _ = selected.select_nth_unstable_by(cap - 1, |a, b| a
+                .pow_hash
+                .cmp(&b.pow_hash)
+                .then_with(|| a.id.cmp(&b.id))
+            );
+            selected.truncate(cap);
+            // Now stable-sort the top-k deterministically for reproducibility across nodes
+            selected.sort_by(|a, b| a
+                .pow_hash
+                .cmp(&b.pow_hash)
+                .then_with(|| a.id.cmp(&b.id))
+            );
+        }
+    } else {
+        selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+    }
+
+    (selected, total_candidates)
 }

@@ -237,8 +237,9 @@ pub async fn spawn_headers_skeleton(
         }
     });
 
-    // Segment consumer: validate, fork-choice, store, update cursor
+    // Segment consumer: validate, fork-choice, store, update cursor, keep window full
     let db_headers = db.clone();
+    let range_tx_consumer = range_tx.clone();
     task::spawn(async move {
         loop {
             tokio::select! {
@@ -288,8 +289,22 @@ pub async fn spawn_headers_skeleton(
                             }
                             if let Some(tip) = seg.headers.last() {
                                 if db_headers.put("epoch", b"latest", tip).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                let (highest_req, mut highest_stored) = db_headers.get_headers_cursor().unwrap_or((0,0));
+                                let (mut highest_req, mut highest_stored) = db_headers.get_headers_cursor().unwrap_or((0,0));
                                 if tip.num > highest_stored { highest_stored = tip.num; let _ = db_headers.put_headers_cursor(highest_req, highest_stored); }
+                                // Keep the headers window full by enqueueing additional ranges beyond highest_requested
+                                // Target window parameters should mirror initial seeding
+                                let desired_ranges_in_flight: u64 = 24;
+                                let range_size: u64 = 2048;
+                                let desired_gap = desired_ranges_in_flight.saturating_mul(range_size);
+                                let mut outstanding = highest_req.saturating_sub(highest_stored);
+                                while outstanding < desired_gap {
+                                    let next_start = highest_req.saturating_add(1);
+                                    // Send and optimistically advance highest_requested cursor
+                                    let _ = range_tx_consumer.send(RangeTask{ start: next_start, count: range_size as u32 }).await;
+                                    highest_req = highest_req.saturating_add(range_size);
+                                    let _ = db_headers.put_headers_cursor(highest_req, highest_stored);
+                                    outstanding = highest_req.saturating_sub(highest_stored);
+                                }
                             }
                         }
                     }

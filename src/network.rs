@@ -1035,6 +1035,8 @@ pub async fn spawn(
         const PEER_ADDR_ADVERTISE_MIN_SECS: u64 = 60;
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
         let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
+        // Periodic retry timer to flush pending publishes even without connection events
+        let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(800));
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
@@ -2176,6 +2178,37 @@ pub async fn spawn(
                         },
                         _ => {}
                     }
+                },
+                // Periodically retry pending publishes to avoid stalls until a reconnect
+                _ = retry_timer.tick() => {
+                    // Only attempt retries if we have any connected peers
+                    let have_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
+                    if !have_peers || pending_commands.is_empty() { continue; }
+                    let mut still_pending = VecDeque::new();
+                    while let Some(cmd) = pending_commands.pop_front() {
+                        let (t, data) = match &cmd {
+                            NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
+                            NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
+                            NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                            NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
+                            NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
+                            NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
+                            NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
+                            NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
+                            NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
+                            NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                            NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
+                            NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
+                            NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
+                            NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
+                        };
+                        if let Some(d) = data {
+                            if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
+                                still_pending.push_back(cmd);
+                            }
+                        }
+                    }
+                    pending_commands = still_pending;
                 },
                 Some(command) = command_rx.recv() => {
                     match &command {

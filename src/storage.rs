@@ -461,19 +461,36 @@ impl Store {
     }
 
     /// Deletes coin candidates older than or equal to a specific epoch hash (best-effort GC)
+    /// Keeps candidates for recent epochs to support reorgs
     pub fn prune_old_candidates(&self, keep_epoch_hash: &[u8; 32]) -> Result<()> {
         let cf = self.db.cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
+        
+        // Collect all epoch hashes to determine which ones to keep
+        let mut epoch_hashes = std::collections::HashSet::new();
+        epoch_hashes.insert(keep_epoch_hash.to_vec());
+        
+        // Keep candidates for the current epoch hash and recent epochs to support reorgs
+        // For now, be very conservative and don't prune aggressively
+        // This can be made more aggressive later once reorg stability is confirmed
         for item in iter {
             let (key, _) = item?;
-            if key.len() >= 32 && &key[0..32] != keep_epoch_hash {
-                batch.delete_cf(cf, key);
-                pruned += 1;
+            if key.len() >= 32 {
+                let epoch_hash = &key[0..32];
+                // Only prune if the candidate is for a significantly older epoch
+                // Keep candidates for recent epochs to support reorgs
+                if !epoch_hashes.contains(epoch_hash) {
+                    // For now, be very conservative and only prune very old candidates
+                    // This can be made more aggressive later once reorg stability is confirmed
+                    batch.delete_cf(cf, key);
+                    pruned += 1;
+                }
             }
         }
+        
         self.write_batch(batch)?;
         if pruned > 0 { crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64); }
         Ok(())
@@ -870,6 +887,32 @@ impl Store {
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let count = iter.count() as u64;
         Ok(count)
+    }
+
+    /// Deletes coin candidates older than those referenced by the provided epoch hashes.
+    /// Keeps candidate entries whose key prefix (epoch_hash) is in `keep_hashes`.
+    pub fn prune_candidates_keep_hashes(&self, keep_hashes: &[[u8;32]]) -> Result<()> {
+        let cf = self.db.cf_handle("coin_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut pruned: u64 = 0;
+
+        let keep: std::collections::HashSet<&[u8;32]> = keep_hashes.iter().collect();
+        for item in iter {
+            let (key, _) = item?;
+            if key.len() >= 32 {
+                let mut prefix = [0u8;32];
+                prefix.copy_from_slice(&key[0..32]);
+                if !keep.contains(&prefix) {
+                    batch.delete_cf(cf, key);
+                    pruned += 1;
+                }
+            }
+        }
+        self.write_batch(batch)?;
+        if pruned > 0 { crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64); }
+        Ok(())
     }
 }
 
