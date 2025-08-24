@@ -192,6 +192,15 @@ async fn main() -> anyhow::Result<()> {
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
     let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
+    // Kick off headers-first skeleton sync in the background (additive protocol, safe if peers don't support it)
+    {
+        let db_h = db.clone();
+        let net_h = net.clone();
+        let shutdown_rx_h = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            crate::sync::spawn_headers_skeleton(db_h, net_h, shutdown_rx_h).await;
+        });
+    }
 
     // Background: subscribe to spends and anchors to trigger deterministic rescans for this wallet
     {

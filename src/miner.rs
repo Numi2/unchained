@@ -76,17 +76,28 @@ impl Miner {
     }
 
     async fn run(&mut self) {
-        // Wait until node is marked synced by main/sync services
+        // Wait until node is marked synced by main/sync services and local tip >= network tip
         loop {
-            let (synced, highest, local) = {
-                let (synced, highest) = self.sync_state.lock().map(|st| (st.synced, st.highest_seen_epoch)).unwrap_or((false, 0));
-                let local = self.db.get::<Anchor>("epoch", b"latest").unwrap_or(None).map_or(0, |a| a.num);
-                (synced, highest, local)
+            let (synced, highest, peer_confirmed, local) = {
+                let (synced, highest, peer_confirmed) = self
+                    .sync_state
+                    .lock()
+                    .map(|st| (st.synced, st.highest_seen_epoch, st.peer_confirmed_tip))
+                    .unwrap_or((false, 0, false));
+                let local = self
+                    .db
+                    .get::<Anchor>("epoch", b"latest")
+                    .unwrap_or(None)
+                    .map_or(0, |a| a.num);
+                (synced, highest, peer_confirmed, local)
             };
 
-            if synced { miner_routine!("🚀 Node is synced – starting mining"); break; }
+            if synced && highest > 0 && local >= highest && peer_confirmed {
+                miner_routine!("🚀 Node is fully synced – starting mining");
+                break;
+            }
 
-            miner_routine!("⌛ Waiting to reach network tip… local {local} / net {highest}");
+            miner_routine!("⌛ Waiting to reach network tip… local {} / net {} (peer-confirmed: {})", local, highest, peer_confirmed);
             tokio::select! {
                 _ = self.shutdown_rx.recv() => { println!("🛑 Miner received shutdown while waiting for sync"); return; }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}

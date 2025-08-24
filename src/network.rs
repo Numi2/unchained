@@ -1249,7 +1249,7 @@ pub async fn spawn(
                                                             // Ask peers for the authoritative sorted leaves so we can serve proofs
                                                             let now = std::time::Instant::now();
                                                             if let Ok(mut map) = RECENT_LEAVES_REQS.lock() {
-                                                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
+                                                                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(5));
                                                                 if !map.contains_key(&a.num) {
                                                                     if let Ok(bytes) = bincode::serialize(&a.num) {
                                                                         try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES_REQUEST, bytes, "epoch-leaves-req");

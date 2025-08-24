@@ -193,7 +193,8 @@ pub async fn spawn_headers_skeleton(
     mut shutdown_rx: Receiver<()>,
 ) {
     let (range_tx, range_rx) = mpsc::channel::<RangeTask>(256);
-    let (seg_tx, mut seg_rx) = mpsc::channel::<HeaderSegment>(64);
+    // Increase capacity to handle more concurrent header responses
+    let (seg_tx, mut seg_rx) = mpsc::channel::<HeaderSegment>(512);
     let _workers = 3usize;
 
     // Fetch workers
@@ -291,11 +292,13 @@ pub async fn spawn_headers_skeleton(
     // Seed ranges based on cursor
     let (_req, stored) = db.get_headers_cursor().unwrap_or((0,0));
     let start = if stored == 0 { 0 } else { stored + 1 };
-    // Request a wider window to saturate network
+    // Request a much wider window and more ranges in flight to accelerate initial catch-up
     let mut s = start;
-    for _ in 0..8u32 { // 8 ranges in flight
-        let _ = range_tx.send(RangeTask{ start: s, count: 512 }).await;
-        s = s.saturating_add(512);
+    let ranges_in_flight: u32 = 24; // previously 8
+    let range_size: u32 = 2048;     // previously 512
+    for _ in 0..ranges_in_flight {
+        let _ = range_tx.send(RangeTask{ start: s, count: range_size }).await;
+        s = s.saturating_add(range_size as u64);
     }
 }
 

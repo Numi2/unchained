@@ -256,12 +256,18 @@ impl Manager {
                         crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
                     },
                     _ = ticker.tick() => {
-                        // When bootstrap peers are configured, avoid producing epochs until we have a peer-confirmed tip.
+                        // When bootstrap peers are configured, strictly avoid producing epochs until fully synced with peers.
                         if !self.net_cfg.bootstrap.is_empty() {
-                            let peer_confirmed = self.sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
-                            if !peer_confirmed {
+                            let (synced, highest_seen, peer_confirmed) = self
+                                .sync_state
+                                .lock()
+                                .map(|s| (s.synced, s.highest_seen_epoch, s.peer_confirmed_tip))
+                                .unwrap_or((false, 0, false));
+                            let local_latest = self.db.get::<Anchor>("epoch", b"latest").unwrap_or(None).map(|a| a.num).unwrap_or(0);
+                            let fully_caught_up = local_latest >= highest_seen && highest_seen > 0;
+                            if !(synced && fully_caught_up && peer_confirmed) {
+                                // Keep requesting latest and fast-forward our cursor to any newly stored tip
                                 self.net.request_latest_epoch().await;
-                                // Also fast-forward our cursor to network-observed latest if we have it
                                 if current_epoch > 0 {
                                     if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
                                         if latest_anchor.num >= current_epoch {
@@ -269,7 +275,10 @@ impl Manager {
                                         }
                                     }
                                 }
-                                println!("⏳ Waiting for peer confirmation before producing epoch {}", current_epoch);
+                                println!(
+                                    "⏳ Waiting for full sync before producing: local={}, network={}, peer-confirmed={}",
+                                    local_latest, highest_seen, peer_confirmed
+                                );
                                 continue;
                             }
                         }
