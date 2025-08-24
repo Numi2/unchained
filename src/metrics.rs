@@ -3,7 +3,7 @@ use bytes::Bytes;
 use hyper::{Body, Request as HRequest, Response as HResponse, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use once_cell::sync::Lazy;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static LOG_BUS: Lazy<LogBus> = Lazy::new(LogBus::new);
 
-const LOG_BUFFER_CAPACITY: usize = 1000;
+const LOG_BUFFER_CAPACITY: usize = 200;
+const INITIAL_SNAPSHOT_LINES: usize = 100;
+const FLUSH_INTERVAL_SECS: u64 = 5;
 
 struct LogBus {
     buffer: Mutex<VecDeque<String>>,
@@ -49,53 +51,172 @@ fn log_line(kind: &str, name: &str, msg: String) {
     LOG_BUS.push(format!("{} [{}] {}: {}", now_millis(), kind, name, msg));
 }
 
+#[derive(Clone, Copy, Default)]
+struct HistAgg {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+struct MetricsAggregator {
+    hist: Mutex<HashMap<&'static str, HistAgg>>, // per-interval histogram stats
+    counters_last: Mutex<HashMap<&'static str, u64>>, // last flushed absolute counter values
+}
+
+impl MetricsAggregator {
+    fn new() -> Self {
+        Self { hist: Mutex::new(HashMap::new()), counters_last: Mutex::new(HashMap::new()) }
+    }
+
+    fn record_hist(&self, name: &'static str, value: f64) {
+        if let Ok(mut map) = self.hist.lock() {
+            let entry = map.entry(name).or_insert_with(|| HistAgg { count: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY });
+            entry.count = entry.count.saturating_add(1);
+            entry.sum += value;
+            if value < entry.min { entry.min = value; }
+            if value > entry.max { entry.max = value; }
+        }
+    }
+
+    fn build_snapshot_and_reset(&self) -> String {
+        use std::sync::atomic::Ordering;
+
+        // Gauges (absolute)
+        let gauges: [(&'static str, i64); 6] = [
+            ("unchained_peer_count", PEERS.value.load(Ordering::Relaxed)),
+            ("unchained_epoch_height", EPOCH_HEIGHT.value.load(Ordering::Relaxed)),
+            ("unchained_candidate_coins", CANDIDATE_COINS.value.load(Ordering::Relaxed)),
+            ("unchained_selected_coins", SELECTED_COINS.value.load(Ordering::Relaxed)),
+            ("unchained_orphan_buffer_len", ORPHAN_BUFFER_LEN.value.load(Ordering::Relaxed)),
+            ("unchained_selection_threshold_u64", SELECTION_THRESHOLD_U64.value.load(Ordering::Relaxed)),
+        ];
+
+        // Counters (delta since last flush)
+        let mut counters_last_guard = self.counters_last.lock().ok();
+        let mut counters_delta: Vec<(&'static str, u64)> = Vec::new();
+        macro_rules! counter_delta {
+            ($name:expr, $static_counter:ident) => {{
+                let current = $static_counter.value.load(Ordering::Relaxed);
+                let last = counters_last_guard.as_ref().and_then(|m| m.get($name).copied()).unwrap_or(0);
+                let delta = current.saturating_sub(last);
+                if let Some(ref mut map) = counters_last_guard { map.insert($name, current); }
+                if delta > 0 { counters_delta.push(($name, delta)); }
+            }};
+        }
+        counter_delta!("unchained_coin_proofs_served_total", PROOFS_SERVED);
+        counter_delta!("unchained_validation_failures_anchor_total", VALIDATION_FAIL_ANCHOR);
+        counter_delta!("unchained_validation_failures_coin_total", VALIDATION_FAIL_COIN);
+        counter_delta!("unchained_validation_failures_transfer_total", VALIDATION_FAIL_TRANSFER);
+        counter_delta!("unchained_v3_sends_total", V3_SENDS);
+        counter_delta!("unchained_legacy_upgrades_total", LEGACY_UPGRADES);
+        counter_delta!("unchained_db_write_failures_total", DB_WRITE_FAILS);
+        counter_delta!("unchained_pruned_candidates_total", PRUNED_CANDIDATES);
+        counter_delta!("unchained_mining_attempts_total", MINING_ATTEMPTS);
+        counter_delta!("unchained_mining_solutions_total", MINING_FOUND);
+        counter_delta!("unchained_alt_fork_events_total", ALT_FORK_EVENTS);
+        counter_delta!("unchained_compact_epochs_sent_total", COMPACT_EPOCHS_SENT);
+        counter_delta!("unchained_compact_epochs_received_total", COMPACT_EPOCHS_RECV);
+        counter_delta!("unchained_compact_tx_requests_total", COMPACT_TX_REQ);
+        counter_delta!("unchained_compact_tx_responses_total", COMPACT_TX_RESP);
+        counter_delta!("unchained_headers_batches_received_total", HEADERS_BATCH_RECV);
+        counter_delta!("unchained_headers_anchors_stored_total", HEADERS_ANCHORS_STORED);
+        counter_delta!("unchained_headers_invalid_total", HEADERS_INVALID);
+        counter_delta!("unchained_compact_fallbacks_total", COMPACT_FALLBACKS);
+
+        // Histograms (stats for the last interval)
+        let hist = self.hist.lock().ok();
+        let taken_hist = if let Some(mut guard) = hist { std::mem::take(&mut *guard) } else { HashMap::new() };
+
+        // Build compact JSON string
+        let mut out = String::new();
+        out.push_str("{");
+        out.push_str("\"ts\":");
+        out.push_str(&now_millis().to_string());
+
+        // Gauges
+        out.push_str(",\"gauges\":{");
+        for (idx, (name, val)) in gauges.iter().enumerate() {
+            if idx > 0 { out.push(','); }
+            out.push_str("\""); out.push_str(name); out.push_str("\":"); out.push_str(&val.to_string());
+        }
+        out.push('}');
+
+        // Counters (only non-zero deltas)
+        out.push_str(",\"counters_delta\":{");
+        for (idx, (name, delta)) in counters_delta.iter().enumerate() {
+            if idx > 0 { out.push(','); }
+            out.push_str("\""); out.push_str(name); out.push_str("\":"); out.push_str(&delta.to_string());
+        }
+        out.push('}');
+
+        // Histograms
+        out.push_str(",\"histograms\":{");
+        let mut wrote_any = false;
+        for (name, agg) in taken_hist.iter() {
+            if agg.count == 0 { continue; }
+            if wrote_any { out.push(','); } else { wrote_any = true; }
+            let avg = if agg.count > 0 { agg.sum / (agg.count as f64) } else { 0.0 };
+            out.push_str("\""); out.push_str(name); out.push_str("\":{");
+            out.push_str("\"count\":"); out.push_str(&agg.count.to_string()); out.push(',');
+            out.push_str("\"avg\":"); out.push_str(&format!("{:.3}", avg)); out.push(',');
+            out.push_str("\"min\":"); out.push_str(&format!("{:.3}", agg.min)); out.push(',');
+            out.push_str("\"max\":"); out.push_str(&format!("{:.3}", agg.max));
+            out.push('}');
+        }
+        out.push('}');
+
+        out.push('}');
+        out
+    }
+}
+
+static AGGREGATOR: Lazy<MetricsAggregator> = Lazy::new(MetricsAggregator::new);
+
 pub struct IntGauge {
-    name: &'static str,
-    description: &'static str,
+    _name: &'static str,
+    _description: &'static str,
     value: std::sync::atomic::AtomicI64,
 }
 
 impl IntGauge {
     pub fn new(name: &'static str, description: &'static str) -> std::result::Result<Self, ()> {
-        Ok(Self { name, description, value: std::sync::atomic::AtomicI64::new(0) })
+        Ok(Self { _name: name, _description: description, value: std::sync::atomic::AtomicI64::new(0) })
     }
     pub fn set(&self, val: i64) {
         self.value.store(val, std::sync::atomic::Ordering::Relaxed);
-        log_line("gauge", self.name, format!("set {} ({})", val, self.description));
     }
 }
 
 pub struct IntCounter {
-    name: &'static str,
-    description: &'static str,
+    _name: &'static str,
+    _description: &'static str,
     value: std::sync::atomic::AtomicU64,
 }
 
 impl IntCounter {
     pub fn new(name: &'static str, description: &'static str) -> std::result::Result<Self, ()> {
-        Ok(Self { name, description, value: std::sync::atomic::AtomicU64::new(0) })
+        Ok(Self { _name: name, _description: description, value: std::sync::atomic::AtomicU64::new(0) })
     }
     pub fn inc(&self) {
-        let v = self.value.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        log_line("counter", self.name, format!("inc -> {} ({})", v, self.description));
+        let _v = self.value.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     }
     pub fn inc_by(&self, by: u64) {
-        let v = self.value.fetch_add(by, std::sync::atomic::Ordering::Relaxed) + by;
-        log_line("counter", self.name, format!("inc_by {} -> {} ({})", by, v, self.description));
+        let _v = self.value.fetch_add(by, std::sync::atomic::Ordering::Relaxed) + by;
     }
 }
 
 pub struct Histogram {
     name: &'static str,
-    description: &'static str,
+    _description: &'static str,
 }
 
 impl Histogram {
     pub fn new(name: &'static str, description: &'static str) -> Self {
-        Self { name, description }
+        Self { name, _description: description }
     }
     pub fn observe(&self, value: f64) {
-        log_line("histogram", self.name, format!("observe {:.3} ({})", value, self.description));
+        AGGREGATOR.record_hist(self.name, value);
     }
 }
 
@@ -156,6 +277,15 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
             }
         };
         listener.set_nonblocking(true).ok();
+        // Periodic, compact metrics snapshot
+        tokio::spawn(async move {
+            use tokio::time::{sleep, Duration};
+            loop {
+                sleep(Duration::from_secs(FLUSH_INTERVAL_SECS)).await;
+                let snapshot = AGGREGATOR.build_snapshot_and_reset();
+                log_line("metrics", "snapshot", snapshot);
+            }
+        });
 
         let service = make_service_fn(|_conn| async move {
             Ok::<_, std::convert::Infallible>(service_fn(|req: HRequest<Body>| async move {
@@ -164,7 +294,9 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
                     let (mut tx, body) = Body::channel();
                     let mut rx = LOG_BUS.tx.subscribe();
                     // Send current snapshot first
-                    let snapshot = LOG_BUS.snapshot();
+                    let mut snapshot = LOG_BUS.snapshot();
+                    let start = snapshot.len().saturating_sub(INITIAL_SNAPSHOT_LINES);
+                    let snapshot = snapshot.split_off(start);
                     // Send in a separate task to keep the response return non-blocking
                     tokio::spawn(async move {
                         // Helper to send one event line
@@ -205,6 +337,5 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
         }
     });
 
-    eprintln!("🖥  Real-time logs available via SSE at http://{}/logs", cfg.bind);
     Ok(())
 }

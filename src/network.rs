@@ -225,18 +225,6 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     if anchor.hash == [0u8; 32] { return Err("Anchor hash cannot be zero".into()); }
     if anchor.difficulty == 0 { return Err("Difficulty cannot be zero".into()); }
     if anchor.mem_kib == 0 { return Err("Memory cannot be zero".into()); }
-    // Special-case genesis: no previous anchor exists. Validate self-consistency only.
-    if anchor.num == 0 {
-        // Check cumulative work matches expected for the given difficulty
-        let expected = Anchor::expected_work_for_difficulty(anchor.difficulty);
-        if anchor.cumulative_work != expected { return Err("Genesis cumulative_work mismatch".into()); }
-        // Recompute hash = blake3(merkle_root)
-        let mut h = blake3::Hasher::new();
-        h.update(&anchor.merkle_root);
-        let recomputed = *h.finalize().as_bytes();
-        if recomputed != anchor.hash { return Err("Genesis hash mismatch".into()); }
-        return Ok(());
-    }
     if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 { return Err("Merkle root cannot be zero when coins are present".into()); }
     if anchor.num == 0 {
         // Enforce consensus-locked parameters for genesis
@@ -1041,6 +1029,7 @@ pub async fn spawn(
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
         let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
         // Periodic retry timer to flush pending publishes even without connection events
+        const MAX_PENDING_COMMANDS: usize = 10_000;
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(800));
         loop {
             tokio::select! {
@@ -1078,8 +1067,9 @@ pub async fn spawn(
                                     }
                                     // Rate-limit our advertisement to avoid causing reciprocal dial storms
                                     if Instant::now().duration_since(last_peer_addr_advertise) > std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS) {
-                                        if let Ok(data) = bincode::serialize(&addr) {
-                                            try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                        if bincode::serialize(&addr).is_ok() {
+                                            // Route peer-addr advertisement via queue for uniform retry/backoff
+                                            let _ = command_tx.send(NetworkCommand::GossipRateLimited(RateLimitedMessage{ content: addr.clone() }));
                                         }
                                         last_peer_addr_advertise = Instant::now();
                                     }
@@ -1260,9 +1250,7 @@ pub async fn spawn(
                                                                     net_log!("🪙 Confirmed {} coins for adopted epoch {}", selected_ids.len(), a.num);
                                                                     // Proactively gossip epoch leaves to help peers serve proofs
                                                                     let bundle = EpochLeavesBundle { epoch_num: a.num, merkle_root: a.merkle_root, leaves: leaves.clone() };
-                                                                    if let Ok(data) = bincode::serialize(&bundle) {
-                                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
-                                                                    }
+                                                                    let _ = command_tx.send(NetworkCommand::GossipEpochLeaves(bundle));
                                                                 }
                                                             }
                                                         } else {
@@ -1271,9 +1259,7 @@ pub async fn spawn(
                                                             if let Ok(mut map) = RECENT_LEAVES_REQS.lock() {
                                                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(5));
                                                                 if !map.contains_key(&a.num) {
-                                                                    if let Ok(bytes) = bincode::serialize(&a.num) {
-                                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES_REQUEST, bytes, "epoch-leaves-req");
-                                                                    }
+                                                                    let _ = command_tx.send(NetworkCommand::RequestEpochLeaves(a.num));
                                                                     map.insert(a.num, now);
                                                                 }
                                                             }
@@ -1879,9 +1865,7 @@ pub async fn spawn(
                                                     if let Ok(mut map) = RECENT_SPEND_REQS.lock() {
                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                         if !map.contains_key(&coin_id) {
-                                                            if let Ok(data) = bincode::serialize(&coin_id) {
-                                                                try_publish_gossip(&mut swarm, TOP_SPEND_REQUEST, data, "spend-req");
-                                                            }
+                                                            let _ = command_tx.send(NetworkCommand::RequestSpend(coin_id));
                                                             map.insert(coin_id, now);
                                                         }
                                                     }
@@ -1893,9 +1877,7 @@ pub async fn spawn(
                                                     if let Ok(mut map) = RECENT_COIN_REQS.lock() {
                                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
                                                         if !map.contains_key(&coin_id) {
-                                                            if let Ok(data) = bincode::serialize(&coin_id) {
-                                                                try_publish_gossip(&mut swarm, TOP_COIN_REQUEST, data, "coin-req");
-                                                            }
+                                                            let _ = command_tx.send(NetworkCommand::RequestCoin(coin_id));
                                                             map.insert(coin_id, now);
                                                         }
                                                     }
@@ -2129,9 +2111,7 @@ pub async fn spawn(
                                     if let Ok(Some(leaves)) = db.get_epoch_leaves(epoch_num) {
                                         if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                                             let bundle = EpochLeavesBundle { epoch_num, merkle_root: anchor.merkle_root, leaves };
-                                            if let Ok(data) = bincode::serialize(&bundle) {
-                                                try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
-                                            }
+                                            let _ = command_tx.send(NetworkCommand::GossipEpochLeaves(bundle));
                                         }
                                     } else {
                                         // No leaves yet: attempt to reconstruct from selected index
@@ -2142,9 +2122,7 @@ pub async fn spawn(
                                                 let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                                 if computed_root == anchor.merkle_root {
                                                     let bundle = EpochLeavesBundle { epoch_num, merkle_root: anchor.merkle_root, leaves };
-                                                    if let Ok(data) = bincode::serialize(&bundle) {
-                                                        try_publish_gossip(&mut swarm, TOP_EPOCH_LEAVES, data, "epoch-leaves");
-                                                    }
+                                                    let _ = command_tx.send(NetworkCommand::GossipEpochLeaves(bundle));
                                                 }
                                             }
                                         }
@@ -2157,7 +2135,10 @@ pub async fn spawn(
                                                 if ids.len() as u32 != anchor2.coin_count { continue; }
                                                 let response = SelectedIdsBundle { epoch_num, merkle_root: anchor2.merkle_root, coin_ids: ids };
                                                 if let Ok(data) = bincode::serialize(&response) {
-                                                    try_publish_gossip(&mut swarm, TOP_EPOCH_SELECTED_RESPONSE, data, "epoch-selected");
+                                                    if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_SELECTED_RESPONSE), data).is_err() {
+                                                        // Selected response is rare; if publish fails, requeue request instead of response
+                                                        let _ = command_tx.send(NetworkCommand::RequestEpochSelected(epoch_num));
+                                                    }
                                                 }
                                             }
                                         }
@@ -2234,8 +2215,26 @@ pub async fn spawn(
                             NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                         };
                         if let Some(d) = data {
-                            if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
-                                still_pending.push_back(cmd);
+                            match swarm.behaviour_mut().publish(IdentTopic::new(t), d) {
+                                Ok(_msg_id) => {}
+                                Err(e) => {
+                                    let es = e.to_string();
+                                    let transient = es.contains("AllQueuesFull")
+                                        || es.contains("InsufficientPeers")
+                                        || es.contains("InsufficientPeersForTopic")
+                                        || es.contains("NoPeersSubscribedToTopic");
+                                    if transient {
+                                        if still_pending.len() < MAX_PENDING_COMMANDS {
+                                            still_pending.push_back(cmd);
+                                        } else {
+                                            net_log!("⚠️ pending_commands full ({}), dropping oldest", MAX_PENDING_COMMANDS);
+                                            let _ = still_pending.pop_front();
+                                            still_pending.push_back(cmd);
+                                        }
+                                    } else {
+                                        eprintln!("⚠️  publish error (non-transient): {}", es);
+                                    }
+                                }
                             }
                         }
                     }
