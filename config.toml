@@ -21,10 +21,10 @@ sync_timeout_secs = 1800
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 bootstrap = [ "/ip4/34.51.215.84/udp/31000/quic-v1/p2p/12D3KooWJhgAAXunyAP7N4F3bJrp9kofgAsuapmXpofCzRb7ugUM",
-              "/ip4/34.174.0.192/udp/31000/quic-v1/p2p/12D3KooWKt5kcwVA6SkDUmMGfmr3ouS9ydhHHgYPzSzuYHuvrhJg", 
+              "/ip4/34.51.215.814/udp/31000/quic-v1/p2p/12D3KooWKt5kcwVA6SkDUmMGfmr3ouS9ydhHHgYPzSzuYHuvrhJg", 
               "/ip4/104.154.156.231/udp/31000/quic-v1/p2p/12D3KooWJLSZi2KFZqKAw75rEm8TjGBhTpuZWpueXtAwZRbfAdwL",
               "/ip4/34.79.121.91/udp/31000/quic-v1/p2p/12D3KooWHnSAm1zzKUMGUH96YDgKQ9eptjLGK1VLJ2KUv2XAx2ob", 
-              "/ip4/34.174.127.124/udp/31000/quic-v1/p2p/12D3KooWLRWnLAT4QadiMEJd5dbeUJXN8ShSx8LGCrH4jN8p1AdG" ]
+              "/ip4/104.154.156.231/udp/31000/quic-v1/p2p/12D3KooWLRWnLAT4QadiMEJd5dbeUJXN8ShSx8LGCrH4jN8p1AdG" ]
 
 
 [p2p]
