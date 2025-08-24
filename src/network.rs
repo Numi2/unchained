@@ -522,8 +522,8 @@ pub async fn spawn(
     let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
-    const MAX_ORPHAN_ANCHORS: usize = 2048;
-    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 1024; // only buffer orphans within this distance of local tip
+    const MAX_ORPHAN_ANCHORS: usize = 6048;
+    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 5024; // only buffer orphans within this distance of local tip
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate coin fetch requests when we receive spends for unknown coins
