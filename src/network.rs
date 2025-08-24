@@ -497,7 +497,8 @@ pub async fn spawn(
     let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let (spend_tx, _) = broadcast::channel(1024);
-    let (anchor_tx, _) = broadcast::channel(256);
+    // Increase anchor broadcast capacity to reduce lag in consumers (e.g., miner)
+    let (anchor_tx, _) = broadcast::channel(4096);
     let (proof_tx, _) = broadcast::channel(256);
     // removed commitment channels
     let (rate_limited_tx, _) = broadcast::channel(64);

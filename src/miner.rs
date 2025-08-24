@@ -277,6 +277,9 @@ impl Miner {
                             if let Some(current_epoch) = self.current_epoch {
                                 println!("🔄 Requesting latest epoch to recover from lag");
                                 self.net.request_epoch(current_epoch).await;
+                                // Also request a small window around it in case multiple were missed
+                                let start = current_epoch.saturating_sub(4);
+                                for n in start..current_epoch { self.net.request_epoch(n).await; }
                                 
                                 // Wait a bit for the request to be processed
                                 time::sleep(Duration::from_millis(1000)).await;
