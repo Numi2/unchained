@@ -434,12 +434,12 @@ pub async fn spawn(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(std::time::Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .mesh_n_low(3)
+        .mesh_n_low(2)
         .mesh_outbound_min(1)
         .mesh_n(6)
-        .mesh_n_high(12)
+        .mesh_n_high(102)
         .flood_publish(true)
-        .max_transmit_size(2 * 1024 * 1024) // 2 MiB cap
+        .max_transmit_size(12 * 1024 * 1024) // 2 MiB cap
         .build()?;
         
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
