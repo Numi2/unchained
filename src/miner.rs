@@ -208,14 +208,13 @@ impl Miner {
                                 }
                             }
                             if !ours_prev.is_empty() {
-                                match self.db.get_selected_coin_ids_for_epoch(prev_epoch) {
+                                // Selection for candidates mined in prev_epoch is recorded under the current anchor number
+                                match self.db.get_selected_coin_ids_for_epoch(anchor.num) {
                                     Ok(selected_ids) => {
                                         let selected_set: std::collections::HashSet<[u8;32]> = selected_ids.into_iter().collect();
                                         for id in ours_prev {
                                             if selected_set.contains(&id) {
                                                 println!("🎉 Epoch #{} finalized: your coin {} was SELECTED", prev_epoch, hex::encode(id));
-                                            } else {
-                                                println!("ℹ️  Epoch #{} finalized: your coin {} was not selected", prev_epoch, hex::encode(id));
                                             }
                                             self.reported_candidates.insert(id);
                                         }

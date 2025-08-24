@@ -1260,7 +1260,6 @@ pub async fn spawn(
                                                                 }
                                                             }
                                                         } else {
-                                                            net_log!("ℹ️ Unable to reconstruct selected set for adopted epoch {} (root/count mismatch)", a.num);
                                                             // Ask peers for the authoritative sorted leaves so we can serve proofs
                                                             let now = std::time::Instant::now();
                                                             if let Ok(mut map) = RECENT_LEAVES_REQS.lock() {
