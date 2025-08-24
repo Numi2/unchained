@@ -223,6 +223,18 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     if anchor.hash == [0u8; 32] { return Err("Anchor hash cannot be zero".into()); }
     if anchor.difficulty == 0 { return Err("Difficulty cannot be zero".into()); }
     if anchor.mem_kib == 0 { return Err("Memory cannot be zero".into()); }
+    // Special-case genesis: no previous anchor exists. Validate self-consistency only.
+    if anchor.num == 0 {
+        // Check cumulative work matches expected for the given difficulty
+        let expected = Anchor::expected_work_for_difficulty(anchor.difficulty);
+        if anchor.cumulative_work != expected { return Err("Genesis cumulative_work mismatch".into()); }
+        // Recompute hash = blake3(merkle_root)
+        let mut h = blake3::Hasher::new();
+        h.update(&anchor.merkle_root);
+        let recomputed = *h.finalize().as_bytes();
+        if recomputed != anchor.hash { return Err("Genesis hash mismatch".into()); }
+        return Ok(());
+    }
     if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 { return Err("Merkle root cannot be zero when coins are present".into()); }
     if anchor.num == 0 {
         // Enforce consensus-locked parameters for genesis

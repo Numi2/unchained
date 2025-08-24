@@ -150,7 +150,19 @@ impl Miner {
                 miner_routine!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
                 self.current_epoch = Some(latest_anchor.num);
                 self.last_heartbeat = time::Instant::now();
-                if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
+                // Guard: do not mine if this local anchor is behind observed network tip
+                let behind_tip = self
+                    .sync_state
+                    .lock()
+                    .map(|st| st.highest_seen_epoch > 0 && latest_anchor.num < st.highest_seen_epoch)
+                    .unwrap_or(false);
+                if behind_tip {
+                    miner_routine!(
+                        "⏭️  Skipping initial mining at local #{} (network observed >= {})",
+                        latest_anchor.num,
+                        self.sync_state.lock().map(|st| st.highest_seen_epoch).unwrap_or(0)
+                    );
+                } else if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
                     eprintln!("⚠️  Initial mining attempt failed: {e}");
                 }
             },
@@ -323,6 +335,21 @@ impl Miner {
     async fn mine_epoch(&mut self, anchor: Anchor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Subscribe to anchor broadcasts so we can abort immediately when a newer epoch arrives.
         let mut live_anchor_rx = self.net.anchor_subscribe();
+
+        // Guard: if network tip is ahead of this anchor, skip mining this epoch
+        let (net_tip, _peer_confirmed) = self
+            .sync_state
+            .lock()
+            .map(|st| (st.highest_seen_epoch, st.peer_confirmed_tip))
+            .unwrap_or((0, false));
+        if net_tip > 0 && anchor.num < net_tip {
+            miner_routine!(
+                "⏭️  Skipping mining for stale epoch #{} (network tip {})",
+                anchor.num,
+                net_tip
+            );
+            return Ok(());
+        }
 
         let creator_address = self.wallet.address();
         let mem_kib = anchor.mem_kib;

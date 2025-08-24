@@ -269,6 +269,16 @@ pub async fn spawn_headers_skeleton(
                     if !ok { crate::metrics::HEADERS_INVALID.inc(); continue; }
 
                     let current_best = db_headers.get::<Anchor>("epoch", b"latest").ok().flatten();
+                    // If we have no local epochs yet, allow genesis header to be accepted to seed tip.
+                    if current_best.is_none() {
+                        if let Some(first) = seg.headers.first() {
+                            if first.num == 0 {
+                                let _ = db_headers.put("epoch", &0u64.to_le_bytes(), first);
+                                let _ = db_headers.put("anchor", &first.hash, first);
+                                let _ = db_headers.put("epoch", b"latest", first);
+                            }
+                        }
+                    }
                     if let Some(last) = seg.headers.last() {
                         if last.is_better_chain(&current_best) {
                             for a in &seg.headers {
