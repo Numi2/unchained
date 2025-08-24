@@ -100,8 +100,8 @@ fn calculate_retarget_params(recent_anchors: &[Anchor]) -> Params {
     let target_x = TARGET_COINS_PER_EPOCH.saturating_mul(PRECISION);
 
     // Difficulty step (±1 within bounds) based on bands
-    let upper = (target_x * RETARGET_UPPER_PCT) / 100;
-    let lower = (target_x * RETARGET_LOWER_PCT) / 100;
+    let upper = (target_x.saturating_mul(RETARGET_UPPER_PCT)) / 100;
+    let lower = (target_x.saturating_mul(RETARGET_LOWER_PCT)) / 100;
 
     let mut new_diff = if avg_coins_x > upper {
         last_params.difficulty.saturating_add(1)
@@ -206,7 +206,6 @@ mod tests {
             coin_count,
             cumulative_work: 0,
             mem_kib,
-            timestamp: 0,
         }
     }
 

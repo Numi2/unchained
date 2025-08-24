@@ -39,68 +39,9 @@ impl Anchor {
         }
     }
 
-    /// Expose retargeting as an associated function for tests/backwards compat
-    pub fn calculate_retarget(
-        recent_anchors: &[Anchor],
-        cfg: &crate::config::Epoch,
-        mining_cfg: &crate::config::Mining,
-    ) -> (usize, u32) {
-        crate::epoch::calculate_retarget(recent_anchors, cfg, mining_cfg)
-    }
 }
 
-pub fn calculate_retarget(
-    recent_anchors: &[Anchor], 
-    cfg: &crate::config::Epoch,
-    mining_cfg: &crate::config::Mining
-) -> (usize, u32) {
-        if recent_anchors.is_empty() {
-            return (cfg.target_leading_zeros, mining_cfg.mem_kib);
-        }
-        
-        let last_anchor = match recent_anchors.last() {
-            Some(a) => a,
-            None => return (cfg.target_leading_zeros, mining_cfg.mem_kib),
-        };
-        let total_coins: u64 = recent_anchors.iter().map(|a| a.coin_count as u64).sum();
-        let num_anchors = recent_anchors.len() as u64;
-
-        const PRECISION: u64 = 1_000_000;
-
-        let avg_coins_x_precision = (total_coins * PRECISION) / num_anchors;
-        let target_coins_x_precision = cfg.target_coins_per_epoch as u64 * PRECISION;
-
-         let new_difficulty = {
-            let current_difficulty = last_anchor.difficulty as u64;
-             let upper = (target_coins_x_precision * cfg.retarget_upper_pct / 100) as u64;
-             let lower = (target_coins_x_precision * cfg.retarget_lower_pct / 100) as u64;
-             let next = if avg_coins_x_precision > upper {
-                 current_difficulty + 1
-             } else if avg_coins_x_precision < lower {
-                 current_difficulty.saturating_sub(1)
-            } else {
-                 current_difficulty
-             } as usize;
-             next.clamp(cfg.difficulty_min, cfg.difficulty_max)
-        };
-        
-        let new_mem = {
-            let current_mem = last_anchor.mem_kib as u64;
-            let mem_adjustment_ratio_x_precision = if avg_coins_x_precision > 0 {
-                (target_coins_x_precision * PRECISION) / avg_coins_x_precision
-            } else {
-                PRECISION
-            };
-
-            let max_adj = (mining_cfg.max_memory_adjustment * PRECISION as f64) as u64;
-            let min_adj = (PRECISION as f64 / mining_cfg.max_memory_adjustment) as u64;
-            let clamped_ratio_x_precision = mem_adjustment_ratio_x_precision.clamp(min_adj, max_adj);
-
-            ((current_mem * clamped_ratio_x_precision) / PRECISION) as u32
-        };
-        
-        (new_difficulty, new_mem.clamp(mining_cfg.min_mem_kib, mining_cfg.max_mem_kib))
-    }
+    
 
 pub struct MerkleTree;
 impl MerkleTree {

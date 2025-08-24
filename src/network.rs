@@ -74,7 +74,7 @@ static PENDING_COMPACTS: Lazy<Mutex<std::collections::HashMap<[u8;32], (CompactE
 static RECENT_EPOCH_TX_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static EPOCH_TX_REQS_PER_PEER: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const EPOCH_TX_REQ_DEDUP_MS: u64 = 1000;
-const MAX_COMPACT_REQ_BATCH: usize = 64;
+const MAX_COMPACT_REQ_BATCH: usize = 132; // 132 is the max number of compact epochs that can be requested in a single batch
 const PENDING_COMPACT_TTL_SECS: u64 = 60;
 const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 20;
 const MAX_FULL_BODY_REQ_BATCH: usize = 256;
@@ -765,7 +765,7 @@ pub async fn spawn(
         }
 
         // Try to assemble a valid alternate branch from first_height..=max_buf_height using BFS across candidates
-        let mut chosen_chain: Vec<Anchor> = Vec::new();
+        let chosen_chain: Vec<Anchor>;
         let mut resolved_parent: Option<Anchor> = None;
         let parent_hashes: std::collections::HashSet<[u8; 32]> = parent_candidates.iter().map(|p| p.hash).collect();
         let mut back: std::collections::HashMap<[u8; 32], [u8; 32]> = std::collections::HashMap::new(); // child.hash -> parent.hash
@@ -811,7 +811,18 @@ pub async fn spawn(
             advanced = true;
         }
         if !advanced {
-            net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", first_height);
+            let now = std::time::Instant::now();
+            let mut allow_log = true;
+            if let Ok(mut map) = LAST_MISMATCH_LOGS.lock() {
+                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                if let Some(last) = map.get(&first_height) {
+                    if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                }
+                if allow_log { map.insert(first_height, now); }
+            }
+            if allow_log {
+                net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", first_height);
+            }
             if first_height > 0 {
                 let start = fork_height.saturating_sub(REORG_BACKFILL);
                 let end = first_height - 1;

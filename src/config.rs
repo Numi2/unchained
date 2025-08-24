@@ -61,7 +61,7 @@ pub struct Epoch {
     pub target_coins_per_epoch: u32,
     /// Hard cap of selected coins per epoch (consensus). If not specified,
     /// defaults to the same as target_coins_per_epoch.
-    #[serde(default = "default_target_coins")]
+    #[serde(default = "default_max_coins")]
     pub max_coins_per_epoch: u32,
     #[serde(default = "default_retarget_interval")]
     pub retarget_interval: u64,
@@ -148,8 +148,9 @@ fn default_bind() -> String { "127.0.0.1:9100".into() }
 fn default_auto_serve_commitments() -> bool { true }
 
 // Epoch retargeting defaults
-fn default_target_coins() -> u32 { 100 }
-fn default_retarget_interval() -> u64 { 10 }
+fn default_target_coins() -> u32 { 11 }
+fn default_max_coins() -> u32 { 111 }
+fn default_retarget_interval() -> u64 { 2000 }
 fn default_difficulty_min() -> usize { 1 }
 fn default_difficulty_max() -> usize { 12 }
 fn default_retarget_upper_pct() -> u64 { 110 }
@@ -158,7 +159,7 @@ fn default_target_leading_zeros() -> usize { 2 }
 
 
 // Mining memory retargeting defaults
-pub fn default_min_mem() -> u32 { 16_384 }        // 16 MiB
+pub fn default_min_mem() -> u32 { 16_192 }        // 16 MiB
 pub fn default_max_mem() -> u32 { 262_144 }       // 256 MiB
 pub fn default_max_memory_adjustment() -> f64 { 1.5 }
 
