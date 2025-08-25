@@ -119,7 +119,7 @@ impl Miner {
                         println!("🛑 Miner shut down gracefully");
                         break;
                     }
-                    eprintln!("❌ Mining session failed (attempt {}/{}) : {}", 
+                    eprintln!("(attempt {}/{}) : {}", 
                              self.consecutive_failures, self.max_consecutive_failures, e);
                     
                     if self.consecutive_failures >= self.max_consecutive_failures {
@@ -306,7 +306,7 @@ impl Miner {
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
                     let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
-                        eprintln!("💔 No anchor received for {} seconds, checking for missed epochs", 
+                        eprintln!(" No anchor received for {} seconds, checking for missed epochs", 
                                  since_last_heartbeat.as_secs());
                         
                         // Try to recover by requesting the next expected epoch
