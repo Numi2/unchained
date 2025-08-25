@@ -52,7 +52,7 @@ enabled = true
 
 # Miner runtime tuning (does not change consensus)
 # Heartbeat interval in seconds (more frequent for network stability)
-heartbeat_interval_secs = 140
+heartbeat_interval_secs = 15
 
 # Maximum mining attempts per epoch before moving to next epoch
 # (alias for `max_attempts` in code)

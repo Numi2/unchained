@@ -80,6 +80,10 @@ const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 20;
 const MAX_FULL_BODY_REQ_BATCH: usize = 256;
 const EPOCH_TX_REQS_PER_PEER_WINDOW_MS: u64 = 2000;
 const EPOCH_TX_REQS_PER_PEER_MAX: u32 = 8;
+// Candidate request dedup/throttle
+static RECENT_EPOCH_CAND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+const EPOCH_CAND_REQ_DEDUP_MS: u64 = 1000;
+const MAX_EPOCH_CAND_RESP: usize = 512;
 
 #[allow(dead_code)]
 fn try_publish_gossip(
@@ -125,6 +129,9 @@ const TOP_EPOCH_HEADERS_RESPONSE: &str = "unchained/epoch_headers_response/v1"; 
 const TOP_EPOCH_COMPACT: &str = "unchained/epoch_compact/v1";   // payload: CompactEpoch
 const TOP_EPOCH_GET_TXN: &str = "unchained/epoch_get_txn/v1";    // payload: (epoch_hash, indexes)
 const TOP_EPOCH_TXN: &str = "unchained/epoch_txn/v1";            // payload: (epoch_hash, txs)
+// New additive topics for pre-seal candidate pulls
+const TOP_EPOCH_CANDIDATES_REQUEST: &str = "unchained/epoch_candidates_request/v1"; // payload: [u8;32] epoch_hash
+const TOP_EPOCH_CANDIDATES_RESPONSE: &str = "unchained/epoch_candidates_response/v1"; // payload: EpochCandidatesResponse
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitedMessage {
@@ -326,6 +333,12 @@ pub struct SelectedIdsBundle {
     pub coin_ids: Vec<[u8; 32]>, // selected coin ids for this epoch
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochCandidatesResponse {
+    pub epoch_hash: [u8; 32],
+    pub candidates: Vec<CoinCandidate>,
+}
+
 // Commitment request/response data structures removed
 // --- Headers-first skeleton sync message types (additive, legacy-safe) ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +405,7 @@ enum NetworkCommand {
     RequestEpochSelected(u64),
     GossipEpochLeaves(EpochLeavesBundle),
     // removed commitment gossip
+    RequestEpochCandidates([u8; 32]),
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -461,6 +475,7 @@ pub async fn spawn(
         TOP_RATE_LIMITED,
         TOP_EPOCH_HEADERS_REQUEST, TOP_EPOCH_HEADERS_RESPONSE,
         TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
+        TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -1103,6 +1118,7 @@ pub async fn spawn(
                                     NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
                                     NetworkCommand::RequestEpochSelected(epoch) => (TOP_EPOCH_SELECTED_REQUEST, bincode::serialize(&epoch).ok()),
                                     NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
+                                    NetworkCommand::RequestEpochCandidates(hash) => (TOP_EPOCH_CANDIDATES_REQUEST, bincode::serialize(&hash).ok()),
                                     NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                                     // commitment gossip removed
                                 };
@@ -2163,6 +2179,23 @@ pub async fn spawn(
                                         }
                                     }
                                 },
+                                TOP_EPOCH_CANDIDATES_REQUEST => if let Ok(epoch_hash) = bincode::deserialize::<[u8;32]>(&message.data) {
+                                    // Rate-limit by hash to avoid spam
+                                    let now = std::time::Instant::now();
+                                    let allow = RECENT_EPOCH_CAND_REQS.lock().map(|mut m| {
+                                        m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(EPOCH_CAND_REQ_DEDUP_MS));
+                                        if !m.contains_key(&epoch_hash) { m.insert(epoch_hash, now); true } else { false }
+                                    }).unwrap_or(false);
+                                    if !allow { continue; }
+                                    // Collect candidates for this epoch hash (V3 only). Cap response size.
+                                    if let Ok(mut list) = db.get_coin_candidates_by_epoch_hash(&epoch_hash) {
+                                        if list.len() > MAX_EPOCH_CAND_RESP { list.truncate(MAX_EPOCH_CAND_RESP); }
+                                        let resp = EpochCandidatesResponse { epoch_hash, candidates: list };
+                                        if let Ok(data) = bincode::serialize(&resp) {
+                                            try_publish_gossip(&mut swarm, TOP_EPOCH_CANDIDATES_RESPONSE, data, "epoch-candidates");
+                                        }
+                                    }
+                                },
                                 TOP_EPOCH_SELECTED_RESPONSE => if let Ok(bundle) = bincode::deserialize::<SelectedIdsBundle>(&message.data) {
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes()) {
                                         if anchor.merkle_root != bundle.merkle_root { continue; }
@@ -2202,6 +2235,15 @@ pub async fn spawn(
                                         }
                                     }
                                 },
+                                TOP_EPOCH_CANDIDATES_RESPONSE => if let Ok(resp) = bincode::deserialize::<EpochCandidatesResponse>(&message.data) {
+                                    // Best-effort import of candidates; validate first
+                                    for cand in resp.candidates {
+                                        if validate_coin_candidate(&cand, &db).is_ok() {
+                                            let key = Store::candidate_key(&cand.epoch_hash, &cand.id);
+                                            db.put("coin_candidate", &key, &cand).ok();
+                                        }
+                                    }
+                                },
                                 // Commitment request/response removed to prevent metadata leakage.
                                 _ => {}
                             }
@@ -2231,6 +2273,7 @@ pub async fn spawn(
                             NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
                             NetworkCommand::RequestEpochSelected(epoch) => (TOP_EPOCH_SELECTED_REQUEST, bincode::serialize(&epoch).ok()),
                             NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
+                            NetworkCommand::RequestEpochCandidates(hash) => (TOP_EPOCH_CANDIDATES_REQUEST, bincode::serialize(&hash).ok()),
                             NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                         };
                         if let Some(d) = data {
@@ -2355,6 +2398,20 @@ pub async fn spawn(
                                 }
                             }
                         }
+                        NetworkCommand::RequestEpochCandidates(hash) => {
+                            let now = std::time::Instant::now();
+                            let allow = RECENT_EPOCH_CAND_REQS.lock().map(|mut m| {
+                                m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(EPOCH_CAND_REQ_DEDUP_MS));
+                                if !m.contains_key(hash) { m.insert(*hash, now); true } else { false }
+                            }).unwrap_or(false);
+                            if allow {
+                                if let Ok(data) = bincode::serialize(hash) {
+                                    if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_CANDIDATES_REQUEST), data).is_err() {
+                                        pending_commands.push_back(command);
+                                    }
+                                }
+                            }
+                        }
                         NetworkCommand::GossipEpochLeaves(bundle) => {
                             if let Ok(data) = bincode::serialize(bundle) {
                                 if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_LEAVES), data).is_err() {
@@ -2424,6 +2481,7 @@ impl Network {
         let req = EpochGetTxn { epoch_hash, indexes };
         let _ = self.command_tx.send(NetworkCommand::RequestEpochTxn(req));
     }
+    pub async fn request_epoch_candidates(&self, epoch_hash: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestEpochCandidates(epoch_hash)); }
     pub async fn request_epoch_leaves(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochLeaves(epoch_num)); }
     // Note: We do not keep an explicit command variant; selected requests are sent directly when needed.
     pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) { let _ = self.command_tx.send(NetworkCommand::GossipEpochLeaves(bundle)); }

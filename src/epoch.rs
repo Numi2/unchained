@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use crate::sync::SyncState;
 use rocksdb::WriteBatch;
+use rand::Rng;
+
+const FINALIZATION_GRACE_MS: u64 = 888;
+const SEALING_JITTER_MS: u64 = 222;
 
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -287,6 +291,11 @@ impl Manager {
                                 if latest_anchor.num >= current_epoch {
                                     println!("⏭️  Chain has advanced. Skipping epoch creation and fast-forwarding from {} to {}.", current_epoch, latest_anchor.num + 1);
                                     current_epoch = latest_anchor.num + 1;
+                                    // Align next tick to now + epoch.seconds
+                                    ticker = time::interval_at(
+                                        time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
+                                        time::Duration::from_secs(self.cfg.seconds)
+                                    );
                                     continue;
                                 }
                             }
@@ -301,6 +310,16 @@ impl Manager {
                                 continue;
                             }
                         }
+
+                        // Pre-seal candidate pull: request candidates for prev.hash to improve inclusion
+                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
+                            self.net.request_epoch_candidates(prev.hash).await;
+                        }
+                        // Finalization grace: allow late candidate gossip to land locally
+                        tokio::time::sleep(time::Duration::from_millis(FINALIZATION_GRACE_MS)).await;
+                        // Tiny jitter to de-synchronize edge races across peers
+                        let jitter_ms: u64 = rand::thread_rng().gen_range(0..=SEALING_JITTER_MS);
+                        tokio::time::sleep(time::Duration::from_millis(jitter_ms)).await;
 
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
@@ -527,6 +546,11 @@ impl Manager {
                             }
                             buffer.clear();
                             current_epoch += 1;
+                            // Align next tick to now + epoch.seconds
+                            ticker = time::interval_at(
+                                time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
+                                time::Duration::from_secs(self.cfg.seconds)
+                            );
                         }
                     }
                 }
