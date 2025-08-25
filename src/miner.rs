@@ -306,32 +306,19 @@ impl Miner {
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
                     let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
-                        eprintln!(" No anchor received for {} seconds, checking for missed epochs", 
-                                 since_last_heartbeat.as_secs());
-                        
-                        // Try to recover by requesting the next expected epoch
+                        eprintln!(
+                            "💔 No anchor received for {} seconds, checking for missed epochs",
+                            since_last_heartbeat.as_secs()
+                        );
+
+                        // Try to recover by requesting the next expected epoch and also the latest tip
                         if let Some(current_epoch) = self.current_epoch {
                             let next_epoch = current_epoch + 1;
                             println!("🔄 Requesting epoch #{next_epoch} due to heartbeat timeout");
                             self.net.request_epoch(next_epoch).await;
-+                           // Also pull latest in case we’re more than one epoch behind
-+                           self.net.request_latest_epoch().await;
+                            // Also pull latest in case we’re more than one epoch behind
+                            self.net.request_latest_epoch().await;
                         }
-                        return Err(" - no anchors received".into());
-                        
-
-                            // Also try to get from database
-                            if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                                if latest_anchor.num >= next_epoch {
-                                    println!("📥 Found missed epoch #{} in database", latest_anchor.num);
-                                    self.current_epoch = Some(latest_anchor.num);
-                                    self.mine_epoch(latest_anchor).await?;
-                                    self.last_heartbeat = time::Instant::now();
-                                    continue;
-                                }
-                            }
-                        }
-                        
                         return Err("Heartbeat timeout - no anchors received".into());
                     }
                 }
