@@ -450,7 +450,7 @@ pub async fn spawn(
         .boxed();
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(std::time::Duration::from_secs(1))
+        .heartbeat_interval(std::time::Duration::from_millis(500))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .mesh_n_low(2)
         .mesh_outbound_min(1)

@@ -311,9 +311,12 @@ impl Manager {
                             }
                         }
 
-                        // Pre-seal candidate pull: request candidates for prev.hash to improve inclusion
+                        // Pre-seal candidate pull: burst requests for prev.hash to improve inclusion
                         if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
-                            self.net.request_epoch_candidates(prev.hash).await;
+                            for _ in 0..3 {
+                                self.net.request_epoch_candidates(prev.hash).await;
+                                tokio::time::sleep(time::Duration::from_millis(200)).await;
+                            }
                         }
                         // Finalization grace: allow late candidate gossip to land locally
                         tokio::time::sleep(time::Duration::from_millis(FINALIZATION_GRACE_MS)).await;
