@@ -314,7 +314,12 @@ impl Miner {
                             let next_epoch = current_epoch + 1;
                             println!("🔄 Requesting epoch #{next_epoch} due to heartbeat timeout");
                             self.net.request_epoch(next_epoch).await;
-                            
++                           // Also pull latest in case we’re more than one epoch behind
++                           self.net.request_latest_epoch().await;
+                        }
+                        return Err(" - no anchors received".into());
+                        
+
                             // Also try to get from database
                             if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
                                 if latest_anchor.num >= next_epoch {
