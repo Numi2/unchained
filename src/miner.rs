@@ -307,7 +307,7 @@ impl Miner {
                     let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!(
-                            "💔 No anchor received for {} seconds, checking for missed epochs",
+                                " No anchor received for {} seconds, checking for missed epochs",
                             since_last_heartbeat.as_secs()
                         );
 
