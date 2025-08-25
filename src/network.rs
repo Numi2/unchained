@@ -1056,7 +1056,7 @@ pub async fn spawn(
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
         let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
         // Periodic retry timer to flush pending publishes even without connection events
-        let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(800));
+        let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {

@@ -12,7 +12,7 @@ use crate::sync::SyncState;
 use rocksdb::WriteBatch;
 use rand::Rng;
 
-const FINALIZATION_GRACE_MS: u64 = 888;
+const FINALIZATION_GRACE_MS: u64 = 2222;
 const SEALING_JITTER_MS: u64 = 222;
 
 
