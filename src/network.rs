@@ -85,6 +85,15 @@ static RECENT_EPOCH_CAND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std
 const EPOCH_CAND_REQ_DEDUP_MS: u64 = 1000;
 const MAX_EPOCH_CAND_RESP: usize = 2048;
 
+// New orphan buffer controls and reorg guardrails
+const ORPHAN_TOTAL_CAP: usize = 12096; // global cap across all heights
+const MAX_ORPHANS_PER_HEIGHT: usize = 16; // per-height cap
+const ORPHAN_TTL_SECS: u64 = 120; // TTL for stale orphans
+const ORPHAN_HEIGHT_COOLDOWN_SECS: u64 = 3; // cooldown when per-height cap hit
+const REORG_MIN_GAP_MS: u64 = 250; // minimum time between reorg attempts
+const MAX_BFS_WIDTH_PER_HEIGHT: usize = 32; // BFS frontier cap per height
+const MAX_REORG_STEPS: usize = 2048; // total heights traversed in one attempt
+
 #[allow(dead_code)]
 fn try_publish_gossip(
     swarm: &mut Swarm<Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>>,
@@ -527,7 +536,10 @@ pub async fn spawn(
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
-    let mut orphan_anchors: HashMap<u64, Vec<Anchor>> = HashMap::new();
+    let mut orphan_buf: OrphanBuffer = OrphanBuffer::new(ORPHAN_TOTAL_CAP, MAX_ORPHANS_PER_HEIGHT, ORPHAN_TTL_SECS);
+    let mut needs_reorg_check: bool = false;
+    let mut last_reorg_attempt: std::time::Instant = std::time::Instant::now() - std::time::Duration::from_millis(REORG_MIN_GAP_MS);
+    let mut last_orphan_snapshot: u64 = 0;
     // Buffer for out-of-order spends (by coin_id)
     let mut pending_spends: HashMap<[u8;32], Vec<Spend>> = HashMap::new();
     let mut pending_spend_deadline: HashMap<[u8;32], std::time::Instant> = HashMap::new();
@@ -537,7 +549,6 @@ pub async fn spawn(
     let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
-    const MAX_ORPHAN_ANCHORS: usize = 6048;
     const ORPHAN_BUFFER_TIP_WINDOW: u64 = 5024; // only buffer orphans within this distance of local tip
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -547,7 +558,7 @@ pub async fn spawn(
     
     static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    const EPOCH_REQ_DEDUP_SECS: u64 = 8;
+    const EPOCH_REQ_DEDUP_SECS: u64 = 12;
     // Deduplicate and throttle responses to latest-epoch requests
     static RECENT_LATEST_REQS: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> = Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
@@ -575,14 +586,14 @@ pub async fn spawn(
     // Attempt to reorg to a better chain using buffered anchors.
     fn attempt_reorg(
         db: &Store,
-        orphan_anchors: &mut HashMap<u64, Vec<Anchor>>,
+        orphan_buf: &mut OrphanBuffer,
         anchor_tx: &broadcast::Sender<Anchor>,
         sync_state: &Arc<Mutex<SyncState>>,
         command_tx: &mpsc::UnboundedSender<NetworkCommand>,
-    ) {
+    ) -> bool {
         let current_latest = match db.get::<Anchor>("epoch", b"latest") {
             Ok(Some(a)) => a,
-            _ => return,
+            _ => return false,
         };
         // Fast-path: adopt the lowest contiguous buffered segment immediately above current tip
         // This helps initial catch-up by extending the tip sequentially when possible.
@@ -590,7 +601,7 @@ pub async fn spawn(
         let mut near_chain: Vec<Anchor> = Vec::new();
         let mut h_near = current_latest.num.saturating_add(1);
         loop {
-            let Some(cands) = orphan_anchors.get(&h_near) else { break; };
+            let Some(cands) = orphan_buf.by_height.get(&h_near) else { break; };
             if cands.is_empty() { break; }
             let mut linked: Option<Anchor> = None;
             for alt in cands {
@@ -621,12 +632,12 @@ pub async fn spawn(
                     db.db.cf_handle("spend"),
                     db.db.cf_handle("nullifier"),
                     db.db.cf_handle("commitment_used"),
-                ) else { return; };
+                ) else { return false; };
                 let mut batch = WriteBatch::default();
                 let mut parent = current_latest.clone();
                 for alt in &near_chain {
                     // 1) Overwrite anchor mappings for this epoch and advance latest
-                    let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return };
+                    let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return false };
                     batch.put_cf(epoch_cf, alt.num.to_le_bytes(), &ser);
                     batch.put_cf(epoch_cf, b"latest", &ser);
                     batch.put_cf(anchor_cf, &alt.hash, &ser);
@@ -712,32 +723,27 @@ pub async fn spawn(
                     }
                     parent = alt.clone();
                 }
-                if let Err(e) = db.db.write(batch) { eprintln!("🔥 Reorg write failed: {}", e); return; }
+                if let Err(e) = db.db.write(batch) { eprintln!("🔥 Reorg write failed: {}", e); return false; }
                 for alt in &near_chain { let _ = anchor_tx.send(alt.clone()); }
                 if let Ok(mut st) = sync_state.lock() { st.highest_seen_epoch = near_tip.num; }
-                for alt in &near_chain {
-                    if let Some(vec) = orphan_anchors.get_mut(&alt.num) {
-                        vec.retain(|a| a.hash != alt.hash);
-                        if vec.is_empty() { orphan_anchors.remove(&alt.num); }
-                    }
-                }
+                for alt in &near_chain { let _ = orphan_buf.remove_exact(alt.num, alt.hash); }
                 net_log!("🔁 Reorg adopted up to epoch {} (sequential catch-up)", near_tip.num);
-                return;
+                return true;
             }
         }
-        let Some(&max_buf_height) = orphan_anchors.keys().max() else { return };
-        if max_buf_height <= current_latest.num { return; }
+        let Some(&max_buf_height) = orphan_buf.by_height.keys().max() else { return false };
+        if max_buf_height <= current_latest.num { return false; }
 
         // Determine earliest contiguous height present in the orphan buffer
         let mut h = max_buf_height;
         while h > 0 {
-            match orphan_anchors.get(&h) {
+            match orphan_buf.by_height.get(&h) {
                 Some(v) if !v.is_empty() => { h -= 1; }
                 _ => break,
             }
         }
-        let first_height = if orphan_anchors.get(&h).is_some() { h } else { h + 1 };
-        if first_height > max_buf_height { return; }
+        let first_height = if orphan_buf.by_height.get(&h).is_some() { h } else { h + 1 };
+        if first_height > max_buf_height { return false; }
         let fork_height = first_height.saturating_sub(1);
         net_routine!("🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
             first_height,
@@ -751,7 +757,7 @@ pub async fn spawn(
         if let Ok(Some(local_parent)) = db.get::<Anchor>("epoch", &fork_height.to_le_bytes()) {
             parent_candidates.push(local_parent);
         }
-        if let Some(alts_at_fork) = orphan_anchors.get(&fork_height) {
+        if let Some(alts_at_fork) = orphan_buf.by_height.get(&fork_height) {
             for a in alts_at_fork { parent_candidates.push(a.clone()); }
         }
         if parent_candidates.is_empty() {
@@ -781,7 +787,7 @@ pub async fn spawn(
                     }
                 }
             }
-            return;
+            return false;
         }
 
         // Try to assemble a valid alternate branch from first_height..=max_buf_height using BFS across candidates
@@ -794,8 +800,10 @@ pub async fn spawn(
         let mut frontier: Vec<Anchor> = parent_candidates.clone();
         let mut last_frontier: Vec<Anchor> = Vec::new();
         let mut advanced = false;
+        let mut steps: usize = 0;
         for height in first_height..=max_buf_height {
-            let Some(cands) = orphan_anchors.get(&height) else { break; };
+            if steps >= MAX_REORG_STEPS { break; }
+            let Some(cands) = orphan_buf.by_height.get(&height) else { break; };
             if cands.is_empty() { break; }
             let mut next_frontier: Vec<Anchor> = Vec::new();
             for p in &frontier {
@@ -811,8 +819,10 @@ pub async fn spawn(
                         // Link p -> alt
                         if !back.contains_key(&alt.hash) { back.insert(alt.hash, p.hash); }
                         next_frontier.push(alt.clone());
+                        if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
                     }
                 }
+                if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
             }
             if next_frontier.is_empty() {
                 break;
@@ -829,6 +839,7 @@ pub async fn spawn(
             last_frontier = deduped.clone();
             frontier = deduped;
             advanced = true;
+            steps = steps.saturating_add(1);
         }
         if !advanced {
             let now = std::time::Instant::now();
@@ -849,11 +860,11 @@ pub async fn spawn(
                 for n in start..=end { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
             }
             let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
-            return;
+            return false;
         }
 
         // Choose the best reachable tip from the last successful frontier
-        let Some(seg_tip) = last_frontier.iter().max_by_key(|a| a.cumulative_work).cloned() else { return };
+        let Some(seg_tip) = last_frontier.iter().max_by_key(|a| a.cumulative_work).cloned() else { return false };
 
         // Reconstruct the chosen chain from seg_tip back to one of the parents
         let mut chain_rev: Vec<Anchor> = Vec::new();
@@ -871,13 +882,13 @@ pub async fn spawn(
         }
         chain_rev.reverse();
         chosen_chain = chain_rev;
-        if chosen_chain.is_empty() { return; }
+        if chosen_chain.is_empty() { return false; }
 
-        let Some(seg_tip) = chosen_chain.last() else { return; };
+        let Some(seg_tip) = chosen_chain.last() else { return false; };
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
             net_routine!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
-            return;
+            return false;
         }
 
         // Adopt: overwrite epochs and latest pointer; reconcile per-epoch selected/leaves/coins
@@ -891,13 +902,13 @@ pub async fn spawn(
             db.db.cf_handle("spend"),
             db.db.cf_handle("nullifier"),
             db.db.cf_handle("commitment_used"),
-        ) else { return; };
+        ) else { return false; };
         let mut batch = WriteBatch::default();
 
-        let mut parent = match resolved_parent { Some(p) => p, None => return };
+        let mut parent = match resolved_parent { Some(p) => p, None => return false };
         for alt in &chosen_chain {
             // 1) Overwrite anchor mappings for this epoch and advance latest
-            let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return };
+            let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return false };
             batch.put_cf(epoch_cf, alt.num.to_le_bytes(), &ser);
             batch.put_cf(epoch_cf, b"latest", &ser);
             batch.put_cf(anchor_cf, &alt.hash, &ser);
@@ -999,19 +1010,15 @@ pub async fn spawn(
 
         if let Err(e) = db.db.write(batch) {
             eprintln!("🔥 Reorg write failed: {}", e);
-            return;
+            return false;
         }
         for alt in &chosen_chain { let _ = anchor_tx.send(alt.clone()); }
         if let Ok(mut st) = sync_state.lock() {
             st.highest_seen_epoch = seg_tip.num;
         }
-        for alt in &chosen_chain {
-            if let Some(vec) = orphan_anchors.get_mut(&alt.num) {
-                vec.retain(|a| a.hash != alt.hash);
-                if vec.is_empty() { orphan_anchors.remove(&alt.num); }
-            }
-        }
+        for alt in &chosen_chain { let _ = orphan_buf.remove_exact(alt.num, alt.hash); }
         net_log!("🔁 Reorg adopted up to epoch {} (better cumulative work)", seg_tip.num);
+        true
     }
 
     tokio::spawn(async move {       
@@ -1268,32 +1275,17 @@ pub async fn spawn(
 
                                             if let Ok(Some(existing)) = db.get::<Anchor>("epoch", &a.num.to_le_bytes()) {
                                                 if existing.hash != a.hash {
-                                                    let entry = orphan_anchors.entry(a.num).or_default();
-                                                    if !entry.iter().any(|x| x.hash == a.hash) {
+                                                    let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
+                                                    if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now()) {
                                                         net_routine!("🔀 Buffered alternate anchor at height {} (valid but not adopted)", a.num);
-                                                        entry.push(a.clone());
                                                     }
                                                 }
                                             }
 
-                                            attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
-                                            let orphan_len: usize = orphan_anchors.values().map(|v| v.len()).sum();
+                                            needs_reorg_check = true;
+                                            let orphan_len: usize = orphan_buf.len();
                                             crate::metrics::ORPHAN_BUFFER_LEN.set(orphan_len as i64);
-                                            if orphan_len > MAX_ORPHAN_ANCHORS {
-                                                // Prefer dropping the farthest height from current tip to keep near-tip continuity
-                                                let drop_key = if let Ok(Some(lat)) = db.get::<Anchor>("epoch", b"latest") {
-                                                    orphan_anchors
-                                                        .keys()
-                                                        .copied()
-                                                        .max_by_key(|h| if *h >= lat.num { h - lat.num } else { lat.num - *h })
-                                                } else {
-                                                    orphan_anchors.keys().copied().max()
-                                                };
-                                                if let Some(old) = drop_key {
-                                                    orphan_anchors.remove(&old);
-                                                    eprintln!("⚠️ Orphan buffer cap exceeded, dropping epoch {} (farthest from tip)", old);
-                                                }
-                                            }
+                                            // capacity is enforced internally by OrphanBuffer
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
                                             // Only buffer orphans near our local tip; skip when we don't have a tip yet
@@ -1303,10 +1295,11 @@ pub async fn spawn(
                                                 if dist <= ORPHAN_BUFFER_TIP_WINDOW { allow_buffer = true; }
                                             }
                                             if allow_buffer {
-                                                let entry = orphan_anchors.entry(a.num).or_default();
-                                                if !entry.iter().any(|x| x.hash == a.hash) {
-                                                    entry.push(a.clone());
-                                                    net_routine!("⏳ Buffered orphan anchor for epoch {}", a.num);
+                                                if let Ok(Some(lat2)) = db.get::<Anchor>("epoch", b"latest") {
+                                                    let tip = Some(lat2.num);
+                                                    if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now()) {
+                                                        net_routine!("⏳ Buffered orphan anchor for epoch {}", a.num);
+                                                    }
                                                 }
                                             }
                                             
@@ -1327,20 +1320,18 @@ pub async fn spawn(
                                                 if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                                                     for n in start..=end {
                                                         if !map.contains_key(&n) {
-                                                            if let Ok(bytes) = bincode::serialize(&n) {
-                                                                let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                                map.insert(n, now);
-                                                            }
+                                                            let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                                                            map.insert(n, now);
                                                         }
                                                     }
                                                 }
                                             }
-                                            attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
+                                            needs_reorg_check = true;
                                         },
                                         Err(e) => {
                                             if e.contains("hash mismatch") {
-                                                let entry = orphan_anchors.entry(a.num).or_default();
-                                                let is_new = !entry.iter().any(|x| x.hash == a.hash);
+                                                let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
+                                                let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
                                                 if is_new {
                                                     // Aggregate per-height unique peers and hashes; emit summary at throttle interval
                                                     let now = std::time::Instant::now();
@@ -1378,7 +1369,7 @@ pub async fn spawn(
                                                             }
                                                         }
                                                     }
-                                                    entry.push(a.clone());
+                                                    // inserted via buffer
                                                 }
                                                 if a.num > 0 {
                                                     let now = std::time::Instant::now();
@@ -1390,10 +1381,8 @@ pub async fn spawn(
                                                     if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                                                         for n in start..=end {
                                                             if !map.contains_key(&n) {
-                                                                if let Ok(bytes) = bincode::serialize(&n) {
-                                                                    let _ = swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), bytes);
-                                                                    map.insert(n, now);
-                                                                }
+                                                                let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                                                                map.insert(n, now);
                                                             }
                                                         }
                                                     }
@@ -1407,7 +1396,7 @@ pub async fn spawn(
                                                     if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                     st.peer_confirmed_tip = true;
                                                 }
-                                                attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
+                                                needs_reorg_check = true;
                                             } else {
                                                 net_log!("❌ Anchor validation from {} failed: {}", peer_id, e);
                                                 crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
@@ -1467,7 +1456,7 @@ pub async fn spawn(
                                             if better { if db.put("epoch", b"latest", &cmp_anchor).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); } }
                                             let _ = anchor_tx.send(cmp_anchor.clone());
                                             // After adoption, reconcile orphan buffer near tip
-                                            attempt_reorg(&db, &mut orphan_anchors, &anchor_tx, &sync_state, &command_tx);
+                                            needs_reorg_check = true;
                                         }
                                     } else {
                                         // Fallback: if missing percentage exceeds threshold, request full epoch bodies by id
@@ -2219,8 +2208,22 @@ pub async fn spawn(
                         _ => {}
                     }
                 },
-                // Periodically retry pending publishes to avoid stalls until a reconnect
+                // Periodically retry pending publishes and run debounced reorg checks
                 _ = retry_timer.tick() => {
+                    let now = std::time::Instant::now();
+                    // Debounced reorg check
+                    if needs_reorg_check && now.duration_since(last_reorg_attempt) >= std::time::Duration::from_millis(REORG_MIN_GAP_MS) {
+                        let snapshot = orphan_buf.version();
+                        if snapshot != last_orphan_snapshot {
+                            let progressed = attempt_reorg(&db, &mut orphan_buf, &anchor_tx, &sync_state, &command_tx);
+                            last_orphan_snapshot = orphan_buf.version();
+                            last_reorg_attempt = now;
+                            if !progressed { needs_reorg_check = false; }
+                        } else {
+                            // no structural change since last check
+                            needs_reorg_check = false;
+                        }
+                    }
                     // Only attempt retries if we have any connected peers
                     let have_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
                     if !have_peers || pending_commands.is_empty() { continue; }
@@ -2458,5 +2461,168 @@ impl Network {
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {
         self.connected_peers.lock().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
+#[derive(Debug)]
+struct OrphanBuffer {
+    by_height: std::collections::HashMap<u64, Vec<Anchor>>,
+    index_fifo: VecDeque<[u8; 32]>,
+    hash_to_height: std::collections::HashMap<[u8; 32], u64>,
+    inserted_at: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    seen_recent: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    per_height_cooldown: std::collections::HashMap<u64, std::time::Instant>,
+    total_cap: usize,
+    per_height_cap: usize,
+    ttl: std::time::Duration,
+    height_cooldown: std::time::Duration,
+    count: usize,
+    version: u64,
+}
+
+impl OrphanBuffer {
+    fn new(total_cap: usize, per_height_cap: usize, ttl_secs: u64) -> Self {
+        Self {
+            by_height: std::collections::HashMap::new(),
+            index_fifo: VecDeque::new(),
+            hash_to_height: std::collections::HashMap::new(),
+            inserted_at: std::collections::HashMap::new(),
+            seen_recent: std::collections::HashMap::new(),
+            per_height_cooldown: std::collections::HashMap::new(),
+            total_cap,
+            per_height_cap,
+            ttl: std::time::Duration::from_secs(ttl_secs),
+            height_cooldown: std::time::Duration::from_secs(ORPHAN_HEIGHT_COOLDOWN_SECS),
+            count: 0,
+            version: 0,
+        }
+    }
+
+    fn len(&self) -> usize { self.count }
+    fn version(&self) -> u64 { self.version }
+
+    fn prune_expired(&mut self, now: std::time::Instant) {
+        // Prune seen_recent
+        self.seen_recent.retain(|_, t| now.duration_since(*t) < self.ttl);
+        // Prune FIFO by TTL
+        let mut rotated: usize = 0;
+        let max_rotate = self.index_fifo.len();
+        while rotated < max_rotate {
+            if let Some(h) = self.index_fifo.front().copied() {
+                let remove = match self.inserted_at.get(&h) {
+                    Some(t) => now.duration_since(*t) >= self.ttl,
+                    None => true,
+                };
+                if remove {
+                    // Find height and remove exact
+                    if let Some(height) = self.hash_to_height.get(&h).copied() {
+                        self.remove_exact(height, h);
+                    } else {
+                        self.index_fifo.pop_front();
+                    }
+                } else {
+                    break;
+                }
+            } else { break; }
+            rotated += 1;
+        }
+        // Prune cooled-down heights map
+        self.per_height_cooldown.retain(|_, t| now.duration_since(*t) < self.height_cooldown);
+    }
+
+    fn remove_exact(&mut self, height: u64, hash: [u8; 32]) -> bool {
+        let removed = {
+            let mut removed = false;
+            if let Some(vec) = self.by_height.get_mut(&height) {
+                let before = vec.len();
+                vec.retain(|a| a.hash != hash);
+                removed = vec.len() != before;
+            }
+            removed
+        };
+        if removed {
+            // now safe to clean maps and possibly remove empty vector
+            if let Some(vec2) = self.by_height.get(&height) {
+                if vec2.is_empty() { self.by_height.remove(&height); }
+            }
+            {
+                self.count = self.count.saturating_sub(1);
+                self.version = self.version.wrapping_add(1);
+                self.hash_to_height.remove(&hash);
+                self.inserted_at.remove(&hash);
+                // excise one instance from FIFO
+                if let Some(pos) = self.index_fifo.iter().position(|h| *h == hash) {
+                    self.index_fifo.remove(pos);
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn remove_first_for_height(&mut self, height: u64) -> Option<[u8; 32]> {
+        // Rotate FIFO until we find first entry for this height
+        let max_rotate = self.index_fifo.len();
+        for _ in 0..max_rotate {
+            if let Some(h) = self.index_fifo.pop_front() {
+                if self.hash_to_height.get(&h).copied() == Some(height) {
+                    let _ = self.remove_exact(height, h);
+                    return Some(h);
+                } else {
+                    self.index_fifo.push_back(h);
+                }
+            } else { break; }
+        }
+        None
+    }
+
+    fn insert(&mut self, anchor: Anchor, local_tip: Option<u64>, tip_window: u64, now: std::time::Instant) -> bool {
+        // Only buffer within window of local tip
+        if let Some(tip) = local_tip {
+            let dist = if anchor.num >= tip { anchor.num - tip } else { tip - anchor.num };
+            if dist > tip_window { return false; }
+        }
+        // TTL prune first
+        self.prune_expired(now);
+        // Dedup recent by hash
+        if let Some(t) = self.seen_recent.get(&anchor.hash).copied() {
+            if now.duration_since(t) < self.ttl { return false; }
+        }
+        self.seen_recent.insert(anchor.hash, now);
+        // Per-height cooldown
+        if let Some(t) = self.per_height_cooldown.get(&anchor.num).copied() {
+            if now.duration_since(t) < self.height_cooldown { return false; }
+        }
+        // Per-height cap enforcement
+        // Use a scoped block to avoid overlapping borrows when we might mutate elsewhere
+        let exists_or_full = {
+            let vec = self.by_height.entry(anchor.num).or_default();
+            if vec.iter().any(|a| a.hash == anchor.hash) { return true; }
+            vec.len() >= self.per_height_cap
+        };
+        if exists_or_full {
+            if self.by_height.get(&anchor.num).map(|v| v.len()).unwrap_or(0) >= self.per_height_cap {
+                self.remove_first_for_height(anchor.num);
+                self.per_height_cooldown.insert(anchor.num, now);
+            } else {
+                // was duplicate
+                return false;
+            }
+        }
+        self.by_height.entry(anchor.num).or_default().push(anchor.clone());
+        self.index_fifo.push_back(anchor.hash);
+        self.hash_to_height.insert(anchor.hash, anchor.num);
+        self.inserted_at.insert(anchor.hash, now);
+        self.count += 1;
+        self.version = self.version.wrapping_add(1);
+        // Global cap enforcement
+        while self.count > self.total_cap {
+            if let Some(old_hash) = self.index_fifo.pop_front() {
+                if let Some(h) = self.hash_to_height.get(&old_hash).copied() {
+                    let _ = self.remove_exact(h, old_hash);
+                }
+            } else { break; }
+        }
+        true
     }
 }
