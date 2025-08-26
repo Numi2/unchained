@@ -207,27 +207,38 @@ pub fn spawn(
                         // we are at tip and have actually synced with network → mark synced once
                         if let Ok(mut st) = sync_state.lock() { if !st.synced { st.synced = true; sync_routine!("✅ Node is fully synced at epoch {}", local_epoch); } }
                         net.request_latest_epoch().await;
-                    } else if highest_seen == 0 {
-                        if local_epoch > 0 {
-                            if has_bootstrap {
-                                // With bootstrap configured, do not self-declare synced; keep polling peers.
-                                sync_routine!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
-                                net.request_latest_epoch().await;
-                            } else {
-                                // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
-                                if let Ok(mut st) = sync_state.lock() {
-                                    if !st.synced {
-                                        st.synced = true;
-                                        if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
-                                        sync_routine!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                            } else if highest_seen == 0 {
+                            if local_epoch > 0 {
+                                if has_bootstrap {
+                                    // With bootstrap configured, do not self-declare synced; keep polling peers.
+                                    sync_routine!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
+                                    net.request_latest_epoch().await;
+                                } else {
+                                    // No network view but we do have a local chain (e.g., single-node). Consider ourselves synced locally.
+                                    if let Ok(mut st) = sync_state.lock() {
+                                        if !st.synced {
+                                            st.synced = true;
+                                            if st.highest_seen_epoch == 0 { st.highest_seen_epoch = local_epoch; }
+                                            sync_routine!("✅ No peers visible; treating local epoch {} as tip.", local_epoch);
+                                        }
                                     }
                                 }
+                            } else {
+                                // We haven't heard from the network yet and have no local chain; keep requesting
+                                net.request_latest_epoch().await;
                             }
-                        } else {
-                            // We haven't heard from the network yet and have no local chain; keep requesting
+                        } else if highest_seen < local_epoch {
+                            // Network is behind us - this can happen after rollback if we have newer epochs
+                            // Force request for latest to see if network has progressed
+                            sync_routine!("🔄 Network appears behind (local: {}, network: {}). Requesting latest...", local_epoch, highest_seen);
                             net.request_latest_epoch().await;
+                            
+                            // Also sample some recent epochs to detect potential conflicts
+                            let sample_start = local_epoch.saturating_sub(10);
+                            for n in sample_start..local_epoch {
+                                net.request_epoch(n).await;
+                            }
                         }
-                    }
                 }
 
                 _ = backfill_timer.tick() => {

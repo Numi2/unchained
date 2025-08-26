@@ -80,6 +80,10 @@ path = "src/bin/wallet_cf.rs"
 name = "fix_fork"
 path = "src/bin/fix_fork.rs"
 
+[[bin]]
+name = "resync_after_rollback"
+path = "src/bin/resync_after_rollback.rs"
+
 
 [dev-dependencies]
 tempfile = "3.8"

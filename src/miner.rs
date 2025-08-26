@@ -127,6 +127,15 @@ impl Miner {
                         self.consecutive_failures = 0;
                         // Reset current epoch to force fresh start
                         self.current_epoch = None;
+                        // Aggressive recovery: proactively redial bootstraps to regain mesh
+                        self.net.redial_bootstraps().await;
+                        // Also ask for latest and a small headers window to quickly resync
+                        self.net.request_latest_epoch().await;
+                        if let Ok(Some(lat)) = self.db.get::<Anchor>("epoch", b"latest") {
+                            let start = lat.num.saturating_sub(16);
+                            let count: u32 = 32;
+                            self.net.request_epoch_headers_range(start, count).await;
+                        }
                     }
                     
                     // Exponential backoff: wait longer after each failure
@@ -318,6 +327,12 @@ impl Miner {
                             self.net.request_epoch(next_epoch).await;
                             // Also pull latest in case we’re more than one epoch behind
                             self.net.request_latest_epoch().await;
+                            // Request a compact range of headers to quickly catch up
+                            let start = current_epoch.saturating_sub(8);
+                            let count: u32 = (next_epoch - start).min(64) as u32;
+                            self.net.request_epoch_headers_range(start, count).await;
+                            // Nudge network to redial bootstraps if we appear isolated
+                            self.net.request_latest_epoch().await; // cheap keepalive
                         }
                         return Err("Heartbeat timeout - no anchors received".into());
                     }
