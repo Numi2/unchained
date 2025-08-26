@@ -76,6 +76,9 @@ path = "src/bin/inspect_db.rs"
 name = "wallet_cf"
 path = "src/bin/wallet_cf.rs"
 
+[[bin]]
+name = "fix_fork"
+path = "src/bin/fix_fork.rs"
 
 
 [dev-dependencies]

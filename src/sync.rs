@@ -4,13 +4,22 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
 use tokio::sync::mpsc;
 
-const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 10;
+const MAX_CONCURRENT_EPOCH_REQUESTS: usize = 32;  // Increased for faster catch-up
 // Back-off parameters to avoid spamming the same missing tip repeatedly when reorg
 // cannot proceed due to unavailable fork parents.
-const TIP_REQUEST_BACKOFF_MS: u64 = 1500;
+const TIP_REQUEST_BACKOFF_MS: u64 = 500;  // Reduced for faster retry
 const SYNC_CHECK_INTERVAL_SECS: u64 = 2;
 // When fully synced, only poll peers for the latest epoch every this many seconds
 const SYNC_IDLE_POLL_INTERVAL_SECS: u64 = 30;
+// Maximum epochs to request in a single batch to avoid overwhelming the network
+const MAX_EPOCH_BATCH_SIZE: u64 = 100;
+// Track failed epoch requests for retry
+const FAILED_EPOCH_RETRY_SECS: u64 = 5;
+
+// Add new constants for better recovery
+const RECOVERY_EPOCH_BATCH_SIZE: u64 = 20;  // Smaller batches during recovery
+const RECOVERY_REQUEST_INTERVAL_MS: u64 = 100;  // Faster retry during recovery
+const RECOVERY_MAX_STALL_COUNT: u32 = 5;  // Trigger recovery sooner (10 seconds)
 
 // Routine sync logs are noisy; gate behind a static flag disabled by default.
 static ALLOW_ROUTINE_SYNC: AtomicBool = AtomicBool::new(false);
@@ -54,6 +63,11 @@ pub fn spawn(
         let mut backfill_timer = interval(Duration::from_secs(10));
 
         let mut last_tip_request: Option<(u64, std::time::Instant)> = None;
+        let mut failed_epochs: std::collections::HashMap<u64, std::time::Instant> = std::collections::HashMap::new();
+        let mut sync_progress_stall_count = 0u32;
+        let mut recovery_mode = false;  // Track if we're in recovery mode
+        let mut recovery_requests: std::collections::HashMap<u64, std::time::Instant> = std::collections::HashMap::new();
+        
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -67,23 +81,122 @@ pub fn spawn(
                     if highest_seen > local_epoch {
                         // we are behind → mark unsynced
                         if let Ok(mut st) = sync_state.lock() { st.synced = false; }
-                        // Avoid hammering the same tip if we've just requested it very recently
+                        
                         let now = std::time::Instant::now();
                         let should_request = match last_tip_request {
                             Some((h, t)) if h == highest_seen && now.duration_since(t).as_millis() < TIP_REQUEST_BACKOFF_MS as u128 => false,
                             _ => true,
                         };
-                        if should_request {
-                            // Ask peers for the latest epoch so we can catch up quickly
+                        
+                        if should_request && !recovery_mode {
                             net.request_latest_epoch().await;
                             sync_routine!("⛓️  Sync state is ahead (local: {}, network: {}). Requesting missing epochs.", local_epoch, highest_seen);
-                            request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                            
+                            let gap = highest_seen.saturating_sub(local_epoch);
+                            if gap > MAX_EPOCH_BATCH_SIZE * 2 {
+                                let batch_end = local_epoch.saturating_add(MAX_EPOCH_BATCH_SIZE);
+                                request_missing_epochs(local_epoch, batch_end, &net, &semaphore, &db).await;
+                                let recent_start = highest_seen.saturating_sub(20);
+                                if recent_start > batch_end {
+                                    request_missing_epochs(recent_start, highest_seen, &net, &semaphore, &db).await;
+                                }
+                            } else {
+                                request_missing_epochs(local_epoch, highest_seen, &net, &semaphore, &db).await;
+                            }
                             last_tip_request = Some((highest_seen, now));
                         }
+                        
+                        // Enhanced recovery logic with bypass mechanism
+                        let prev_local = local_epoch;
                         if let Ok(Some(latest_anchor)) = db.get::<Anchor>("epoch", b"latest") {
                             local_epoch = latest_anchor.num;
-                            sync_routine!("📊 Local epoch updated to: {}", local_epoch);
+                            if local_epoch > prev_local {
+                                sync_routine!("📊 Local epoch updated to: {}", local_epoch);
+                                sync_progress_stall_count = 0;
+                                recovery_mode = false;
+                                recovery_requests.clear();
+                            } else {
+                                sync_progress_stall_count += 1;
+                                
+                                // Enter recovery mode sooner and with more aggressive tactics
+                                if sync_progress_stall_count > RECOVERY_MAX_STALL_COUNT {
+                                    if !recovery_mode {
+                                        println!("⚠️  Sync appears stuck at epoch {}. Entering recovery mode...", local_epoch);
+                                        recovery_mode = true;
+                                    }
+                                    
+                                    // Clean up old recovery requests
+                                    recovery_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(RECOVERY_REQUEST_INTERVAL_MS * 5));
+                                    
+                                    // Request immediate next epochs with bypass mechanism
+                                    let recovery_end = (local_epoch + RECOVERY_EPOCH_BATCH_SIZE).min(highest_seen);
+                                    for n in (local_epoch + 1)..=recovery_end {
+                                        if !recovery_requests.contains_key(&n) {
+                                            // Use direct network bypass to avoid deduplication
+                                            request_epoch_bypass(&net, n).await;
+                                            recovery_requests.insert(n, now);
+                                            failed_epochs.insert(n, now);
+                                            
+                                            // Small delay to avoid overwhelming
+                                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                        }
+                                    }
+                                    
+                                    // Also request a sample of recent epochs to detect potential forks
+                                    let sample_start = highest_seen.saturating_sub(10);
+                                    for n in sample_start..=highest_seen {
+                                        if !recovery_requests.contains_key(&n) {
+                                            request_epoch_bypass(&net, n).await;
+                                            recovery_requests.insert(n, now);
+                                        }
+                                    }
+                                    
+                                    sync_progress_stall_count = 0; // Reset to allow multiple recovery attempts
+                                }
+                            }
                         }
+                        
+                        // Enhanced retry logic for failed epochs
+                        if recovery_mode {
+                            let epochs_to_retry: Vec<u64> = failed_epochs
+                                .iter()
+                                .filter_map(|(epoch, last_attempt)| {
+                                    if now.duration_since(*last_attempt) > std::time::Duration::from_millis(RECOVERY_REQUEST_INTERVAL_MS) {
+                                        Some(*epoch)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .take(10) // Limit concurrent retries
+                                .collect();
+                            
+                            for epoch in epochs_to_retry {
+                                request_epoch_bypass(&net, epoch).await;
+                                failed_epochs.insert(epoch, now);
+                                recovery_requests.insert(epoch, now);
+                            }
+                        } else {
+                            // Normal retry logic for non-recovery mode
+                            let epochs_to_retry: Vec<u64> = failed_epochs
+                                .iter()
+                                .filter_map(|(epoch, last_attempt)| {
+                                    if now.duration_since(*last_attempt) > std::time::Duration::from_secs(FAILED_EPOCH_RETRY_SECS) {
+                                        Some(*epoch)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            
+                            for epoch in epochs_to_retry {
+                                net.request_epoch(epoch).await;
+                                failed_epochs.remove(&epoch);
+                            }
+                        }
+                    } else {
+                        sync_progress_stall_count = 0;
+                        recovery_mode = false;
+                        recovery_requests.clear();
                     }
                 }
 
@@ -344,18 +457,42 @@ async fn request_missing_epochs(
         return;
     }
 
-    sync_routine!("📥 Requesting epochs {} to {}", start_epoch, target_epoch);
+    let count = target_epoch.saturating_sub(start_epoch) + 1;
+    sync_routine!("📥 Requesting {} epochs: {} to {}", count, start_epoch, target_epoch);
+    
+    // Limit concurrent requests to avoid overwhelming the system
     let mut request_tasks = Vec::new();
+    let batch_size = MAX_CONCURRENT_EPOCH_REQUESTS.min(count as usize);
+    
     for missing in start_epoch..=target_epoch {
         let net_clone = net.clone();
         let sem_clone = semaphore.clone();
         let task = tokio::spawn(async move {
-            let Ok(_permit) = sem_clone.acquire().await else { return; };
-            net_clone.request_epoch(missing).await;
+            if let Ok(_permit) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sem_clone.acquire()
+            ).await {
+                net_clone.request_epoch(missing).await;
+            }
         });
         request_tasks.push(task);
+        
+        // Process in batches to avoid too many concurrent tasks
+        if request_tasks.len() >= batch_size || missing == target_epoch {
+            for task in request_tasks.drain(..) {
+                let _ = task.await;
+            }
+            // Small delay between batches to avoid network congestion
+            if missing < target_epoch {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
     }
-    for task in request_tasks {
-        let _ = task.await;
-    }
+}
+
+// New bypass function that circumvents deduplication
+async fn request_epoch_bypass(net: &NetHandle, epoch: u64) {
+    // Create a direct network request that bypasses the normal deduplication
+    // This is used only during recovery mode
+    net.request_epoch_direct(epoch).await;
 }

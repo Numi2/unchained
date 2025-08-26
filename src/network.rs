@@ -75,8 +75,8 @@ static RECENT_EPOCH_TX_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::
 static EPOCH_TX_REQS_PER_PEER: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const EPOCH_TX_REQ_DEDUP_MS: u64 = 1000;
 const MAX_COMPACT_REQ_BATCH: usize = 132; // 132 is the max number of compact epochs that can be requested in a single batch
-const PENDING_COMPACT_TTL_SECS: u64 = 60;
-const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 20;
+const PENDING_COMPACT_TTL_SECS: u64 = 120;  // Increased for slower sync scenarios
+const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 30;  // More tolerant of missing txs during sync
 const MAX_FULL_BODY_REQ_BATCH: usize = 256;
 const EPOCH_TX_REQS_PER_PEER_WINDOW_MS: u64 = 2000;
 const EPOCH_TX_REQS_PER_PEER_MAX: u32 = 8;
@@ -86,13 +86,13 @@ const EPOCH_CAND_REQ_DEDUP_MS: u64 = 1000;
 const MAX_EPOCH_CAND_RESP: usize = 2048;
 
 // New orphan buffer controls and reorg guardrails
-const ORPHAN_TOTAL_CAP: usize = 12096; // global cap across all heights
-const MAX_ORPHANS_PER_HEIGHT: usize = 16; // per-height cap
-const ORPHAN_TTL_SECS: u64 = 120; // TTL for stale orphans
-const ORPHAN_HEIGHT_COOLDOWN_SECS: u64 = 3; // cooldown when per-height cap hit
-const REORG_MIN_GAP_MS: u64 = 250; // minimum time between reorg attempts
-const MAX_BFS_WIDTH_PER_HEIGHT: usize = 32; // BFS frontier cap per height
-const MAX_REORG_STEPS: usize = 2048; // total heights traversed in one attempt
+const ORPHAN_TOTAL_CAP: usize = 32768; // Increased: global cap across all heights
+const MAX_ORPHANS_PER_HEIGHT: usize = 64; // Increased: per-height cap for better fork handling
+const ORPHAN_TTL_SECS: u64 = 300; // Increased TTL for slow sync scenarios
+const ORPHAN_HEIGHT_COOLDOWN_SECS: u64 = 1; // Reduced cooldown for faster processing
+const REORG_MIN_GAP_MS: u64 = 100; // Reduced for faster reorg attempts during sync
+const MAX_BFS_WIDTH_PER_HEIGHT: usize = 64; // Increased BFS frontier cap
+const MAX_REORG_STEPS: usize = 4096; // Increased for larger reorgs during sync
 
 #[allow(dead_code)]
 fn try_publish_gossip(
@@ -415,6 +415,7 @@ enum NetworkCommand {
     GossipEpochLeaves(EpochLeavesBundle),
     // removed commitment gossip
     RequestEpochCandidates([u8; 32]),
+    RequestEpochDirect(u64),  // Bypass deduplication
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -549,7 +550,7 @@ pub async fn spawn(
     let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     let mut outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
-    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 5024; // only buffer orphans within this distance of local tip
+    const ORPHAN_BUFFER_TIP_WINDOW: u64 = 10000; // Increased window for large sync gaps
     static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate coin fetch requests when we receive spends for unknown coins
@@ -558,7 +559,8 @@ pub async fn spawn(
     
     static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    const EPOCH_REQ_DEDUP_SECS: u64 = 12;
+    // Reduce deduplication time for better responsiveness
+    const EPOCH_REQ_DEDUP_SECS: u64 = 5;  // Reduced from 12 to 5 seconds
     // Deduplicate and throttle responses to latest-epoch requests
     static RECENT_LATEST_REQS: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> = Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
@@ -1095,6 +1097,7 @@ pub async fn spawn(
                                     NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
                                     NetworkCommand::RequestEpochCandidates(hash) => (TOP_EPOCH_CANDIDATES_REQUEST, bincode::serialize(&hash).ok()),
                                     NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
+                                    NetworkCommand::RequestEpochDirect(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     // commitment gossip removed
                                 };
                                 if let Some(d) = data {
@@ -1178,6 +1181,11 @@ pub async fn spawn(
                                             }
                                             continue;
                                         }
+                                        // Log details when receiving the next expected epoch
+                                        if a.num == latest.num + 1 {
+                                            net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent expected: {})", 
+                                                a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty, hex::encode(&latest.hash[..8]));
+                                        }
                                     }
                                     if score.check_rate_limit() { net_routine!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id); }
                                     match validate_anchor(&a, &db) {
@@ -1186,7 +1194,15 @@ pub async fn spawn(
                                                 if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                 st.peer_confirmed_tip = true;
                                             }
-                                            if a.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None)) {
+                                            let current_best = db.get("epoch", b"latest").unwrap_or(None);
+                                            let is_better = a.is_better_chain(&current_best);
+                                            if let Some(ref best) = current_best {
+                                                if a.num == best.num + 1 && !is_better {
+                                                    net_log!("⚠️  Epoch {} not adopted: cum_work {} <= current {}, diff {} vs {}",
+                                                        a.num, a.cumulative_work, best.cumulative_work, a.difficulty, best.difficulty);
+                                                }
+                                            }
+                                            if is_better {
                                                 net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
@@ -1288,6 +1304,19 @@ pub async fn spawn(
                                             // capacity is enforced internally by OrphanBuffer
                                         }
                                         Err(e) if e.starts_with("Previous anchor") => {
+                                            // Log details about missing previous anchor
+                                            if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
+                                                if a.num == latest.num + 1 || a.num == latest.num + 2 {
+                                                    net_log!("⚠️  Epoch {} validation failed: {}. Looking for parent at {}", 
+                                                        a.num, e, a.num - 1);
+                                                    // Check if we have the previous epoch with a different hash
+                                                    if let Ok(Some(stored_prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                        net_log!("❌ Hash mismatch at epoch {}: stored hash {}, anchor expects parent {}",
+                                                            a.num - 1, hex::encode(&stored_prev.hash[..8]), 
+                                                            hex::encode(&a.hash[..8]));
+                                                    }
+                                                }
+                                            }
                                             // Only buffer orphans near our local tip; skip when we don't have a tip yet
                                             let mut allow_buffer = false;
                                             if let Ok(Some(lat)) = db.get::<Anchor>("epoch", b"latest") {
@@ -1298,7 +1327,16 @@ pub async fn spawn(
                                                 if let Ok(Some(lat2)) = db.get::<Anchor>("epoch", b"latest") {
                                                     let tip = Some(lat2.num);
                                                     if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now()) {
-                                                        net_routine!("⏳ Buffered orphan anchor for epoch {}", a.num);
+                                                        net_routine!("⏳ Buffered orphan anchor for epoch {} (buffer size: {})", a.num, orphan_buf.len());
+                                                        // If buffer is getting full, trigger aggressive cleanup and reorg
+                                                        if orphan_buf.len() > ORPHAN_TOTAL_CAP * 3 / 4 {
+                                                            net_log!("⚠️  Orphan buffer at {}% capacity, triggering cleanup", 
+                                                                (orphan_buf.len() * 100) / ORPHAN_TOTAL_CAP);
+                                                            orphan_buf.prune_expired(std::time::Instant::now());
+                                                        }
+                                                    } else if orphan_buf.len() >= ORPHAN_TOTAL_CAP {
+                                                        eprintln!("❌ Orphan buffer full! Forcing prune of old entries.");
+                                                        orphan_buf.force_prune_oldest(ORPHAN_TOTAL_CAP / 4);
                                                     }
                                                 }
                                             }
@@ -1329,6 +1367,12 @@ pub async fn spawn(
                                             needs_reorg_check = true;
                                         },
                                         Err(e) => {
+                                            // Log validation errors for expected next epochs
+                                            if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
+                                                if a.num == latest.num + 1 {
+                                                    net_log!("❌ Next epoch {} validation failed: {}", a.num, e);
+                                                }
+                                            }
                                             if e.contains("hash mismatch") {
                                                 let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
                                                 let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
@@ -2246,6 +2290,7 @@ pub async fn spawn(
                             NetworkCommand::RequestEpochLeaves(epoch) => (TOP_EPOCH_LEAVES_REQUEST, bincode::serialize(&epoch).ok()),
                             NetworkCommand::RequestEpochCandidates(hash) => (TOP_EPOCH_CANDIDATES_REQUEST, bincode::serialize(&hash).ok()),
                             NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
+                            NetworkCommand::RequestEpochDirect(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                         };
                         if let Some(d) = data {
                             if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
@@ -2288,6 +2333,14 @@ pub async fn spawn(
                                             map.insert(*n, now);
                                         }
                                     }
+                                }
+                            }
+                        }
+                        NetworkCommand::RequestEpochDirect(n) => {
+                            // Skip deduplication for direct requests
+                            if let Ok(data) = bincode::serialize(n) {
+                                if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_REQUEST), data).is_err() {
+                                    pending_commands.push_back(command);
                                 }
                             }
                         }
@@ -2440,6 +2493,7 @@ impl Network {
     pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> { self.rate_limited_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
     pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
+    pub async fn request_epoch_direct(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochDirect(n)); }
     pub async fn request_epoch_headers_range(&self, start_height: u64, count: u32) {
         let range = EpochHeadersRange { start_height, count };
         let _ = self.command_tx.send(NetworkCommand::RequestEpochHeadersRange(range));
@@ -2462,6 +2516,8 @@ impl Network {
     pub fn peer_count(&self) -> usize {
         self.connected_peers.lock().map(|s| s.len()).unwrap_or(0)
     }
+    
+
 }
 
 #[derive(Debug)]
@@ -2574,6 +2630,22 @@ impl OrphanBuffer {
             } else { break; }
         }
         None
+    }
+
+    fn force_prune_oldest(&mut self, count: usize) {
+        // Force remove the oldest entries to make room
+        let mut removed = 0;
+        while removed < count && !self.index_fifo.is_empty() {
+            if let Some(hash) = self.index_fifo.pop_front() {
+                if let Some(height) = self.hash_to_height.get(&hash).copied() {
+                    let _ = self.remove_exact(height, hash);
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            eprintln!("Force pruned {} orphan anchors to prevent overflow", removed);
+        }
     }
 
     fn insert(&mut self, anchor: Anchor, local_tip: Option<u64>, tip_window: u64, now: std::time::Instant) -> bool {
