@@ -38,6 +38,8 @@ impl Anchor {
             Some(best) => {
                 if self.cumulative_work > best.cumulative_work { return true; }
                 if self.cumulative_work == best.cumulative_work && self.num > best.num { return true; }
+                // Deterministic tie-break: at equal work and height, prefer lexicographically smaller hash
+                if self.cumulative_work == best.cumulative_work && self.num == best.num && self.hash < best.hash { return true; }
                 false
             }
         }
@@ -323,6 +325,20 @@ impl Manager {
                         // Tiny jitter to de-synchronize edge races across peers
                         let jitter_ms: u64 = rand::thread_rng().gen_range(0..=SEALING_JITTER_MS);
                         tokio::time::sleep(time::Duration::from_millis(jitter_ms)).await;
+
+                        // Post-grace tip check: skip sealing if chain advanced during grace window
+                        if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                            if latest_anchor.num >= current_epoch {
+                                println!("⏭️  Chain advanced during grace; skipping local seal at epoch {}", current_epoch);
+                                current_epoch = latest_anchor.num + 1;
+                                // Realign ticker to now + epoch.seconds
+                                ticker = time::interval_at(
+                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
+                                    time::Duration::from_secs(self.cfg.seconds)
+                                );
+                                continue;
+                            }
+                        }
 
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();

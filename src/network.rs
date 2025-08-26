@@ -83,7 +83,7 @@ const EPOCH_TX_REQS_PER_PEER_MAX: u32 = 8;
 // Candidate request dedup/throttle
 static RECENT_EPOCH_CAND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const EPOCH_CAND_REQ_DEDUP_MS: u64 = 1000;
-const MAX_EPOCH_CAND_RESP: usize = 512;
+const MAX_EPOCH_CAND_RESP: usize = 2048;
 
 #[allow(dead_code)]
 fn try_publish_gossip(
