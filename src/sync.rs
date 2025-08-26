@@ -288,10 +288,21 @@ pub fn spawn(
                 Ok(anchor) = anchor_rx.recv() => {
                     if anchor.num > local_epoch {
                         if anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or_default()) {
-                            if anchor.num > local_epoch + 1 {
+                            // Only fast-forward to anchor if it's strictly the next contiguous epoch and parent is present;
+                            // otherwise request the missing range to enforce sequential adoption.
+                            if anchor.num == local_epoch + 1 {
+                                // Verify parent exists and links correctly before trusting this as progress
+                                let mut ok = false;
+                                if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &local_epoch.to_le_bytes()) {
+                                    let mut h = blake3::Hasher::new();
+                                    h.update(&anchor.merkle_root); h.update(&prev.hash);
+                                    ok = *h.finalize().as_bytes() == anchor.hash;
+                                }
+                                if ok { local_epoch = anchor.num; }
+                                else { request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await; }
+                            } else if anchor.num > local_epoch + 1 {
                                 request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await;
                             }
-                            local_epoch = anchor.num;
                         }
                     }
                 }
@@ -412,7 +423,8 @@ pub async fn spawn_headers_skeleton(
                                 crate::metrics::HEADERS_ANCHORS_STORED.inc();
                             }
                             if let Some(tip) = seg.headers.last() {
-                                if db_headers.put("epoch", b"latest", tip).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                // Do NOT advance canonical latest here; headers are skeleton only.
+                                // Track progress via headers cursors instead.
                                 let (mut highest_req, mut highest_stored) = db_headers.get_headers_cursor().unwrap_or((0,0));
                                 if tip.num > highest_stored { highest_stored = tip.num; let _ = db_headers.put_headers_cursor(highest_req, highest_stored); }
                                 // Keep the headers window full by enqueueing additional ranges beyond highest_requested

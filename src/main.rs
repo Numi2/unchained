@@ -262,10 +262,13 @@ async fn main() -> anyhow::Result<()> {
             println!("🔄 Initiating synchronization with the network...");
             net.request_latest_epoch().await;
 
+            let mut anchor_rx = net.anchor_subscribe();
             let poll_interval_ms: u64 = 500;
             let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
             let mut synced = false;
-            for attempt in 0..max_attempts {
+            let mut attempt: u64 = 0;
+            let mut last_local_displayed: u64 = u64::MAX; // force initial print once we have network view
+            while attempt < max_attempts {
                 let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
                 let peer_confirmed = sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
                 let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
@@ -287,16 +290,24 @@ async fn main() -> anyhow::Result<()> {
                     synced = true;
                     break;
                 }
+
                 if highest_seen > 0 {
-                    if cfg.net.bootstrap.is_empty() {
-                        println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
-                    } else {
-                        println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                    if last_local_displayed != local_epoch || attempt == 0 {
+                        if cfg.net.bootstrap.is_empty() {
+                            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                        } else {
+                            println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                        }
+                        last_local_displayed = local_epoch;
                     }
                 } else {
                     println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+
+                tokio::select! {
+                    Ok(_a) = anchor_rx.recv() => { continue; }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
+                }
             }
             if !synced {
                 println!(
@@ -666,10 +677,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("🔄 Initiating synchronization with the network...");
                 net.request_latest_epoch().await;
 
+                let mut anchor_rx = net.anchor_subscribe();
                 let poll_interval_ms: u64 = 500;
                 let max_attempts: u64 = ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
                 let mut synced = false;
-                for attempt in 0..max_attempts {
+                let mut attempt: u64 = 0;
+                let mut last_local_displayed: u64 = u64::MAX;
+                while attempt < max_attempts {
                     let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
                     let peer_confirmed = sync_state.lock().map(|s| s.peer_confirmed_tip).unwrap_or(false);
                     let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
@@ -690,16 +704,24 @@ async fn main() -> anyhow::Result<()> {
                         synced = true;
                         break;
                     }
+
                     if highest_seen > 0 {
-                        if cfg.net.bootstrap.is_empty() {
-                            println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
-                        } else {
-                            println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                        if last_local_displayed != local_epoch || attempt == 0 {
+                            if cfg.net.bootstrap.is_empty() {
+                                println!("⏳ Syncing... local epoch: {}, network epoch: {}", local_epoch, highest_seen);
+                            } else {
+                                println!("⏳ Syncing... local {}, network {}, peer-confirmed: {}", local_epoch, highest_seen, peer_confirmed);
+                            }
+                            last_local_displayed = local_epoch;
                         }
                     } else {
                         println!("⏳ Waiting for network response... (attempt {})", attempt + 1);
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+
+                    tokio::select! {
+                        Ok(_a) = anchor_rx.recv() => { continue; }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
+                    }
                 }
                 if !synced {
                     println!(

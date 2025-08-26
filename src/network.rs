@@ -1334,6 +1334,8 @@ pub async fn spawn(
                                             } else {
                                                 net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)", 
                                                     a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
+                                                // Parent missing: explicitly request backfill around parent height
+                                                request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
                                             }
                                         }
                                     }
@@ -1356,7 +1358,23 @@ pub async fn spawn(
                                                 net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                // Advance latest only if the parent exists locally and links correctly.
+                                                let mut advance_latest = true;
+                                                if a.num > 0 {
+                                                    if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                        let mut h = blake3::Hasher::new();
+                                                        h.update(&a.merkle_root); h.update(&prev.hash);
+                                                        if *h.finalize().as_bytes() != a.hash { advance_latest = false; }
+                                                    } else {
+                                                        advance_latest = false;
+                                                    }
+                                                }
+                                                if advance_latest {
+                                                    if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                                } else {
+                                                    // Parent missing or mismatch: request targeted backfill and do not advance latest
+                                                    request_aligned_range(&command_tx, a.num, REORG_BACKFILL);
+                                                }
                                                 let _ = anchor_tx.send(a.clone());
 
                                                 if a.num > 0 {
