@@ -12,7 +12,7 @@ use crate::sync::SyncState;
 use rocksdb::WriteBatch;
 use rand::Rng;
 
-const FINALIZATION_GRACE_MS: u64 = 2222;
+const FINALIZATION_GRACE_MS: u64 = 11111;
 const SEALING_JITTER_MS: u64 = 222;
 
 
@@ -363,26 +363,36 @@ impl Manager {
                             candidates
                         };
 
-                        // Select up to max_coins_per_epoch by smallest pow_hash, tie-break by coin_id for determinism
+                        // Select up to max_coins_per_epoch by smallest pow_hash (stable tie-break by id)
                         let cap = self.cfg.max_coins_per_epoch as usize;
-                        if selected.len() > cap {
-                            if cap == 0 {
-                                selected.clear();
-                            } else {
-                                // Partial select the k smallest to avoid full sort on large candidate sets
-                                let _ = selected.select_nth_unstable_by(cap - 1, |a, b| a
-                                    .pow_hash
-                                    .cmp(&b.pow_hash)
-                                    .then_with(|| a.id.cmp(&b.id))
-                                );
-                                selected.truncate(cap);
-                                // Now stable-sort the top-k deterministically for reproducibility across nodes
-                                selected.sort_by(|a, b| a
-                                    .pow_hash
-                                    .cmp(&b.pow_hash)
-                                    .then_with(|| a.id.cmp(&b.id))
-                                );
+                        if cap == 0 {
+                            selected.clear();
+                        } else if selected.len() > cap {
+                            // Streaming top-k with a bounded max-heap; then stable-sort the winners
+                            use std::cmp::Ordering;
+                            use std::collections::BinaryHeap;
+                            #[derive(Eq, Clone)]
+                            struct Keyed(crate::coin::CoinCandidate);
+                            impl Ord for Keyed {
+                                fn cmp(&self, other: &Self) -> Ordering {
+                                    self.0.pow_hash.cmp(&other.0.pow_hash).then_with(|| self.0.id.cmp(&other.0.id))
+                                }
                             }
+                            impl PartialOrd for Keyed { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+                            impl PartialEq for Keyed { fn eq(&self, o: &Self) -> bool { self.cmp(o) == Ordering::Equal } }
+
+                            let mut heap: BinaryHeap<Keyed> = BinaryHeap::with_capacity(cap);
+                            for cand in selected.into_iter() {
+                                if heap.len() < cap { heap.push(Keyed(cand)); }
+                                else if let Some(top) = heap.peek() {
+                                    if cand.pow_hash < top.0.pow_hash || (cand.pow_hash == top.0.pow_hash && cand.id < top.0.id) {
+                                        heap.pop();
+                                        heap.push(Keyed(cand));
+                                    }
+                                }
+                            }
+                            selected = heap.into_iter().map(|k| k.0).collect();
+                            selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
                         } else {
                             selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
                         }
@@ -571,46 +581,41 @@ pub fn select_candidates_for_epoch(
     cap: usize,
     _buffer: Option<&std::collections::HashSet<[u8; 32]>>,
 ) -> (Vec<crate::coin::CoinCandidate>, usize) {
-    // Collect all candidates for this epoch based on parent anchor hash
+    // Stream candidates for this epoch and keep only the k best
     let candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
         Ok(v) => v,
         Err(_) => Vec::new(),
     };
-
-    // Enforce PoW difficulty from the parent anchor before selection
-    let mut selected: Vec<crate::coin::CoinCandidate> = if parent.difficulty > 0 {
-        candidates
-            .into_iter()
-            .filter(|c| c.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0))
-            .collect()
-    } else {
-        candidates
-    };
-
-    let total_candidates = selected.len();
-
-    // Select up to cap by smallest pow_hash, tie-break by coin_id for determinism
-    if selected.len() > cap {
-        if cap == 0 {
-            selected.clear();
-        } else {
-            // Partial select the k smallest to avoid full sort on large candidate sets
-            let _ = selected.select_nth_unstable_by(cap - 1, |a, b| a
-                .pow_hash
-                .cmp(&b.pow_hash)
-                .then_with(|| a.id.cmp(&b.id))
-            );
-            selected.truncate(cap);
-            // Now stable-sort the top-k deterministically for reproducibility across nodes
-            selected.sort_by(|a, b| a
-                .pow_hash
-                .cmp(&b.pow_hash)
-                .then_with(|| a.id.cmp(&b.id))
-            );
+    let mut total_candidates = 0usize;
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+    #[derive(Eq, Clone)]
+    struct Keyed(crate::coin::CoinCandidate);
+    impl Ord for Keyed {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.pow_hash.cmp(&other.0.pow_hash).then_with(|| self.0.id.cmp(&other.0.id))
         }
-    } else {
-        selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+    }
+    impl PartialOrd for Keyed { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl PartialEq for Keyed { fn eq(&self, o: &Self) -> bool { self.cmp(o) == Ordering::Equal } }
+
+    if cap == 0 {
+        return (Vec::new(), 0);
     }
 
+    let mut heap: BinaryHeap<Keyed> = BinaryHeap::with_capacity(cap);
+    for cand in candidates.into_iter() {
+        if parent.difficulty > 0 && !cand.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0) { continue; }
+        total_candidates += 1;
+        if heap.len() < cap { heap.push(Keyed(cand)); }
+        else if let Some(top) = heap.peek() {
+            if cand.pow_hash < top.0.pow_hash || (cand.pow_hash == top.0.pow_hash && cand.id < top.0.id) {
+                heap.pop();
+                heap.push(Keyed(cand));
+            }
+        }
+    }
+    let mut selected: Vec<_> = heap.into_iter().map(|k| k.0).collect();
+    selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
     (selected, total_candidates)
 }

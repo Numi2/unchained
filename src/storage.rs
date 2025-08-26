@@ -107,6 +107,18 @@ impl Store {
         
         // Configure column family options with sane production defaults
         let mut cf_opts = Options::default();
+        // Enable Bloom filters and prefix extractor for better prefix seeks (coin_candidate: 32-byte epoch_hash)
+        {
+            let mut block = rocksdb::BlockBasedOptions::default();
+            // Bloom filter ~10 bits/key; enable index/filter caching
+            block.set_bloom_filter(10.0, false);
+            block.set_cache_index_and_filter_blocks(true);
+            // Partitioned bloom filters improve prefix-iteration performance
+            block.set_partition_filters(true);
+            // Keep L0 index/filter pinned in cache to reduce thrash during bursts
+            block.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            cf_opts.set_block_based_table_factory(&block);
+        }
         // Larger memtable for throughput; multiple write buffers
         cf_opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
         cf_opts.set_max_write_buffer_number(2);
@@ -178,7 +190,15 @@ impl Store {
         }
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = final_cf_names
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(name.clone(), cf_opts.clone()))
+            .map(|name| {
+                let mut opts = cf_opts.clone();
+                // Apply a fixed-length 32-byte prefix extractor on coin_candidate CF to optimize per-epoch scans
+                if name == "coin_candidate" {
+                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+                    opts.set_optimize_filters_for_hits(true);
+                }
+                ColumnFamilyDescriptor::new(name.clone(), opts)
+            })
             .collect();
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors)
@@ -429,17 +449,27 @@ impl Store {
         key
     }
 
-    /// Iterate coin candidates by epoch hash using prefix iteration
+    /// Iterate coin candidates by epoch hash using bounded prefix iteration
     pub fn get_coin_candidates_by_epoch_hash(&self, epoch_hash: &[u8; 32]) -> Result<Vec<crate::coin::CoinCandidate>> {
         let cf = self.db.cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
         let mut coins = Vec::new();
-        let prefix = epoch_hash;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let mut upper = Vec::with_capacity(64);
+        upper.extend_from_slice(epoch_hash);
+        upper.extend_from_slice(&[0xFF; 32]);
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_iterate_lower_bound(epoch_hash.to_vec());
+        ro.set_iterate_upper_bound(upper);
+        let iter = self.db.iterator_cf_opt(
+            cf,
+            ro,
+            rocksdb::IteratorMode::From(epoch_hash, rocksdb::Direction::Forward),
+        );
         for item in iter {
             let (k, v) = item?;
             if k.len() < 64 { continue; }
-            if &k[0..32] != prefix { break; }
+            // within bounds due to iterate_upper_bound; keep prefix guard for safety
+            if &k[0..32] != &epoch_hash[..] { break; }
             if let Ok(coin) = crate::coin::decode_candidate(&v) {
                 coins.push(coin);
             }

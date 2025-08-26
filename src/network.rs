@@ -665,22 +665,9 @@ pub async fn spawn(
                     }
                     batch.delete_cf(leaves_cf, &prefix);
 
-                    // 4) Attempt to reconstruct selected set using local candidates
-                    let mut candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) { Ok(v) => v, Err(_) => Vec::new() };
-                    if parent.difficulty > 0 { candidates.retain(|c| c.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0)); }
+                    // 4) Attempt to reconstruct selected set using canonical selector
                     let cap = alt.coin_count as usize;
-                    if cap == 0 {
-                    } else if candidates.len() > cap {
-                        let _ = candidates.select_nth_unstable_by(cap - 1, |a, b| a
-                            .pow_hash
-                            .cmp(&b.pow_hash)
-                            .then_with(|| a.id.cmp(&b.id))
-                        );
-                        candidates.truncate(cap);
-                        candidates.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-                    } else {
-                        candidates.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-                    }
+                    let (candidates, _total_candidates) = crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
                     let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
                     let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
                     leaves.sort();
@@ -953,28 +940,9 @@ pub async fn spawn(
             }
             batch.delete_cf(leaves_cf, &prefix);
 
-            // 4) Attempt to reconstruct selected set using local candidates
-            let mut candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            };
-            if parent.difficulty > 0 {
-                candidates.retain(|c| c.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0));
-            }
+            // 4) Attempt to reconstruct selected set using canonical selector
             let cap = alt.coin_count as usize;
-            if cap == 0 {
-                // Nothing selected for this epoch
-            } else if candidates.len() > cap {
-                let _ = candidates.select_nth_unstable_by(cap - 1, |a, b| a
-                    .pow_hash
-                    .cmp(&b.pow_hash)
-                    .then_with(|| a.id.cmp(&b.id))
-                );
-                candidates.truncate(cap);
-                candidates.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-            } else {
-                candidates.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-            }
+            let (candidates, _total_candidates) = crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
 
             let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
             let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
