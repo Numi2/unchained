@@ -93,7 +93,7 @@ const EPOCH_TX_REQS_PER_PEER_WINDOW_MS: u64 = 2000;
 const EPOCH_TX_REQS_PER_PEER_MAX: u32 = 8;
 // Candidate request dedup/throttle
 static RECENT_EPOCH_CAND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-const EPOCH_CAND_REQ_DEDUP_MS: u64 = 1000;
+const EPOCH_CAND_REQ_DEDUP_MS: u64 = 500;
 const MAX_EPOCH_CAND_RESP: usize = 2048;
 
 // New orphan buffer controls and reorg guardrails
@@ -817,20 +817,7 @@ pub async fn spawn(
                     let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
                     let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
                     leaves.sort();
-                    let computed_root = if leaves.is_empty() { [0u8;32] } else {
-                        let mut tmp = leaves.clone();
-                        while tmp.len() > 1 {
-                            let mut next = Vec::new();
-                            for chunk in tmp.chunks(2) {
-                                let mut hasher = blake3::Hasher::new();
-                                hasher.update(&chunk[0]);
-                                hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
-                                next.push(*hasher.finalize().as_bytes());
-                            }
-                            tmp = next;
-                        }
-                        tmp[0]
-                    };
+                    let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
 
                     if computed_root == alt.merkle_root && selected_ids.len() as u32 == alt.coin_count {
                         for cand in &candidates {

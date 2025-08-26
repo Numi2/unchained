@@ -84,6 +84,10 @@ path = "src/bin/fix_fork.rs"
 name = "resync_after_rollback"
 path = "src/bin/resync_after_rollback.rs"
 
+[[bin]]
+name = "list_epochs"
+path = "src/bin/list_epochs.rs"
+
 
 [dev-dependencies]
 tempfile = "3.8"

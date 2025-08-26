@@ -313,15 +313,20 @@ impl Manager {
                             }
                         }
 
-                        // Pre-seal candidate pull: burst requests for prev.hash to improve inclusion
+                        // Active candidate pull during grace to reduce producer bias
                         if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
-                            for _ in 0..3 {
+                            let deadline = time::Instant::now() + time::Duration::from_millis(FINALIZATION_GRACE_MS);
+                            // Small randomized delay to avoid herd behavior on request start
+                            let pull_jitter: u64 = rand::thread_rng().gen_range(0..=200);
+                            tokio::time::sleep(time::Duration::from_millis(pull_jitter)).await;
+                            while time::Instant::now() < deadline {
                                 self.net.request_epoch_candidates(prev.hash).await;
-                                tokio::time::sleep(time::Duration::from_millis(200)).await;
+                                tokio::time::sleep(time::Duration::from_millis(500)).await;
+                                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                                    if latest_anchor.num >= current_epoch { break; }
+                                }
                             }
                         }
-                        // Finalization grace: allow late candidate gossip to land locally
-                        tokio::time::sleep(time::Duration::from_millis(FINALIZATION_GRACE_MS)).await;
                         // Tiny jitter to de-synchronize edge races across peers
                         let jitter_ms: u64 = rand::thread_rng().gen_range(0..=SEALING_JITTER_MS);
                         tokio::time::sleep(time::Duration::from_millis(jitter_ms)).await;
@@ -343,74 +348,12 @@ impl Manager {
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
 
-                        // Collect all candidates for this epoch: include any from buffer and any seen from the network
-                        let candidates: Vec<CoinCandidate> = if let Some(prev) = &prev_anchor {
-                            // Fetch all candidates matching the prev anchor hash (current epoch is prev+1)
-                            match self.db.get_coin_candidates_by_epoch_hash(&prev.hash) {
-                                Ok(mut v) => {
-                                    // Ensure locally buffered coins are included even if not yet persisted (best-effort)
-                                    // Candidate CF key = epoch_hash || coin_id
-                                    for id in buffer.iter() {
-                                        if !v.iter().any(|c| &c.id == id) {
-                                            let composite = crate::storage::Store::candidate_key(&prev.hash, id);
-                                            if let Ok(Some(c)) = self.db.get::<CoinCandidate>("coin_candidate", &composite) {
-                                                v.push(c);
-                                            }
-                                        }
-                                    }
-                                    v
-                                }
-                                Err(_) => Vec::new(),
-                            }
-                        } else {
-                            // Genesis: no prev anchor, use only buffered coins (should be empty)
-                            Vec::new()
-                        };
-
-                        // Enforce PoW difficulty from the previous anchor before selection
-                        let mut selected: Vec<CoinCandidate> = if let Some(prev) = &prev_anchor {
-                            let required_difficulty = prev.difficulty;
-                            candidates
-                                .into_iter()
-                                .filter(|c| c.pow_hash.iter().take(required_difficulty).all(|b| *b == 0))
-                                .collect()
-                        } else {
-                            // Genesis: nothing to filter
-                            candidates
-                        };
-
-                        // Select up to max_coins_per_epoch by smallest pow_hash (stable tie-break by id)
-                        let cap = self.cfg.max_coins_per_epoch as usize;
-                        if cap == 0 {
-                            selected.clear();
-                        } else if selected.len() > cap {
-                            // Streaming top-k with a bounded max-heap; then stable-sort the winners
-                            use std::cmp::Ordering;
-                            use std::collections::BinaryHeap;
-                            #[derive(Eq, Clone)]
-                            struct Keyed(crate::coin::CoinCandidate);
-                            impl Ord for Keyed {
-                                fn cmp(&self, other: &Self) -> Ordering {
-                                    self.0.pow_hash.cmp(&other.0.pow_hash).then_with(|| self.0.id.cmp(&other.0.id))
-                                }
-                            }
-                            impl PartialOrd for Keyed { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-                            impl PartialEq for Keyed { fn eq(&self, o: &Self) -> bool { self.cmp(o) == Ordering::Equal } }
-
-                            let mut heap: BinaryHeap<Keyed> = BinaryHeap::with_capacity(cap);
-                            for cand in selected.into_iter() {
-                                if heap.len() < cap { heap.push(Keyed(cand)); }
-                                else if let Some(top) = heap.peek() {
-                                    if cand.pow_hash < top.0.pow_hash || (cand.pow_hash == top.0.pow_hash && cand.id < top.0.id) {
-                                        heap.pop();
-                                        heap.push(Keyed(cand));
-                                    }
-                                }
-                            }
-                            selected = heap.into_iter().map(|k| k.0).collect();
-                            selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-                        } else {
-                            selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+                        // Use canonical fair selection that ensures diversity across creators
+                        let mut selected: Vec<CoinCandidate> = Vec::new();
+                        if let Some(prev) = &prev_anchor {
+                            let cap = self.cfg.max_coins_per_epoch as usize;
+                            let (list, _total) = crate::epoch::select_candidates_for_epoch(&self.db, prev, cap, Some(&buffer));
+                            selected = list;
                         }
                         if let Some(last) = selected.last() {
                             // approximate selection threshold: interpret first 8 bytes of pow_hash as u64
@@ -595,43 +538,71 @@ pub fn select_candidates_for_epoch(
     db: &crate::storage::Store,
     parent: &Anchor,
     cap: usize,
-    _buffer: Option<&std::collections::HashSet<[u8; 32]>>,
+    buffer: Option<&std::collections::HashSet<[u8; 32]>>,
 ) -> (Vec<crate::coin::CoinCandidate>, usize) {
-    // Stream candidates for this epoch and keep only the k best
-    let candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
+    // Collect candidates for this epoch hash and optionally merge locally buffered ids
+    let mut candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
         Ok(v) => v,
         Err(_) => Vec::new(),
     };
-    let mut total_candidates = 0usize;
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-    #[derive(Eq, Clone)]
-    struct Keyed(crate::coin::CoinCandidate);
-    impl Ord for Keyed {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.0.pow_hash.cmp(&other.0.pow_hash).then_with(|| self.0.id.cmp(&other.0.id))
+    // Track existing candidate IDs to avoid O(n^2) scans during merge
+    let mut candidate_ids: std::collections::HashSet<[u8;32]> =
+        std::collections::HashSet::from_iter(candidates.iter().map(|c| c.id));
+    if let Some(buf) = buffer {
+        for id in buf.iter() {
+            if candidate_ids.contains(id) { continue; }
+            let key = crate::storage::Store::candidate_key(&parent.hash, id);
+            if let Ok(Some(c)) = db.get::<crate::coin::CoinCandidate>("coin_candidate", &key) {
+                candidate_ids.insert(c.id);
+                candidates.push(c);
+            }
         }
     }
-    impl PartialOrd for Keyed { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl PartialEq for Keyed { fn eq(&self, o: &Self) -> bool { self.cmp(o) == Ordering::Equal } }
 
     if cap == 0 {
         return (Vec::new(), 0);
     }
 
-    let mut heap: BinaryHeap<Keyed> = BinaryHeap::with_capacity(cap);
+    // Filter by PoW difficulty
+    let mut filtered: Vec<crate::coin::CoinCandidate> = Vec::new();
+    let mut total_candidates = 0usize;
     for cand in candidates.into_iter() {
-        if parent.difficulty > 0 && !cand.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0) { continue; }
+        if parent.difficulty > 0 && !cand.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0) {
+            continue;
+        }
         total_candidates += 1;
-        if heap.len() < cap { heap.push(Keyed(cand)); }
-        else if let Some(top) = heap.peek() {
-            if cand.pow_hash < top.0.pow_hash || (cand.pow_hash == top.0.pow_hash && cand.id < top.0.id) {
-                heap.pop();
-                heap.push(Keyed(cand));
+        filtered.push(cand);
+    }
+
+    // Global order by pow_hash, then id (deterministic)
+    filtered.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+
+    // Fair, round-based selection across creators while preserving global order.
+    use std::collections::{HashMap, HashSet};
+    let mut picked: Vec<crate::coin::CoinCandidate> = Vec::with_capacity(cap);
+    let mut by_creator: HashMap<[u8;32], usize> = HashMap::new();
+    let mut round: usize = 0;
+    let mut picked_ids: HashSet<[u8;32]> = HashSet::new();
+
+    while picked.len() < cap {
+        let mut advanced = false;
+        for c in filtered.iter() {
+            if picked.len() >= cap { break; }
+            let cnt = *by_creator.get(&c.creator_address).unwrap_or(&0);
+            if cnt == round && !picked_ids.contains(&c.id) {
+                picked.push(c.clone());
+                picked_ids.insert(c.id);
+                by_creator.insert(c.creator_address, cnt + 1);
+                advanced = true;
+                if picked.len() >= cap { break; }
             }
         }
+        if !advanced { break; }
+        round += 1;
     }
-    let mut selected: Vec<_> = heap.into_iter().map(|k| k.0).collect();
-    selected.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
-    (selected, total_candidates)
+
+    // Ensure deterministic ordering of the selected set
+    picked.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+
+    (picked, total_candidates)
 }

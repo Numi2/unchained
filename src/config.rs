@@ -110,6 +110,9 @@ pub struct Mining {
 pub struct Metrics {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// How many recent epochs tools should display by default
+    #[serde(default = "default_last_epochs_to_show")]
+    pub last_epochs_to_show: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -145,6 +148,7 @@ pub struct WalletCfg {
 
 fn default_mem() -> u32   { 65_536 }          // 64 MiB
 fn default_bind() -> String { "127.0.0.1:9100".into() }
+fn default_last_epochs_to_show() -> u64 { 10 }
 fn default_auto_serve_commitments() -> bool { true }
 
 // Epoch retargeting defaults
@@ -243,7 +247,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "enabled","mem_kib","min_mem_kib","max_mem_kib","max_memory_adjustment","heartbeat_interval_secs","max_attempts","max_mining_attempts","check_interval_attempts","workers","offload_blocking"
                 ]),
-                ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind"]),
+                ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind","last_epochs_to_show"]),
                 ("wallet", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["auto_serve_commitments"]),
                 _ => {}
             }

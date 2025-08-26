@@ -56,7 +56,7 @@ heartbeat_interval_secs = 15
 
 # Maximum mining attempts per epoch before moving to next epoch
 # (alias for `max_attempts` in code)
-max_mining_attempts = 200000
+max_mining_attempts = 1000000
 
 
 
