@@ -628,7 +628,7 @@ pub async fn spawn(
         gs,
         peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(std::time::Duration::from_secs(120))
+            .with_idle_connection_timeout(std::time::Duration::from_secs(555))
     );
     
     let mut port = net_cfg.listen_port;
@@ -1439,6 +1439,8 @@ pub async fn spawn(
                                                                     map.insert(a.num, now);
                                                                 }
                                                             }
+                                                            // Also request selected IDs to backfill the per-epoch index if peers can provide it
+                                                            let _ = command_tx.send(NetworkCommand::RequestEpochSelected(a.num));
                                                         }
                                                     }
                                                 }
@@ -2237,6 +2239,36 @@ pub async fn spawn(
                                         if !already_have_same {
                                             if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
                                                 net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
+                                            }
+                                        }
+                                        // Opportunistically backfill selected IDs if the index is missing and we have coins
+                                        if let Ok(existing_ids) = db.get_selected_coin_ids_for_epoch(bundle.epoch_num) {
+                                            if existing_ids.is_empty() && anchor.coin_count > 0 {
+                                                if let Ok(all_confirmed) = db.iterate_coins() {
+                                                    let mut ids: Vec<[u8;32]> = all_confirmed
+                                                        .into_iter()
+                                                        .filter(|c| c.epoch_hash == anchor.hash)
+                                                        .map(|c| c.id)
+                                                        .collect();
+                                                    if ids.len() == anchor.coin_count as usize {
+                                                        let mut verify_leaves: Vec<[u8;32]> = ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                                                        verify_leaves.sort();
+                                                        let root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&verify_leaves);
+                                                        if root == anchor.merkle_root {
+                                                            if let Some(sel_cf) = db.db.cf_handle("epoch_selected") {
+                                                                let mut batch = rocksdb::WriteBatch::default();
+                                                                for coin_id in &ids {
+                                                                    let mut key = Vec::with_capacity(8 + 32);
+                                                                    key.extend_from_slice(&bundle.epoch_num.to_le_bytes());
+                                                                    key.extend_from_slice(coin_id);
+                                                                    batch.put_cf(sel_cf, &key, &[]);
+                                                                }
+                                                                let _ = db.db.write(batch);
+                                                                net_log!("🧩 Backfilled selected IDs for epoch {} from local coins", bundle.epoch_num);
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         // Try to serve any pending coin-proof requests that belong to this epoch
