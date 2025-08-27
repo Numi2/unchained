@@ -310,6 +310,16 @@ impl Miner {
                 
                 // Heartbeat monitoring
                 _ = heartbeat_interval.tick() => {
+                    // Lightweight keepalive and cross-check of epoch candidates
+                    // This helps keep QUIC/NAT bindings warm and asks peers' epoch managers
+                    // for their current candidate sets for the latest known parent hash.
+                    if self.net.peer_count() > 0 {
+                        self.net.request_latest_epoch().await;
+                        if let Ok(Some(latest)) = self.db.get::<Anchor>("epoch", b"latest") {
+                            self.net.request_epoch_candidates(latest.hash).await;
+                        }
+                    }
+
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
                     // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.

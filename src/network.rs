@@ -2191,13 +2191,13 @@ pub async fn spawn(
                                                 }
                                                 if !responded {
                                                     if let Ok(all_confirmed) = db.iterate_coins() {
-                                                        let mut ids: Vec<[u8;32]> = all_confirmed
+                                                        let ids: Vec<[u8;32]> = all_confirmed
                                                             .into_iter()
                                                             .filter(|c| db.get_epoch_for_coin(&c.id).ok().flatten() == Some(anchor.num))
                                                             .map(|c| c.id)
                                                             .collect();
                                                         if ids.len() as u32 == anchor.coin_count {
-                                                            let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
+                                                            let set: HashSet<[u8;32]> = HashSet::from_iter(ids.into_iter());
                                                             if set.contains(&coin.id) {
                                                                 if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
                                                                     let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
@@ -2245,7 +2245,7 @@ pub async fn spawn(
                                         if let Ok(existing_ids) = db.get_selected_coin_ids_for_epoch(bundle.epoch_num) {
                                             if existing_ids.is_empty() && anchor.coin_count > 0 {
                                                 if let Ok(all_confirmed) = db.iterate_coins() {
-                                                    let mut ids: Vec<[u8;32]> = all_confirmed
+                                                    let ids: Vec<[u8;32]> = all_confirmed
                                                         .into_iter()
                                                         .filter(|c| c.epoch_hash == anchor.hash)
                                                         .map(|c| c.id)
