@@ -543,6 +543,7 @@ enum NetworkCommand {
     
     GossipSpend(Spend),
     GossipCompactEpoch(CompactEpoch),
+    GossipEpochSelectedResponse(SelectedIdsBundle),
     GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
@@ -1219,7 +1220,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                                     NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
                                     NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
-                                    
+                                    NetworkCommand::GossipEpochSelectedResponse(bundle) => (TOP_EPOCH_SELECTED_RESPONSE, bincode::serialize(&bundle).ok()),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
@@ -2375,9 +2376,8 @@ pub async fn spawn(
                                             if let Ok(Some(anchor2)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                                                 if ids.len() as u32 != anchor2.coin_count { continue; }
                                                 let response = SelectedIdsBundle { epoch_num, merkle_root: anchor2.merkle_root, coin_ids: ids };
-                                                if let Ok(data) = bincode::serialize(&response) {
-                                                    try_publish_gossip(&mut swarm, TOP_EPOCH_SELECTED_RESPONSE, data, "epoch-selected");
-                                                }
+                                                // Enqueue for retry/backoff to avoid dropping on AllQueuesFull
+                                                let _ = command_tx.send(NetworkCommand::GossipEpochSelectedResponse(response));
                                             }
                                         }
                                     }
@@ -2479,6 +2479,7 @@ pub async fn spawn(
                             NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                             NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
                             NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
+                            NetworkCommand::GossipEpochSelectedResponse(bundle) => (TOP_EPOCH_SELECTED_RESPONSE, bincode::serialize(&bundle).ok()),
                             NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
