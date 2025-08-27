@@ -103,7 +103,7 @@ const ORPHAN_TTL_SECS: u64 = 300; // Increased TTL for slow sync scenarios
 const ORPHAN_HEIGHT_COOLDOWN_SECS: u64 = 1; // Reduced cooldown for faster processing
 const REORG_MIN_GAP_MS: u64 = 100; // Reduced for faster reorg attempts during sync
 const MAX_BFS_WIDTH_PER_HEIGHT: usize = 64; // Increased BFS frontier cap
-const MAX_REORG_STEPS: usize = 4096; // Increased for larger reorgs during sync
+const MAX_REORG_STEPS: usize = 12096; // Increased for larger reorgs during sync
 
 #[allow(dead_code)]
 fn try_publish_gossip(
