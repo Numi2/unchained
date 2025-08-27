@@ -145,6 +145,8 @@ const TOP_RATE_LIMITED: &str = "unchained/limited_24h/v1";
 // Headers-first skeleton sync (additive topics; legacy-safe)
 const TOP_EPOCH_HEADERS_REQUEST: &str = "unchained/epoch_headers_request/v1";   // payload: EpochHeadersRange
 const TOP_EPOCH_HEADERS_RESPONSE: &str = "unchained/epoch_headers_response/v1"; // payload: EpochHeadersBatch
+const TOP_EPOCH_BY_HASH_REQUEST: &str = "unchained/epoch_header_by_hash_request/v1";   // payload: EpochByHash
+const TOP_EPOCH_BY_HASH_RESPONSE: &str = "unchained/epoch_header_by_hash_response/v1"; // payload: Anchor
 // Compact epoch relay (additive)
 const TOP_EPOCH_COMPACT: &str = "unchained/epoch_compact/v1";   // payload: CompactEpoch
 const TOP_EPOCH_GET_TXN: &str = "unchained/epoch_get_txn/v1";    // payload: (epoch_hash, indexes)
@@ -395,6 +397,9 @@ fn links_to_available_parent(a: &Anchor, orphan_buf: &OrphanBuffer, db: &Store) 
 // Debounce map for compact range backfill requests with chunk alignment
 static RECENT_RANGE_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const RANGE_REQ_DEDUP_SECS: u64 = 5;
+// Debounce map for epoch-by-hash requests to prevent spam
+static RECENT_HASH_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+const HASH_REQ_DEDUP_SECS: u64 = 3;
 const HDR_CHUNK: u64 = 64; // Align range requests to 64-epoch chunks
 
 // Bootstrap redial deduplication by address string
@@ -514,6 +519,11 @@ pub struct EpochHeadersBatch {
     pub headers: Vec<Anchor>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochByHash {
+    pub hash: [u8; 32],
+}
+
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
@@ -536,6 +546,7 @@ enum NetworkCommand {
     GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
+    RequestEpochByHash([u8; 32]),
     RequestSpend([u8;32]),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
@@ -617,6 +628,7 @@ pub async fn spawn(
         TOP_PEER_ADDR,
         TOP_RATE_LIMITED,
         TOP_EPOCH_HEADERS_REQUEST, TOP_EPOCH_HEADERS_RESPONSE,
+        TOP_EPOCH_BY_HASH_REQUEST, TOP_EPOCH_BY_HASH_RESPONSE,
         TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
         TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
     ] {
@@ -1212,6 +1224,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
+                                    NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),
                                     NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                                     NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
@@ -1317,6 +1330,10 @@ pub async fn spawn(
                                                     net_log!("🔀 Received fork epoch {} (hash: {}, cum_work: {}, diff: {}, linked to parent {} ≠ expected {})", 
                                                         a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty, 
                                                         hex::encode(&p_hash[..8]), hex::encode(&latest.hash[..8]));
+                                                    // Request the exact parent by hash to enable reorg
+                                                    let _ = command_tx.send(NetworkCommand::RequestEpochByHash(p_hash));
+                                                    // Also request aligned range for additional context
+                                                    request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
                                                 }
                                             } else {
                                                 net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)", 
@@ -1525,6 +1542,12 @@ pub async fn spawn(
                                             let parent_hash = links_to_available_parent(&a, &orphan_buf, &db);
                                             if let Some(p_hash) = parent_hash { 
                                                 net_routine!("🔗 Fork epoch {} linked to parent {}", a.num, hex::encode(&p_hash[..8])); 
+                                                // Check if this parent differs from our local tip and request it by hash
+                                                if let Ok(Some(lat)) = db.get::<Anchor>("epoch", b"latest") {
+                                                    if p_hash != lat.hash {
+                                                        let _ = command_tx.send(NetworkCommand::RequestEpochByHash(p_hash));
+                                                    }
+                                                }
                                             }
                                             let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
                                             let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
@@ -2123,6 +2146,31 @@ pub async fn spawn(
                                     // Re-broadcast internally for sync skeleton
                                     let _ = headers_tx.send(batch);
                                 },
+                                TOP_EPOCH_BY_HASH_REQUEST => if let Ok(req) = bincode::deserialize::<EpochByHash>(&message.data) {
+                                    net_routine!("📨 Received request for epoch by hash {} from peer: {}", hex::encode(&req.hash[..8]), peer_id);
+                                    if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &req.hash) {
+                                        net_routine!("📤 Sending epoch {} (hash: {}) to peer", anchor.num, hex::encode(&req.hash[..8]));
+                                        if let Ok(data) = bincode::serialize(&anchor) {
+                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_BY_HASH_RESPONSE), data).ok();
+                                        }
+                                    } else {
+                                        net_routine!("⚠️  Epoch with hash {} not found", hex::encode(&req.hash[..8]));
+                                    }
+                                },
+                                TOP_EPOCH_BY_HASH_RESPONSE => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
+                                    net_routine!("📥 Received epoch {} by hash from peer: {}", a.num, peer_id);
+                                    // Buffer and trigger reorg attempt
+                                    let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
+                                    let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
+                                    if is_new {
+                                        net_routine!("⏳ Buffered epoch {} from hash request (buffer size: {})", a.num, orphan_buf.len());
+                                    }
+                                    if let Ok(mut st) = sync_state.lock() { 
+                                        if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
+                                        st.peer_confirmed_tip = true;
+                                    }
+                                    needs_reorg_check = true;
+                                },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                         if let Ok(data) = bincode::serialize(&coin) {
@@ -2435,6 +2483,7 @@ pub async fn spawn(
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                             NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
+                            NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),
                             NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                             NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
                             NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
@@ -2536,6 +2585,19 @@ impl Network {
     pub async fn request_epoch_headers_range(&self, start_height: u64, count: u32) {
         let range = EpochHeadersRange { start_height, count };
         let _ = self.command_tx.send(NetworkCommand::RequestEpochHeadersRange(range));
+    }
+    pub async fn request_epoch_by_hash(&self, hash: [u8; 32]) { 
+        // Deduplicate requests to avoid spam
+        let now = std::time::Instant::now();
+        let mut allow = true;
+        if let Ok(mut m) = RECENT_HASH_REQS.lock() {
+            m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(HASH_REQ_DEDUP_SECS));
+            allow = !m.contains_key(&hash);
+            if allow { m.insert(hash, now); }
+        }
+        if allow {
+            let _ = self.command_tx.send(NetworkCommand::RequestEpochByHash(hash));
+        }
     }
     pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
     pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }

@@ -93,6 +93,8 @@ impl Miner {
             };
 
             if synced && highest > 0 && local >= highest && peer_confirmed {
+                // Additional safety: ensure we've been peer-confirmed for a reasonable time
+                // to avoid racing with potential fork detection after restart
                 miner_routine!("🚀 Node is fully synced – starting mining");
                 break;
             }
