@@ -436,7 +436,9 @@ fn allow_peer_orphan_contribution(peer_id: PeerId) -> bool {
 // Request aligned header range with coalescing
 fn request_aligned_range(command_tx: &mpsc::UnboundedSender<NetworkCommand>, target_height: u64, window: u64) {
     let aligned_start = (target_height.saturating_sub(window) / HDR_CHUNK) * HDR_CHUNK;
-    let count = ((target_height - aligned_start).min(256)) as u32;
+    // Ensure we include the target height itself; avoid zero-count requests
+    let diff = target_height.saturating_sub(aligned_start);
+    let count = ((diff.saturating_add(1)).min(256)) as u32;
     
     let now = std::time::Instant::now();
     let mut allow = true;
@@ -544,6 +546,7 @@ enum NetworkCommand {
     GossipSpend(Spend),
     GossipCompactEpoch(CompactEpoch),
     GossipEpochSelectedResponse(SelectedIdsBundle),
+    GossipEpochCandidatesResponse(EpochCandidatesResponse),
     GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
@@ -1221,6 +1224,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
                                     NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                                     NetworkCommand::GossipEpochSelectedResponse(bundle) => (TOP_EPOCH_SELECTED_RESPONSE, bincode::serialize(&bundle).ok()),
+                                    NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
@@ -2394,9 +2398,8 @@ pub async fn spawn(
                                     if let Ok(mut list) = db.get_coin_candidates_by_epoch_hash(&epoch_hash) {
                                         if list.len() > MAX_EPOCH_CAND_RESP { list.truncate(MAX_EPOCH_CAND_RESP); }
                                         let resp = EpochCandidatesResponse { epoch_hash, candidates: list };
-                                        if let Ok(data) = bincode::serialize(&resp) {
-                                            try_publish_gossip(&mut swarm, TOP_EPOCH_CANDIDATES_RESPONSE, data, "epoch-candidates");
-                                        }
+                                        // Enqueue for retry/backoff to avoid dropping on AllQueuesFull
+                                        let _ = command_tx.send(NetworkCommand::GossipEpochCandidatesResponse(resp));
                                     }
                                 },
                                 TOP_EPOCH_SELECTED_RESPONSE => if let Ok(bundle) = bincode::deserialize::<SelectedIdsBundle>(&message.data) {
@@ -2480,6 +2483,7 @@ pub async fn spawn(
                             NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
                             NetworkCommand::GossipCoin(c)   => (TOP_COIN, bincode::serialize(&c).ok()),
                             NetworkCommand::GossipEpochSelectedResponse(bundle) => (TOP_EPOCH_SELECTED_RESPONSE, bincode::serialize(&bundle).ok()),
+                            NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                             NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),

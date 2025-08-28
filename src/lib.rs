@@ -13,6 +13,7 @@ pub mod sync;
 pub mod metrics;
 pub mod wallet;
 pub mod consensus;
+pub mod bridge;
 
 // Re-export commonly used types for convenience
 pub use coin::Coin;
@@ -22,3 +23,4 @@ pub use epoch::{Anchor, MerkleTree};
 pub use wallet::Wallet;
 // Legacy Transfer removed; export only Spend
 pub use transfer::Spend;
+pub use bridge::{BridgeState, BridgeEvent, BridgeOutTransaction, BridgeInTransaction, BridgeStatus};

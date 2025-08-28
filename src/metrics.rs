@@ -83,13 +83,14 @@ impl MetricsAggregator {
         use std::sync::atomic::Ordering;
 
         // Gauges (absolute)
-        let gauges: [(&'static str, i64); 6] = [
+        let gauges: [(&'static str, i64); 7] = [
             ("unchained_peer_count", PEERS.value.load(Ordering::Relaxed)),
             ("unchained_epoch_height", EPOCH_HEIGHT.value.load(Ordering::Relaxed)),
             ("unchained_candidate_coins", CANDIDATE_COINS.value.load(Ordering::Relaxed)),
             ("unchained_selected_coins", SELECTED_COINS.value.load(Ordering::Relaxed)),
             ("unchained_orphan_buffer_len", ORPHAN_BUFFER_LEN.value.load(Ordering::Relaxed)),
             ("unchained_selection_threshold_u64", SELECTION_THRESHOLD_U64.value.load(Ordering::Relaxed)),
+            ("unchained_bridge_pending_ops", BRIDGE_PENDING_OPS.value.load(Ordering::Relaxed)),
         ];
 
         // Counters (delta since last flush)
@@ -123,6 +124,17 @@ impl MetricsAggregator {
         counter_delta!("unchained_headers_anchors_stored_total", HEADERS_ANCHORS_STORED);
         counter_delta!("unchained_headers_invalid_total", HEADERS_INVALID);
         counter_delta!("unchained_compact_fallbacks_total", COMPACT_FALLBACKS);
+        // Bridge counters
+        counter_delta!("unchained_bridge_out_requests_total", BRIDGE_OUT_REQUESTS);
+        counter_delta!("unchained_bridge_out_locked_coins_total", BRIDGE_OUT_LOCKED_COINS);
+        counter_delta!("unchained_bridge_in_unlocked_coins_total", BRIDGE_IN_UNLOCKED_COINS);
+        counter_delta!("unchained_bridge_errors_total", BRIDGE_ERRORS);
+        counter_delta!("unchained_bridge_verify_ok_total", BRIDGE_VERIFY_OK);
+        counter_delta!("unchained_bridge_verify_fail_total", BRIDGE_VERIFY_FAIL);
+        counter_delta!("unchained_bridge_replay_attempts_total", BRIDGE_REPLAY_ATTEMPTS);
+        counter_delta!("unchained_bridge_pending_expired_total", BRIDGE_PENDING_EXPIRED);
+        counter_delta!("unchained_bridge_pending_confirmed_total", BRIDGE_PENDING_CONFIRMED);
+        counter_delta!("unchained_bridge_pending_failed_total", BRIDGE_PENDING_FAILED);
 
         // Histograms (stats for the last interval)
         let hist = self.hist.lock().ok();
@@ -247,6 +259,19 @@ pub static HEADERS_BATCH_RECV: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("
 pub static HEADERS_ANCHORS_STORED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_anchors_stored_total", "Anchors stored from header batches").unwrap());
 pub static HEADERS_INVALID: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_invalid_total", "Invalid anchors in header batches").unwrap());
 pub static COMPACT_FALLBACKS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_fallbacks_total", "Fallbacks to full bodies due to high missing %").unwrap());
+
+// --- Bridge metrics ---
+pub static BRIDGE_OUT_REQUESTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_out_requests_total", "Bridge-out submissions received").unwrap());
+pub static BRIDGE_OUT_LOCKED_COINS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_out_locked_coins_total", "Coins locked for bridge-out").unwrap());
+pub static BRIDGE_IN_UNLOCKED_COINS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_in_unlocked_coins_total", "Coins unlocked via Sui burn proof").unwrap());
+pub static BRIDGE_ERRORS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_errors_total", "Bridge errors").unwrap());
+pub static BRIDGE_PENDING_OPS: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_bridge_pending_ops", "Current pending bridge ops").unwrap());
+pub static BRIDGE_VERIFY_OK: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_verify_ok_total", "Successful Sui burn proof verifications").unwrap());
+pub static BRIDGE_VERIFY_FAIL: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_verify_fail_total", "Failed Sui burn proof verifications").unwrap());
+pub static BRIDGE_REPLAY_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_replay_attempts_total", "Rejected replayed Sui digests").unwrap());
+pub static BRIDGE_PENDING_EXPIRED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_expired_total", "Pending bridge ops expired by sweeper").unwrap());
+pub static BRIDGE_PENDING_CONFIRMED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_confirmed_total", "Pending bridge ops marked confirmed").unwrap());
+pub static BRIDGE_PENDING_FAILED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_failed_total", "Pending bridge ops marked failed").unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // Initialize some defaults

@@ -15,6 +15,8 @@ pub struct Config {
     pub compact: Compact,
     #[serde(default)]
     pub wallet: WalletCfg,
+    #[serde(default)]
+    pub bridge: BridgeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -146,6 +148,74 @@ pub struct WalletCfg {
     pub auto_serve_commitments: bool,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct BridgeConfig {
+    #[serde(default = "default_sui_rpc_url")]
+    pub sui_rpc_url: String,
+    #[serde(default = "default_sui_package_id")]
+    pub sui_package_id: String,
+    #[serde(default = "default_sui_config_object")]
+    pub sui_config_object: String,
+    /// Stealth paycode where Unchained coins are locked during bridge_out
+    #[serde(default)]
+    pub vault_paycode: Option<String>,
+    /// Optional admin token required for admin endpoints. If None, admin endpoints are open on localhost.
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    #[serde(default = "default_bridge_enabled")]
+    pub bridge_enabled: bool,
+    #[serde(default = "default_bridge_min_amount")]
+    pub min_amount: u64,
+    #[serde(default = "default_bridge_max_amount")]
+    pub max_amount: u64,
+    #[serde(default = "default_bridge_fee_bps")]
+    pub fee_basis_points: u64,
+    /// Bind for the lightweight bridge HTTP RPC (JSON). Defaults to 127.0.0.1:9110
+    #[serde(default = "default_bridge_rpc_bind")]
+    pub rpc_bind: String,
+    /// Rolling window for rate limits (seconds)
+    #[serde(default = "default_bridge_rate_window_secs")]
+    pub rate_window_secs: u64,
+    /// Per-Unchained-sender daily cap (in coins)
+    #[serde(default = "default_bridge_per_address_daily_cap")]
+    pub per_address_daily_cap: u64,
+    /// Global daily cap (in coins)
+    #[serde(default = "default_bridge_global_daily_cap")]
+    pub global_daily_cap: u64,
+    /// Sui bridge module name containing the burn/mint events
+    #[serde(default = "default_sui_bridge_module")]
+    pub sui_bridge_module: String,
+    /// Sui burn event type name emitted on bridge burn
+    #[serde(default = "default_sui_burn_event")]
+    pub sui_burn_event: String,
+    /// Optional Sui coin type that must match in the burn event (e.g. 0x..::unch::UNCH)
+    #[serde(default)]
+    pub sui_coin_type: Option<String>,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            sui_rpc_url: default_sui_rpc_url(),
+            sui_package_id: default_sui_package_id(),
+            sui_config_object: default_sui_config_object(),
+            vault_paycode: None,
+            admin_token: None,
+            bridge_enabled: default_bridge_enabled(),
+            min_amount: default_bridge_min_amount(),
+            max_amount: default_bridge_max_amount(),
+            fee_basis_points: default_bridge_fee_bps(),
+            rpc_bind: default_bridge_rpc_bind(),
+            rate_window_secs: default_bridge_rate_window_secs(),
+            per_address_daily_cap: default_bridge_per_address_daily_cap(),
+            global_daily_cap: default_bridge_global_daily_cap(),
+            sui_bridge_module: default_sui_bridge_module(),
+            sui_burn_event: default_sui_burn_event(),
+            sui_coin_type: None,
+        }
+    }
+}
+
 fn default_mem() -> u32   { 65_536 }          // 64 MiB
 fn default_bind() -> String { "127.0.0.1:9100".into() }
 fn default_last_epochs_to_show() -> u64 { 10 }
@@ -192,6 +262,22 @@ fn default_compact_short_id_len() -> u8 { 8 }
 fn default_compact_max_missing_pct() -> u8 { 20 }
 
 
+// Bridge defaults (Sui Testnet deployment provided by user)
+fn default_sui_rpc_url() -> String { "https://fullnode.testnet.sui.io:443".into() }
+fn default_sui_package_id() -> String { "0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089".into() }
+fn default_sui_config_object() -> String { "0x37f9f48977d272674bae2d4d217e842398dac2073868ff638a8ff019c0bdc50e".into() }
+fn default_bridge_enabled() -> bool { true }
+fn default_bridge_min_amount() -> u64 { 1 }
+fn default_bridge_max_amount() -> u64 { 1_000_000 }
+fn default_bridge_fee_bps() -> u64 { 10 }
+fn default_bridge_rpc_bind() -> String { "127.0.0.1:9110".into() }
+fn default_bridge_rate_window_secs() -> u64 { 24 * 60 * 60 }
+fn default_bridge_per_address_daily_cap() -> u64 { 1_000_000_000 }
+fn default_bridge_global_daily_cap() -> u64 { 10_000_000_000 }
+fn default_sui_bridge_module() -> String { "simple_bridge".into() }
+fn default_sui_burn_event() -> String { "Burn".into() }
+
+
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.
 ///
@@ -226,7 +312,7 @@ pub fn load_from_str(text: &str) -> Result<Config> {
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
-    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics","wallet"].into_iter().collect();
+    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics","wallet","bridge"].into_iter().collect();
     if let Some(table) = val.as_table() {
         for (k, v) in table.iter() {
             if !top_allowed.contains(k.as_str()) {
@@ -249,6 +335,9 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind","last_epochs_to_show"]),
                 ("wallet", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["auto_serve_commitments"]),
+                ("bridge", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
+                    "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind"
+                ]),
                 _ => {}
             }
         }

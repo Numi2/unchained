@@ -103,6 +103,13 @@ impl Store {
             "peers",
             "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
             "meta",                 // miscellaneous metadata (e.g., cursors)
+            // Bridge-related CFs
+            "bridge_state",           // serialized BridgeState summary
+            "bridge_pending",         // op_id -> PendingBridgeOp
+            "bridge_processed_sui",   // sui_tx_hash -> 1
+            "bridge_locked",          // coin_id -> op_id
+            "bridge_op_coins",        // op_id -> Vec<coin_id>
+            "bridge_events",          // append-only event log (key: millis||rand)
         ];
         
         // Configure column family options with sane production defaults

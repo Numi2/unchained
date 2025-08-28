@@ -9,6 +9,7 @@ use std::io::{self, Write};
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
+pub mod bridge;
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use crate::network::RateLimitedMessage;
@@ -749,6 +750,16 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
+    // Start bridge RPC (lightweight JSON server)
+    {
+        let bridge_cfg = cfg.bridge.clone();
+        let db_h = db.clone();
+        let wallet_h = wallet.clone();
+        let net_h = net.clone();
+        tokio::spawn(async move {
+            let _ = bridge::serve(bridge_cfg, db_h, wallet_h, net_h).await;
+        });
+    }
 
     println!("\n🚀 unchained node is running!");
     println!("   📡 P2P listening on port {}", cfg.net.listen_port);
