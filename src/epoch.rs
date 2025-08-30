@@ -12,9 +12,9 @@ use crate::sync::SyncState;
 use rocksdb::WriteBatch;
 use rand::Rng;
 
-const FINALIZATION_GRACE_MS: u64 = 11111;
+const FINALIZATION_GRACE_MS: u64 = 2222;
 const SEALING_JITTER_MS: u64 = 2222;
-const DETERMINISTIC_JITTER_MAX_MS: u64 = 3333;
+const DETERMINISTIC_JITTER_MAX_MS: u64 = 1111;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
