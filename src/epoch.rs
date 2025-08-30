@@ -16,7 +16,6 @@ const FINALIZATION_GRACE_MS: u64 = 11111;
 const SEALING_JITTER_MS: u64 = 2222;
 const DETERMINISTIC_JITTER_MAX_MS: u64 = 3333;
 
-
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
     pub num:          u64,
