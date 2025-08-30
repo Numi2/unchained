@@ -438,8 +438,12 @@ impl Wallet {
                 store.put_otp_index(&coin.id, &pk_hash)?;
                 // Invariants: coin exists; spending updates are already recorded under CFs
                 // Nothing to write here; scanning functions will reflect ownership.
-                // Log once for visibility
-                println!("📥 Detected incoming spend for me: coin {} value {}", hex::encode(coin.id), coin.value);
+                // Idempotent log: only print once per spend
+                let seen_key = format!("seen_spend:{}", hex::encode(coin.id));
+                if store.get_raw_bytes("wallet", seen_key.as_bytes())?.is_none() {
+                    store.put("wallet", seen_key.as_bytes(), &1u8)?;
+                    println!("📥 Detected incoming spend for me: coin {} value {}", hex::encode(coin.id), coin.value);
+                }
             }
         } else {
             // FIXED: Coin not yet available - try scanning without coin context first
@@ -448,8 +452,11 @@ impl Wallet {
             if spend.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id).is_ok() {
                 // Mark this spend as potentially ours for later confirmation when coin arrives
                 let spend_marker = format!("pending_spend:{}", hex::encode(spend.coin_id));
-                store.put("wallet_scan_pending", spend_marker.as_bytes(), &[1u8])?;
-                println!("📥 Detected incoming spend for me (coin pending): coin {} (will confirm when coin syncs)", hex::encode(spend.coin_id));
+                // Idempotent pending log: only print the first time we observe it
+                if store.get_raw_bytes("wallet_scan_pending", spend_marker.as_bytes())?.is_none() {
+                    store.put("wallet_scan_pending", spend_marker.as_bytes(), &[1u8])?;
+                    println!("📥 Detected incoming spend for me (coin pending): coin {} (will confirm when coin syncs)", hex::encode(spend.coin_id));
+                }
             }
         }
         Ok(())

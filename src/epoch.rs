@@ -10,11 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use crate::sync::SyncState;
 use rocksdb::WriteBatch;
-use rand::Rng;
-
-const FINALIZATION_GRACE_MS: u64 = 2222;
-const SEALING_JITTER_MS: u64 = 2222;
-const DETERMINISTIC_JITTER_MAX_MS: u64 = 1111;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
@@ -229,7 +224,6 @@ pub struct Manager {
     shutdown_rx: broadcast::Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
     compact_cfg: crate::config::Compact,
-    node_jitter_salt: [u8;32],
 }
 impl Manager {
     pub fn new(
@@ -243,29 +237,7 @@ impl Manager {
         compact_cfg: crate::config::Compact,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        // Derive a stable per-node salt from libp2p PeerId. Falls back to zeroed salt on error (rare).
-        let node_jitter_salt = {
-            if let Ok(pid) = crate::network::peer_id_string() {
-                let mut h = blake3::Hasher::new();
-                h.update(pid.as_bytes());
-                *h.finalize().as_bytes()
-            } else {
-                [0u8;32]
-            }
-        };
-        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg, node_jitter_salt }
-    }
-
-    #[inline]
-    fn derive_deterministic_jitter_ms(&self, parent_hash: &[u8;32]) -> u64 {
-        let mut h = blake3::Hasher::new();
-        h.update(parent_hash);
-        h.update(&self.node_jitter_salt);
-        let full = *h.finalize().as_bytes();
-        let mut eight = [0u8;8];
-        eight.copy_from_slice(&full[..8]);
-        let v = u64::from_le_bytes(eight);
-        if DETERMINISTIC_JITTER_MAX_MS == 0 { 0 } else { v % DETERMINISTIC_JITTER_MAX_MS }
+        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg }
     }
 
     pub fn spawn_loop(mut self) {
@@ -304,15 +276,13 @@ impl Manager {
             }
 
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
-            // Only tick immediately for genesis. For existing chains, wait a full interval to avoid
-            // advancing the epoch immediately on node restarts, which can cause unnecessary height bumps.
-            let mut ticker = if current_epoch == 0 {
-                time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds))
-            } else {
-                time::interval(time::Duration::from_secs(self.cfg.seconds))
-            };
+            // Tick immediately on startup for all cases; no restart grace period
+            let mut ticker = time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds));
             // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Periodic candidate pull during the entire epoch interval
+            let mut candidate_pull_ticker = time::interval(time::Duration::from_millis(500));
+            candidate_pull_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -363,44 +333,7 @@ impl Manager {
                                 continue;
                             }
                         }
-
-                        // Active candidate pull during grace to reduce producer bias
-                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
-                            let deadline = time::Instant::now() + time::Duration::from_millis(FINALIZATION_GRACE_MS);
-                            // Small randomized delay to avoid herd behavior on request start
-                            let pull_jitter: u64 = rand::thread_rng().gen_range(0..=200);
-                            tokio::time::sleep(time::Duration::from_millis(pull_jitter)).await;
-                            while time::Instant::now() < deadline {
-                                self.net.request_epoch_candidates(prev.hash).await;
-                                tokio::time::sleep(time::Duration::from_millis(500)).await;
-                                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                                    if latest_anchor.num >= current_epoch { break; }
-                                }
-                            }
-                        }
-                        // Tiny jitter to de-synchronize edge races across peers
-                        let jitter_ms: u64 = rand::thread_rng().gen_range(0..=SEALING_JITTER_MS);
-                        tokio::time::sleep(time::Duration::from_millis(jitter_ms)).await;
-                        // Deterministic per-node jitter to fairly randomize who seals first, derived from parent hash and local PeerId
-                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
-                            let dj_ms = self.derive_deterministic_jitter_ms(&prev.hash);
-                            if dj_ms > 0 { tokio::time::sleep(time::Duration::from_millis(dj_ms)).await; }
-                        }
-
-                        // Post-grace tip check: skip sealing if chain advanced during grace window
-                        if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                            if latest_anchor.num >= current_epoch {
-                                println!("⏭️  Chain advanced during grace; skipping local seal at epoch {}", current_epoch);
-                                current_epoch = latest_anchor.num + 1;
-                                // Realign ticker to now + epoch.seconds
-                                ticker = time::interval_at(
-                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                    time::Duration::from_secs(self.cfg.seconds)
-                                );
-                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                                continue;
-                            }
-                        }
+                        
 
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
@@ -583,6 +516,12 @@ impl Manager {
                                 time::Duration::from_secs(self.cfg.seconds)
                             );
                             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        }
+                    }
+                    _ = candidate_pull_ticker.tick() => {
+                        // Continuously pull candidates for the upcoming epoch's parent hash
+                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
+                            self.net.request_epoch_candidates(prev.hash).await;
                         }
                     }
                 }
