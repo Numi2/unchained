@@ -303,6 +303,37 @@ pub fn nullifier_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preima
     *h.finalize().as_bytes()
 }
 
+/// Commitment hash for HTLC preimages: ch = BLAKE3("ch" || chain_id32 || coin_id || lp(p)||p)
+pub fn commitment_hash_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"ch");
+    h.update(chain_id32);
+    h.update(coin_id);
+    h.update(&lp(preimage.len()));
+    h.update(preimage);
+    *h.finalize().as_bytes()
+}
+
+/// HTLC lock hash committing to both paths and timeout epoch:
+/// htlc = BLAKE3("htlc" || chain_id32 || coin_id || timeout_epoch_le || ch_claim || ch_refund)
+pub fn htlc_lock_hash(
+    chain_id32: &[u8; 32],
+    coin_id: &[u8; 32],
+    timeout_epoch: u64,
+    ch_claim: &[u8; 32],
+    ch_refund: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Hasher::new();
+    h.update(b"htlc");
+    h.update(chain_id32);
+    h.update(coin_id);
+    h.update(&timeout_epoch.to_le_bytes());
+    h.update(ch_claim);
+    h.update(ch_refund);
+    *h.finalize().as_bytes()
+}
+
 /// View tag (1 byte) for receiver-side filtering: vt = BLAKE3("vt" || lp(ss)||ss)[0]
 pub fn view_tag(shared_secret: &[u8]) -> u8 {
     fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }

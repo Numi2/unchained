@@ -300,7 +300,7 @@ pub fn spawn(
                             let iter = db.db.iterator_cf(sp_cf, rocksdb::IteratorMode::Start);
                             for item in iter {
                                 if let Ok((_k, v)) = item {
-                                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                                    if let Some(sp) = db.decode_spend_bytes_tolerant(&v) {
                                         if db.get::<crate::coin::Coin>("coin", &sp.coin_id).unwrap_or(None).is_none() {
                                             net.request_coin(sp.coin_id).await;
                                         }

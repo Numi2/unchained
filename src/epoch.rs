@@ -13,7 +13,8 @@ use rocksdb::WriteBatch;
 use rand::Rng;
 
 const FINALIZATION_GRACE_MS: u64 = 11111;
-const SEALING_JITTER_MS: u64 = 222;
+const SEALING_JITTER_MS: u64 = 2222;
+const DETERMINISTIC_JITTER_MAX_MS: u64 = 3333;
 
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -51,6 +52,45 @@ impl Anchor {
 
 pub struct MerkleTree;
 impl MerkleTree {
+    /// Build all Merkle levels from sorted leaves. levels[0] = sorted leaves, levels.last()[0] = root.
+    pub fn build_levels_from_sorted_leaves(sorted_leaves: &[[u8; 32]]) -> Vec<Vec<[u8;32]>> {
+        let mut levels: Vec<Vec<[u8;32]>> = Vec::new();
+        if sorted_leaves.is_empty() { return levels; }
+        let mut level: Vec<[u8;32]> = sorted_leaves.to_vec();
+        levels.push(level.clone());
+        while level.len() > 1 {
+            let mut next_level: Vec<[u8;32]> = Vec::with_capacity(level.len().div_ceil(2));
+            for chunk in level.chunks(2) {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&chunk[0]);
+                hasher.update(chunk.get(1).unwrap_or(&chunk[0]));
+                next_level.push(*hasher.finalize().as_bytes());
+            }
+            levels.push(next_level.clone());
+            level = next_level;
+        }
+        levels
+    }
+
+    /// Build proof using precomputed levels and target leaf hash. levels[0] must contain target_leaf.
+    pub fn build_proof_from_levels(levels: &Vec<Vec<[u8;32]>>, target_leaf: &[u8;32]) -> Option<Vec<([u8;32], bool)>> {
+        if levels.is_empty() { return None; }
+        let mut index = levels[0].iter().position(|h| h == target_leaf)?;
+        let mut proof: Vec<([u8;32], bool)> = Vec::new();
+        for level in &levels[..levels.len()-1] {
+            if level.is_empty() { return None; }
+            let (sibling_hash, sibling_is_left) = if index % 2 == 0 {
+                let sib = *level.get(index + 1).unwrap_or(&level[index]);
+                (sib, false)
+            } else {
+                let sib = level[index - 1];
+                (sib, true)
+            };
+            proof.push((sibling_hash, sibling_is_left));
+            index /= 2;
+        }
+        Some(proof)
+    }
     /// Compute Merkle root from a set of coin IDs. This method:
     /// - Hashes each coin id into a leaf using `Coin::id_to_leaf_hash`
     /// - Sorts leaves ascending to obtain a canonical order
@@ -190,6 +230,7 @@ pub struct Manager {
     shutdown_rx: broadcast::Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
     compact_cfg: crate::config::Compact,
+    node_jitter_salt: [u8;32],
 }
 impl Manager {
     pub fn new(
@@ -203,7 +244,29 @@ impl Manager {
         compact_cfg: crate::config::Compact,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg }
+        // Derive a stable per-node salt from libp2p PeerId. Falls back to zeroed salt on error (rare).
+        let node_jitter_salt = {
+            if let Ok(pid) = crate::network::peer_id_string() {
+                let mut h = blake3::Hasher::new();
+                h.update(pid.as_bytes());
+                *h.finalize().as_bytes()
+            } else {
+                [0u8;32]
+            }
+        };
+        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg, node_jitter_salt }
+    }
+
+    #[inline]
+    fn derive_deterministic_jitter_ms(&self, parent_hash: &[u8;32]) -> u64 {
+        let mut h = blake3::Hasher::new();
+        h.update(parent_hash);
+        h.update(&self.node_jitter_salt);
+        let full = *h.finalize().as_bytes();
+        let mut eight = [0u8;8];
+        eight.copy_from_slice(&full[..8]);
+        let v = u64::from_le_bytes(eight);
+        if DETERMINISTIC_JITTER_MAX_MS == 0 { 0 } else { v % DETERMINISTIC_JITTER_MAX_MS }
     }
 
     pub fn spawn_loop(mut self) {
@@ -288,20 +351,7 @@ impl Manager {
                                 continue;
                             }
                         }
-                        if current_epoch > 0 {
-                            if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                                if latest_anchor.num >= current_epoch {
-                                    println!("⏭️  Chain has advanced. Skipping epoch creation and fast-forwarding from {} to {}.", current_epoch, latest_anchor.num + 1);
-                                    current_epoch = latest_anchor.num + 1;
-                                    // Align next tick to now + epoch.seconds
-                                    ticker = time::interval_at(
-                                        time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                        time::Duration::from_secs(self.cfg.seconds)
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
+                    
 
                         if current_epoch == 0 && buffer.is_empty() {
                             if self.net_cfg.bootstrap.is_empty() {
@@ -330,6 +380,11 @@ impl Manager {
                         // Tiny jitter to de-synchronize edge races across peers
                         let jitter_ms: u64 = rand::thread_rng().gen_range(0..=SEALING_JITTER_MS);
                         tokio::time::sleep(time::Duration::from_millis(jitter_ms)).await;
+                        // Deterministic per-node jitter to fairly randomize who seals first, derived from parent hash and local PeerId
+                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
+                            let dj_ms = self.derive_deterministic_jitter_ms(&prev.hash);
+                            if dj_ms > 0 { tokio::time::sleep(time::Duration::from_millis(dj_ms)).await; }
+                        }
 
                         // Post-grace tip check: skip sealing if chain advanced during grace window
                         if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
@@ -371,7 +426,8 @@ impl Manager {
                         if prev_anchor.is_some() && selected_ids.is_empty() {
                             continue;
                         }
-                        let merkle_root = MerkleTree::compute_root_from_sorted_leaves(&leaves);
+                        let levels = MerkleTree::build_levels_from_sorted_leaves(&leaves);
+                        let merkle_root = if levels.is_empty() { [0u8;32] } else { *levels.last().unwrap().first().unwrap() };
                         // Anchor hash commits to merkle_root and previous anchor hash (if any)
                         let hash = {
                             let mut h = blake3::Hasher::new();
@@ -456,6 +512,7 @@ impl Manager {
                             }
                         }
                         if let Err(e) = self.db.store_epoch_leaves(current_epoch, &leaves) { eprintln!("⚠️ Failed to store epoch leaves: {}", e); }
+                        if let Err(e) = self.db.store_epoch_levels(current_epoch, &levels) { eprintln!("⚠️ Failed to store epoch levels: {}", e); }
                         
                         if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
                             batch.put_cf(anchor_cf, &hash, &serialized_anchor);

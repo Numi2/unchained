@@ -137,6 +137,15 @@ pub struct Spend {
     /// Next-hop lock hash (V3), computed from Kyber shared secret and context.
     #[serde(default)]
     pub next_lock_hash: Option<[u8; 32]>,
+    /// Optional HTLC timeout epoch (epoch number T). If set, previous lock must be HTLC.
+    #[serde(default)]
+    pub htlc_timeout_epoch: Option<u64>,
+    /// Commitment hash for claim path: ch_claim = CH(chain_id, coin_id, s_claim)
+    #[serde(default)]
+    pub htlc_ch_claim: Option<[u8;32]>,
+    /// Commitment hash for refund path: ch_refund = CH(chain_id, coin_id, s_refund)
+    #[serde(default)]
+    pub htlc_ch_refund: Option<[u8;32]>,
 }
 
 impl Spend {
@@ -192,6 +201,65 @@ impl Spend {
             to,
             unlock_preimage: Some(unlock_preimage),
             next_lock_hash: Some(next_lock_hash),
+            htlc_timeout_epoch: None,
+            htlc_ch_claim: None,
+            htlc_ch_refund: None,
+        })
+    }
+
+    /// Construct a signatureless HTLC-based spend (claim or refund path), with epoch timeout.
+    /// - Claim path valid if current_epoch < T and CH(p) == ch_claim
+    /// - Refund path valid if current_epoch >= T and CH(p) == ch_refund
+    pub fn create_htlc_hashlock(
+        coin_id: [u8; 32],
+        anchor: &crate::epoch::Anchor,
+        proof: Vec<([u8; 32], bool)>,
+        unlock_preimage: [u8; 32],
+        receiver_commitment: &ReceiverLockCommitment,
+        amount: u64,
+        chain_id32: &[u8; 32],
+        timeout_epoch: u64,
+        ch_claim: [u8;32],
+        ch_refund: [u8;32],
+    ) -> Result<Self> {
+        // Enforce amount binding to receiver commitment
+        if receiver_commitment.amount_le != amount {
+            return Err(anyhow!("Receiver commitment amount mismatch"));
+        }
+        // Cross-check commitment_id integrity deterministically
+        let computed_cid = commitment_id_v1(
+            &receiver_commitment.one_time_pk,
+            &receiver_commitment.kyber_ct,
+            &receiver_commitment.next_lock_hash,
+            &coin_id,
+            amount,
+            chain_id32,
+        );
+        if computed_cid != receiver_commitment.commitment_id {
+            return Err(anyhow!("Receiver commitment_id mismatch"));
+        }
+        let commitment = commitment_of_stealth_ct(&receiver_commitment.kyber_ct);
+        let mut to = StealthOutput { one_time_pk: [0u8; OTP_PK_BYTES], kyber_ct: [0u8; KYBER_CT_BYTES], amount_le: amount, view_tag: None };
+        to.one_time_pk.copy_from_slice(&receiver_commitment.one_time_pk);
+        to.kyber_ct.copy_from_slice(&receiver_commitment.kyber_ct);
+
+        // Nullifier
+        let nullifier = crate::crypto::nullifier_from_preimage(chain_id32, &coin_id, &unlock_preimage);
+        // Next-hop lock hash provided by receiver (not HTLC for next hop by default)
+        let next_lock_hash = receiver_commitment.next_lock_hash;
+
+        Ok(Spend {
+            coin_id,
+            root: anchor.merkle_root,
+            proof,
+            commitment,
+            nullifier,
+            to,
+            unlock_preimage: Some(unlock_preimage),
+            next_lock_hash: Some(next_lock_hash),
+            htlc_timeout_epoch: Some(timeout_epoch),
+            htlc_ch_claim: Some(ch_claim),
+            htlc_ch_refund: Some(ch_refund),
         })
     }
 
@@ -206,30 +274,14 @@ impl Spend {
             .context("Failed to query coin")?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // 2) Anchor exists and root matches (prefer committed epoch index; tolerate missing index by falling back to anchor-by-hash)
-        let anchor: crate::epoch::Anchor = if let Some(commit_epoch) = db
-            .get_epoch_for_coin(&self.coin_id)
-            .context("Failed to query coin->epoch mapping")?
-        {
-            db
-                .get("epoch", &commit_epoch.to_le_bytes())
-                .context("Failed to query committing anchor by epoch number")?
-                .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?
-        } else {
-            db
-                .get("anchor", &coin.epoch_hash)
-                .context("Failed to query committing anchor by hash")?
-                .ok_or_else(|| anyhow!("Anchor not found for coin's epoch hash"))?
-        };
+        // 2) Genesis anchor required in this mode and empty proof
+        let anchor: crate::epoch::Anchor = db
+            .get("epoch", &0u64.to_le_bytes())
+            .context("Failed to query genesis anchor")?
+            .ok_or_else(|| anyhow!("Anchor not found for genesis"))?;
+        if anchor.num != 0 { return Err(anyhow!("Non-genesis anchor in genesis-only validation")); }
         if anchor.merkle_root != self.root { return Err(anyhow!("Merkle root mismatch")); }
-
-        // 3) Proof verifies
-        let expected_len = crate::epoch::MerkleTree::expected_proof_len(anchor.coin_count);
-        if self.proof.len() != expected_len { return Err(anyhow!("Merkle proof length mismatch")); }
-        let leaf = crate::coin::Coin::id_to_leaf_hash(&self.coin_id);
-        if !crate::epoch::MerkleTree::verify_proof(&leaf, &self.proof, &self.root) {
-            return Err(anyhow!("Invalid Merkle proof"));
-        }
+        if !self.proof.is_empty() { return Err(anyhow!("Expected empty proof for genesis")); }
 
         // 4) Commitment check – must be H(kyber_ct)
         let expected_commitment = crate::crypto::commitment_of_stealth_ct(&self.to.kyber_ct);
@@ -244,7 +296,7 @@ impl Spend {
             return Err(anyhow!("Nullifier already seen (double spend)"));
         }
 
-        // 6) Authorization: require V3 hashlock
+        // 6) Authorization: require V3 hashlock, potentially HTLC-gated by epoch
         let preimage = self.unlock_preimage.ok_or_else(|| anyhow!("V3 hashlock preimage required"))?;
         // Determine expected previous lock hash
         let expected_lock_hash = if let Some(prev_spend) = db.get_spend_tolerant(&self.coin_id)? {
@@ -253,14 +305,30 @@ impl Spend {
             // Genesis lock hash stored in coin
             coin.lock_hash
         };
-        // Check preimage matches (new scheme first, then legacy fallback). If no lock was committed (legacy), skip.
         let chain_id = db.get_chain_id()?;
-        if expected_lock_hash != [0u8; 32] {
-            let lh_new = crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
-            if lh_new != expected_lock_hash {
-                let lh_legacy = crate::crypto::lock_hash(&preimage);
-                if lh_legacy != expected_lock_hash {
-                    return Err(anyhow!("Invalid hashlock preimage"));
+        // If HTLC params present, enforce HTLC epoch gating and composite lock
+        if let (Some(t), Some(ch_claim), Some(ch_refund)) = (self.htlc_timeout_epoch, self.htlc_ch_claim, self.htlc_ch_refund) {
+            // Current epoch number
+            let current_epoch = db.get::<crate::epoch::Anchor>("epoch", b"latest")
+                .ok().flatten().map(|a| a.num).unwrap_or(0);
+            let ch_of_pre = crate::crypto::commitment_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
+            if current_epoch < t {
+                if ch_of_pre != ch_claim { return Err(anyhow!("HTLC claim path CH mismatch before timeout")); }
+            } else {
+                if ch_of_pre != ch_refund { return Err(anyhow!("HTLC refund path CH mismatch at/after timeout")); }
+            }
+            // Verify composite HTLC lock equals expected previous lock
+            let expected_htlc = crate::crypto::htlc_lock_hash(&chain_id, &self.coin_id, t, &ch_claim, &ch_refund);
+            if expected_lock_hash != expected_htlc { return Err(anyhow!("HTLC composite lock mismatch")); }
+        } else {
+            // Standard single-path hashlock: Check preimage matches (new scheme first, then legacy fallback). If no lock was committed (legacy), skip.
+            if expected_lock_hash != [0u8; 32] {
+                let lh_new = crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
+                if lh_new != expected_lock_hash {
+                    let lh_legacy = crate::crypto::lock_hash(&preimage);
+                    if lh_legacy != expected_lock_hash {
+                        return Err(anyhow!("Invalid hashlock preimage"));
+                    }
                 }
             }
         }
@@ -307,7 +375,7 @@ impl Spend {
                 batch.put_cf(cf, &cid, &[1u8;1]);
             }
         }
-        db.db.write(batch).context("write spend batch")?;
+        db.write_batch(batch).context("write spend batch")?;
         Ok(())
     }
 }

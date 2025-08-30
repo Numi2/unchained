@@ -40,6 +40,12 @@ pub struct PendingBridgeOp {
     pub created_at: u64,
     pub nonce: u64,
     pub status: PendingStatus,
+    /// Last attempt timestamp (secs since epoch) for retry backoff
+    #[serde(default)]
+    pub last_attempt: u64,
+    /// Number of retry attempts so far
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +70,7 @@ pub struct BridgeState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BridgeEvent {
-    TokensLocked { amount: u64, sui_recipient: String, tx_hash: String },
+    TokensLocked { amount: u64, sui_recipient: String, tx_hash: String, op_id: String },
     TokensUnlocked { amount: u64, recipient: Address, sui_tx_hash: String },
     BridgeError { error: String, context: String },
 }
@@ -117,7 +123,13 @@ impl BridgeService {
         let pending_cf = self.db.db.cf_handle("bridge_pending").ok_or_else(|| anyhow!("bridge_pending CF missing"))?;
         let iter = self.db.db.iterator_cf(pending_cf, rocksdb::IteratorMode::Start);
         let mut cnt = 0u64;
-        for _ in iter { cnt = cnt.saturating_add(1); }
+        for item in iter {
+            if let Ok((_k, v)) = item {
+                if let Ok(op) = bincode::deserialize::<PendingBridgeOp>(&v) {
+                    if matches!(op.status, PendingStatus::Submitted) { cnt = cnt.saturating_add(1); }
+                }
+            }
+        }
         crate::metrics::BRIDGE_PENDING_OPS.set(cnt as i64);
         Ok(BridgeStatus {
             total_locked: st.total_locked,
@@ -152,13 +164,36 @@ struct BridgeOutReq { amount: u64, sui_recipient: String }
 #[derive(Serialize)]
 struct SubmitResp { tx_hash: String }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status")]
+pub enum BridgeOutResult {
+    Locked { tx_hash: String },
+    Pending { op_id: String },
+}
+
+// Direct submission helper for CLI: perform bridge_out without HTTP
+pub async fn submit_bridge_out_direct(
+    cfg: crate::config::BridgeConfig,
+    db: Arc<Store>,
+    wallet: Arc<Wallet>,
+    net: NetHandle,
+    amount: u64,
+    sui_recipient: String,
+)
+-> Result<BridgeOutResult> {
+    let svc = Arc::new(BridgeService::new(db, cfg, wallet, net));
+    let req = BridgeOutReq { amount, sui_recipient };
+    bridge_out_submit(&svc, req).await
+}
+
 pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc<Wallet>, net: NetHandle) -> Result<()> {
     use hyper::{Server, Request, Body, Method};
     use hyper::service::{make_service_fn, service_fn};
     let svc = Arc::new(BridgeService::new(db.clone(), cfg.clone(), wallet, net));
 
+    let svc_http = svc.clone();
     let make = make_service_fn(move |_conn| {
-        let svc = svc.clone();
+        let svc = svc_http.clone();
         async move {
             Ok::<_, std::convert::Infallible>(service_fn(move |req: Request<Body>| {
                 let svc = svc.clone();
@@ -213,6 +248,24 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                                 let _ = svc.persist_state();
                             }
                             json_response(&serde_json::json!({"ok": true}), 200)
+                        },
+                        (Method::POST, p) if p.starts_with("/admin/bridge_pending_requeue/") => {
+                            if !authorized { return Ok::<_, std::convert::Infallible>(err_response("unauthorized", 401)); }
+                            let id = p.trim_start_matches("/admin/bridge_pending_requeue/");
+                            let cf = if let Some(cf) = svc.db.db.cf_handle("bridge_pending") { cf } else { return Ok::<_, std::convert::Infallible>(err_response("bridge_pending CF missing", 500)); };
+                            match svc.db.db.get_cf(cf, id.as_bytes()) {
+                                Ok(Some(bytes)) => {
+                                    if let Ok(mut op) = bincode::deserialize::<PendingBridgeOp>(&bytes) {
+                                        op.status = PendingStatus::Submitted;
+                                        op.last_attempt = 0;
+                                        op.retry_count = 0;
+                                        if let Ok(ser) = bincode::serialize(&op) { let _ = svc.db.db.put_cf(cf, id.as_bytes(), &ser); }
+                                        json_response(&serde_json::json!({"ok": true}), 200)
+                                    } else { err_response("malformed pending op", 500) }
+                                },
+                                Ok(None) => err_response("not found", 404),
+                                Err(e) => err_response(&format!("{}", e), 500),
+                            }
                         },
                         (Method::POST, p) if p.starts_with("/admin/bridge_pending_confirm/") => {
                             if !authorized { return Ok::<_, std::convert::Infallible>(err_response("unauthorized", 401)); }
@@ -274,7 +327,8 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                             match serde_json::from_slice::<BridgeOutReq>(&whole) {
                                 Ok(reqo) => {
                                     match bridge_out_submit(&svc, reqo).await {
-                                        Ok(txh) => json_response(&SubmitResp { tx_hash: txh }, 200),
+                                        Ok(BridgeOutResult::Locked { tx_hash }) => json_response(&SubmitResp { tx_hash }, 200),
+                                        Ok(BridgeOutResult::Pending { op_id }) => json_response(&serde_json::json!({"pending": true, "op_id": op_id}), 200),
                                         Err(e) => err_response(&format!("{}", e), 400),
                                     }
                                 },
@@ -307,24 +361,98 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
     tokio::spawn(async move {
         if let Err(e) = Server::bind(&addr).serve(make).await { eprintln!("bridge rpc serve error: {}", e); }
     });
-    // Background sweeper: expire long-lived pending ops (e.g., > 24h)
+    // Background processor: retry Submitted ops automatically and expire long-lived ones
     {
-        let db_h = db.clone();
+        let svc_h = svc.clone();
         let cfg_h = cfg.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await; // every 5 minutes
-                if let Some(cf) = db_h.db.cf_handle("bridge_pending") {
-                    let iter = db_h.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await; // drive retries promptly
+                // Open fresh CF handles inside each loop iteration and avoid holding them across awaits
+                if let Some(cf_name) = Some("bridge_pending") {
+                    let cf = match svc_h.db.db.cf_handle(cf_name) { Some(c) => c, None => continue };
+                    let iter = svc_h.db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                     let cutoff = now.saturating_sub(cfg_h.rate_window_secs);
                     for item in iter {
                         if let Ok((k, v)) = item {
                             if let Ok(mut op) = bincode::deserialize::<PendingBridgeOp>(&v) {
+                                // Expire too old Submitted ops
                                 if matches!(op.status, PendingStatus::Submitted) && op.created_at < cutoff {
                                     op.status = PendingStatus::Failed("expired".to_string());
-                                    if let Ok(ser) = bincode::serialize(&op) { let _ = db_h.db.put_cf(cf, &k, &ser); }
+                                    if let Some(cf2) = svc_h.db.db.cf_handle("bridge_pending") {
+                                        if let Ok(ser) = bincode::serialize(&op) { let _ = svc_h.db.db.put_cf(cf2, &k, &ser); }
+                                    }
                                     crate::metrics::BRIDGE_PENDING_EXPIRED.inc();
+                                    continue;
+                                }
+                                // Retry Submitted ops with exponential backoff
+                                if matches!(op.status, PendingStatus::Submitted) {
+                                    // Skip if already processed (has coins mapping)
+                                    if let Some(cf_oc) = svc_h.db.db.cf_handle("bridge_op_coins") {
+                                        if svc_h.db.db.get_cf(cf_oc, &k).ok().flatten().is_some() { continue; }
+                                    }
+                                    let attempts = op.retry_count;
+                                    let backoff_secs = u64::min(600, 5 * (1u64 << attempts.min(10)));
+                                    let last = op.last_attempt;
+                                    if last == 0 || now.saturating_sub(last) >= backoff_secs {
+                                        // Reattempt the wallet send to vault
+                                        // Proactively nudge network to fetch latest headers and nearby leaves/selected
+                                        let _ = svc_h.net.request_latest_epoch().await;
+                                        if let Ok(Some(latest_anchor)) = svc_h.db.get::<crate::epoch::Anchor>("epoch", b"latest") {
+                                            let start = latest_anchor.num.saturating_sub(8);
+                                            for n in start..=latest_anchor.num {
+                                                svc_h.net.request_epoch_leaves(n).await;
+                                                svc_h.net.request_epoch_selected(n).await;
+                                            }
+                                        }
+                                        let vault_paycode = svc_h.cfg.vault_paycode.clone().unwrap_or_else(|| svc_h.wallet.export_stealth_address());
+                                        let mut note = [0u8;32];
+                                        let h = blake3::hash(std::str::from_utf8(&k).unwrap_or("").as_bytes());
+                                        note.copy_from_slice(&h.as_bytes()[..32]);
+                                        match svc_h.wallet.send_with_paycode_and_note(&vault_paycode, op.amount, &svc_h.net, &note).await {
+                                            Ok(outcome) => {
+                                                // Success: write mappings/state/events mirroring bridge_out_submit
+                                                let tx_hash = combine_spend_hashes(&outcome.spends);
+                                                let mut batch = rocksdb::WriteBatch::default();
+                                                if let Some(cf_oc) = svc_h.db.db.cf_handle("bridge_op_coins") {
+                                                    let coins: Vec<[u8;32]> = outcome.spends.iter().map(|s| s.coin_id).collect();
+                                                    let ser = bincode::serialize(&coins).unwrap_or_default();
+                                                    batch.put_cf(&cf_oc, &k, &ser);
+                                                }
+                                                if let Some(cf_bl) = svc_h.db.db.cf_handle("bridge_locked") {
+                                                    for c in outcome.spends.iter() { batch.put_cf(&cf_bl, &c.coin_id, &k); }
+                                                }
+                                                // Update totals and persist state
+                                                if let Ok(mut st) = svc_h.state.lock() {
+                                                    st.total_locked = st.total_locked.saturating_add(op.amount);
+                                                    if let Ok(state_ser) = bincode::serialize(&*st) {
+                                                        if let Some(cf_st) = svc_h.db.db.cf_handle("bridge_state") { batch.put_cf(&cf_st, b"state", &state_ser); }
+                                                    }
+                                                }
+                                                if let Some(cf_ev) = svc_h.db.db.cf_handle("bridge_events") {
+                                                    let ev = BridgeEvent::TokensLocked { amount: op.amount, sui_recipient: op.sui_recipient.clone(), tx_hash: hex::encode(tx_hash), op_id: String::from_utf8_lossy(&k).to_string() };
+                                                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
+                                                    let rand = rand::random::<u64>().to_le_bytes();
+                                                    let mut key = Vec::with_capacity(16);
+                                                    key.extend_from_slice(&now_ms.to_le_bytes());
+                                                    key.extend_from_slice(&rand);
+                                                    let ser = bincode::serialize(&ev).unwrap_or_default();
+                                                    batch.put_cf(&cf_ev, &key, &ser);
+                                                }
+                                                // Remove pending on success
+                                                if let Some(cf_p) = svc_h.db.db.cf_handle("bridge_pending") { batch.delete_cf(&cf_p, &k); }
+                                                let _ = svc_h.db.db.write(batch);
+                                            }
+                                            Err(e) => {
+                                                let is_timeout = format!("{}", e).contains("Timed out waiting for valid coin proof");
+                                                op.last_attempt = now;
+                                                op.retry_count = op.retry_count.saturating_add(1);
+                                                if !is_timeout { op.status = PendingStatus::Failed(format!("{}", e)); }
+                                                if let Some(cf3) = svc_h.db.db.cf_handle("bridge_pending") { let _ = svc_h.db.db.put_cf(cf3, &k, &bincode::serialize(&op).unwrap_or_default()); }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -362,7 +490,7 @@ fn authorize_admin(cfg: &crate::config::BridgeConfig, req: &hyper::Request<hyper
     true
 }
 
-async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Result<String> {
+async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Result<BridgeOutResult> {
     // Basic validation and rate-limit snapshot (copy fields out to avoid holding mutex across await)
     let (enabled, min_amt, max_amt, fee_bps, rate_window_secs, per_cap, global_cap, from_addr_hex) = {
         let st = svc.state.lock().unwrap();
@@ -408,6 +536,8 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         nonce: 0,
         status: PendingStatus::Submitted,
+        last_attempt: 0,
+        retry_count: 0,
     };
     // Write pending op (do not hold CF across awaits)
     {
@@ -426,19 +556,29 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
     let outcome = match outcome_res {
         Ok(o) => o,
         Err(e) => {
-            // Mark pending as failed
+            // If proof timeout, keep as Submitted and schedule retry; otherwise mark Failed
+            let is_timeout = format!("{}", e).contains("Timed out waiting for valid coin proof")
+                || format!("{}", e).contains("Timed out waiting for valid coin proof");
             if let Some(cf2) = svc.db.db.cf_handle("bridge_pending") {
                 match svc.db.db.get_cf(cf2, op_id.as_bytes()) {
                     Ok(Some(bytes)) => {
                         if let Ok(mut po) = bincode::deserialize::<PendingBridgeOp>(&bytes) {
-                            po.status = PendingStatus::Failed(format!("{}", e));
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                            if is_timeout {
+                                po.status = PendingStatus::Submitted;
+                                po.last_attempt = now;
+                                po.retry_count = po.retry_count.saturating_add(1);
+                            } else {
+                                po.status = PendingStatus::Failed(format!("{}", e));
+                                crate::metrics::BRIDGE_PENDING_FAILED.inc();
+                            }
                             let _ = svc.db.db.put_cf(cf2, op_id.as_bytes(), &bincode::serialize(&po).unwrap_or_default());
-                            crate::metrics::BRIDGE_PENDING_FAILED.inc();
                         }
                     },
                     _ => {}
                 }
             }
+            if is_timeout { return Ok(BridgeOutResult::Pending { op_id: op_id.clone() }); }
             return Err(anyhow!("wallet send to vault failed: {}", e));
         }
     };
@@ -478,7 +618,7 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
         }
         // Append event
         if let Some(cf_ev) = svc.db.db.cf_handle("bridge_events") {
-            let ev = BridgeEvent::TokensLocked { amount: op.amount, sui_recipient: op.sui_recipient.clone(), tx_hash: hex::encode(tx_hash) };
+            let ev = BridgeEvent::TokensLocked { amount: op.amount, sui_recipient: op.sui_recipient.clone(), tx_hash: hex::encode(tx_hash), op_id: op_id.clone() };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
             let rand = rand::random::<u64>().to_le_bytes();
             let mut key = Vec::with_capacity(16);
@@ -491,7 +631,7 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
     }
     crate::metrics::BRIDGE_OUT_LOCKED_COINS.inc_by(req.amount);
 
-    Ok(hex::encode(tx_hash))
+    Ok(BridgeOutResult::Locked { tx_hash: hex::encode(tx_hash) })
 }
 
 fn valid_sui_addr(s: &str) -> bool {
@@ -610,26 +750,65 @@ async fn bridge_in_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Strin
     if !verified.digest.eq_ignore_ascii_case(&r.sui_tx_hash) { return Err(anyhow!("sui_tx_hash mismatch")); }
     // Enforce amount matches burn
     if verified.amount != r.amount { return Err(anyhow!("amount mismatch vs Sui burn")); }
-    // Replay protection
+    // Two-phase replay protection: check if already processed or pending
     if svc.is_sui_tx_processed(&verified.digest)? { crate::metrics::BRIDGE_REPLAY_ATTEMPTS.inc(); return Err(anyhow!("sui tx already processed")); }
+    
+    // Phase 1: Mark as pending to prevent concurrent processing
+    let pending_key = format!("pending:{}", verified.digest);
+    if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") {
+        // Check if already pending
+        if svc.db.db.get_cf(cf, pending_key.as_bytes())?.is_some() {
+            crate::metrics::BRIDGE_REPLAY_ATTEMPTS.inc();
+            return Err(anyhow!("sui tx already being processed"));
+        }
+        // Mark as pending
+        svc.db.db.put_cf(cf, pending_key.as_bytes(), &[0u8])?;
+    }
     // Unlock: send from wallet (vault) to recipient paycode; deterministic note from digest
     let mut note = [0u8;32];
     let h = blake3::hash(verified.digest.as_bytes());
     note.copy_from_slice(&h.as_bytes()[..32]);
-    let outcome = svc.wallet.send_with_paycode_and_note(&r.to_paycode, r.amount, &svc.net, &note).await
-        .context("wallet send for bridge_in failed")?;
-    let tx_hash = combine_spend_hashes(&outcome.spends);
-    // Atomically mark processed, update totals, and record event
+    let outcome = svc.wallet.send_with_paycode_and_note(&r.to_paycode, r.amount, &svc.net, &note).await;
+    
+    // Handle wallet send result and complete two-phase commit
+    let tx_hash = match outcome {
+        Ok(outcome) => {
+            let tx_hash = combine_spend_hashes(&outcome.spends);
+            // Phase 2: Atomically mark as processed, clean up pending marker, update totals, and record event
+            let mut batch = rocksdb::WriteBatch::default();
+            if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") { 
+                batch.put_cf(&cf, verified.digest.as_bytes(), &[1u8]); // Mark as processed
+                batch.delete_cf(&cf, pending_key.as_bytes()); // Clean up pending marker
+            }
+            tx_hash
+        }
+        Err(e) => {
+            // Rollback: remove pending marker on failure
+            if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") {
+                let _ = svc.db.db.delete_cf(cf, pending_key.as_bytes());
+            }
+            return Err(anyhow!("wallet send for bridge_in failed: {}", e));
+        }
+    };
+    
+    // Complete the atomic update
     {
         let mut batch = rocksdb::WriteBatch::default();
-        if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") { batch.put_cf(&cf, verified.digest.as_bytes(), &[1u8]); }
+        if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") { 
+            batch.put_cf(&cf, verified.digest.as_bytes(), &[1u8]); // Mark as processed
+            batch.delete_cf(&cf, pending_key.as_bytes()); // Clean up pending marker
+        }
         {
             let mut st = svc.state.lock().unwrap();
             st.total_unlocked = st.total_unlocked.saturating_add(r.amount);
             if let Ok(state_ser) = bincode::serialize(&*st) { if let Some(cf_st) = svc.db.db.cf_handle("bridge_state") { batch.put_cf(&cf_st, b"state", &state_ser); } }
         }
         if let Some(cf_ev) = svc.db.db.cf_handle("bridge_events") {
-            let ev = BridgeEvent::TokensUnlocked { amount: r.amount, recipient: svc.wallet.address(), sui_tx_hash: verified.digest.clone() };
+            let recipient_addr = match crate::wallet::Wallet::parse_stealth_address(&r.to_paycode) {
+                Ok((addr, _)) => addr,
+                Err(_) => svc.wallet.address(),
+            };
+            let ev = BridgeEvent::TokensUnlocked { amount: r.amount, recipient: recipient_addr, sui_tx_hash: verified.digest.clone() };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
             let rand = rand::random::<u64>().to_le_bytes();
             let mut key = Vec::with_capacity(16);

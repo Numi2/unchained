@@ -83,7 +83,7 @@ impl MetricsAggregator {
         use std::sync::atomic::Ordering;
 
         // Gauges (absolute)
-        let gauges: [(&'static str, i64); 7] = [
+        let gauges: [(&'static str, i64); 8] = [
             ("unchained_peer_count", PEERS.value.load(Ordering::Relaxed)),
             ("unchained_epoch_height", EPOCH_HEIGHT.value.load(Ordering::Relaxed)),
             ("unchained_candidate_coins", CANDIDATE_COINS.value.load(Ordering::Relaxed)),
@@ -91,6 +91,7 @@ impl MetricsAggregator {
             ("unchained_orphan_buffer_len", ORPHAN_BUFFER_LEN.value.load(Ordering::Relaxed)),
             ("unchained_selection_threshold_u64", SELECTION_THRESHOLD_U64.value.load(Ordering::Relaxed)),
             ("unchained_bridge_pending_ops", BRIDGE_PENDING_OPS.value.load(Ordering::Relaxed)),
+            ("unchained_net_pending_cmds", NET_PENDING_COMMANDS.value.load(Ordering::Relaxed)),
         ];
 
         // Counters (delta since last flush)
@@ -124,6 +125,11 @@ impl MetricsAggregator {
         counter_delta!("unchained_headers_anchors_stored_total", HEADERS_ANCHORS_STORED);
         counter_delta!("unchained_headers_invalid_total", HEADERS_INVALID);
         counter_delta!("unchained_compact_fallbacks_total", COMPACT_FALLBACKS);
+        // Network command counters
+        counter_delta!("unchained_net_cmd_enqueued_total", NET_CMDS_ENQUEUED);
+        counter_delta!("unchained_net_cmd_dropped_dup_total", NET_CMDS_DROPPED_DUP);
+        counter_delta!("unchained_net_publish_fail_total", NET_PUBLISH_FAILS);
+        counter_delta!("unchained_net_cmd_published_total", NET_CMDS_PUBLISHED_OK);
         // Bridge counters
         counter_delta!("unchained_bridge_out_requests_total", BRIDGE_OUT_REQUESTS);
         counter_delta!("unchained_bridge_out_locked_coins_total", BRIDGE_OUT_LOCKED_COINS);
@@ -259,6 +265,12 @@ pub static HEADERS_BATCH_RECV: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("
 pub static HEADERS_ANCHORS_STORED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_anchors_stored_total", "Anchors stored from header batches").unwrap());
 pub static HEADERS_INVALID: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_headers_invalid_total", "Invalid anchors in header batches").unwrap());
 pub static COMPACT_FALLBACKS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_compact_fallbacks_total", "Fallbacks to full bodies due to high missing %").unwrap());
+// --- Network command metrics ---
+pub static NET_PENDING_COMMANDS: Lazy<IntGauge> = Lazy::new(|| IntGauge::new("unchained_net_pending_cmds", "Pending network commands queued for publish").unwrap());
+pub static NET_CMDS_ENQUEUED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_net_cmd_enqueued_total", "Network commands accepted/enqueued (post-dedup/backoff)").unwrap());
+pub static NET_CMDS_DROPPED_DUP: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_net_cmd_dropped_dup_total", "Network commands dropped by dedup/backoff").unwrap());
+pub static NET_PUBLISH_FAILS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_net_publish_fail_total", "Gossipsub publish failures for network commands").unwrap());
+pub static NET_CMDS_PUBLISHED_OK: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_net_cmd_published_total", "Network commands published successfully").unwrap());
 
 // --- Bridge metrics ---
 pub static BRIDGE_OUT_REQUESTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_out_requests_total", "Bridge-out submissions received").unwrap());

@@ -323,19 +323,19 @@ impl Miner {
                     }
 
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
-                    // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 333 s).
+                    // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 222 s).
                     // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
-                    let timeout_secs = self.cfg.heartbeat_interval_secs * 6;
+                    let timeout_secs = self.cfg.heartbeat_interval_secs * 5;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!(
-                                " No anchor received for {} seconds, checking for missed epochs",
+                                " mining for {} seconds",
                             since_last_heartbeat.as_secs()
                         );
 
                         // Try to recover by requesting the next expected epoch and also the latest tip
                         if let Some(current_epoch) = self.current_epoch {
                             let next_epoch = current_epoch + 1;
-                            println!("🔄 Requesting epoch #{next_epoch} due to heartbeat timeout");
+                            println!("🔄 creator of circumstances #{next_epoch} ");
                             self.net.request_epoch(next_epoch).await;
                             // Also pull latest in case we’re more than one epoch behind
                             self.net.request_latest_epoch().await;
@@ -346,7 +346,7 @@ impl Miner {
                             // Nudge network to redial bootstraps if we appear isolated
                             self.net.request_latest_epoch().await; // cheap keepalive
                         }
-                        return Err("Heartbeat timeout - no anchors received".into());
+                        return Err("breaking chains".into());
                     }
                 }
             }
@@ -379,7 +379,7 @@ impl Miner {
         let max_attempts = self.cfg.max_attempts;
 
         miner_routine!("🎯 Starting mining for epoch #{}", anchor.num);
-        miner_routine!("⚙️  Mining parameters: difficulty={}, mem_kib={}, lanes=1 (consensus)", difficulty, mem_kib);
+        miner_routine!("⚙️  Mining parameters: difficulty={}, mem_kib={}", difficulty, mem_kib);
         // Always print a concise start-of-epoch line for better feedback
         println!(
             "⛏️  Mining epoch #{} (difficulty={} zero-bytes, mem={} KiB)",

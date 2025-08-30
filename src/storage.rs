@@ -91,6 +91,7 @@ impl Store {
             "coin_candidate",
             "epoch_selected", // per-epoch selected coin IDs
             "epoch_leaves",   // per-epoch sorted leaf hashes for proofs
+            "epoch_levels",   // per-epoch merkle levels for fast proofs
             "coin_epoch",     // coin_id -> epoch number mapping (child epoch that committed the coin)
             "head",
             "wallet",
@@ -324,14 +325,24 @@ impl Store {
                 if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&value[..]) {
                     return Ok(Some(sp));
                 }
-                eprintln!(
-                    "\u{26a0}\u{fe0f}  Ignoring malformed spend record for key {}",
-                    hex::encode(key)
-                );
+                // Malformed spend bytes: be tolerant and return None without logging to avoid spam in hot paths.
                 Ok(None)
             }
             None => Ok(None),
         }
+    }
+
+    /// Tolerant decode for arbitrary CF values into Spend (used when iterating CF directly)
+    pub fn decode_spend_bytes_tolerant(&self, bytes: &[u8]) -> Option<crate::transfer::Spend> {
+        if let Ok(decompressed) = zstd::decode_all(bytes) {
+            if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
+                return Some(sp);
+            }
+        }
+        if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(bytes) {
+            return Some(sp);
+        }
+        None
     }
 
     /// Fetch raw bytes without attempting to deserialize
@@ -547,6 +558,27 @@ impl Store {
     pub fn get_epoch_leaves(&self, epoch_num: u64) -> Result<Option<Vec<[u8;32]>>> {
         let cf = self.db.cf_handle("epoch_leaves")
             .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
+        let key = epoch_num.to_le_bytes();
+        match self.db.get_cf(cf, &key)? {
+            Some(v) => Ok(Some(bincode::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store full Merkle levels for an epoch for O(log N) proof generation without recomputation
+    pub fn store_epoch_levels(&self, epoch_num: u64, levels: &Vec<Vec<[u8;32]>>) -> Result<()> {
+        let cf = self.db.cf_handle("epoch_levels")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
+        let key = epoch_num.to_le_bytes();
+        let data = bincode::serialize(levels)?;
+        self.db.put_cf(cf, &key, &data)?;
+        Ok(())
+    }
+
+    /// Load Merkle levels for an epoch if present. Level 0 must be sorted leaves.
+    pub fn get_epoch_levels(&self, epoch_num: u64) -> Result<Option<Vec<Vec<[u8;32]>>>> {
+        let cf = self.db.cf_handle("epoch_levels")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
         let key = epoch_num.to_le_bytes();
         match self.db.get_cf(cf, &key)? {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),

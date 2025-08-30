@@ -1,8 +1,3 @@
-// network.rs
-// Copyright 2025 The Unchained Authors
-// SPDX-License-Identifier: Apache-2.0
-
-//! Network layer for Unchained.
 //! Spends are gossiped/served using the V3 hashlock flow only.
 
 use crate::{
@@ -40,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use rocksdb::WriteBatch;
+use crate::metrics;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -129,6 +125,9 @@ const TOP_ANCHOR: &str = "unchained/anchor/v1";
 const TOP_COIN: &str = "unchained/coin/v1";
 const TOP_COIN_PROOF_REQUEST: &str = "unchained/coin_proof_request/v1";
 const TOP_COIN_PROOF_RESPONSE: &str = "unchained/coin_proof_response/v1";
+// Additive priority channels for time-sensitive proof serving
+const TOP_COIN_PROOF_REQUEST_URGENT: &str = "unchained/coin_proof_request/priority/v1";
+const TOP_COIN_PROOF_RESPONSE_URGENT: &str = "unchained/coin_proof_response/priority/v1";
 const TOP_SPEND: &str = "unchained/spend/v2";
 const TOP_SPEND_REQUEST: &str = "unchained/spend_request/v2";    // payload: [u8;32] coin_id
 const TOP_SPEND_RESPONSE: &str = "unchained/spend_response/v2";  // payload: Option<Spend>
@@ -396,10 +395,33 @@ fn links_to_available_parent(a: &Anchor, orphan_buf: &OrphanBuffer, db: &Store) 
 
 // Debounce map for compact range backfill requests with chunk alignment
 static RECENT_RANGE_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-const RANGE_REQ_DEDUP_SECS: u64 = 5;
+const RANGE_REQ_DEDUP_SECS: u64 = 20;
 // Debounce map for epoch-by-hash requests to prevent spam
 static RECENT_HASH_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-const HASH_REQ_DEDUP_SECS: u64 = 3;
+const HASH_REQ_DEDUP_SECS: u64 = 20;
+
+// Queue-level de-duplication and per-key backoff controls
+static RECENT_ENQUEUED_CMDS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static CMD_BACKOFF: Lazy<Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+const QUEUE_DEDUP_TTL_SECS: u64 = 30;
+const BACKOFF_BASE_MS: u64 = 2000;
+const BACKOFF_CAP_MS: u64 = 16000;
+
+fn command_key(cmd: &NetworkCommand) -> Option<String> {
+    match cmd {
+        NetworkCommand::RequestEpoch(n) | NetworkCommand::RequestEpochDirect(n) => Some(format!("epoch:{}", n)),
+        NetworkCommand::RequestEpochHeadersRange(range) => Some(format!("hdr:{}:{}", range.start_height, range.count)),
+        NetworkCommand::RequestEpochByHash(h) => Some(format!("epoch_by_hash:{}", hex::encode(&h[..8]))),
+        NetworkCommand::RequestCoin(id) => Some(format!("coin:{}", hex::encode(&id[..8]))),
+        NetworkCommand::RequestLatestEpoch => Some("latest".to_string()),
+        NetworkCommand::RequestCoinProof(id) => Some(format!("proof:{}", hex::encode(&id[..8]))),
+        NetworkCommand::RequestEpochTxn(req) => Some(format!("txn:{}", hex::encode(&req.epoch_hash[..8]))),
+        NetworkCommand::RequestEpochLeaves(n) => Some(format!("leaves:{}", n)),
+        NetworkCommand::RequestEpochSelected(n) => Some(format!("selected:{}", n)),
+        NetworkCommand::RequestEpochCandidates(h) => Some(format!("cands:{}", hex::encode(&h[..8]))),
+        _ => None,
+    }
+}
 const HDR_CHUNK: u64 = 64; // Align range requests to 64-epoch chunks
 
 // Bootstrap redial deduplication by address string
@@ -626,6 +648,7 @@ pub async fn spawn(
         TOP_ANCHOR, TOP_COIN, TOP_SPEND,
         TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
         TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE,
+        TOP_COIN_PROOF_REQUEST_URGENT, TOP_COIN_PROOF_RESPONSE_URGENT,
         TOP_EPOCH_LEAVES, TOP_EPOCH_LEAVES_REQUEST,
         TOP_EPOCH_SELECTED_REQUEST, TOP_EPOCH_SELECTED_RESPONSE,
         TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
@@ -677,8 +700,12 @@ pub async fn spawn(
     let (spend_tx, _) = broadcast::channel(1024);
     // Increase anchor broadcast capacity to reduce lag in consumers (e.g., miner)
     let (anchor_tx, _) = broadcast::channel(4096);
-    let (proof_tx, _) = broadcast::channel(256);
+    let (proof_tx, _) = broadcast::channel(1024);
     // removed commitment channels
+
+
+
+    
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (headers_tx, _headers_rx) = broadcast::channel::<EpochHeadersBatch>(1024);
@@ -1172,15 +1199,22 @@ pub async fn spawn(
         const PEER_ADDR_ADVERTISE_MIN_SECS: u64 = 60;
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
         let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
+        // Opportunistic dialing of stored peer addresses and periodic bootstrap nudges
+        const KNOWN_ADDR_REFRESH_SECS: u64 = 60;
+        const PER_TICK_DIAL_LIMIT: usize = 2;
+        const BOOTSTRAP_REDIAL_INTERVAL_SECS: u64 = 45;
+        let mut known_peer_addrs: Vec<String> = Vec::new();
+        let mut next_known_addr_idx: usize = 0;
+        let mut last_known_addrs_refresh: Instant = Instant::now() - std::time::Duration::from_secs(KNOWN_ADDR_REFRESH_SECS);
+        let mut last_bootstrap_redial: Instant = Instant::now() - std::time::Duration::from_secs(BOOTSTRAP_REDIAL_INTERVAL_SECS);
         // Periodic retry timer to flush pending publishes even without connection events
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
                     match event {
-                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        SwarmEvent::OutgoingConnectionError { peer_id, .. } => {
                             if let Some(pid) = peer_id { dialing_peers.remove(&pid); }
-                            eprintln!("⚠️  Outgoing connection error: {:?}", error);
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             net_log!("🤝 Connected to peer: {}", peer_id);
@@ -1232,7 +1266,7 @@ pub async fn spawn(
                                     NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),
                                     NetworkCommand::RequestCoin(id) => (TOP_COIN_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestLatestEpoch => (TOP_LATEST_REQUEST, bincode::serialize(&()).ok()),
-                                    NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
+                                    NetworkCommand::RequestCoinProof(id) => (TOP_COIN_PROOF_REQUEST_URGENT, bincode::serialize(&CoinProofRequest{ coin_id: *id }).ok()),
                                     NetworkCommand::RequestSpend(id) => (TOP_SPEND_REQUEST, bincode::serialize(&id).ok()),
                                     NetworkCommand::RequestEpochTxn(req) => (TOP_EPOCH_GET_TXN, bincode::serialize(&req).ok()),
                                     NetworkCommand::RequestEpochSelected(epoch) => (TOP_EPOCH_SELECTED_REQUEST, bincode::serialize(&epoch).ok()),
@@ -1243,6 +1277,85 @@ pub async fn spawn(
                                     NetworkCommand::RedialBootstraps => (TOP_ANCHOR, None), // no-op for pending queue
                                     // commitment gossip removed
                                 };
+                                // Local fast-path: directly serve proof to local subscribers when we request it
+                                if let NetworkCommand::RequestCoinProof(req_id) = &cmd {
+                                    if let Ok(Some(coin)) = db.get::<Coin>("coin", req_id) {
+                                        if let Ok(Some(epoch_num)) = db.get_epoch_for_coin(&coin.id) {
+                                            if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
+                                                let mut responded_local = false;
+                                                if let Ok(Some(levels)) = db.get_epoch_levels(anchor.num) {
+                                                    let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                    if !levels.is_empty() && levels[0].binary_search(&target_leaf).is_ok() {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_levels(&levels, &target_leaf) {
+                                                            let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                            let _ = proof_tx.send(resp.clone());
+                                                            if let Ok(bytes) = bincode::serialize(&resp) {
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                crate::metrics::PROOFS_SERVED.inc();
+                                                            }
+                                                            responded_local = true;
+                                                        }
+                                                    }
+                                                } else if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
+                                                    let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                    if leaves.binary_search(&target_leaf).is_ok() {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
+                                                            let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                            let _ = proof_tx.send(resp.clone());
+                                                            if let Ok(bytes) = bincode::serialize(&resp) {
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                crate::metrics::PROOFS_SERVED.inc();
+                                                            }
+                                                            responded_local = true;
+                                                        }
+                                                    }
+                                                }
+                                                if !responded_local {
+                                                    if let Ok(selected_ids) = db.get_selected_coin_ids_for_epoch(anchor.num) {
+                                                        let set: std::collections::HashSet<[u8;32]> = std::collections::HashSet::from_iter(selected_ids.into_iter());
+                                                        if set.contains(&coin.id) {
+                                                            if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                                let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                                let _ = proof_tx.send(resp.clone());
+                                                                if let Ok(bytes) = bincode::serialize(&resp) {
+                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                    crate::metrics::PROOFS_SERVED.inc();
+                                                                }
+                                                                responded_local = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if !responded_local {
+                                                    if let Ok(all_confirmed) = db.iterate_coins() {
+                                                        let ids: Vec<[u8;32]> = all_confirmed
+                                                            .into_iter()
+                                                            .filter(|c| db.get_epoch_for_coin(&c.id).ok().flatten() == Some(anchor.num))
+                                                            .map(|c| c.id)
+                                                            .collect();
+                                                        if ids.len() as u32 == anchor.coin_count {
+                                                            let set: std::collections::HashSet<[u8;32]> = std::collections::HashSet::from_iter(ids.into_iter());
+                                                            if set.contains(&coin.id) {
+                                                                if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
+                                                                    let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                                    let _ = proof_tx.send(resp.clone());
+                                                                    if let Ok(bytes) = bincode::serialize(&resp) {
+                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                        crate::metrics::PROOFS_SERVED.inc();
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(d) = data {
                                     if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
                                         still_pending.push_back(cmd);
@@ -1805,7 +1918,7 @@ pub async fn spawn(
                                                                     }
                                                                 }
                                                             }
-                                                            let _ = db.db.write(batch);
+                                                            let _ = db.write_batch(batch);
                                                         }
                                                         let _ = spend_tx.send(q.clone());
                                                         made_progress = true;
@@ -1876,7 +1989,7 @@ pub async fn spawn(
                                                         }
                                                     }
                                                 }
-                                                let _ = db.db.write(batch);
+                                                let _ = db.write_batch(batch);
                                             }
                                             let _ = spend_tx.send(sp.clone());
                                             // Hard invariant: after a confirmed spend is processed, coin must exist
@@ -1908,7 +2021,7 @@ pub async fn spawn(
                                                                         }
                                                                     }
                                                                 }
-                                                                let _ = db.db.write(batch);
+                                                                let _ = db.write_batch(batch);
                                                             }
                                                             let _ = spend_tx.send(q.clone());
                                                             made_progress = true;
@@ -2001,7 +2114,7 @@ pub async fn spawn(
                                                             }
                                                         }
                                                     }
-                                                    let _ = db.db.write(batch);
+                                                    let _ = db.write_batch(batch);
                                                 }
                                                 let _ = spend_tx.send(sp.clone());
                                                 // Try apply any buffered successors now that base is present
@@ -2018,7 +2131,7 @@ pub async fn spawn(
                                                                         batch.put_cf(sp_cf, &q.coin_id, &bytes);
                                                                     }
                                                                     batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]);
-                                                                    let _ = db.db.write(batch);
+                                                                    let _ = db.write_batch(batch);
                                                                 }
                                                                 let _ = spend_tx.send(q.clone());
                                                                 made_progress = true;
@@ -2201,7 +2314,7 @@ pub async fn spawn(
                                         }
                                     }
                                 },
-                                TOP_COIN_PROOF_REQUEST => if let Ok(req) = bincode::deserialize::<CoinProofRequest>(&message.data) {
+                                TOP_COIN_PROOF_REQUEST | TOP_COIN_PROOF_REQUEST_URGENT => if let Ok(req) = bincode::deserialize::<CoinProofRequest>(&message.data) {
                                     let now = std::time::Instant::now();
                                     if let Ok(mut map) = RECENT_PROOF_REQS.lock() {
                                         map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
@@ -2214,7 +2327,21 @@ pub async fn spawn(
                                         if let Ok(Some(epoch_num)) = db.get_epoch_for_coin(&coin.id) {
                                             if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                                                 let mut responded = false;
-                                                if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
+                                                // Prefer cached levels for deterministic, faster proofs
+                                                if let Ok(Some(levels)) = db.get_epoch_levels(anchor.num) {
+                                                    let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+                                                    if !levels.is_empty() && levels[0].binary_search(&target_leaf).is_ok() {
+                                                        if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_levels(&levels, &target_leaf) {
+                                                            let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
+                                                            if let Ok(data) = bincode::serialize(&resp) {
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                crate::metrics::PROOFS_SERVED.inc();
+                                                                let _ = proof_tx.send(resp);
+                                                                responded = true;
+                                                            }
+                                                        }
+                                                    }
+                                                } else if let Ok(Some(leaves)) = db.get_epoch_leaves(anchor.num) {
                                                     let target_leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
                                                     if leaves.binary_search(&target_leaf).is_ok() {
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
@@ -2222,6 +2349,7 @@ pub async fn spawn(
                                                             if let Ok(data) = bincode::serialize(&resp) {
                                                                 swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
+                                                                let _ = proof_tx.send(resp);
                                                                 responded = true;
                                                             }
                                                         }
@@ -2236,6 +2364,7 @@ pub async fn spawn(
                                                                 if let Ok(data) = bincode::serialize(&resp) {
                                                                     swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                     crate::metrics::PROOFS_SERVED.inc();
+                                                                    let _ = proof_tx.send(resp);
                                                                     responded = true;
                                                                 }
                                                             }
@@ -2255,8 +2384,10 @@ pub async fn spawn(
                                                                 if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
                                                                     let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
                                                                     if let Ok(data) = bincode::serialize(&resp) {
-                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
+                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
                                                                         crate::metrics::PROOFS_SERVED.inc();
+                                                                        let _ = proof_tx.send(resp);
                                                                     }
                                                                 }
                                                             }
@@ -2271,7 +2402,7 @@ pub async fn spawn(
                                         }
                                     }
                                 },
-                                TOP_COIN_PROOF_RESPONSE => if let Ok(resp) = bincode::deserialize::<CoinProofResponse>(&message.data) {
+                                TOP_COIN_PROOF_RESPONSE | TOP_COIN_PROOF_RESPONSE_URGENT => if let Ok(resp) = bincode::deserialize::<CoinProofResponse>(&message.data) {
                                     let _ = proof_tx.send(resp);
                                 },
                                 TOP_EPOCH_LEAVES => if let Ok(bundle) = bincode::deserialize::<EpochLeavesBundle>(&message.data) {
@@ -2293,6 +2424,9 @@ pub async fn spawn(
                                             if db.store_epoch_leaves(bundle.epoch_num, &leaves).is_ok() {
                                                 net_log!("🌿 Stored epoch {} leaves from peer", bundle.epoch_num);
                                             }
+                                            // Also compute and store levels for faster proofs next time
+                                            let levels = crate::epoch::MerkleTree::build_levels_from_sorted_leaves(&leaves);
+                                            let _ = db.store_epoch_levels(bundle.epoch_num, &levels);
                                         }
                                         // Opportunistically backfill selected IDs if the index is missing and we have coins
                                         if let Ok(existing_ids) = db.get_selected_coin_ids_for_epoch(bundle.epoch_num) {
@@ -2336,8 +2470,10 @@ pub async fn spawn(
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
+                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
+                                                                let _ = proof_tx.send(resp);
                                                                 satisfied.push(*coin_id);
                                                             }
                                                         }
@@ -2473,11 +2609,99 @@ pub async fn spawn(
                             needs_reorg_check = false;
                         }
                     }
+                    // Opportunistic peer discovery/dialing when we're under capacity
+                    let connected_count = connected_peers.lock().map(|s| s.len()).unwrap_or(0);
+                    let under_cap = connected_count < net_cfg.max_peers as usize;
+                    if under_cap {
+                        // Refresh known peer addresses periodically
+                        if now.duration_since(last_known_addrs_refresh) > std::time::Duration::from_secs(KNOWN_ADDR_REFRESH_SECS) {
+                            if let Ok(addrs) = db.load_peer_addrs() {
+                                known_peer_addrs = addrs;
+                                next_known_addr_idx = 0;
+                                last_known_addrs_refresh = now;
+                            }
+                        }
+
+                        // Re-advertise our external address occasionally to aid peer exchange
+                        if net_cfg.peer_exchange {
+                            let to_advertise = swarm
+                                .external_addresses()
+                                .next()
+                                .map(|a| format!("{}/p2p/{}", a, swarm.local_peer_id()))
+                                .or_else(|| net_cfg.public_ip.clone().map(|ip|
+                                    format!("/ip4/{}/udp/{}/quic-v1/p2p/{}", ip, port, swarm.local_peer_id())
+                                ));
+                            if let Some(addr) = to_advertise {
+                                let ok_public = addr.starts_with("/ip4/") && addr.contains("/udp/") && addr.contains("/quic-v1/");
+                                if ok_public {
+                                    if let Some(ip_str) = addr.split('/').nth(3) {
+                                        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if !ip.is_private() && !ip.is_loopback() {
+                                            if now.duration_since(last_peer_addr_advertise) > std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS) {
+                                                if let Ok(data) = bincode::serialize(&addr) {
+                                                    try_publish_gossip(&mut swarm, TOP_PEER_ADDR, data, "peer-addr");
+                                                }
+                                                last_peer_addr_advertise = now;
+                                            }
+                                        }}
+                                    }
+                                }
+                            }
+                        }
+
+                        // Periodically nudge bootstrap redials only while we have zero connected peers
+                        if now.duration_since(last_bootstrap_redial) > std::time::Duration::from_secs(BOOTSTRAP_REDIAL_INTERVAL_SECS) {
+                            let have_any_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
+                            if !have_any_peers {
+                                let _ = command_tx.send(NetworkCommand::RedialBootstraps);
+                            }
+                            last_bootstrap_redial = now;
+                        }
+
+                        // Dial a few stored addresses per tick to gradually fill connections
+                        if !known_peer_addrs.is_empty() {
+                            let mut attempted: usize = 0;
+                            let total = known_peer_addrs.len();
+                            let mut scanned: usize = 0;
+                            while attempted < PER_TICK_DIAL_LIMIT && scanned < total {
+                                let idx = if total == 0 { 0 } else { next_known_addr_idx % total };
+                                next_known_addr_idx = next_known_addr_idx.saturating_add(1);
+                                scanned += 1;
+                                let addr_str = &known_peer_addrs[idx];
+                                if !addr_str.starts_with("/ip4/") || !addr_str.contains("/udp/") || !addr_str.contains("/quic-v1/") { continue; }
+                                let Some(id_str) = addr_str.split("/p2p/").last() else { continue; };
+                                let Ok(remote_pid) = PeerId::from_str(id_str) else { continue; };
+                                // Skip if already connected or dialing
+                                let already_connected = connected_peers.lock().map(|s| s.contains(&remote_pid)).unwrap_or(false);
+                                if already_connected || dialing_peers.contains(&remote_pid) { continue; }
+                                // TTL de-dup on dials
+                                recent_peer_dials.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PEER_DIAL_DEDUP_SECS));
+                                if recent_peer_dials.contains_key(&remote_pid) { continue; }
+                                if let Ok(m) = addr_str.parse::<Multiaddr>() {
+                                    match swarm.dial(m) {
+                                        Ok(()) => { dialing_peers.insert(remote_pid); recent_peer_dials.insert(remote_pid, now); attempted += 1; },
+                                        Err(_) => { /* ignore */ }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Only attempt retries if we have any connected peers
                     let have_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
+                    metrics::NET_PENDING_COMMANDS.set(pending_commands.len() as i64);
                     if !have_peers || pending_commands.is_empty() { continue; }
                     let mut still_pending = VecDeque::new();
                     while let Some(cmd) = pending_commands.pop_front() {
+                        if let Some(key) = command_key(&cmd) {
+                            // Backoff check per key
+                            let now = std::time::Instant::now();
+                            let mut skip_due_to_backoff = false;
+                            if let Ok( bo) = CMD_BACKOFF.lock() {
+                                if let Some((next_at, _)) = bo.get(&key).copied() {
+                                    if now < next_at { skip_due_to_backoff = true; }
+                                }
+                            }
+                            if skip_due_to_backoff { still_pending.push_back(cmd); continue; }
+                        }
                         let (t, data) = match &cmd {
                             NetworkCommand::GossipAnchor(a) => (TOP_ANCHOR, bincode::serialize(&a).ok()),
                             NetworkCommand::GossipCompactEpoch(c) => (TOP_EPOCH_COMPACT, bincode::serialize(&c).ok()),
@@ -2503,11 +2727,28 @@ pub async fn spawn(
                         };
                         if let Some(d) = data {
                             if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
+                                metrics::NET_PUBLISH_FAILS.inc();
+                                // Increase backoff on failure
+                                if let Some(key) = command_key(&cmd) {
+                                    let now = std::time::Instant::now();
+                                    if let Ok(mut bo) = CMD_BACKOFF.lock() {
+                                        let (_, cur) = bo.get(&key).copied().unwrap_or((now, BACKOFF_BASE_MS));
+                                        let next = (cur.saturating_mul(2)).min(BACKOFF_CAP_MS);
+                                        bo.insert(key, (now + std::time::Duration::from_millis(next), next));
+                                    }
+                                }
                                 still_pending.push_back(cmd);
+                            } else {
+                                metrics::NET_CMDS_PUBLISHED_OK.inc();
+                                // Reset backoff on success
+                                if let Some(key) = command_key(&cmd) {
+                                    if let Ok(mut bo) = CMD_BACKOFF.lock() { bo.remove(&key); }
+                                }
                             }
                         }
                     }
                     pending_commands = still_pending;
+                    metrics::NET_PENDING_COMMANDS.set(pending_commands.len() as i64);
                 },
                 Some(command) = command_rx.recv() => {
                     match &command {
@@ -2530,6 +2771,10 @@ pub async fn spawn(
                             }
                         }
                         NetworkCommand::RedialBootstraps => {
+                            // Only redial bootstraps if we are currently not connected to any peer
+                            let have_any_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
+                            if have_any_peers { continue; }
+                            
                             // Actively redial configured bootstraps with address-based deduplication
                             let now = Instant::now();
                             if let Ok(mut map) = RECENT_BOOTSTRAP_DIALS.lock() {
@@ -2558,7 +2803,24 @@ pub async fn spawn(
                         }
                         _ => {
                             // For other commands, push to pending to be published via gossipsub
-                            pending_commands.push_back(command.clone());
+                            let mut allow_enqueue = true;
+                            if let Some(key) = command_key(&command) {
+                                let now = std::time::Instant::now();
+                                if let Ok(mut m) = RECENT_ENQUEUED_CMDS.lock() {
+                                    m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(QUEUE_DEDUP_TTL_SECS));
+                                    if m.contains_key(&key) { allow_enqueue = false; }
+                                    else { m.insert(key.clone(), now); }
+                                }
+                                // Check backoff gate
+                                if allow_enqueue {
+                                    if let Ok(bo) = CMD_BACKOFF.lock() {
+                                        if let Some((next_at, _)) = bo.get(&key) { if std::time::Instant::now() < *next_at { allow_enqueue = false; } }
+                                    }
+                                }
+                            }
+                            if allow_enqueue { pending_commands.push_back(command.clone()); metrics::NET_CMDS_ENQUEUED.inc(); }
+                            else { metrics::NET_CMDS_DROPPED_DUP.inc(); }
+                            metrics::NET_PENDING_COMMANDS.set(pending_commands.len() as i64);
                         }
                     }
                 }

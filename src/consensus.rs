@@ -1,6 +1,3 @@
-// src/consensus.rs
-// Deterministic, config-free consensus parameters & retargeting.
-// Uses only u32/u64 internally; provides a tuple-returning shim to match existing call sites.
 
 use crate::epoch::Anchor;
 

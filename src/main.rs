@@ -72,8 +72,64 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
+    /// HTLC: Sender precomputes ch_refund (and optionally secrets) from plan
+    HtlcRefundPrepare {
+        /// Plan JSON from HtlcPlan
+        #[arg(long)] plan: String,
+        /// Optional hex/base64-url refund secret base; if omitted, random per-coin secrets are generated and saved
+        #[arg(long)] refund_base: Option<String>,
+        /// Output JSON for ch_refund mapping
+        #[arg(long)] out: String,
+        /// Optional output JSON to store refund secrets per coin (only used when refund_base is not provided)
+        #[arg(long)] out_secrets: Option<String>,
+    },
     Balance,
     History,
+    /// HTLC: Plan an offer (sender) and output a JSON plan
+    HtlcPlan {
+        #[arg(long)] paycode: String,
+        #[arg(long)] amount: u64,
+        /// Timeout epoch number T
+        #[arg(long, value_parser = clap::value_parser!(u64))] timeout: u64,
+        /// Output file to write the plan JSON
+        #[arg(long)] out: String,
+    },
+    /// HTLC: Receiver computes claim CHs from claim secret and writes JSON
+    HtlcClaimPrepare {
+        /// Claim secret s_claim (hex or base64-url)
+        #[arg(long)] claim_secret: String,
+        /// Comma-separated coin ids (hex) to claim
+        #[arg(long)] coins: String,
+        /// Output JSON file to write claim CHs
+        #[arg(long)] out: String,
+    },
+    /// HTLC: Execute sender offer (build spends with HTLC locks) using plan and receiver claim doc
+    HtlcOfferExecute {
+        #[arg(long)] plan: String,
+        #[arg(long)] claims: String,
+        /// Optional hex/base64-url refund secret base to derive per-coin refund secrets deterministically
+        #[arg(long)] refund_base: Option<String>,
+        /// Optional path to write per-coin refund secrets; required if refund_base is not provided
+        #[arg(long)] refund_secrets_out: Option<String>,
+    },
+    /// HTLC: Execute claim spends before timeout with claim secret
+    HtlcClaim {
+        #[arg(long)] timeout: u64,
+        #[arg(long)] claim_secret: String,
+        /// JSON file mapping coin_id -> ch_refund (computed on sender during offer execute)
+        #[arg(long)] refunds: String,
+        /// Receiver paycode for the next hop
+        #[arg(long)] paycode: String,
+    },
+    /// HTLC: Execute refund at/after timeout with refund secret
+    HtlcRefund {
+        #[arg(long)] timeout: u64,
+        #[arg(long)] refund_secret: String,
+        /// JSON file mapping coin_id -> ch_claim (from receiver)
+        #[arg(long)] claims: String,
+        /// Sender paycode (destination for refunded coins)
+        #[arg(long)] paycode: String,
+    },
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
     RepairSpends,
     // Commitment request/response tooling removed
@@ -107,6 +163,18 @@ enum Cmd {
         /// Input snapshot file path
         #[arg(long)]
         input: String,
+    },
+    /// Bridge: Lock UNCH on Unchained for a Sui recipient
+    BridgeOut {
+        /// Sui recipient address (0x-prefixed lowercase hex)
+        #[arg(long)]
+        sui_recipient: String,
+        /// Amount to lock
+        #[arg(long)]
+        amount: u64,
+        /// Seconds to pre-warm coin proofs before submitting (0 to disable)
+        #[arg(long, default_value_t = 12)]
+        prewarm_secs: u64,
     },
 }
 
@@ -222,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
                             let iter = db_clone.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
                             for item in iter {
                                 if let Ok((_k, v)) = item {
-                                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                                    if let Some(sp) = db_clone.decode_spend_bytes_tolerant(&v) {
                                         let _ = wallet_clone.scan_spend_for_me(&sp);
                                     }
                                 }
@@ -514,6 +582,120 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::HtlcPlan { paycode, amount, timeout, out }) => {
+            let plan = wallet.plan_htlc_offer(*amount, paycode, *timeout)?;
+            let json = serde_json::to_string_pretty(&plan)?;
+            std::fs::write(out, json)?;
+            println!("✅ Wrote HTLC plan to {} (timeout epoch {})", out, timeout);
+            return Ok(());
+        }
+        Some(Cmd::HtlcClaimPrepare { claim_secret, coins, out }) => {
+            let claim_bytes = {
+                let s = claim_secret.trim();
+                if let Ok(b) = hex::decode(s.trim_start_matches("0x")) { b } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)? }
+            };
+            if claim_bytes.is_empty() { return Err(anyhow::anyhow!("claim_secret empty")); }
+            let mut entries = Vec::new();
+            for hex_id in coins.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let id_vec = hex::decode(hex_id).map_err(|e| anyhow::anyhow!("Invalid coin id {}: {}", hex_id, e))?;
+                if id_vec.len() != 32 { return Err(anyhow::anyhow!("coin id {} must be 32 bytes", hex_id)); }
+                let mut coin_id = [0u8;32]; coin_id.copy_from_slice(&id_vec);
+                let chain_id = db.get_chain_id()?;
+                let ch = crypto::commitment_hash_from_preimage(&chain_id, &coin_id, &claim_bytes);
+                entries.push(crate::wallet::HtlcClaimsDocEntry { coin_id, ch_claim: ch });
+            }
+            let doc = crate::wallet::HtlcClaimsDoc { claims: entries };
+            let json = serde_json::to_string_pretty(&doc)?;
+            std::fs::write(out, json)?;
+            println!("✅ Wrote HTLC claim CHs to {}", out);
+            return Ok(());
+        }
+        Some(Cmd::HtlcOfferExecute { plan, claims, refund_base, refund_secrets_out }) => {
+            let plan_doc: crate::wallet::HtlcPlanDoc = serde_json::from_slice(&std::fs::read(plan)?)?;
+            let claims_doc: crate::wallet::HtlcClaimsDoc = serde_json::from_slice(&std::fs::read(claims)?)?;
+            if refund_base.is_none() && refund_secrets_out.is_none() {
+                return Err(anyhow::anyhow!("Provide either --refund_base (deterministic) or --refund_secrets_out to persist generated secrets"));
+            }
+            let refund_base_bytes: Option<Vec<u8>> = if let Some(b) = refund_base {
+                let t = b.trim();
+                if let Ok(h) = hex::decode(t.trim_start_matches("0x")) { Some(h) } else { Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t)?) }
+            } else { None };
+            let outcome = wallet.execute_htlc_offer(&plan_doc, &claims_doc, &net, refund_base_bytes.as_deref(), refund_secrets_out.as_deref(), None).await?;
+            println!("✅ Built and broadcast {} HTLC offer spend(s)", outcome.spends.len());
+            return Ok(());
+        }
+        Some(Cmd::HtlcRefundPrepare { plan, refund_base, out, out_secrets }) => {
+            let plan_doc: crate::wallet::HtlcPlanDoc = serde_json::from_slice(&std::fs::read(plan)?)?;
+            let chain_id = plan_doc.chain_id;
+            let mut refunds = Vec::new();
+            let mut secrets_dump: Vec<(String,String)> = Vec::new();
+            use rand::RngCore;
+            for c in &plan_doc.coins {
+                let secret: [u8;32] = if let Some(b) = refund_base {
+                    let base_bytes = if let Ok(h) = hex::decode(b.trim().trim_start_matches("0x")) { h } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b.trim())? };
+                    let mut h = blake3::Hasher::new_derive_key("unchained.htlc.refund.base");
+                    h.update(&base_bytes); h.update(&c.coin_id);
+                    let mut out = [0u8;32]; h.finalize_xof().fill(&mut out); out
+                } else {
+                    let mut s = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut s);
+                    secrets_dump.push((hex::encode(c.coin_id), hex::encode(s)));
+                    s
+                };
+                let ch = crypto::commitment_hash_from_preimage(&chain_id, &c.coin_id, &secret);
+                refunds.push(crate::wallet::HtlcRefundsDocEntry { coin_id: c.coin_id, ch_refund: ch });
+            }
+            let doc = crate::wallet::HtlcRefundsDoc { refunds };
+            std::fs::write(out, serde_json::to_string_pretty(&doc)?)?;
+            if refund_base.is_none() {
+                if let Some(path) = out_secrets {
+                    let json = serde_json::to_string_pretty(&secrets_dump)?;
+                    std::fs::write(path, json)?;
+                    println!("✅ Wrote per-coin refund secrets (keep safe)");
+                }
+            }
+            println!("✅ Wrote HTLC refund CHs to {}", out);
+            return Ok(());
+        }
+        Some(Cmd::HtlcClaim { timeout, claim_secret, refunds, paycode }) => {
+            // Guard: Claim only valid when current_epoch < T
+            let current_epoch = db.get::<epoch::Anchor>("epoch", b"latest")?.map(|a| a.num).unwrap_or(0);
+            if current_epoch >= *timeout {
+                return Err(anyhow::anyhow!(
+                    "Claim path not valid: current_epoch={} ≥ T={}. Use htlc-refund instead.",
+                    current_epoch, timeout
+                ));
+            }
+            let refunds_doc: crate::wallet::HtlcRefundsDoc = serde_json::from_slice(&std::fs::read(refunds)?)?;
+            let mut map = std::collections::HashMap::new();
+            for e in refunds_doc.refunds { map.insert(e.coin_id, e.ch_refund); }
+            let s_bytes = {
+                let s = claim_secret.trim();
+                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) { h } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)? }
+            };
+            let outcome = wallet.htlc_claim(*timeout, &s_bytes, &map, paycode, &net, None).await?;
+            println!("✅ Built and broadcast {} HTLC claim spend(s)", outcome.spends.len());
+            return Ok(());
+        }
+        Some(Cmd::HtlcRefund { timeout, refund_secret, claims, paycode }) => {
+            // Guard: Refund only valid when current_epoch ≥ T
+            let current_epoch = db.get::<epoch::Anchor>("epoch", b"latest")?.map(|a| a.num).unwrap_or(0);
+            if current_epoch < *timeout {
+                return Err(anyhow::anyhow!(
+                    "Refund path not valid: current_epoch={} < T={}. Use htlc-claim instead.",
+                    current_epoch, timeout
+                ));
+            }
+            let claims_doc: crate::wallet::HtlcClaimsDoc = serde_json::from_slice(&std::fs::read(claims)?)?;
+            let mut map = std::collections::HashMap::new();
+            for e in claims_doc.claims { map.insert(e.coin_id, e.ch_claim); }
+            let s_bytes = {
+                let s = refund_secret.trim();
+                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) { h } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)? }
+            };
+            let outcome = wallet.htlc_refund(*timeout, &s_bytes, &map, paycode, &net, None).await?;
+            println!("✅ Built and broadcast {} HTLC refund spend(s)", outcome.spends.len());
+            return Ok(());
+        }
         Some(Cmd::Balance) => {
             match wallet.balance() {
                 Ok(balance) => {
@@ -596,6 +778,55 @@ async fn main() -> anyhow::Result<()> {
             let added = db.import_anchors_snapshot(input)?;
             println!("✅ Imported {} anchors from {}", added, input);
             return Ok(());
+        }
+        Some(Cmd::BridgeOut { sui_recipient, amount, prewarm_secs }) => {
+            // Optional: pre-warm proofs for inputs that will cover the amount
+            if *prewarm_secs > 0 {
+                match wallet.select_inputs(*amount) {
+                    Ok(coins) => {
+                        let mut rx = net.proof_subscribe();
+                        for c in coins.iter() {
+                            net.request_coin_proof(c.id).await;
+                        }
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*prewarm_secs);
+                        loop {
+                            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() { break; }
+                            if let Ok(Ok(resp)) = tokio::time::timeout(remaining, rx.recv()).await {
+                                // Stop early if we have observed at least one proof for our set
+                                if coins.iter().any(|c| c.id == resp.coin.id) {
+                                    // best-effort: a single hit means peers are responsive
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Could not pre-warm proofs: {}", e);
+                    }
+                }
+            }
+            // Submit directly via in-process bridge service to avoid HTTP dependency
+            match bridge::submit_bridge_out_direct(
+                cfg.bridge.clone(),
+                db.clone(),
+                wallet.clone(),
+                net.clone(),
+                *amount,
+                sui_recipient.clone(),
+            ).await {
+                Ok(bridge::BridgeOutResult::Locked { tx_hash }) => {
+                    println!("✅ Locked. tx_hash={}", tx_hash);
+                }
+                Ok(bridge::BridgeOutResult::Pending { op_id }) => {
+                    println!("⏳ Submitted pending op. op_id={}", op_id);
+                }
+                Err(e) => {
+                    eprintln!("❌ bridge_out failed: {}", e);
+                }
+            }
         }
         // commitment commands removed
         Some(Cmd::MsgSend { text }) => {
@@ -748,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let metrics_bind = cfg.metrics.bind.clone();
+    let _metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
     // Start bridge RPC (lightweight JSON server)
     {
@@ -762,13 +993,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("\n🚀 unchained node is running!");
-    println!("   📡 P2P listening on port {}", cfg.net.listen_port);
+    println!("   📡 unchained listening on port {}", cfg.net.listen_port);
     if let Some(public_ip) = cfg.net.public_ip {
         println!("   📢 Public IP announced as: {public_ip}");
     }
-    println!("   📊 Metrics available on http://{metrics_bind}");
+    println!("   📊 Epoch length: 222 seconds");
     println!("   ⛏️  Mining: {}", if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled { "enabled" } else { "disabled" });
-    println!("   🎯 Epoch coin cap (max selected): {}", cfg.epoch.max_coins_per_epoch);
+    println!("   🎯 Epoch coin cap: {}", cfg.epoch.max_coins_per_epoch);
     println!("   Press Ctrl+C to stop");
 
     match signal::ctrl_c().await {

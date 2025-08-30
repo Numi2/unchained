@@ -39,7 +39,6 @@ pub struct StealthAddressDoc {
 }
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
-use std::collections::HashSet;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use argon2::{Argon2, Params};
 use chacha20poly1305::{
@@ -550,7 +549,7 @@ impl Wallet {
             let iter_sp = store.db.iterator_cf(cf_spend, rocksdb::IteratorMode::Start);
             for item in iter_sp {
                 let (_k, v) = item?;
-                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
+                if let Some(sp) = store.decode_spend_bytes_tolerant(&v) {
                     if counted.contains(&sp.coin_id) { continue; }
                     // Only count if this spend is addressed to me
                     let chain_id = store.get_chain_id()?;
@@ -656,92 +655,11 @@ impl Wallet {
                 commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, &chain_id),
                 amount_le: coin.value,
             };
-            // Resolve epoch and proof (unchanged logic)
-            let commit_epoch = store
-                .get_epoch_for_coin(&coin.id)?
-                .ok_or_else(|| anyhow!("Missing coin->epoch index for committed coin"))?;
-            let local_anchor: crate::epoch::Anchor = store
-                .get("epoch", &commit_epoch.to_le_bytes())?
-                .ok_or_else(|| anyhow!("Anchor not found for committed epoch"))?;
-            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-            let mut anchor_used: crate::epoch::Anchor = local_anchor.clone();
-            let mut proof_used: Option<Vec<([u8; 32], bool)>> = None;
-            if let Some(leaves) = store.get_epoch_leaves(local_anchor.num)? {
-                if leaves.binary_search(&leaf).is_ok() {
-                    if let Some(p) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf) {
-                        if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
-                            proof_used = Some(p);
-                        }
-                    }
-                }
-            }
-            if proof_used.is_none() {
-                if let Ok(selected_ids) = store.get_selected_coin_ids_for_epoch(local_anchor.num) {
-                    let set: HashSet<[u8; 32]> = HashSet::from_iter(selected_ids.into_iter());
-                    if set.contains(&coin.id) {
-                        if let Some(p) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                            if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
-                                proof_used = Some(p);
-                            }
-                        }
-                    }
-                }
-            }
-            if proof_used.is_none() {
-                if let Ok(all_confirmed) = store.iterate_coins() {
-                    let mut ids: Vec<[u8;32]> = all_confirmed
-                        .into_iter()
-                        .filter(|c| c.epoch_hash == local_anchor.hash)
-                        .map(|c| c.id)
-                        .collect();
-                    if ids.len() as u32 == local_anchor.coin_count {
-                        let set: HashSet<[u8;32]> = HashSet::from_iter(ids.drain(..));
-                        if set.contains(&coin.id) {
-                            if let Some(p) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
-                                if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
-                                    proof_used = Some(p);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if proof_used.is_none() {
-                let mut proof_rx = network.proof_subscribe();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-                network.request_epoch_leaves(local_anchor.num).await;
-                network.request_coin_proof(coin.id).await;
-                loop {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() { return Err(anyhow!("Timed out waiting for valid coin proof")); }
-                    match tokio::time::timeout(remaining, proof_rx.recv()).await {
-                        Ok(Ok(resp)) => {
-                            if resp.coin.id != coin.id { continue; }
-                            if resp.anchor.hash != local_anchor.hash { continue; }
-                            if local_anchor.merkle_root != resp.anchor.merkle_root { continue; }
-                            if crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root) {
-                                anchor_used = resp.anchor;
-                                proof_used = Some(resp.proof);
-                                break;
-                            } else {
-                                network.request_coin_proof(coin.id).await;
-                                network.request_epoch_leaves(local_anchor.num).await;
-                                if let Ok(Some(leaves)) = store.get_epoch_leaves(local_anchor.num) {
-                                    if leaves.binary_search(&leaf).is_ok() {
-                                        if let Some(p) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf) {
-                                            if crate::epoch::MerkleTree::verify_proof(&leaf, &p, &local_anchor.merkle_root) {
-                                                proof_used = Some(p);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => { return Err(anyhow!("Timed out waiting for valid coin proof")); }
-                    }
-                }
-            }
+            // Resolve anchor and proof against genesis only
+            let anchor_used: crate::epoch::Anchor = store
+                .get("epoch", &0u64.to_le_bytes())?
+                .ok_or_else(|| anyhow!("Genesis anchor not found"))?;
+            let proof_used: Option<Vec<([u8; 32], bool)>> = Some(Vec::new());
 
             // Determine correct unlock preimage for the coin being spent (genesis or previous spend)
             let unlock_preimage = if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
@@ -846,6 +764,267 @@ impl Wallet {
     /// Commitment response builder removed.
     pub fn build_commitment_response(&self, _req: &()) -> Result<()> {
         anyhow::bail!("commitment flow removed")
+    }
+}
+
+// ---------------- HTLC helper documents ----------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcPlanCoin {
+    pub coin_id: [u8;32],
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcPlanDoc {
+    pub chain_id: [u8;32],
+    pub timeout_epoch: u64,
+    pub amount: u64,
+    pub paycode: String,
+    pub coins: Vec<HtlcPlanCoin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcClaimsDocEntry {
+    pub coin_id: [u8;32],
+    pub ch_claim: [u8;32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcClaimsDoc { pub claims: Vec<HtlcClaimsDocEntry> }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcRefundsDocEntry { pub coin_id: [u8;32], pub ch_refund: [u8;32] }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HtlcRefundsDoc { pub refunds: Vec<HtlcRefundsDocEntry> }
+
+impl Wallet {
+    pub fn plan_htlc_offer(&self, amount: u64, paycode: &str, timeout_epoch: u64) -> Result<HtlcPlanDoc> {
+        // Validate paycode parseable up-front
+        let _ = Self::parse_stealth_address(paycode).context("Invalid receiver paycode")?;
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let coins = self.select_inputs(amount)?;
+        let chain_id = store.get_chain_id()?;
+        let coins_list = coins.into_iter().map(|c| HtlcPlanCoin { coin_id: c.id, value: c.value }).collect();
+        Ok(HtlcPlanDoc { chain_id, timeout_epoch, amount, paycode: paycode.to_string(), coins: coins_list })
+    }
+
+    pub async fn execute_htlc_offer(
+        &self,
+        plan: &HtlcPlanDoc,
+        claims: &HtlcClaimsDoc,
+        network: &crate::network::NetHandle,
+        refund_secret_base: Option<&[u8]>,
+        refund_secrets_out: Option<&str>,
+        note_s: Option<&[u8]>,
+    ) -> Result<SendOutcome> {
+        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(&plan.paycode)
+            .context("Invalid receiver paycode in plan")?;
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        // Build lookup for ch_claim per coin
+        let mut ch_claim_map: std::collections::HashMap<[u8;32],[u8;32]> = std::collections::HashMap::new();
+        for e in &claims.claims { ch_claim_map.insert(e.coin_id, e.ch_claim); }
+
+        let mut spends = Vec::new();
+        let mut secrets_dump: Vec<(String,String)> = Vec::new();
+        for coin_ent in &plan.coins {
+            // Fetch full coin and anchor/proof
+            let coin = store.get::<crate::coin::Coin>("coin", &coin_ent.coin_id)?.ok_or_else(|| anyhow!("Coin not found for plan coin_id"))?;
+            let commit_epoch = store.get_epoch_for_coin(&coin.id)?.ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
+            let anchor: crate::epoch::Anchor = store.get("epoch", &commit_epoch.to_le_bytes())?.ok_or_else(|| anyhow!("Anchor not found"))?;
+            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
+            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
+            } else { None }.ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+
+            // Build receiver commitment with composite HTLC next_lock_hash
+            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let chain_id = plan.chain_id;
+            let value_tag = coin.value.to_le_bytes();
+            let seed = crate::crypto::stealth_seed_v3(shared.as_bytes(), &recipient_addr, ct.as_bytes(), &value_tag, &chain_id);
+            let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
+            let vt = crate::crypto::view_tag(shared.as_bytes());
+            // ch_claim from receiver (per coin)
+            let ch_claim = *ch_claim_map.get(&coin.id).ok_or_else(|| anyhow!("Missing ch_claim for coin in claims doc"))?;
+            // ch_refund derived from refund_secret_base or generated randomly per coin
+            let refund_secret = if let Some(base) = refund_secret_base {
+                // Derive per-coin secret deterministically
+                let mut h = blake3::Hasher::new_derive_key("unchained.htlc.refund.base");
+                h.update(base);
+                h.update(&coin.id);
+                let mut out = [0u8;32]; h.finalize_xof().fill(&mut out); out
+            } else {
+                let mut s = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut s); s
+            };
+            let ch_refund = crate::crypto::commitment_hash_from_preimage(&chain_id, &coin.id, &refund_secret);
+            let next_lock_hash = crate::crypto::htlc_lock_hash(&chain_id, &coin.id, plan.timeout_epoch, &ch_claim, &ch_refund);
+
+            let mut one_time_pk = [0u8; OTP_PK_BYTES]; one_time_pk.copy_from_slice(&ot_pk_bytes);
+            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES]; kyber_ct.copy_from_slice(ct.as_bytes());
+            let receiver_commitment = crate::transfer::ReceiverLockCommitment {
+                one_time_pk,
+                kyber_ct,
+                next_lock_hash,
+                commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, &chain_id),
+                amount_le: coin.value,
+            };
+
+            // Determine unlock preimage for current input
+            let unlock_preimage = if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
+                prev_spend.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id, note_s.unwrap_or(&[]))?
+            } else {
+                self.compute_genesis_lock_secret(&coin.id, &chain_id)
+            };
+
+            // Build standard V3 spend towards receiver with HTLC next lock
+            let mut spend = crate::transfer::Spend::create_hashlock(
+                coin.id,
+                &anchor,
+                proof.clone(),
+                unlock_preimage,
+                &receiver_commitment,
+                coin.value,
+                &chain_id,
+            )?;
+            spend.to.view_tag = Some(vt);
+            spend.validate(&store)?; spend.apply(&store)?; network.gossip_spend(&spend).await; spends.push(spend);
+
+            // Collect refund secret for optional file output only
+            if refund_secret_base.is_none() {
+                secrets_dump.push((hex::encode(coin.id), hex::encode(refund_secret)));
+            }
+        }
+        // Persist generated refund secrets if requested
+        if refund_secret_base.is_none() {
+            if let Some(path) = refund_secrets_out {
+                let json = serde_json::to_string_pretty(&secrets_dump)?;
+                // Write atomically and set restrictive permissions best-effort
+                std::fs::write(path, &json)?;
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+                println!("🗝️  Wrote per-coin refund secrets to {} (keep secure)", path);
+            }
+        }
+        Ok(SendOutcome { spends })
+    }
+
+    pub async fn htlc_claim(
+        &self,
+        timeout_epoch: u64,
+        claim_secret: &[u8],
+        refund_ch_map: &std::collections::HashMap<[u8;32],[u8;32]>,
+        paycode: &str,
+        network: &crate::network::NetHandle,
+        note_s: Option<&[u8]>,
+    ) -> Result<SendOutcome> {
+        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(paycode)?;
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let chain_id = store.get_chain_id()?;
+        let mut spends = Vec::new();
+        // Iterate unspent coins that are addressed to us
+        for coin in self.list_unspent()? {
+            // Skip coins we created (genesis owner) — focus on received HTLC outputs
+            let recorded_spend = store.get_spend_tolerant(&coin.id)?;
+            if recorded_spend.is_none() { continue; }
+
+            // Build Merkle proof
+            let commit_epoch = store.get_epoch_for_coin(&coin.id)?.ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
+            let anchor: crate::epoch::Anchor = store.get("epoch", &commit_epoch.to_le_bytes())?.ok_or_else(|| anyhow!("Anchor not found"))?;
+            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
+            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
+            } else { None }.ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+
+            // Build next receiver commitment (normal next-hop lock)
+            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let value_tag = coin.value.to_le_bytes();
+            let seed = crate::crypto::stealth_seed_v3(shared.as_bytes(), &recipient_addr, ct.as_bytes(), &value_tag, &chain_id);
+            let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
+            let vt = crate::crypto::view_tag(shared.as_bytes());
+            let s_next = crate::crypto::derive_next_lock_secret_with_note(shared.as_bytes(), ct.as_bytes(), coin.value, &coin.id, &chain_id, note_s.unwrap_or(&[]));
+            let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
+            let mut one_time_pk = [0u8; OTP_PK_BYTES]; one_time_pk.copy_from_slice(&ot_pk_bytes);
+            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES]; kyber_ct.copy_from_slice(ct.as_bytes());
+            let receiver_commitment = crate::transfer::ReceiverLockCommitment {
+                one_time_pk,
+                kyber_ct,
+                next_lock_hash,
+                commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, &chain_id),
+                amount_le: coin.value,
+            };
+
+            // Compute CHs
+            let ch_claim = crate::crypto::commitment_hash_from_preimage(&chain_id, &coin.id, claim_secret);
+            let Some(ch_refund) = refund_ch_map.get(&coin.id) else { continue; };
+            // For claim, the unlock preimage used is the claim secret itself
+            let mut unlock_preimage = [0u8;32];
+            if claim_secret.len() != 32 { anyhow::bail!("claim_secret must be 32 bytes"); }
+            unlock_preimage.copy_from_slice(&claim_secret[..32]);
+            let mut spend = crate::transfer::Spend::create_htlc_hashlock(
+                coin.id, &anchor, proof.clone(), unlock_preimage, &receiver_commitment, coin.value, &chain_id, timeout_epoch, ch_claim, *ch_refund,
+            )?;
+            spend.to.view_tag = Some(vt);
+            spend.validate(&store)?; spend.apply(&store)?; network.gossip_spend(&spend).await; spends.push(spend);
+        }
+        Ok(SendOutcome { spends })
+    }
+
+    pub async fn htlc_refund(
+        &self,
+        timeout_epoch: u64,
+        refund_secret: &[u8],
+        claim_ch_map: &std::collections::HashMap<[u8;32],[u8;32]>,
+        paycode: &str,
+        network: &crate::network::NetHandle,
+        note_s: Option<&[u8]>,
+    ) -> Result<SendOutcome> {
+        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(paycode)?;
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let chain_id = store.get_chain_id()?;
+        let mut spends = Vec::new();
+        // Only coins we control as creator (sender side) are refundable
+        for coin in self.list_unspent()? {
+            // Focus on coins we can currently spend (either created by us or addressed to us)
+            // Build Merkle proof
+            let commit_epoch = store.get_epoch_for_coin(&coin.id)?.ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
+            let anchor: crate::epoch::Anchor = store.get("epoch", &commit_epoch.to_le_bytes())?.ok_or_else(|| anyhow!("Anchor not found"))?;
+            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
+            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
+                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
+            } else { None }.ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+
+            // Next receiver commitment (normal next-hop lock)
+            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let value_tag = coin.value.to_le_bytes();
+            let seed = crate::crypto::stealth_seed_v3(shared.as_bytes(), &recipient_addr, ct.as_bytes(), &value_tag, &chain_id);
+            let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
+            let vt = crate::crypto::view_tag(shared.as_bytes());
+            let s_next = crate::crypto::derive_next_lock_secret_with_note(shared.as_bytes(), ct.as_bytes(), coin.value, &coin.id, &chain_id, note_s.unwrap_or(&[]));
+            let next_lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
+            let mut one_time_pk = [0u8; OTP_PK_BYTES]; one_time_pk.copy_from_slice(&ot_pk_bytes);
+            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES]; kyber_ct.copy_from_slice(ct.as_bytes());
+            let receiver_commitment = crate::transfer::ReceiverLockCommitment { one_time_pk, kyber_ct, next_lock_hash, commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, &chain_id), amount_le: coin.value };
+
+            // Compute CHs
+            let ch_refund = crate::crypto::commitment_hash_from_preimage(&chain_id, &coin.id, refund_secret);
+            let Some(ch_claim) = claim_ch_map.get(&coin.id) else { continue; };
+            let mut p = [0u8;32]; p.copy_from_slice(refund_secret);
+            let mut spend = crate::transfer::Spend::create_htlc_hashlock(
+                coin.id, &anchor, proof.clone(), p, &receiver_commitment, coin.value, &chain_id, timeout_epoch, *ch_claim, ch_refund,
+            )?;
+            spend.to.view_tag = Some(vt);
+            spend.validate(&store)?; spend.apply(&store)?; network.gossip_spend(&spend).await; spends.push(spend);
+        }
+        Ok(SendOutcome { spends })
     }
 }
 

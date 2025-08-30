@@ -211,7 +211,7 @@ impl Default for BridgeConfig {
             global_daily_cap: default_bridge_global_daily_cap(),
             sui_bridge_module: default_sui_bridge_module(),
             sui_burn_event: default_sui_burn_event(),
-            sui_coin_type: None,
+            sui_coin_type: default_sui_coin_type(),
         }
     }
 }
@@ -276,6 +276,7 @@ fn default_bridge_per_address_daily_cap() -> u64 { 1_000_000_000 }
 fn default_bridge_global_daily_cap() -> u64 { 10_000_000_000 }
 fn default_sui_bridge_module() -> String { "simple_bridge".into() }
 fn default_sui_burn_event() -> String { "Burn".into() }
+fn default_sui_coin_type() -> Option<String> { Some("0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089::unch::UNCH".into()) }
 
 
 /// Read the TOML file at `p` and deserialize into `Config`.
@@ -336,7 +337,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind","last_epochs_to_show"]),
                 ("wallet", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["auto_serve_commitments"]),
                 ("bridge", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind"
+                    "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind","rate_window_secs","per_address_daily_cap","global_daily_cap","sui_bridge_module","sui_burn_event","sui_coin_type"
                 ]),
                 _ => {}
             }
