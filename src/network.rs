@@ -687,7 +687,23 @@ pub async fn spawn(
         swarm.add_external_address(external_addr.clone());
     }
 
+    // Build an in-memory ban set from configuration
+    let banned_peer_ids: HashSet<PeerId> = net_cfg
+        .banned_peer_ids
+        .iter()
+        .filter_map(|s| PeerId::from_str(s).ok())
+        .collect();
+
     for addr in &net_cfg.bootstrap {
+        // Skip dialing bootstraps that are explicitly banned
+        if let Some(id_str) = addr.split("/p2p/").last() {
+            if let Ok(pid) = PeerId::from_str(id_str) {
+                if banned_peer_ids.contains(&pid) {
+                    net_log!("⛔ Skipping banned bootstrap: {}", pid);
+                    continue;
+                }
+            }
+        }
         net_log!("🔗 Dialing bootstrap node: {}", addr);
         match swarm.dial(addr.parse::<Multiaddr>()?) {
             Ok(_) => net_log!("✅ Bootstrap dial initiated"),
@@ -1217,6 +1233,16 @@ pub async fn spawn(
                             if let Some(pid) = peer_id { dialing_peers.remove(&pid); }
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            // Immediately drop connections from banned peers
+                            if banned_peer_ids.contains(&peer_id) {
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                if let Ok(mut set) = connected_peers.lock() {
+                                    set.remove(&peer_id);
+                                    crate::metrics::PEERS.set(set.len() as i64);
+                                }
+                                dialing_peers.remove(&peer_id);
+                                continue;
+                            }
                             net_log!("🤝 Connected to peer: {}", peer_id);
                             peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             if let Ok(mut set) = connected_peers.lock() {
@@ -1375,6 +1401,7 @@ pub async fn spawn(
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let Some(peer_id) = message.source else { continue };
+                            if banned_peer_ids.contains(&peer_id) { continue; }
                             let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             let rate_limit_exempt = topic_str == TOP_ANCHOR || topic_str == TOP_RATE_LIMITED;
@@ -1401,6 +1428,7 @@ pub async fn spawn(
                                         let Some(id_str) = addr.split("/p2p/").last() else { continue };
                                         let Ok(remote_pid) = PeerId::from_str(id_str) else { continue };
                                         if remote_pid == *swarm.local_peer_id() { continue; }
+                                        if banned_peer_ids.contains(&remote_pid) { continue; }
                                         if let Some(ip_str) = addr.split('/').nth(3) {
                                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() { if ip.is_private() || ip.is_loopback() { continue; } }
                                         }
@@ -2670,6 +2698,7 @@ pub async fn spawn(
                                 if !addr_str.starts_with("/ip4/") || !addr_str.contains("/udp/") || !addr_str.contains("/quic-v1/") { continue; }
                                 let Some(id_str) = addr_str.split("/p2p/").last() else { continue; };
                                 let Ok(remote_pid) = PeerId::from_str(id_str) else { continue; };
+                                if banned_peer_ids.contains(&remote_pid) { continue; }
                                 // Skip if already connected or dialing
                                 let already_connected = connected_peers.lock().map(|s| s.contains(&remote_pid)).unwrap_or(false);
                                 if already_connected || dialing_peers.contains(&remote_pid) { continue; }
@@ -2782,6 +2811,12 @@ pub async fn spawn(
                             }
                             
                             for addr in &net_cfg.bootstrap {
+                                // Skip banned bootstraps
+                                if let Some(id_str) = addr.split("/p2p/").last() {
+                                    if let Ok(pid) = PeerId::from_str(id_str) {
+                                        if banned_peer_ids.contains(&pid) { continue; }
+                                    }
+                                }
                                 if let Ok(m) = addr.parse::<Multiaddr>() {
                                     // Capacity and address-based dedup checks
                                     let under_cap = connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize;

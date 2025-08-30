@@ -35,6 +35,9 @@ pub struct Net {
     pub public_ip: Option<String>,
     #[serde(default = "default_sync_timeout")]
     pub sync_timeout_secs: u64,
+    /// Optional static ban list of libp2p PeerIds. Connections and dials to these peers are blocked.
+    #[serde(default)]
+    pub banned_peer_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -322,7 +325,7 @@ fn warn_unknown_keys(val: &TomlValue) {
             }
             match (k.as_str(), v) {
                 ("net", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "listen_port","bootstrap","peer_exchange","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs"
+                    "listen_port","bootstrap","peer_exchange","max_peers","connection_timeout_secs","public_ip","sync_timeout_secs","banned_peer_ids"
                 ]),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "max_validation_failures_per_peer","peer_ban_duration_secs","rate_limit_window_secs","max_messages_per_window"
