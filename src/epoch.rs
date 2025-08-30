@@ -311,6 +311,8 @@ impl Manager {
             } else {
                 time::interval(time::Duration::from_secs(self.cfg.seconds))
             };
+            // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -395,6 +397,7 @@ impl Manager {
                                     time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
                                     time::Duration::from_secs(self.cfg.seconds)
                                 );
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 continue;
                             }
                         }
@@ -579,6 +582,7 @@ impl Manager {
                                 time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
                                 time::Duration::from_secs(self.cfg.seconds)
                             );
+                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         }
                     }
                 }
