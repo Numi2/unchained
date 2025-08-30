@@ -36,7 +36,6 @@ use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use rocksdb::WriteBatch;
 use crate::metrics;
-use rand::Rng;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -733,9 +732,6 @@ pub async fn spawn(
     let mut orphan_buf: OrphanBuffer = OrphanBuffer::new(ORPHAN_TOTAL_CAP, MAX_ORPHANS_PER_HEIGHT, ORPHAN_TTL_SECS);
     let mut needs_reorg_check: bool = false;
     let mut last_reorg_attempt: std::time::Instant = std::time::Instant::now() - std::time::Duration::from_millis(REORG_MIN_GAP_MS);
-    // Per-epoch adoption holdoff and per-anchor witness set
-    let mut accept_after_epoch: std::collections::HashMap<u64, std::time::Instant> = std::collections::HashMap::new();
-    let mut anchor_witnesses: std::collections::HashMap<[u8;32], std::collections::HashSet<String>> = std::collections::HashMap::new();
     let mut last_orphan_snapshot: u64 = 0;
     // Buffer for out-of-order spends (by coin_id)
     let mut pending_spends: HashMap<[u8;32], Vec<Spend>> = HashMap::new();
@@ -769,10 +765,6 @@ pub async fn spawn(
     const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
     // Throttle noisy reorg logs (per-height)
     const REORG_LOG_THROTTLE_SECS: u64 = 30;
-    // --- Adoption gating against early epoch push ---
-    const ANCHOR_ADOPT_HOLDOFF_MS: u64 = 11_111;
-    const ANCHOR_ADOPT_JITTER_MS: u64 = 333;
-    const ANCHOR_ADOPT_QUORUM: usize = 2;
     static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     
@@ -1504,25 +1496,6 @@ pub async fn spawn(
                                                 if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                 st.peer_confirmed_tip = true;
                                             }
-                                            // Record witness for this anchor hash
-                                            {
-                                                let e = anchor_witnesses.entry(a.hash).or_insert_with(|| std::collections::HashSet::new());
-                                                e.insert(peer_id.to_string());
-                                            }
-                                            let mut gating_block = false;
-                                            // Apply gating only for next-epoch adoption near local tip when bootstrapped
-                                            if let Ok(Some(best)) = db.get::<Anchor>("epoch", b"latest") {
-                                                if !net_cfg.bootstrap.is_empty() && a.num == best.num.saturating_add(1) {
-                                                    let now = std::time::Instant::now();
-                                                    let entry = accept_after_epoch.entry(a.num).or_insert_with(|| {
-                                                        let jitter = if ANCHOR_ADOPT_JITTER_MS > 0 { rand::thread_rng().gen_range(0..=ANCHOR_ADOPT_JITTER_MS) } else { 0 };
-                                                        now + std::time::Duration::from_millis(ANCHOR_ADOPT_HOLDOFF_MS + jitter)
-                                                    });
-                                                    let witnesses = anchor_witnesses.get(&a.hash).map(|s| s.len()).unwrap_or(0);
-                                                    if now < *entry || witnesses < ANCHOR_ADOPT_QUORUM { gating_block = true; }
-                                                    if a.coin_count == 0 && now < *entry { gating_block = true; }
-                                                }
-                                            }
                                             let current_best = db.get("epoch", b"latest").unwrap_or(None);
                                             let is_better = a.is_better_chain(&current_best);
                                             if let Some(ref best) = current_best {
@@ -1535,7 +1508,7 @@ pub async fn spawn(
                                                 net_log!("✅ Storing anchor for epoch {}", a.num);
                                                 if db.put("epoch", &a.num.to_le_bytes(), &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 if db.put("anchor", &a.hash, &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                // Advance latest only if the parent exists locally and links correctly and gating allows it
+                                                // Advance latest only if the parent exists locally and links correctly.
                                                 let mut advance_latest = true;
                                                 if a.num > 0 {
                                                     if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
@@ -1546,11 +1519,8 @@ pub async fn spawn(
                                                         advance_latest = false;
                                                     }
                                                 }
-                                                if gating_block { advance_latest = false; }
                                                 if advance_latest {
                                                     if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                                    // Clear holdoff for this height once adopted
-                                                    accept_after_epoch.remove(&a.num);
                                                 } else {
                                                     // Parent missing or mismatch: request targeted backfill and do not advance latest
                                                     request_aligned_range(&command_tx, a.num, REORG_BACKFILL);
