@@ -304,8 +304,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Commitment auto-serve removed
-
     let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Spawn background sync task (safe for read-only commands; does not advance epochs itself)
@@ -359,7 +357,6 @@ async fn main() -> anyhow::Result<()> {
                     synced = true;
                     break;
                 }
-
                 if highest_seen > 0 {
                     if last_local_displayed != local_epoch || attempt == 0 {
                         if cfg.net.bootstrap.is_empty() {

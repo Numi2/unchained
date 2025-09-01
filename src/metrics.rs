@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static LOG_BUS: Lazy<LogBus> = Lazy::new(LogBus::new);
 
+
 const LOG_BUFFER_CAPACITY: usize = 200;
 const INITIAL_SNAPSHOT_LINES: usize = 100;
 const FLUSH_INTERVAL_SECS: u64 = 5;

@@ -1,4 +1,5 @@
-//! Spends are gossiped/served using the V3 hashlock flow only.
+
+// network.rs
 
 use crate::{
     storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Spend, crypto, config, sync::SyncState,
@@ -12,8 +13,6 @@ use crate::consensus::{
     MIN_MEM_KIB, MAX_MEM_KIB,
 };
 use std::sync::{Arc, Mutex};
-// use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
-// use pqcrypto_traits::kem::Ciphertext as _;
 use libp2p::{
     gossipsub,
     identity, quic, PeerId, Swarm, Transport, Multiaddr,
@@ -53,7 +52,7 @@ macro_rules! net_log {
 #[allow(unused_imports)]
 use net_log;
 
-// Routine network logs (informational chatter) — always suppressed by default.
+// Rouine network logs (informational chatter) — always suppressed by default.
 // Enable only for debugging by toggling ALLOW_ROUTINE_NET to true.
 static ALLOW_ROUTINE_NET: AtomicBool = AtomicBool::new(false);
 macro_rules! net_routine {
@@ -1209,6 +1208,8 @@ pub async fn spawn(
     tokio::spawn(async move {       
         // Track peers being dialed to avoid duplicate concurrent dials
         let mut dialing_peers: HashSet<PeerId> = HashSet::new();
+        // Track active connection counts per peer to deduplicate logs and state updates
+        let mut peer_connection_counts: HashMap<PeerId, u32> = HashMap::new();
         // Track time of last dial attempt per peer for TTL de-duplication
         let mut recent_peer_dials: HashMap<PeerId, Instant> = HashMap::new();
         // Rate-limit self address advertisement to avoid connect storms
@@ -1243,12 +1244,20 @@ pub async fn spawn(
                                 dialing_peers.remove(&peer_id);
                                 continue;
                             }
-                            net_log!("🤝 Connected to peer: {}", peer_id);
-                            peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
-                            if let Ok(mut set) = connected_peers.lock() {
-                                set.insert(peer_id);
-                                crate::metrics::PEERS.set(set.len() as i64);
+                            // Increment connection count and only log/mark on first connection
+                            let entry = peer_connection_counts.entry(peer_id).or_insert(0);
+                            let was_zero = *entry == 0;
+                            *entry = entry.saturating_add(1);
+                            if was_zero {
+                                net_log!("🤝 Connected to peer: {}", peer_id);
+                                if let Ok(mut set) = connected_peers.lock() {
+                                    set.insert(peer_id);
+                                    crate::metrics::PEERS.set(set.len() as i64);
+                                }
+                            } else {
+                                net_routine!("🤝 Additional conn to {} ({} active)", peer_id, *entry);
                             }
+                            peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             // Clear dialing-in-progress marker on success
                             dialing_peers.remove(&peer_id);
                             // After connecting, exchange external address (if enabled)
@@ -1391,10 +1400,24 @@ pub async fn spawn(
                             pending_commands = still_pending;
                         },
                         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                            net_log!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
-                            if let Ok(mut set) = connected_peers.lock() {
-                                set.remove(&peer_id);
-                                crate::metrics::PEERS.set(set.len() as i64);
+                            // Decrement connection count and only emit disconnect when last one closes
+                            let mut fully_disconnected = true;
+                            if let Some(cnt) = peer_connection_counts.get_mut(&peer_id) {
+                                if *cnt > 1 {
+                                    *cnt -= 1;
+                                    fully_disconnected = false;
+                                    net_routine!("👋 Conn closed with {} (remaining {}) due to {:?}", peer_id, *cnt, cause);
+                                } else {
+                                    peer_connection_counts.remove(&peer_id);
+                                    fully_disconnected = true;
+                                }
+                            }
+                            if fully_disconnected {
+                                net_log!("👋 Disconnected from peer: {} due to {:?}", peer_id, cause);
+                                if let Ok(mut set) = connected_peers.lock() {
+                                    set.remove(&peer_id);
+                                    crate::metrics::PEERS.set(set.len() as i64);
+                                }
                             }
                             // Allow re-dial in the future
                             dialing_peers.remove(&peer_id);

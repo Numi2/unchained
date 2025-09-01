@@ -60,6 +60,7 @@ impl core::fmt::Display for ConsensusError {
     }
 }
 
+
 impl std::error::Error for ConsensusError {}
 
 // ---------- Helpers ----------

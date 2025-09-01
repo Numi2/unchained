@@ -16,6 +16,7 @@ const MAX_EPOCH_BATCH_SIZE: u64 = 100;
 // Track failed epoch requests for retry
 const FAILED_EPOCH_RETRY_SECS: u64 = 5;
 
+
 // Add new constants for better recovery
 const RECOVERY_EPOCH_BATCH_SIZE: u64 = 20;  // Smaller batches during recovery
 const RECOVERY_REQUEST_INTERVAL_MS: u64 = 100;  // Faster retry during recovery
@@ -39,11 +40,13 @@ pub struct SyncState {
     pub peer_confirmed_tip: bool,
 }
 
+
 impl Default for SyncState {
     fn default() -> Self {
         Self { highest_seen_epoch: 0, synced: false, peer_confirmed_tip: false }
     }
 }
+
 
 pub fn spawn(
     db: Arc<Store>,

@@ -20,10 +20,9 @@ sync_timeout_secs = 1800
 
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.174.71.153/udp/31000/quic-v1/p2p/12D3KooWJhgAAXunyAP7N4F3bJrp9kofgAsuapmXpofCzRb7ugUM",
+bootstrap = [ "/ip4/34.174.37.168/udp/31000/quic-v1/p2p/12D3KooWJhgAAXunyAP7N4F3bJrp9kofgAsuapmXpofCzRb7ugUM",
               "/ip4/34.51.215.84/udp/31000/quic-v1/p2p/12D3KooWKt5kcwVA6SkDUmMGfmr3ouS9ydhHHgYPzSzuYHuvrhJg", 
               "/ip4/34.30.62.71/udp/31000/quic-v1/p2p/12D3KooWJLSZi2KFZqKAw75rEm8TjGBhTpuZWpueXtAwZRbfAdwL",
-              "/ip4/34.22.147.126/udp/31000/quic-v1/p2p/12D3KooWHnSAm1zzKUMGUH96YDgKQ9eptjLGK1VLJ2KUv2XAx2ob", 
               "/ip4/34.174.127.124/udp/31000/quic-v1/p2p/12D3KooWLRWnLAT4QadiMEJd5dbeUJXN8ShSx8LGCrH4jN8p1AdG" ]
 
 
@@ -35,9 +34,6 @@ rate_limit_window_secs = 600
 max_messages_per_window = 1000
 
 [storage]
-# Path where blockchain data will be stored (outside src-tauri to avoid rebuild loops)
-# Move runtime data one directory up so that it no longer lives inside
-# `src-tauri` – this prevents the Tauri development file-watcher from
 # rebuilding the app every time the node writes to its database.
 path = "../blockchain_data"
 
@@ -50,9 +46,8 @@ seconds = 222
 # Enable mining by default
 enabled = true
 
-# Miner runtime tuning (does not change consensus)
-# Heartbeat interval in seconds (more frequent for network stability)
-heartbeat_interval_secs = 15
+# Heartbeat interval to keep connection fresh
+heartbeat_interval_secs = 60
 
 # Maximum mining attempts per epoch before moving to next epoch
 # (alias for `max_attempts` in code)

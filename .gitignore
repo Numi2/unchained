@@ -33,10 +33,13 @@ target/
 Thumbs.db
 notes.md
 y
+context.md
+htlc_cli_guide.md
 
 # Logs
 *.log
 
+peer_identity.key
 # Temporary files
 tmp
 tmp.rs

@@ -1,3 +1,4 @@
+
 use crate::{storage::Store, crypto, epoch::Anchor, coin::{Coin, CoinCandidate}, network::NetHandle, wallet::Wallet};
 use rand::Rng;
 use pqcrypto_traits::sign::PublicKey as _;
@@ -8,13 +9,11 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::sync::SyncState;
 use std::sync::atomic::{AtomicBool, Ordering};
-
 // Routine miner logs: gated to reduce console noise during normal operation.
 static ALLOW_ROUTINE_MINER: AtomicBool = AtomicBool::new(false);
 macro_rules! miner_routine { ($($arg:tt)*) => { if ALLOW_ROUTINE_MINER.load(Ordering::Relaxed) { println!($($arg)*); } } }
 #[allow(unused_imports)]
 use miner_routine;
-
 pub fn spawn(
     cfg: crate::config::Mining,
     db: Arc<Store>,
@@ -335,7 +334,7 @@ impl Miner {
                         // Try to recover by requesting the next expected epoch and also the latest tip
                         if let Some(current_epoch) = self.current_epoch {
                             let next_epoch = current_epoch + 1;
-                            println!("🔄 creator of circumstances #{next_epoch} ");
+                            println!("🔄 creator of circumstances manifesting next epoch #{next_epoch} ");
                             self.net.request_epoch(next_epoch).await;
                             // Also pull latest in case we’re more than one epoch behind
                             self.net.request_latest_epoch().await;
@@ -514,5 +513,7 @@ impl Miner {
                 tokio::task::yield_now().await;
             }
         }
+        
     }
+
 }
