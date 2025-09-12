@@ -576,15 +576,29 @@ impl Wallet {
     /// Selects a minimal set of inputs whose combined value ≥ `amount`.
     /// Returns the inputs **unsorted** (caller may sort for determinism).
     pub fn select_inputs(&self, amount: u64) -> Result<Vec<crate::coin::Coin>> {
-        let mut coins = self.list_unspent()?;
-        // Simple greedy selection: sort ascending, pick until we cover the amount.
-        coins.sort_by_key(|c| c.value);
-        let mut selected = Vec::new();
+        // Prefer newest coins first: sort by commit epoch descending; ignore value (all coins are 1).
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let coins = self.list_unspent()?;
+        let mut coins_with_epoch: Vec<(crate::coin::Coin, u64)> = Vec::with_capacity(coins.len());
+        for coin in coins {
+            // If epoch mapping is unavailable, treat as oldest (epoch 0)
+            let epoch = store.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
+            coins_with_epoch.push((coin, epoch));
+        }
+        coins_with_epoch.sort_by(|a, b| {
+            // Newest (higher epoch) first; tie-break by id for determinism
+            b.1.cmp(&a.1)
+                .then(b.0.id.cmp(&a.0.id))
+        });
+
+        let mut selected: Vec<crate::coin::Coin> = Vec::new();
         let mut total = 0u64;
-        for coin in coins.into_iter().rev() { // start with largest
-            let v = coin.value;
+        for (coin, _epoch) in coins_with_epoch.into_iter() {
+            total = total.saturating_add(coin.value);
             selected.push(coin);
-            total = total.saturating_add(v);
             if total >= amount { break; }
         }
         if total < amount {
@@ -622,8 +636,49 @@ impl Wallet {
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        // Select inputs locally; no receiver commitment exchange over network
-        let coins_to_spend: Vec<crate::coin::Coin> = self.select_inputs(amount)?;
+        // Re-select inputs robustly: newest-first, owned by us, spendable now, and nullifier unseen
+        let chain_id_sel = store.get_chain_id()?;
+        let mut candidates = self.list_unspent()?;
+        let mut candidates_with_epoch: Vec<(crate::coin::Coin, u64)> = Vec::with_capacity(candidates.len());
+        for coin in candidates.drain(..) {
+            let epoch = store.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
+            candidates_with_epoch.push((coin, epoch));
+        }
+        candidates_with_epoch.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then(b.0.id.cmp(&a.0.id))
+        });
+        let mut coins_to_spend: Vec<crate::coin::Coin> = Vec::new();
+        let mut total_selected: u64 = 0;
+        for (coin, _epoch) in candidates_with_epoch.into_iter() {
+            // Verify current ownership against latest spend record (race-safe)
+            let owned = if let Some(sp) = store.get_spend_tolerant(&coin.id)? {
+                sp.to.is_for_receiver(&self.kyber_sk, &self.pk, &chain_id_sel).is_ok()
+            } else {
+                coin.creator_address == self.address
+            };
+            if !owned { continue; }
+
+            // Ensure we can derive the unlock preimage at this moment
+            let unlock_preimage = if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
+                match prev_spend.to.derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id_sel, _s_bytes) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                }
+            } else {
+                self.compute_genesis_lock_secret(&coin.id, &chain_id_sel)
+            };
+            // Pre-check nullifier uniqueness to avoid selecting already-spent hops
+            let nullifier = crate::crypto::nullifier_from_preimage(&chain_id_sel, &coin.id, &unlock_preimage);
+            if store.get::<[u8;1]>("nullifier", &nullifier)?.is_some() { continue; }
+
+            coins_to_spend.push(coin);
+            total_selected = total_selected.saturating_add(coins_to_spend.last().unwrap().value);
+            if total_selected >= amount { break; }
+        }
+        if total_selected < amount {
+            return Err(anyhow!("Insufficient funds: requested {}, available {}", amount, total_selected));
+        }
         let mut spends = Vec::new();
 
         for coin in coins_to_spend {

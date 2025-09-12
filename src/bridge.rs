@@ -377,8 +377,11 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                     for item in iter {
                         if let Ok((k, v)) = item {
                             if let Ok(mut op) = bincode::deserialize::<PendingBridgeOp>(&v) {
-                                // Expire too old Submitted ops
+                                // Expire too old Submitted ops (skip if already finalized via op->coins mapping)
                                 if matches!(op.status, PendingStatus::Submitted) && op.created_at < cutoff {
+                                    if let Some(cf_oc) = svc_h.db.db.cf_handle("bridge_op_coins") {
+                                        if svc_h.db.db.get_cf(cf_oc, &k).ok().flatten().is_some() { continue; }
+                                    }
                                     op.status = PendingStatus::Failed("expired".to_string());
                                     if let Some(cf2) = svc_h.db.db.cf_handle("bridge_pending") {
                                         if let Ok(ser) = bincode::serialize(&op) { let _ = svc_h.db.db.put_cf(cf2, &k, &ser); }
@@ -483,11 +486,8 @@ fn authorize_admin(cfg: &crate::config::BridgeConfig, req: &hyper::Request<hyper
         }
         return false;
     }
-    // No token configured: allow local-only via simple forwarded-for hint; otherwise allow (bound on localhost by default)
-    if let Some(addr) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        return addr == "127.0.0.1" || addr == "::1";
-    }
-    true
+    // No token configured: disable admin APIs for safety
+    false
 }
 
 async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Result<BridgeOutResult> {
@@ -598,6 +598,10 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
                 batch.put_cf(&cf_bl, &c.coin_id, op_id.as_bytes());
             }
         }
+        // Remove pending on success
+        if let Some(cf_p) = svc.db.db.cf_handle("bridge_pending") {
+            batch.delete_cf(&cf_p, op_id.as_bytes());
+        }
         // Update state: totals and rate windows
         {
             let mut st = svc.state.lock().unwrap();
@@ -638,7 +642,8 @@ fn valid_sui_addr(s: &str) -> bool {
     let s = s.trim();
     if !s.starts_with("0x") { return false; }
     let hex_part = &s[2..];
-    if hex_part.is_empty() { return false; }
+    let len = hex_part.len();
+    if len == 0 || len > 64 || (len % 2) != 0 { return false; }
     // Enforce lowercase hex for Sui addresses
     if hex_part.chars().any(|c| !c.is_ascii_hexdigit() || c.is_ascii_uppercase()) { return false; }
     true
@@ -708,8 +713,8 @@ async fn verify_sui_burn_proof(svc: &Arc<BridgeService>, proof_bytes: &[u8]) -> 
     if let Some(effects) = result.get("effects") {
         if let Some(status) = effects.get("status").and_then(|s| s.get("status")).and_then(|s| s.as_str()) { if status != "success" { crate::metrics::BRIDGE_VERIFY_FAIL.inc(); return Err(anyhow!("sui tx not successful")); } }
     }
-    // Optionally require checkpoint presence to ensure finalization
-    if result.get("checkpoint").is_none() { /* allow but track */ }
+    // Require checkpoint presence to ensure finalization
+    if result.get("checkpoint").is_none() { crate::metrics::BRIDGE_VERIFY_FAIL.inc(); return Err(anyhow!("sui tx not finalized (no checkpoint)")); }
 
     // Events array
     let events = result.get("events").and_then(|v| v.as_array()).or_else(|| result.get("eventsData").and_then(|v| v.as_array())).ok_or_else(|| anyhow!("missing events"))?;
@@ -774,12 +779,6 @@ async fn bridge_in_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Strin
     let tx_hash = match outcome {
         Ok(outcome) => {
             let tx_hash = combine_spend_hashes(&outcome.spends);
-            // Phase 2: Atomically mark as processed, clean up pending marker, update totals, and record event
-            let mut batch = rocksdb::WriteBatch::default();
-            if let Some(cf) = svc.db.db.cf_handle("bridge_processed_sui") { 
-                batch.put_cf(&cf, verified.digest.as_bytes(), &[1u8]); // Mark as processed
-                batch.delete_cf(&cf, pending_key.as_bytes()); // Clean up pending marker
-            }
             tx_hash
         }
         Err(e) => {
