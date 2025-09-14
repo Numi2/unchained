@@ -9,7 +9,7 @@ use std::io::{self, Write};
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
-pub mod bridge;
+pub mod bridge;    pub mod offers;
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use crate::network::RateLimitedMessage;
@@ -129,6 +129,62 @@ enum Cmd {
         #[arg(long)] claims: String,
         /// Sender paycode (destination for refunded coins)
         #[arg(long)] paycode: String,
+    },
+    /// Offer: Create and sign an offer from an HTLC plan
+    OfferCreate {
+        /// Receiver paycode
+        #[arg(long)] paycode: String,
+        /// Amount to offer
+        #[arg(long)] amount: u64,
+        /// Timeout epoch number T
+        #[arg(long, value_parser = clap::value_parser!(u64))] timeout: u64,
+        /// Optional maker price in basis points (10000 = 100%)
+        #[arg(long)] price_bps: Option<u64>,
+        /// Optional note/label
+        #[arg(long)] note: Option<String>,
+        /// Output JSON path for the signed offer
+        #[arg(long)] out: String,
+    },
+    /// Offer: Publish a signed offer to the network
+    OfferPublish {
+        /// Input offer JSON path
+        #[arg(long)] input: String,
+    },
+    /// Offer: Watch incoming offers (prints JSON lines)
+    OfferWatch {
+        /// Exit after receiving N offers (optional)
+        #[arg(long)] count: Option<u64>,
+        /// Minimum amount filter
+        #[arg(long)] min_amount: Option<u64>,
+        /// Filter by maker address (hex)
+        #[arg(long)] maker: Option<String>,
+        /// Resume from millis cursor
+        #[arg(long)] since: Option<u128>,
+    },
+    /// Offer: Verify a signed offer file
+    OfferVerify {
+        /// Input offer JSON path
+        #[arg(long)] input: String,
+    },
+    /// Offer: Accept a signed offer file (deterministic secrets policy)
+    OfferAccept {
+        /// Input offer JSON path
+        #[arg(long)] input: String,
+        /// Claim secret s_claim (hex or base64-url)
+        #[arg(long)] claim_secret: String,
+        /// Refund base (deterministic per-coin), 32-byte hex/base64-url; if omitted, secrets are written to file
+        #[arg(long)] refund_base: Option<String>,
+        /// Path to write generated refund secrets per coin (required if --refund_base is absent)
+        #[arg(long)] refund_secrets_out: Option<String>,
+    },
+    /// Offer: Prepare receiver claim CHs from an offer and claim secret
+    OfferAcceptPrepare {
+        /// Input offer JSON path
+        #[arg(long)] input: String,
+        /// Claim secret s_claim (hex or base64-url)
+        #[arg(long)] claim_secret: String,
+        /// Output JSON file to write claim CHs
+        #[arg(long)] out: String,
     },
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
     RepairSpends,
@@ -260,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
     
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
-    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), db.clone(), sync_state.clone()).await?;
+    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), cfg.offers.clone(), db.clone(), sync_state.clone()).await?;
     // Kick off headers-first skeleton sync in the background (additive protocol, safe if peers don't support it)
     {
         let db_h = db.clone();
@@ -693,6 +749,101 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Built and broadcast {} HTLC refund spend(s)", outcome.spends.len());
             return Ok(());
         }
+        Some(Cmd::OfferCreate { paycode, amount, timeout, price_bps, note, out }) => {
+            let plan = wallet.plan_htlc_offer(*amount, paycode, *timeout)?;
+            let offer = wallet.create_offer_doc(plan, *price_bps, note.clone())?;
+            let json = serde_json::to_string_pretty(&offer)?;
+            std::fs::write(out, json)?;
+            println!("✅ Wrote signed offer to {}", out);
+            return Ok(());
+        }
+        Some(Cmd::OfferVerify { input }) => {
+            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            wallet::Wallet::verify_offer_doc(&offer)?;
+            println!("✅ Offer signature and maker address verified");
+            return Ok(());
+        }
+        Some(Cmd::OfferAccept { input, claim_secret, refund_base, refund_secrets_out }) => {
+            // 1) Verify offer
+            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            wallet::Wallet::verify_offer_doc(&offer)?;
+            // 2) Build receiver claim doc deterministically from provided claim_secret
+            let s_bytes = {
+                let s = claim_secret.trim();
+                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) { h } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)? }
+            };
+            if s_bytes.len() != 32 { return Err(anyhow::anyhow!("claim_secret must be 32 bytes")); }
+            let mut claims = Vec::new();
+            for c in &offer.plan.coins {
+                let ch = crypto::commitment_hash_from_preimage(&offer.plan.chain_id, &c.coin_id, &s_bytes);
+                claims.push(crate::wallet::HtlcClaimsDocEntry { coin_id: c.coin_id, ch_claim: ch });
+            }
+            let claims_doc = crate::wallet::HtlcClaimsDoc { claims };
+            // 3) Execute HTLC offer spends via wallet; never print secrets, only file output if requested
+            if refund_base.is_none() && refund_secrets_out.is_none() {
+                return Err(anyhow::anyhow!("Provide either --refund_base (deterministic) or --refund_secrets_out to persist generated secrets"));
+            }
+            let refund_base_bytes: Option<Vec<u8>> = if let Some(b) = refund_base {
+                let t = b.trim();
+                if let Ok(h) = hex::decode(t.trim_start_matches("0x")) { Some(h) } else { Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t)?) }
+            } else { None };
+            let outcome = wallet.execute_htlc_offer(&offer.plan, &claims_doc, &net, refund_base_bytes.as_deref(), refund_secrets_out.as_deref(), None).await?;
+            println!("✅ Accepted offer. Built and broadcast {} spend(s)", outcome.spends.len());
+            return Ok(());
+        }
+        Some(Cmd::OfferPublish { input }) => {
+            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            wallet::Wallet::verify_offer_doc(&offer)?;
+            // Publish via network
+            // Use binary bincode payload to match network path
+            // Reuse GossipOffer command
+            net.gossip_offer(&offer).await;
+            println!("📢 Published offer to network");
+            return Ok(());
+        }
+        Some(Cmd::OfferWatch { count, min_amount, maker, since: _ }) => {
+            // Local subscribe; apply filters; since is not used in local mode
+            let mut rx = net.offers_subscribe();
+            let mut remaining = *count;
+            loop {
+                tokio::select! {
+                    Ok(ofr) = rx.recv() => {
+                        if let Some(min) = *min_amount { if ofr.plan.amount < min { continue; } }
+                        if let Some(m) = maker.clone() {
+                            let want = m.trim_start_matches("0x");
+                            if hex::encode(ofr.maker_address) != want { continue; }
+                        }
+                        let json = serde_json::to_string(&ofr)?;
+                        println!("{}", json);
+                        if let Some(left) = remaining.as_mut() {
+                            if *left > 0 { *left -= 1; }
+                            if *left == 0 { break; }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(Cmd::OfferAcceptPrepare { input, claim_secret, out }) => {
+            // Verify offer and emit receiver-side claim CHs for coins listed in maker plan
+            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            wallet::Wallet::verify_offer_doc(&offer)?;
+            let s_bytes = {
+                let s = claim_secret.trim();
+                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) { h } else { base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)? }
+            };
+            if s_bytes.len() != 32 { return Err(anyhow::anyhow!("claim_secret must be 32 bytes")); }
+            let mut entries = Vec::new();
+            for c in &offer.plan.coins {
+                let ch = crypto::commitment_hash_from_preimage(&offer.plan.chain_id, &c.coin_id, &s_bytes);
+                entries.push(crate::wallet::HtlcClaimsDocEntry { coin_id: c.coin_id, ch_claim: ch });
+            }
+            let doc = crate::wallet::HtlcClaimsDoc { claims: entries };
+            let json = serde_json::to_string_pretty(&doc)?;
+            std::fs::write(out, json)?;
+            println!("✅ Wrote claim CHs for {} coins", doc.claims.len());
+            return Ok(());
+        }
         Some(Cmd::Balance) => {
             match wallet.balance() {
                 Ok(balance) => {
@@ -978,6 +1129,15 @@ async fn main() -> anyhow::Result<()> {
 
     let _metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
+    // Start offers HTTP API (SSE + GET)
+    {
+        let offers_cfg = cfg.offers.clone();
+        let db_h = db.clone();
+        let net_h = net.clone();
+        tokio::spawn(async move {
+            let _ = offers::serve(offers_cfg, db_h, net_h).await;
+        });
+    }
     // Start bridge RPC (lightweight JSON server)
     {
         let bridge_cfg = cfg.bridge.clone();

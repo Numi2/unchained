@@ -126,6 +126,11 @@ impl MetricsAggregator {
         counter_delta!("unchained_headers_anchors_stored_total", HEADERS_ANCHORS_STORED);
         counter_delta!("unchained_headers_invalid_total", HEADERS_INVALID);
         counter_delta!("unchained_compact_fallbacks_total", COMPACT_FALLBACKS);
+        // Offers counters
+        counter_delta!("unchained_offers_received_total", OFFERS_RECEIVED);
+        counter_delta!("unchained_offers_republished_total", OFFERS_REPUBLISHED);
+        counter_delta!("unchained_offers_pruned_total", OFFERS_PRUNED);
+        counter_delta!("unchained_offers_rejected_total", OFFERS_REJECTED);
         // Network command counters
         counter_delta!("unchained_net_cmd_enqueued_total", NET_CMDS_ENQUEUED);
         counter_delta!("unchained_net_cmd_dropped_dup_total", NET_CMDS_DROPPED_DUP);
@@ -285,6 +290,12 @@ pub static BRIDGE_REPLAY_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| IntCounter::n
 pub static BRIDGE_PENDING_EXPIRED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_expired_total", "Pending bridge ops expired by sweeper").unwrap());
 pub static BRIDGE_PENDING_CONFIRMED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_confirmed_total", "Pending bridge ops marked confirmed").unwrap());
 pub static BRIDGE_PENDING_FAILED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_bridge_pending_failed_total", "Pending bridge ops marked failed").unwrap());
+
+// --- Offers metrics ---
+pub static OFFERS_RECEIVED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_offers_received_total", "Verified offers received from gossip").unwrap());
+pub static OFFERS_REPUBLISHED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_offers_republished_total", "Verified offers re-gossiped").unwrap());
+pub static OFFERS_PRUNED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_offers_pruned_total", "Offers pruned by TTL/cap").unwrap());
+pub static OFFERS_REJECTED: Lazy<IntCounter> = Lazy::new(|| IntCounter::new("unchained_offers_rejected_total", "Offers rejected by limits/validation").unwrap());
 
 pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // Initialize some defaults

@@ -308,6 +308,36 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                                 Err(e) => err_response(&format!("{}", e), 500),
                             }
                         },
+                        // Stable alias
+                        (Method::GET, "/bridge/status") => {
+                            match svc.get_status() {
+                                Ok(st) => json_response(&st, 200),
+                                Err(e) => err_response(&format!("{}", e), 500),
+                            }
+                        },
+                        // Quote endpoint: compute fee and bounds for an input amount
+                        (Method::GET, "/bridge/quote") => {
+                            let q = req.uri().query().unwrap_or("");
+                            let params: std::collections::HashMap<_, _> = q.split('&').filter(|p| !p.is_empty()).filter_map(|p| p.split_once('=')).map(|(k,v)| (k.to_string(), v.to_string())).collect();
+                            let amount = params.get("amount").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                            let st = svc.state.lock().unwrap().clone();
+                            let min_ok = amount >= st.min_bridge_amount;
+                            let max_ok = amount <= st.max_bridge_amount;
+                            let fee_bps = st.bridge_fee_basis_points;
+                            let fee = amount.saturating_mul(fee_bps).saturating_div(10_000);
+                            let effective = amount.saturating_sub(fee);
+                            let resp = serde_json::json!({
+                                "amount": amount,
+                                "fee_bps": fee_bps,
+                                "fee": fee,
+                                "effective": effective,
+                                "min_ok": min_ok,
+                                "max_ok": max_ok,
+                                "min_amount": st.min_bridge_amount,
+                                "max_amount": st.max_bridge_amount,
+                            });
+                            json_response(&resp, 200)
+                        },
                         (Method::GET, "/get_pending_bridge_ops") => {
                             match svc.list_pending() {
                                 Ok(v) => json_response(&v, 200),

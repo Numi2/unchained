@@ -11,6 +11,8 @@ use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_byte
 use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
 use base64::Engine;
 use serde::{Serialize, Deserialize};
+use pqcrypto_dilithium::dilithium3::{detached_sign as dili_detached_sign, verify_detached_signature as dili_verify_detached, DetachedSignature as DiliDetachedSignature};
+use pqcrypto_traits::sign::DetachedSignature as _;
 
 // V3 format
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1105,4 +1107,68 @@ pub struct TransactionRecord {
 #[derive(Debug, Clone)]
 pub struct SendOutcome {
     pub spends: Vec<crate::transfer::Spend>,
+}
+
+// ---------------- Signed Offer document (V1) ----------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OfferSignableV1 {
+    version: u8,
+    maker_address: Address,
+    maker_dili_pk: Vec<u8>,
+    plan: HtlcPlanDoc,
+    price_bps: Option<u64>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferDocV1 {
+    pub version: u8,
+    pub maker_address: Address,
+    pub maker_dili_pk: Vec<u8>,
+    pub plan: HtlcPlanDoc,
+    pub price_bps: Option<u64>,
+    pub note: Option<String>,
+    pub sig: Vec<u8>,
+}
+
+impl Wallet {
+    /// Create and sign an OfferDocV1 from an HTLC plan and optional pricing metadata.
+    pub fn create_offer_doc(&self, plan: HtlcPlanDoc, price_bps: Option<u64>, note: Option<String>) -> Result<OfferDocV1> {
+        let maker_address = self.address;
+        let maker_dili_pk = self.pk.as_bytes().to_vec();
+        let signable = OfferSignableV1 { version: 1, maker_address, maker_dili_pk: maker_dili_pk.clone(), plan: plan.clone(), price_bps, note: note.clone() };
+        let bytes = bincode::serialize(&signable)?;
+        let sig = dili_detached_sign(&bytes, &self.sk);
+        Ok(OfferDocV1 {
+            version: 1,
+            maker_address,
+            maker_dili_pk,
+            plan,
+            price_bps,
+            note,
+            sig: sig.as_bytes().to_vec(),
+        })
+    }
+
+    /// Verify an OfferDocV1 signature and address binding.
+    pub fn verify_offer_doc(doc: &OfferDocV1) -> Result<()> {
+        if doc.version != 1 { anyhow::bail!("Unsupported offer doc version: {}", doc.version); }
+        let pk = PublicKey::from_bytes(&doc.maker_dili_pk).map_err(|_| anyhow!("Invalid maker Dilithium PK in offer"))?;
+        let signable = OfferSignableV1 {
+            version: doc.version,
+            maker_address: doc.maker_address,
+            maker_dili_pk: doc.maker_dili_pk.clone(),
+            plan: doc.plan.clone(),
+            price_bps: doc.price_bps,
+            note: doc.note.clone(),
+        };
+        let bytes = bincode::serialize(&signable)?;
+        let sig = DiliDetachedSignature::from_bytes(&doc.sig).map_err(|_| anyhow!("Invalid offer signature bytes"))?;
+        dili_verify_detached(&sig, &bytes, &pk).map_err(|_| anyhow!("Offer signature verification failed"))?;
+        // Address binding: ensure maker_address equals hash of PK
+        let addr = crate::crypto::address_from_pk(&pk);
+        if addr != doc.maker_address { anyhow::bail!("Offer maker address mismatch"); }
+        Ok(())
+    }
 }

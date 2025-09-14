@@ -68,13 +68,16 @@ Or enable mining in `config.toml` (set `[mining].enabled = true`) and run withou
 ### Common CLI commands
 ```bash
 # Show your P2P Peer ID
-unchained -- peer-id
+unchained peer-id
 
 # Print your stealth receiving address (base64‑url)
-unchained -- stealth-address
+unchained stealth-address
 
-# Send coins to a recipient’s stealth address
-unchained send --stealth <Address> --amount 1
+# Send coins to a recipient’s stealth address (paycode)
+unchained send --paycode <Address> --amount 1
+
+# Request and verify a coin proof by id (hex)
+unchained proof --coin-id <hex>
 
 # Check your balance and address
 unchained balance
@@ -82,7 +85,7 @@ unchained balance
 # Show simple transaction history
 unchained history
 
-# P2P: Send a short message (2 msgs / 24h outbound limit)
+# P2P: Send a short message to the limited topic
 unchained msg-send --text "Hello from Unchained"
 
 # P2P: Listen for incoming messages on the limited topic
@@ -94,6 +97,69 @@ Tip: add `--quiet-net` to suppress routine gossip logs.
 
 ---
 
+## Offers: APIs and CLI
+
+### SSE stream (live + replay)
+```bash
+# Tail recent verified offers, redact signatures
+curl -N 'http://127.0.0.1:9120/offers?stream=1&redact_sig=1'
+
+# Resume from a millisecond cursor
+curl -N 'http://127.0.0.1:9120/offers?stream=1&since=0'
+
+# Or resume using Last-Event-ID header
+curl -N -H 'Last-Event-ID: 1690000000000' 'http://127.0.0.1:9120/offers?stream=1&redact_sig=1'
+```
+
+### Paginated reads
+```bash
+curl 'http://127.0.0.1:9120/offers?limit=100&since=0&redact_sig=1'
+```
+
+### CLI: watch offers with filters
+```bash
+# Show up to 10 offers, filter by minimum amount and maker
+unchained offer-watch --min-amount 1000 --maker 0x<maker_address_hex> --count 10
+```
+
+### CLI: accept a signed offer (deterministic, no secrets printed)
+```bash
+# Deterministic refunds via a base secret (recommended for prod)
+unchained offer-accept \
+  --input maker_offer.json \
+  --claim-secret <32-byte hex|base64-url> \
+  --refund-base <32-byte hex|base64-url>
+
+# Or write per-coin refund secrets to a file (kept secure)
+unchained offer-accept \
+  --input maker_offer.json \
+  --claim-secret <32-byte hex|base64-url> \
+  --refund-secrets-out refunds_secrets.json
+```
+
+Notes:
+- Offers are verified (Dilithium3) and only verified offers are streamed.
+- Secrets are never printed; use `--refund-base` for deterministic derivation or `--refund-secrets-out` to persist securely.
+
+---
+
+## Bridge REST
+
+### Status (stable alias)
+```bash
+curl 'http://127.0.0.1:<bridge_port>/bridge/status'
+```
+
+### Quote
+```bash
+curl 'http://127.0.0.1:<bridge_port>/bridge/quote?amount=100000'
+# → { "amount": 100000, "fee_bps": 10, "fee": 1000, "effective": 99000, "min_ok": true, "max_ok": true, ... }
+```
+
+Ensure your `config.toml` reflects bridge limits and fees; the quote endpoint enforces min/max and returns fee and effective.
+
+---
+
 ## Installation (Windows)
 - Install Rust from rustup (MSVC toolchain): `https://rustup.rs/`
 - Ensure CMake is available (Visual Studio Build Tools or standalone CMake)
@@ -102,7 +168,7 @@ Tip: add `--quiet-net` to suppress routine gossip logs.
 git clone https://github.com/Numi2/unchained.git
 cd unchained
 cargo build --release
-.\ttarget\release\unchained.exe
+.\target\release\unchained.exe
 ```
 
 If you run behind a firewall/NAT, forward the UDP QUIC port from your `config.toml` and/or configure `net.public_ip`.
@@ -112,7 +178,7 @@ If you run behind a firewall/NAT, forward the UDP QUIC port from your `config.to
 ## What happens when you send/receive
 
 - You copy your stealth receiving address (base64‑url string) and share it with a sender.
-- The sender’s wallet derives a private one‑time output for you using Kyber768 and BLAKE3, plus an inclusion proof against the current epoch’s Merkle root.
+- The sender’s wallet derives a private one‑time output for you using Kyber768 and BLAKE3. Standard V3 spends validate against the genesis anchor (empty proof); HTLC/bridge flows include a Merkle inclusion proof from the coin’s commit epoch.
 - Validators check: coin inclusion via Merkle path, output commitment, and that the spend’s nullifier hasn’t been seen before (double‑spend protection).
 - The coin leaves the sender’s balance immediately after the spend is validated and applied.
 - The recipient’s wallet deterministically recognizes and decrypts the new output; the coin appears in their balance.
@@ -126,7 +192,7 @@ The important part is the recipient’s public keys that enable private output d
 
 Edit `config.toml` (shipped in the repo). Key sections:
 
-- `[[net]]`: P2P networking
+- `[net]`: P2P networking
   - `listen_port`: UDP port for QUIC
   - `bootstrap`: optional list of peer multiaddrs to join a network
   - `public_ip`: advertise a public IP if you’re behind NAT
@@ -155,9 +221,9 @@ We use Argon2id with consensus‑locked lanes and tuned memory to make hardware 
 
 ### Commitments and nullifiers (hashlock transfers)
 - Commitments bind outputs to immutable data (the Kyber ciphertext) via BLAKE3, avoiding circular dependencies and keeping transactions minimal.
-- Ownership = knowledge of the current unlock preimage. The previous lock hash is `LOCK_HASH_prev = BLAKE3(unlock_preimage)`.
-- Uniqueness is enforced by a nullifier: `nf = BLAKE3("nfV3" || chain_id32 || coin_id32 || unlock_preimage32)`. The same `nf` cannot appear twice.
-- Each spend supplies `(unlock_preimage, next_lock_hash)`, where `next_lock_hash = BLAKE3(s_next)` and `s_next` is derived from Kyber decapsulation on the receiver side.
+- Ownership = knowledge of the current unlock preimage. The previous lock hash is domain‑separated and context‑bound: `LOCK_HASH_prev = BLAKE3("lh" || chain_id32 || coin_id32 || lp(p)||p)`; legacy nodes accept `BLAKE3_k("unchained.lock.v1", p)`.
+- Uniqueness is enforced by a nullifier: `nf = BLAKE3("nf" || chain_id32 || coin_id32 || lp(p)||p)`; legacy nodes accept `BLAKE3("unchained.nullifier.v3" || chain_id32 || coin_id32 || p)`. The same `nf` cannot appear twice.
+- Each spend supplies `(unlock_preimage, next_lock_hash)`, where `next_lock_hash = BLAKE3("lh" || chain_id32 || coin_id32 || lp(s_next)||s_next)` and `s_next` is derived from Kyber decapsulation (optionally bound to an out‑of‑band note).
 
 ### Privacy without signatures on the transfer path
 Transfers are authorized by providing the correct unlock preimage for the current lock (hashlock), not by signatures. The system relies on:
@@ -188,7 +254,7 @@ You’ll see:
 ## Operating the wallet
 - Wallet secrets are encrypted at rest (XChaCha20‑Poly1305) with a key derived from your passphrase (Argon2id, high memory). Passphrases are prompted interactively; for non‑interactive runs, set `WALLET_PASSPHRASE`.
 - To receive, run `stealth-address` and share the base64‑url string.
-- To send, run `send --stealth <ADDR> --amount <N>`. The coin leaves your balance when the spend is validated and applied; the recipient’s wallet will detect and show the coin deterministically.
+- To send, run `send --paycode <ADDR> --amount <N>`. The coin leaves your balance when the spend is validated and applied; the recipient’s wallet will detect and show the coin deterministically.
 
 ---
 
@@ -202,9 +268,8 @@ You can print your Peer ID with `peer-id` and share a multiaddr if `net.public_i
 
 ### P2P messages (24h-limited topic)
 - Use `msg-send` to publish a short text message to the public 24h‑limited gossip topic.
-  - Outbound is restricted to 2 messages per 24 hours per node.
 - Use `msg-listen` to stream incoming messages; they print as simple text lines.
-- The node also enforces an inbound limit of 2 messages per 24 hours per peer.
+- The node enforces an inbound limit of 2 messages per 24 hours per peer. Outbound is not enforced by the node.
 - This is meant for lightweight coordination or testing messages; do not rely on it for durable storage.
 
 ---
@@ -221,7 +286,7 @@ You can print your Peer ID with `peer-id` and share a multiaddr if `net.public_i
 ## Security model (summary)
 - Private receiving: Kyber768 (stealth outputs)
 - Authorization: hashlock preimage (ownership), next‑hop lock hash commitment
-- Nullifier: `BLAKE3("nfV3" || chain_id32 || coin_id32 || unlock_preimage32)`
+- Nullifier: `BLAKE3("nf" || chain_id32 || coin_id32 || lp(p)||p)` (legacy `unchained.nullifier.v3` accepted)
 - Hashing: BLAKE3 with explicit domain separation
 - PoW: Argon2id (memory‑hard), lanes locked by consensus
 - Persistence: RocksDB with column families tuned for this workload

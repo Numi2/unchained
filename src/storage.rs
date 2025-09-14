@@ -104,6 +104,9 @@ impl Store {
             "peers",
             "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
             "meta",                 // miscellaneous metadata (e.g., cursors)
+            // Offer discovery CFs
+            "offers",               // id -> OfferStored
+            "offers_quota",         // day||peer_hash -> u64 count
             // Bridge-related CFs
             "bridge_state",           // serialized BridgeState summary
             "bridge_pending",         // op_id -> PendingBridgeOp

@@ -1,4 +1,3 @@
-
 // network.rs
 
 use crate::{
@@ -13,6 +12,7 @@ use crate::consensus::{
     MIN_MEM_KIB, MAX_MEM_KIB,
 };
 use std::sync::{Arc, Mutex};
+use crate::wallet::Wallet;
 use libp2p::{
     gossipsub,
     identity, quic, PeerId, Swarm, Transport, Multiaddr,
@@ -152,6 +152,8 @@ const TOP_EPOCH_TXN: &str = "unchained/epoch_txn/v1";            // payload: (ep
 // New additive topics for pre-seal candidate pulls
 const TOP_EPOCH_CANDIDATES_REQUEST: &str = "unchained/epoch_candidates_request/v1"; // payload: [u8;32] epoch_hash
 const TOP_EPOCH_CANDIDATES_RESPONSE: &str = "unchained/epoch_candidates_response/v1"; // payload: EpochCandidatesResponse
+// Additive offers topic for signed offers (no renames to existing topics)
+const TOP_OFFERS_V1: &str = "unchained/offers/v1"; // payload: OfferDocV1
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitedMessage {
@@ -555,6 +557,7 @@ pub struct Network {
     // removed commitment channels
     rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
+    offers_tx: broadcast::Sender<crate::wallet::OfferDocV1>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
@@ -569,6 +572,7 @@ enum NetworkCommand {
     GossipEpochSelectedResponse(SelectedIdsBundle),
     GossipEpochCandidatesResponse(EpochCandidatesResponse),
     GossipRateLimited(RateLimitedMessage),
+    GossipOffer(crate::wallet::OfferDocV1),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
@@ -617,6 +621,7 @@ pub fn peer_id_string() -> anyhow::Result<String> {
 pub async fn spawn(
     net_cfg: config::Net,
     p2p_cfg: config::P2p,
+    offers_cfg: crate::config::Offers,
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
 ) -> anyhow::Result<NetHandle> {
@@ -657,6 +662,7 @@ pub async fn spawn(
         TOP_EPOCH_BY_HASH_REQUEST, TOP_EPOCH_BY_HASH_RESPONSE,
         TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
         TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
+        TOP_OFFERS_V1,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -711,11 +717,38 @@ pub async fn spawn(
     }
 
     let connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Offers ingest accounting (per-peer sliding 24h window, approximate global count)
+    let mut offers_total_estimate: u64 = {
+        // Try persisted gauge; else approximate by bounded scan at startup
+        let meta = db.db.cf_handle("meta");
+        let key = b"offers_count";
+        if let Some(cf) = meta {
+            if let Ok(Some(v)) = db.db.get_cf(cf, key) {
+                if v.len() == 8 {
+                    let mut a = [0u8;8]; a.copy_from_slice(&v);
+                    u64::from_le_bytes(a)
+                } else { 0 }
+            } else {
+                // Approximate: count up to max_entries + small slice
+                let mut c: u64 = 0;
+                if let Some(of) = db.db.cf_handle("offers") {
+                    let it = db.db.iterator_cf(of, rocksdb::IteratorMode::Start);
+                    for item in it.take(200_000) { if item.is_ok() { c = c.saturating_add(1); } }
+                }
+                if let Some(cf2) = meta { let _ = db.db.put_cf(cf2, key, &c.to_le_bytes()); }
+                c
+            }
+        } else { 0 }
+    };
+    let mut offers_per_peer: std::collections::HashMap<PeerId, std::collections::VecDeque<u64>> = std::collections::HashMap::new();
+    let mut _last_offers_prune: std::time::Instant = std::time::Instant::now();
+    // Offers pruning cursor and schedule (single timer)
 
     let (spend_tx, _) = broadcast::channel(1024);
     // Increase anchor broadcast capacity to reduce lag in consumers (e.g., miner)
     let (anchor_tx, _) = broadcast::channel(4096);
     let (proof_tx, _) = broadcast::channel(1024);
+    let (offers_tx, _) = broadcast::channel::<crate::wallet::OfferDocV1>(1024);
     // removed commitment channels
 
 
@@ -724,7 +757,7 @@ pub async fn spawn(
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (headers_tx, _headers_rx) = broadcast::channel::<EpochHeadersBatch>(1024);
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), headers_tx: headers_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), headers_tx: headers_tx.clone(), offers_tx: offers_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -1296,6 +1329,7 @@ pub async fn spawn(
                                     NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
+                                    NetworkCommand::GossipOffer(offer) => (TOP_OFFERS_V1, bincode::serialize(&offer).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
                                     NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),
@@ -1431,6 +1465,76 @@ pub async fn spawn(
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
                             match topic_str {
+                                TOP_OFFERS_V1 => {
+                                    if let Ok(offer) = bincode::deserialize::<crate::wallet::OfferDocV1>(&message.data) {
+                                        // Verify signature and maker binding before accepting/relaying
+                                        if Wallet::verify_offer_doc(&offer).is_ok() {
+                                            crate::metrics::OFFERS_RECEIVED.inc();
+                                            // Enforce minimal ingest limits: size and min_amount
+                                            let size_ok = message.data.len() as u64 <= offers_cfg.max_size_bytes;
+                                            let amount_ok = offer.plan.amount >= offers_cfg.min_amount;
+                                            // Per-peer window (in-memory) and persisted per-peer/day quota
+                                            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                                            let mut peer_ok = true;
+                                            {
+                                                let q = offers_per_peer.entry(peer_id).or_insert_with(|| std::collections::VecDeque::new());
+                                                let window_start = now_secs.saturating_sub(24 * 60 * 60);
+                                                while let Some(&ts) = q.front() { if ts < window_start { q.pop_front(); } else { break; } }
+                                                if (q.len() as u64) >= offers_cfg.per_peer_daily { peer_ok = false; }
+                                            }
+                                            // Persisted per-peer/day quota check (survives restarts)
+                                            if peer_ok {
+                                                if let Some(cf_quota) = db.db.cf_handle("offers_quota") {
+                                                    // key: day(u64 LE) || blake3(peer_id_bytes)
+                                                    let day: u64 = now_secs / (24 * 60 * 60);
+                                                    let mut key = Vec::with_capacity(8 + 32);
+                                                    key.extend_from_slice(&day.to_le_bytes());
+                                                    let mut hasher = blake3::Hasher::new_derive_key("unchained.offers.quota");
+                                                    hasher.update(peer_id.to_bytes().as_slice());
+                                                    let ph = hasher.finalize();
+                                                    key.extend_from_slice(&ph.as_bytes()[..32]);
+                                                    let mut count_u64: u64 = 0;
+                                                    if let Ok(Some(v)) = db.db.get_cf(cf_quota, &key) {
+                                                        if v.len() == 8 { let mut a=[0u8;8]; a.copy_from_slice(&v); count_u64 = u64::from_le_bytes(a); }
+                                                    }
+                                                    if count_u64 >= offers_cfg.per_peer_daily { peer_ok = false; }
+                                                }
+                                            }
+                                            let global_ok = offers_total_estimate < offers_cfg.max_entries;
+                                            if !size_ok || !amount_ok || !peer_ok || !global_ok { crate::metrics::OFFERS_REJECTED.inc(); continue; }
+                                            // Store ephemeral offer with TTL key: ts||hash
+                                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u128;
+                                            let mut key = Vec::with_capacity(16 + 32);
+                                            key.extend_from_slice(&ts.to_le_bytes());
+                                            let mut h = blake3::Hasher::new();
+                                            let _ = h.update(&message.data);
+                                            key.extend_from_slice(&h.finalize().as_bytes()[..32]);
+                                            let _ = db.db.cf_handle("offers").ok_or(()).and_then(|cf| db.db.put_cf(cf, &key, &message.data).map_err(|_| ()));
+                                            let _ = offers_tx.send(offer.clone());
+                                            if let Some(q) = offers_per_peer.get_mut(&peer_id) { q.push_back(now_secs); }
+                                            offers_total_estimate = offers_total_estimate.saturating_add(1);
+                                            // Persist updated global estimate
+                                            if let Some(meta_cf) = db.db.cf_handle("meta") { let _ = db.db.put_cf(meta_cf, b"offers_count", &offers_total_estimate.to_le_bytes()); }
+                                            // Increment persisted per-peer/day quota counter
+                                            if let Some(cf_quota) = db.db.cf_handle("offers_quota") {
+                                                let day: u64 = now_secs / (24 * 60 * 60);
+                                                let mut qkey = Vec::with_capacity(8 + 32);
+                                                qkey.extend_from_slice(&day.to_le_bytes());
+                                                let mut hasher = blake3::Hasher::new_derive_key("unchained.offers.quota");
+                                                hasher.update(peer_id.to_bytes().as_slice());
+                                                let ph = hasher.finalize();
+                                                qkey.extend_from_slice(&ph.as_bytes()[..32]);
+                                                let mut count_u64: u64 = 0;
+                                                if let Ok(Some(v)) = db.db.get_cf(cf_quota, &qkey) { if v.len() == 8 { let mut a=[0u8;8]; a.copy_from_slice(&v); count_u64 = u64::from_le_bytes(a); } }
+                                                let next = count_u64.saturating_add(1);
+                                                let _ = db.db.put_cf(cf_quota, &qkey, &next.to_le_bytes());
+                                            }
+                                            // Re-publish (gossip) verified offers to aid propagation
+                                            try_publish_gossip(&mut swarm, TOP_OFFERS_V1, message.data.clone(), "offers");
+                                            crate::metrics::OFFERS_REPUBLISHED.inc();
+                                        }
+                                    }
+                                },
                                 TOP_RATE_LIMITED => {
                                     if let Ok(msg) = bincode::deserialize::<RateLimitedMessage>(&message.data) {
                                         // enforce per-sender quota: 2 messages per 24h per peer
@@ -2762,6 +2866,7 @@ pub async fn spawn(
                             NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                             NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
+                            NetworkCommand::GossipOffer(ofr) => (TOP_OFFERS_V1, bincode::serialize(&ofr).ok()),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                             NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
                             NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),
@@ -2883,6 +2988,67 @@ pub async fn spawn(
                     }
                 }
             }
+            // Prune offers CF periodically using a persisted monotonic cursor; bounded, non-blocking
+            if _last_offers_prune.elapsed() > std::time::Duration::from_secs(15) {
+                _last_offers_prune = std::time::Instant::now();
+                if let Some(cf) = db.db.cf_handle("offers") {
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u128;
+                    let ttl_ms = (offers_cfg.ttl_secs as u128) * 1000u128;
+                    let cutoff = now_ms.saturating_sub(ttl_ms);
+                    // Load cursor
+                    let meta_cf = db.db.cf_handle("meta");
+                    let cursor_key = b"offers_prune_cursor_ts";
+                    let mut cursor_ts: u128 = 0;
+                    if let Some(meta) = meta_cf { if let Ok(Some(v)) = db.db.get_cf(meta, cursor_key) { if v.len() == 16 { let mut a=[0u8;16]; a.copy_from_slice(&v); cursor_ts = u128::from_le_bytes(a); } } }
+                    if cursor_ts == 0 { cursor_ts = cutoff.saturating_sub(1_000u128); }
+
+                    // Iterate from cursor forward, bounded
+                    let mut ro = rocksdb::ReadOptions::default();
+                    ro.set_iterate_lower_bound(cursor_ts.to_le_bytes().to_vec());
+                    let it = db.db.iterator_cf_opt(cf, ro, rocksdb::IteratorMode::From(&cursor_ts.to_le_bytes(), rocksdb::Direction::Forward));
+                    let mut pruned: u64 = 0;
+                    let mut visited: u64 = 0;
+                    let mut last_seen_ts: u128 = cursor_ts;
+                    let mut batch = rocksdb::WriteBatch::default();
+                    const MAX_VISIT: u64 = 10_000; // bounded work per tick
+                    for item in it {
+                        if visited >= MAX_VISIT { break; }
+                        if let Ok((k, _v)) = item {
+                            if k.len() < 16 { continue; }
+                            let mut ts_le = [0u8;16]; ts_le.copy_from_slice(&k[0..16]);
+                            let ts = u128::from_le_bytes(ts_le);
+                            last_seen_ts = ts;
+                            visited = visited.saturating_add(1);
+                            if ts < cutoff { batch.delete_cf(&cf, &k); pruned = pruned.saturating_add(1); }
+                            else { break; }
+                        }
+                    }
+                    if pruned > 0 { let _ = db.db.write(batch); crate::metrics::OFFERS_PRUNED.inc_by(pruned); }
+                    // Persist next cursor (advance even if no prunes, to avoid rescanning)
+                    if let Some(meta) = meta_cf { let _ = db.db.put_cf(meta, cursor_key, &last_seen_ts.to_le_bytes()); }
+
+                    // Enforce global cap approximately: if over cap, delete oldest beyond cap in small batches
+                    // Use an approximate pass without full counting; remove up to CAP_SLICE oldest entries
+                    const CAP_SLICE: u64 = 2_000;
+                    if offers_cfg.max_entries > 0 {
+                        let mut count: u64 = 0;
+                        // Count up to max_entries + CAP_SLICE
+                        let mut total_est: u64 = 0;
+                        let iter_count = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+                        for item in iter_count.take((offers_cfg.max_entries + CAP_SLICE) as usize) { if item.is_ok() { total_est = total_est.saturating_add(1); } }
+                        if total_est > offers_cfg.max_entries {
+                            let to_prune = (total_est - offers_cfg.max_entries).min(CAP_SLICE);
+                            let mut batch2 = rocksdb::WriteBatch::default();
+                            let iter2 = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+                            for item in iter2 {
+                                if count >= to_prune { break; }
+                                if let Ok((k, _)) = item { batch2.delete_cf(&cf, &k); count = count.saturating_add(1); }
+                            }
+                            if count > 0 { let _ = db.db.write(batch2); crate::metrics::OFFERS_PRUNED.inc_by(count); }
+                        }
+                    }
+                }
+            }
         }
     });
     Ok(net)
@@ -2902,6 +3068,7 @@ impl Network {
     pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
     pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> { self.spend_tx.subscribe() }
     pub fn headers_subscribe(&self) -> broadcast::Receiver<EpochHeadersBatch> { self.headers_tx.subscribe() }
+    pub fn offers_subscribe(&self) -> broadcast::Receiver<crate::wallet::OfferDocV1> { self.offers_tx.subscribe() }
     // Commitment subscription interfaces removed
     pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> { self.rate_limited_tx.subscribe() }
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
@@ -2936,6 +3103,7 @@ impl Network {
     pub async fn request_epoch_leaves(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochLeaves(epoch_num)); }
     // Note: We do not keep an explicit command variant; selected requests are sent directly when needed.
     pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) { let _ = self.command_tx.send(NetworkCommand::GossipEpochLeaves(bundle)); }
+    pub async fn gossip_offer(&self, offer: &crate::wallet::OfferDocV1) { let _ = self.command_tx.send(NetworkCommand::GossipOffer(offer.clone())); }
     // Commitment gossip removed
     
     /// Gets the current number of connected peers

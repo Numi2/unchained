@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(default)]
     pub wallet: WalletCfg,
     #[serde(default)]
+    pub offers: Offers,
+    #[serde(default)]
     pub bridge: BridgeConfig,
 }
 
@@ -169,6 +171,45 @@ impl Default for Compact {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct Offers {
+    /// Bind address for the offers HTTP API (SSE + GET). Defaults to 127.0.0.1:9120
+    #[serde(default = "default_offers_bind")]
+    pub bind: String,
+    /// TTL for offers durability window (seconds)
+    #[serde(default = "default_offers_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum number of offers retained in the store
+    #[serde(default = "default_offers_max_entries")]
+    pub max_entries: u64,
+    /// Maximum allowed size for offer payloads (bytes)
+    #[serde(default = "default_offers_max_size_bytes")]
+    pub max_size_bytes: u64,
+    /// Per-peer daily cap on accepted offers (count)
+    #[serde(default = "default_offers_per_peer_daily")]
+    pub per_peer_daily: u64,
+    /// Minimum allowed amount in offers (coins)
+    #[serde(default = "default_offers_min_amount")]
+    pub min_amount: u64,
+    /// Default fee basis points to expect/advertise if not present
+    #[serde(default = "default_offers_fee_bps_default")]
+    pub fee_bps_default: u64,
+}
+
+impl Default for Offers {
+    fn default() -> Self {
+        Self {
+            bind: default_offers_bind(),
+            ttl_secs: default_offers_ttl_secs(),
+            max_entries: default_offers_max_entries(),
+            max_size_bytes: default_offers_max_size_bytes(),
+            per_peer_daily: default_offers_per_peer_daily(),
+            min_amount: default_offers_min_amount(),
+            fee_bps_default: default_offers_fee_bps_default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WalletCfg {
     #[serde(default = "default_auto_serve_commitments")]
@@ -306,6 +347,15 @@ fn default_sui_bridge_module() -> String { "simple_bridge".into() }
 fn default_sui_burn_event() -> String { "Burn".into() }
 fn default_sui_coin_type() -> Option<String> { Some("0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089::unch::UNCH".into()) }
 
+// Offers defaults
+fn default_offers_bind() -> String { "127.0.0.1:9120".into() }
+fn default_offers_ttl_secs() -> u64 { 60 * 60 } // 1 hour
+fn default_offers_max_entries() -> u64 { 50_000 }
+fn default_offers_max_size_bytes() -> u64 { 512 * 1024 } // 512 KiB
+fn default_offers_per_peer_daily() -> u64 { 10_000 }
+fn default_offers_min_amount() -> u64 { 1 }
+fn default_offers_fee_bps_default() -> u64 { 0 }
+
 
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.
@@ -345,7 +395,7 @@ pub fn load_from_str(text: &str) -> Result<Config> {
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
-    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics","wallet","bridge"].into_iter().collect();
+    let top_allowed: HashSet<&str> = ["net","p2p","storage","epoch","mining","metrics","wallet","offers","bridge"].into_iter().collect();
     if let Some(table) = val.as_table() {
         for (k, v) in table.iter() {
             if !top_allowed.contains(k.as_str()) {
@@ -368,6 +418,9 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ]),
                 ("metrics", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["bind","last_epochs_to_show"]),
                 ("wallet", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["auto_serve_commitments"]),
+                ("offers", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
+                    "bind","ttl_secs","max_entries","max_size_bytes","per_peer_daily","min_amount","fee_bps_default"
+                ]),
                 ("bridge", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
                     "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind","rate_window_secs","per_address_daily_cap","global_daily_cap","sui_bridge_module","sui_burn_event","sui_coin_type"
                 ]),
