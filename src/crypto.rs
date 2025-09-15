@@ -14,6 +14,7 @@ use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use zeroize::Zeroizing;
 use anyhow::bail;
+use chacha20poly1305::{aead::{Aead, NewAead}, XChaCha20Poly1305, Key, XNonce};
 use atty;
 use rpassword;
 use webpki_roots;
@@ -380,6 +381,55 @@ pub fn derive_next_lock_secret_with_note(
     h.update(chain_id32);
     h.update(&lp(note_s.len())); h.update(note_s);
     *h.finalize().as_bytes()
+}
+
+// -----------------------------------------------------------------------------
+// Meta-transfer (EIP-3009 style) helpers: Kyber KEM + XChaCha20-Poly1305
+// -----------------------------------------------------------------------------
+
+use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
+use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
+
+/// Derive a 32-byte AEAD key from a Kyber shared secret using domain-separated BLAKE3.
+#[inline]
+pub fn derive_meta_authz_aead_key(shared_secret: &[u8]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    let mut h = Hasher::new();
+    h.update(b"meta-authz.aead.key.v1");
+    h.update(&lp(shared_secret.len()));
+    h.update(shared_secret);
+    *h.finalize().as_bytes()
+}
+
+/// AEAD encrypt with XChaCha20-Poly1305. Returns ciphertext bytes.
+pub fn aead_encrypt_xchacha(key32: &[u8; 32], nonce24: &[u8; 24], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
+    Ok(cipher.encrypt(XNonce::from_slice(nonce24), plaintext)
+        .map_err(|e| anyhow::anyhow!("AEAD encrypt: {}", e))?)
+}
+
+/// AEAD decrypt with XChaCha20-Poly1305. Returns plaintext bytes.
+pub fn aead_decrypt_xchacha(key32: &[u8; 32], nonce24: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
+    Ok(cipher.decrypt(XNonce::from_slice(nonce24), ciphertext)
+        .map_err(|_| anyhow::anyhow!("AEAD decrypt failed"))?)
+}
+
+/// Perform a Kyber768 KEM encapsulation to a facilitator Kyber public key. Returns (kem_ct, aead_key32)
+pub fn kem_encapsulate_to_kyber(pk: &KyberPk) -> ([u8; KYBER768_CT_BYTES], [u8; 32]) {
+    let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(pk);
+    let mut kem_ct = [0u8; KYBER768_CT_BYTES];
+    kem_ct.copy_from_slice(ct.as_bytes());
+    (kem_ct, derive_meta_authz_aead_key(shared.as_bytes()))
+}
+
+/// Decapsulate a Kyber768 KEM ciphertext with the facilitator's secret key to derive the AEAD key.
+pub fn kem_decapsulate_kyber(sk: &KyberSk, kem_ct_bytes: &[u8]) -> Result<[u8; 32]> {
+    use pqcrypto_traits::kem::Ciphertext as _;
+    let ct = pqcrypto_kyber::kyber768::Ciphertext::from_bytes(kem_ct_bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid Kyber768 KEM ciphertext"))?;
+    let shared = pqcrypto_kyber::kyber768::decapsulate(&ct, sk);
+    Ok(derive_meta_authz_aead_key(shared.as_bytes()))
 }
 
 /// Derive the genesis lock secret deterministically from Dilithium SK, coin id and chain id.

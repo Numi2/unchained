@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod wallet;
 pub mod consensus;
 pub mod bridge;
+pub mod x402;
 
 pub use coin::Coin;
 pub use crypto::{Address, blake3_hash, argon2id_pow, address_from_pk, dilithium3_keypair};

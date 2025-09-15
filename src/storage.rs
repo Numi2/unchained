@@ -99,6 +99,7 @@ impl Store {
             "spend",
             "nullifier",
             "commitment_used",
+            "meta_authz_used",  // EIP-3009-style meta-transfer replay protection (from||nonce)
             "otp_sk",
             "otp_index",
             "peers",
@@ -114,6 +115,7 @@ impl Store {
             "bridge_locked",          // coin_id -> op_id
             "bridge_op_coins",        // op_id -> Vec<coin_id>
             "bridge_events",          // append-only event log (key: millis||rand)
+            "bridge_invoices",        // invoice_id -> X402InvoiceRecord
         ];
         
         // Configure column family options with sane production defaults

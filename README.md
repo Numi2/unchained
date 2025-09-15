@@ -158,6 +158,34 @@ curl 'http://127.0.0.1:<bridge_port>/bridge/quote?amount=100000'
 
 Ensure your `config.toml` reflects bridge limits and fees; the quote endpoint enforces min/max and returns fee and effective.
 
+### x402 payments (experimental)
+Protected resources under `/paid/*` return HTTP 402 with an Unchained payment challenge when `[bridge].x402_enabled = true`.
+
+Client flow:
+1) Request a protected resource → receive 402 JSON challenge.
+2) Call wallet helper to pay and get a receipt header:
+```rust
+// Rust client inside this node
+let header = wallet.x402_pay_from_challenge(&challenge_json, &net).await?;
+// Resubmit original request with header
+let req = reqwest::Client::new()
+    .get("http://127.0.0.1:9110/paid/example")
+    .header("X-PAYMENT", header)
+    .send().await?;
+```
+3) Server verifies receipt against local state and returns 200.
+
+Config:
+```toml
+[bridge]
+x402_enabled = true
+x402_min_confs = 0
+x402_invoice_ttl_ms = 300000
+x402_protected_prefixes = ["/paid"]
+# Optional: set specific recipient KeyDoc or paycode; defaults to server wallet
+# x402_recipient_handle = "<stealth or KeyDoc>"
+```
+
 ---
 
 ## Installation (Windows)
@@ -257,6 +285,32 @@ You’ll see:
 - To send, run `send --paycode <ADDR> --amount <N>`. The coin leaves your balance when the spend is validated and applied; the recipient’s wallet will detect and show the coin deterministically.
 
 ---
+
+### Unified recipient handle (stealth address or KeyDoc JSON)
+
+You can now paste either a stealth address OR a KeyDoc JSON into the same "paycode" input. The wallet will auto‑verify and send; no pre‑import step or public lookup.
+
+- What is a KeyDoc? A short JSON the receiver shares out‑of‑band:
+```json
+{
+  "chain_id": "<32‑byte hex or base64>",
+  "dili_pk": "<Dilithium3 public key bytes>",
+  "kyber_pk": "<Kyber768 public key bytes>",
+  "sig": "sig_dilithium3(\"bind\" | chain_id | dili_pk | kyber_pk)"
+}
+```
+- Privacy: The KeyDoc is never published on‑chain or to the network. Each output remains unlinkable (per‑payment Kyber KEM + view tag + one‑time key) just like stealth addresses.
+
+Examples
+- CLI: pass a stealth address or paste a KeyDoc JSON string directly:
+```bash
+unchained send --paycode '<stealth_or_keydoc_string>' --amount 1
+```
+- API: use the simple wrapper, which accepts either format and uses an empty note:
+```rust
+wallet.pay(handle_str, 1, &network).await?;
+```
+
 
 ## Networking
 - Transport: QUIC over UDP (libp2p)

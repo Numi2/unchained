@@ -2,6 +2,7 @@
 // Unchained ↔ Sui bridge: state, types, RPC, and basic flows.
 
 use serde::{Serialize, Deserialize};
+use crate::x402;
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow, Context};
 use crate::{storage::Store, crypto::Address};
@@ -9,6 +10,20 @@ use crate::{wallet::Wallet, network::NetHandle};
 use blake3;
 use std::collections::VecDeque;
 use rocksdb;
+use pqcrypto_dilithium::dilithium3::{PublicKey as DiliPk, DetachedSignature as DiliDetachedSignature};
+use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct X402InvoiceRecord {
+    invoice_id: String,
+    resource: String,
+    amount: u64,
+    expiry_ms: u64,
+    #[serde(default)]
+    used: bool,
+    #[serde(default)]
+    used_at_ms: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeOutTransaction {
@@ -201,7 +216,62 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                     let path = req.uri().path().to_string();
                     let method = req.method().clone();
                     let authorized = authorize_admin(&svc.cfg, &req);
+                    // x402 protected resources: gate before route matching
+                    let mut x402_paid_ok = false;
+                    if svc.cfg.x402_enabled && is_protected_path(&svc.cfg, &path) {
+                        // If client supplied a receipt header, attempt verification first
+                        if let Some(h) = req.headers().get(crate::x402::HEADER_X_PAYMENT) {
+                            if let Ok(hs) = h.to_str() {
+                                if let Ok(()) = verify_x402_any_receipt(&svc, hs, Some(&path)).await {
+                                    x402_paid_ok = true;
+                                } else {
+                                    return Ok::<_, std::convert::Infallible>(err_response("payment verification failed", 402));
+                                }
+                            }
+                        }
+                        if !x402_paid_ok {
+                            // No valid receipt: return a 402 challenge
+                            let ch = match build_x402_challenge(&svc, &path) { Ok(c) => c, Err(e) => { return Ok::<_, std::convert::Infallible>(err_response(&format!("{}", e), 500)); } };
+                            let mut resp = json_response(&ch, 402);
+                            *resp.status_mut() = hyper::StatusCode::PAYMENT_REQUIRED;
+                            return Ok::<_, std::convert::Infallible>(resp);
+                        }
+                    }
                     let resp = match (method, path.as_str()) {
+                        // x402 endpoints
+                        (Method::GET, "/402/challenge") => {
+                            let q = req.uri().query().unwrap_or("");
+                            let params: std::collections::HashMap<_, _> = q.split('&').filter(|p| !p.is_empty()).filter_map(|p| p.split_once('=')).map(|(k,v)| (k.to_string(), v.to_string())).collect();
+                            let resource = params.get("resource").cloned().unwrap_or("".into());
+                            match build_x402_challenge(&svc, &resource) {
+                                Ok(ch) => { let mut r = json_response(&ch, 402); *r.status_mut() = hyper::StatusCode::PAYMENT_REQUIRED; r },
+                                Err(e) => err_response(&format!("{}", e), 500),
+                            }
+                        },
+                        (Method::POST, "/402/verify") => {
+                            let body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+                            #[derive(Deserialize)]
+                            struct VerifyReq { receipt: String, resource: Option<String> }
+                            let (receipt_str, resource_opt) = match serde_json::from_slice::<VerifyReq>(&body) {
+                                Ok(v) => (v.receipt, v.resource),
+                                Err(_) => (String::from_utf8_lossy(&body).to_string(), None),
+                            };
+                            match verify_x402_any_receipt(&svc, &receipt_str, resource_opt.as_deref()).await {
+                                Ok(_) => json_response(&serde_json::json!({"ok": true}), 200),
+                                Err(e) => err_response(&format!("{}", e), 402),
+                            }
+                        },
+                        (Method::POST, "/meta-transfer/submit") => {
+                            let body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+                            match meta_transfer_submit(&svc, &body).await {
+                                Ok(hashes) => json_response(&serde_json::json!({"spend_hashes": hashes}), 200),
+                                Err(e) => err_response(&format!("{}", e), 400),
+                            }
+                        },
+                        // Paid demo resource: ensure x402 gate above enforced payment first
+                        (Method::GET, "/paid/hello") => {
+                            json_response(&serde_json::json!({"hello": "world", "paid": true}), 200)
+                        },
                         (Method::POST, "/admin/bridge_pause") => {
                             if !authorized { return Ok::<_, std::convert::Infallible>(err_response("unauthorized", 401)); }
                             set_bridge_paused(&svc, true);
@@ -491,10 +561,204 @@ pub async fn serve(cfg: crate::config::BridgeConfig, db: Arc<Store>, wallet: Arc
                         }
                     }
                 }
+                // Cleanup expired or used invoices periodically
+                if let Some(cf_inv) = svc_h.db.db.cf_handle("bridge_invoices") {
+                    let iter = svc_h.db.db.iterator_cf(cf_inv, rocksdb::IteratorMode::Start);
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
+                    let mut batch = rocksdb::WriteBatch::default();
+                    let mut deletes: u64 = 0;
+                    for item in iter {
+                        if let Ok((k, v)) = item {
+                            if let Ok(rec) = bincode::deserialize::<X402InvoiceRecord>(&v) {
+                                // Drop any invoice that is used or expired by more than 5 minutes
+                                if rec.used || now_ms.saturating_sub(rec.expiry_ms) > 5 * 60 * 1000 {
+                                    batch.delete_cf(&cf_inv, &k);
+                                    deletes = deletes.saturating_add(1);
+                                }
+                            }
+                        }
+                        // Bound work per loop to avoid long pauses
+                        if deletes >= 1000 { break; }
+                    }
+                    if deletes > 0 { let _ = svc_h.db.db.write(batch); }
+                }
             }
         });
     }
     Ok(())
+}
+
+fn is_protected_path(cfg: &crate::config::BridgeConfig, path: &str) -> bool {
+    cfg.x402_protected_prefixes.iter().any(|p| p == "/" || (!p.is_empty() && path.starts_with(p)))
+}
+
+fn new_invoice_id(resource: &str, amount: u64) -> String {
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let rand: u64 = rand::random();
+    let mut v = Vec::new();
+    v.extend_from_slice(resource.as_bytes());
+    v.extend_from_slice(&amount.to_le_bytes());
+    v.extend_from_slice(&now_ms.to_le_bytes());
+    v.extend_from_slice(&rand.to_le_bytes());
+    hex::encode(crate::crypto::blake3_hash(&v))
+}
+
+fn build_x402_challenge(svc: &Arc<BridgeService>, resource: &str) -> Result<x402::X402Challenge> {
+    // Determine chain id and recipient handle
+    let chain_id = hex::encode(svc.db.get_chain_id()?);
+    let recipient = svc.cfg.x402_recipient_handle.clone().unwrap_or_else(|| svc.wallet.export_stealth_address());
+    let invoice_id = new_invoice_id(resource, 1);
+    let amount = 1u64; // minimal sample amount; production should parameterize per resource
+    let expiry_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64 + svc.cfg.x402_invoice_ttl_ms;
+    let mut ch = x402::build_challenge(invoice_id.clone(), chain_id, recipient, amount, expiry_ms, svc.cfg.x402_min_confs, Some(resource.to_string()));
+    // Optionally add an EVM/facilitator method
+    if let (Some(url), Some(net), Some(recv)) = (&svc.cfg.x402_facilitator_url, &svc.cfg.x402_evm_network, &svc.cfg.x402_evm_recipient) {
+        let binding_b64 = ch.methods.get(0).map(|m| m.note_binding_b64.clone()).unwrap_or_default();
+        let price = svc.cfg.x402_price_usd_micros;
+        ch.methods.push(x402::X402Method {
+            chain: "evm".to_string(),
+            chain_id: net.clone(),
+            recipient: recv.clone(),
+            amount,
+            expiry_ms,
+            note_binding_b64: binding_b64,
+            min_confs: svc.cfg.x402_min_confs,
+            network: Some(net.clone()),
+            facilitator_url: Some(url.clone()),
+            recipient_evm: Some(recv.clone()),
+            price_usd_micros: price,
+        });
+    }
+    // Persist invoice for expiry/resource checks
+    if let Some(cf) = svc.db.db.cf_handle("bridge_invoices") {
+        let rec = X402InvoiceRecord { invoice_id: ch.invoice_id.clone(), resource: resource.to_string(), amount, expiry_ms, used: false, used_at_ms: 0 };
+        if let Ok(bytes) = bincode::serialize(&rec) {
+            let _ = svc.db.db.put_cf(cf, ch.invoice_id.as_bytes(), &bytes);
+        }
+    }
+    Ok(ch)
+}
+
+async fn verify_x402_any_receipt(svc: &Arc<BridgeService>, header_or_body: &str, resource_hint: Option<&str>) -> Result<()> {
+    // Accept either header-encoded base64 or raw JSON receipt
+    if let Ok(any) = x402::decode_any_receipt_header(header_or_body) {
+        match any {
+            x402::X402AnyReceipt::Unchained { invoice_id, spend_hashes, amount, binding_b64 } => {
+                verify_invoice_and_binding(svc, &invoice_id, resource_hint, amount, &binding_b64)?;
+                let res = verify_unchained_receipt(svc, &spend_hashes, amount, &binding_b64).await;
+                if res.is_ok() { mark_invoice_used(svc, &invoice_id); }
+                res
+            }
+            x402::X402AnyReceipt::Evm { invoice_id, network, facilitator_url, proof } => {
+                // Pin facilitator and network to config
+                let exp_url = svc.cfg.x402_facilitator_url.as_deref().ok_or_else(|| anyhow!("facilitator not configured"))?;
+                let exp_net = svc.cfg.x402_evm_network.as_deref().ok_or_else(|| anyhow!("evm network not configured"))?;
+                if facilitator_url.trim_end_matches('/') != exp_url.trim_end_matches('/') { return Err(anyhow!("facilitator url mismatch")); }
+                if network != exp_net { return Err(anyhow!("evm network mismatch")); }
+                // Also verify binding against stored invoice if present
+                // EVM receipt doesn't carry binding bytes, so rely on invoice store only
+                verify_invoice_exists_and_not_expired(svc, &invoice_id, resource_hint)?;
+                let res = verify_evm_receipt_via_facilitator(svc, &facilitator_url, &proof).await;
+                if res.is_ok() { mark_invoice_used(svc, &invoice_id); }
+                res
+            }
+        }
+    } else {
+        // Back-compat with Unchained-only receipt
+        let receipt = match x402::decode_receipt_header(header_or_body) {
+            Ok(r) => r,
+            Err(_) => serde_json::from_str::<x402::X402Receipt>(header_or_body).context("invalid receipt payload")?,
+        };
+        verify_invoice_and_binding(svc, &receipt.invoice_id, resource_hint, receipt.amount, &receipt.binding_b64)?;
+        let res = verify_unchained_receipt(svc, &receipt.spend_hashes, receipt.amount, &receipt.binding_b64).await;
+        if res.is_ok() { mark_invoice_used(svc, &receipt.invoice_id); }
+        res
+    }
+}
+
+fn verify_invoice_exists_and_not_expired(svc: &Arc<BridgeService>, invoice_id: &str, resource_hint: Option<&str>) -> Result<()> {
+    if let Some(cf) = svc.db.db.cf_handle("bridge_invoices") {
+        if let Some(bytes) = svc.db.db.get_cf(cf, invoice_id.as_bytes())? {
+            if let Ok(rec) = bincode::deserialize::<X402InvoiceRecord>(&bytes) {
+                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
+                if now_ms > rec.expiry_ms { return Err(anyhow!("invoice expired")); }
+                if rec.used { return Err(anyhow!("invoice already used")); }
+                if let Some(res) = resource_hint { if !res.is_empty() && res != rec.resource { return Err(anyhow!("resource mismatch")); } }
+                return Ok(());
+            }
+        }
+    }
+    Err(anyhow!("unknown invoice"))
+}
+
+fn verify_invoice_and_binding(svc: &Arc<BridgeService>, invoice_id: &str, resource_hint: Option<&str>, amount: u64, binding_b64: &str) -> Result<()> {
+    // Check invoice record and expiry/resource
+    verify_invoice_exists_and_not_expired(svc, invoice_id, resource_hint)?;
+    // Recompute expected binding using stored resource; fall back to hint if record missing (already error above)
+    let resource = if let Some(cf) = svc.db.db.cf_handle("bridge_invoices") {
+        if let Some(bytes) = svc.db.db.get_cf(cf, invoice_id.as_bytes())? {
+            if let Ok(rec) = bincode::deserialize::<X402InvoiceRecord>(&bytes) { rec.resource } else { resource_hint.unwrap_or("").to_string() }
+        } else { resource_hint.unwrap_or("").to_string() }
+    } else { resource_hint.unwrap_or("").to_string() };
+    let expected = x402::compute_binding(invoice_id, &resource, amount);
+    let provided = x402::binding_bytes_from_b64(binding_b64)?;
+    if expected != provided { return Err(anyhow!("binding mismatch")); }
+    Ok(())
+}
+
+fn mark_invoice_used(svc: &Arc<BridgeService>, invoice_id: &str) {
+    if let Some(cf) = svc.db.db.cf_handle("bridge_invoices") {
+        if let Ok(Some(bytes)) = svc.db.db.get_cf(cf, invoice_id.as_bytes()) {
+            if let Ok(mut rec) = bincode::deserialize::<X402InvoiceRecord>(&bytes) {
+                rec.used = true;
+                rec.used_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64;
+                if let Ok(out) = bincode::serialize(&rec) { let _ = svc.db.db.put_cf(cf, invoice_id.as_bytes(), &out); }
+            }
+        }
+    }
+}
+
+async fn verify_unchained_receipt(svc: &Arc<BridgeService>, spend_hashes: &Vec<String>, amount: u64, binding_b64: &str) -> Result<()> {
+    if amount == 0 { return Err(anyhow!("amount must be > 0")); }
+    let _binding = x402::binding_bytes_from_b64(binding_b64)?;
+    let store = &svc.db;
+    let chain_id = store.get_chain_id()?;
+    let mut received: u64 = 0;
+    let cf = store.db.cf_handle("spend").ok_or_else(|| anyhow!("spend CF missing"))?;
+    let iter = store.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+    let mut map: std::collections::HashSet<String> = spend_hashes.iter().cloned().collect();
+    for item in iter {
+        let (_k, v) = item?;
+        if let Some(sp) = store.decode_spend_bytes_tolerant(&v) {
+            let mut txh = Vec::new();
+            txh.extend_from_slice(&sp.root);
+            txh.extend_from_slice(&sp.nullifier);
+            txh.extend_from_slice(&sp.commitment);
+            txh.extend_from_slice(&sp.to.canonical_bytes());
+            let tx_hash = hex::encode(crate::crypto::blake3_hash(&txh));
+            if !map.contains(&tx_hash) { continue; }
+            if !svc.wallet.is_output_for_me(&sp.to, &chain_id) { continue; }
+            received = received.saturating_add(sp.to.amount_le);
+            map.remove(&tx_hash);
+            if map.is_empty() { break; }
+        }
+    }
+    if !map.is_empty() { return Err(anyhow!("one or more spends not found")); }
+    if received < amount { return Err(anyhow!("insufficient paid amount")); }
+    Ok(())
+}
+
+async fn verify_evm_receipt_via_facilitator(_svc: &Arc<BridgeService>, facilitator_url: &str, proof: &serde_json::Value) -> Result<()> {
+    // POST proof to facilitator /verify endpoint per x402 facilitator spec
+    // Expect { ok: true } on success
+    let url = format!("{}/verify", facilitator_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(proof).send().await.context("facilitator http")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    if !status.is_success() { return Err(anyhow!("facilitator verify failed: status {}", status)); }
+    if body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) { return Ok(()); }
+    Err(anyhow!("facilitator verify rejected"))
 }
 
 fn json_response<T: serde::Serialize>(val: &T, status: u16) -> hyper::Response<hyper::Body> {
@@ -850,6 +1114,124 @@ async fn bridge_in_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Strin
     }
     crate::metrics::BRIDGE_IN_UNLOCKED_COINS.inc_by(r.amount);
     Ok(hex::encode(tx_hash))
+}
+
+// -------- Meta-transfer facilitator path --------
+
+#[derive(serde::Deserialize)]
+struct MetaTransferAuthV1In {
+    version: u8,
+    chain_id: [u8;32],
+    from_address: crate::crypto::Address,
+    from_dili_pk: Vec<u8>,
+    to_handle: String,
+    total_amount: u64,
+    valid_after_epoch: u64,
+    valid_before_epoch: u64,
+    nonce: [u8;32],
+    coins: Vec<crate::wallet::MetaAuthCoinV1>,
+    sig: Vec<u8>,
+}
+
+async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Vec<String>> {
+    // Accept JSON or bincode; try JSON first
+    let authz: MetaTransferAuthV1In = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => bincode::deserialize(body).context("invalid authz payload")?,
+    };
+    if authz.version != 1 { return Err(anyhow!("unsupported authz version")); }
+    let chain_id = svc.db.get_chain_id()?;
+    if authz.chain_id != chain_id { return Err(anyhow!("chain_id mismatch")); }
+
+    // Validity window
+    let current_epoch = svc.db.get::<crate::epoch::Anchor>("epoch", b"latest").ok().flatten().map(|a| a.num).unwrap_or(0);
+    if !(current_epoch >= authz.valid_after_epoch && current_epoch < authz.valid_before_epoch) {
+        return Err(anyhow!("authorization not valid in current epoch"));
+    }
+
+    // Verify signature over signable
+    let pk = DiliPk::from_bytes(&authz.from_dili_pk).map_err(|_| anyhow!("invalid from Dilithium PK"))?;
+    let addr = crate::crypto::address_from_pk(&pk);
+    if addr != authz.from_address { return Err(anyhow!("from address mismatch")); }
+    let signable = crate::wallet::MetaTransferAuthSignableV1 {
+        version: authz.version,
+        chain_id: authz.chain_id,
+        from_address: authz.from_address,
+        from_dili_pk: authz.from_dili_pk.clone(),
+        to_handle: authz.to_handle.clone(),
+        total_amount: authz.total_amount,
+        valid_after_epoch: authz.valid_after_epoch,
+        valid_before_epoch: authz.valid_before_epoch,
+        nonce: authz.nonce,
+        coins: authz.coins.clone(),
+    };
+    let bytes = bincode::serialize(&signable)?;
+    let mut dom = Vec::with_capacity(16 + bytes.len());
+    dom.extend_from_slice(b"meta-authz.sign.v1");
+    dom.extend_from_slice(&bytes);
+    let sig = DiliDetachedSignature::from_bytes(&authz.sig).map_err(|_| anyhow!("invalid authz signature bytes"))?;
+    pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &dom, &pk).map_err(|_| anyhow!("authz signature verify failed"))?;
+
+    // Replay protection with two-phase (pending -> used)
+    let mut used_key = Vec::with_capacity(1 + 32 + 32);
+    used_key.extend_from_slice(b"U");
+    used_key.extend_from_slice(&authz.from_address);
+    used_key.extend_from_slice(&authz.nonce);
+    let already_used = {
+        let cf = svc.db.db.cf_handle("meta_authz_used").ok_or_else(|| anyhow!("meta_authz_used CF missing"))?;
+        svc.db.db.get_cf(cf, &used_key)?.is_some()
+    };
+    if already_used { return Err(anyhow!("authorization already used")); }
+    let mut pending_key = Vec::with_capacity(1 + 32 + 32);
+    pending_key.extend_from_slice(b"P");
+    pending_key.extend_from_slice(&authz.from_address);
+    pending_key.extend_from_slice(&authz.nonce);
+    let already_pending = {
+        let cf = svc.db.db.cf_handle("meta_authz_used").ok_or_else(|| anyhow!("meta_authz_used CF missing"))?;
+        svc.db.db.get_cf(cf, &pending_key)?.is_some()
+    };
+    if already_pending { return Err(anyhow!("authorization already pending")); }
+    {
+        let cf = svc.db.db.cf_handle("meta_authz_used").ok_or_else(|| anyhow!("meta_authz_used CF missing"))?;
+        svc.db.db.put_cf(cf, &pending_key, &[0u8])?;
+    }
+
+    // Build spends
+    let mut spend_hashes: Vec<String> = Vec::new();
+    let mut total: u64 = 0;
+    for c in authz.coins.iter() {
+        // Decrypt preimage using KEM
+        let aead_key = crate::crypto::kem_decapsulate_kyber(&svc.wallet.kyber_secret_key(), &c.kem_ct)?;
+        let preimage = crate::crypto::aead_decrypt_xchacha(&aead_key, &c.aead_nonce24, &c.unlock_preimage_ct)?;
+        if preimage.len() != 32 { return Err(anyhow!("invalid preimage length")); }
+        let mut p = [0u8;32]; p.copy_from_slice(&preimage);
+        // Verify commitment integrity
+        let cid = crate::crypto::commitment_id_v1(&c.receiver_commitment.one_time_pk, &c.receiver_commitment.kyber_ct, &c.receiver_commitment.next_lock_hash, &c.coin_id, c.receiver_commitment.amount_le, &chain_id);
+        if cid != c.receiver_commitment.commitment_id { return Err(anyhow!("receiver commitment_id mismatch")); }
+        // Nullifier precheck
+        let nf = crate::crypto::nullifier_from_preimage(&chain_id, &c.coin_id, &p);
+        if svc.db.get::<[u8;1]>("nullifier", &nf)?.is_some() { continue; }
+        // Build spend using genesis anchor
+        let anchor: crate::epoch::Anchor = svc.db.get("epoch", &0u64.to_le_bytes())?.ok_or_else(|| anyhow!("genesis anchor missing"))?;
+        let sp = crate::transfer::Spend::create_hashlock(c.coin_id, &anchor, Vec::new(), p, &c.receiver_commitment, c.receiver_commitment.amount_le, &chain_id)?;
+        sp.validate(&svc.db)?; sp.apply(&svc.db)?; svc.net.gossip_spend(&sp).await;
+        total = total.saturating_add(c.receiver_commitment.amount_le);
+        let mut txh = Vec::new();
+        txh.extend_from_slice(&sp.root);
+        txh.extend_from_slice(&sp.nullifier);
+        txh.extend_from_slice(&sp.commitment);
+        txh.extend_from_slice(&sp.to.canonical_bytes());
+        spend_hashes.push(hex::encode(crate::crypto::blake3_hash(&txh)));
+    }
+    if total < authz.total_amount { return Err(anyhow!("authorized total not met by constructed spends")); }
+    // Mark used (commit after success)
+    {
+        let cf = svc.db.db.cf_handle("meta_authz_used").ok_or_else(|| anyhow!("meta_authz_used CF missing"))?;
+        svc.db.db.delete_cf(cf, &pending_key)?;
+        svc.db.db.put_cf(cf, &used_key, &[1u8])?;
+    }
+    if spend_hashes.is_empty() { return Err(anyhow!("no spends constructed (all nullifiers seen?)")); }
+    Ok(spend_hashes)
 }
 
 #[cfg(test)]

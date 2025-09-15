@@ -259,6 +259,33 @@ pub struct BridgeConfig {
     /// Optional Sui coin type that must match in the burn event (e.g. 0x..::unch::UNCH)
     #[serde(default)]
     pub sui_coin_type: Option<String>,
+    // --- x402 payment integration (served via bridge RPC bind) ---
+    #[serde(default = "default_x402_enabled")]
+    pub x402_enabled: bool,
+    /// Minimum confirmations required for x402 receipts (currently only 0 is supported)
+    #[serde(default = "default_x402_min_confs")]
+    pub x402_min_confs: u32,
+    /// Invoice TTL in milliseconds
+    #[serde(default = "default_x402_invoice_ttl_ms")]
+    pub x402_invoice_ttl_ms: u64,
+    /// Recipient handle (stealth address or KeyDoc). If None, server wallet address is used.
+    #[serde(default)]
+    pub x402_recipient_handle: Option<String>,
+    /// Path prefixes that will be protected and require x402 payment if accessed via HTTP
+    #[serde(default = "default_x402_protected_prefixes")]
+    pub x402_protected_prefixes: Vec<String>,
+    /// Optional EVM x402 facilitator (e.g., Base Sepolia/Testnet or Mainnet URL)
+    #[serde(default)]
+    pub x402_facilitator_url: Option<String>,
+    /// EVM network name (e.g., "base-sepolia", "base") for informational display
+    #[serde(default)]
+    pub x402_evm_network: Option<String>,
+    /// EVM recipient address for facilitator-based payments
+    #[serde(default)]
+    pub x402_evm_recipient: Option<String>,
+    /// Static price in USD micros for protected resources when offering EVM method
+    #[serde(default)]
+    pub x402_price_usd_micros: Option<u64>,
 }
 
 impl Default for BridgeConfig {
@@ -280,6 +307,15 @@ impl Default for BridgeConfig {
             sui_bridge_module: default_sui_bridge_module(),
             sui_burn_event: default_sui_burn_event(),
             sui_coin_type: default_sui_coin_type(),
+            x402_enabled: default_x402_enabled(),
+            x402_min_confs: default_x402_min_confs(),
+            x402_invoice_ttl_ms: default_x402_invoice_ttl_ms(),
+            x402_recipient_handle: None,
+            x402_protected_prefixes: default_x402_protected_prefixes(),
+            x402_facilitator_url: None,
+            x402_evm_network: None,
+            x402_evm_recipient: None,
+            x402_price_usd_micros: None,
         }
     }
 }
@@ -346,6 +382,12 @@ fn default_bridge_global_daily_cap() -> u64 { 10_000_000_000 }
 fn default_sui_bridge_module() -> String { "simple_bridge".into() }
 fn default_sui_burn_event() -> String { "Burn".into() }
 fn default_sui_coin_type() -> Option<String> { Some("0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089::unch::UNCH".into()) }
+
+// x402 defaults
+fn default_x402_enabled() -> bool { false }
+fn default_x402_min_confs() -> u32 { 0 }
+fn default_x402_invoice_ttl_ms() -> u64 { 5 * 60 * 1000 }
+fn default_x402_protected_prefixes() -> Vec<String> { vec!["/paid".into()] }
 
 // Offers defaults
 fn default_offers_bind() -> String { "127.0.0.1:9120".into() }
@@ -422,7 +464,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     "bind","ttl_secs","max_entries","max_size_bytes","per_peer_daily","min_amount","fee_bps_default"
                 ]),
                 ("bridge", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[
-                    "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind","rate_window_secs","per_address_daily_cap","global_daily_cap","sui_bridge_module","sui_burn_event","sui_coin_type"
+                    "sui_rpc_url","sui_package_id","sui_config_object","vault_paycode","admin_token","bridge_enabled","min_amount","max_amount","fee_basis_points","rpc_bind","rate_window_secs","per_address_daily_cap","global_daily_cap","sui_bridge_module","sui_burn_event","sui_coin_type","x402_enabled","x402_min_confs","x402_invoice_ttl_ms","x402_recipient_handle","x402_protected_prefixes","x402_facilitator_url","x402_evm_network","x402_evm_recipient","x402_price_usd_micros"
                 ]),
                 _ => {}
             }

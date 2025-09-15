@@ -9,10 +9,11 @@ use std::io::{self, Write};
 pub mod config;    pub mod crypto;   pub mod storage;  pub mod epoch;
 pub mod coin;      pub mod transfer; pub mod miner;    pub mod network;
 pub mod sync;      pub mod metrics;  pub mod wallet;   pub mod consensus;
-pub mod bridge;    pub mod offers;
+pub mod bridge;    pub mod offers;   pub mod x402;
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use crate::network::RateLimitedMessage;
+use pqcrypto_traits::kem::PublicKey as KyberPkTrait;
 fn print_qr_to_terminal(data: &str) -> anyhow::Result<()> {
     let code = QrCode::new(data.as_bytes())?;
     let image = code.render::<unicode::Dense1x2>().dark_color(unicode::Dense1x2::Light).build();
@@ -85,6 +86,13 @@ enum Cmd {
     },
     Balance,
     History,
+    /// x402: Pay a 402 challenge at a protected URL and print X-PAYMENT header
+    X402Pay {
+        /// URL to the protected resource (server will return 402 with challenge)
+        #[arg(long)] url: String,
+        /// Optional: auto-resubmit and print resource body after paying
+        #[arg(long, default_value_t = true)] auto_resubmit: bool,
+    },
     /// HTLC: Plan an offer (sender) and output a JSON plan
     HtlcPlan {
         #[arg(long)] paycode: String,
@@ -231,6 +239,23 @@ enum Cmd {
         /// Seconds to pre-warm coin proofs before submitting (0 to disable)
         #[arg(long, default_value_t = 12)]
         prewarm_secs: u64,
+    },
+    /// Meta: Create a signed authorization for facilitator to submit spends (EIP-3009-like)
+    MetaAuthzCreate {
+        /// Receiver paycode (base64-url)
+        #[arg(long)] to: String,
+        /// Total amount to authorize
+        #[arg(long)] amount: u64,
+        /// Valid after this epoch (inclusive)
+        #[arg(long)] valid_after: u64,
+        /// Valid before this epoch (exclusive)
+        #[arg(long)] valid_before: u64,
+        /// Facilitator Kyber768 public key (base64-url)
+        #[arg(long)] facilitator_kyber_b64: String,
+        /// Optional x402-style 32-byte binding (base64-url)
+        #[arg(long)] binding_b64: Option<String>,
+        /// Output file for the JSON document
+        #[arg(long)] out: String,
     },
 }
 
@@ -883,6 +908,29 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::X402Pay { url, auto_resubmit }) => {
+            // Fetch challenge
+            let client = reqwest::Client::new();
+            let resp = client.get(url).send().await?;
+            if resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+                eprintln!("Expected 402, got {}", resp.status());
+                return Err(anyhow::anyhow!("not a 402"));
+            }
+            let challenge_json = resp.text().await?;
+            // Pay using wallet and produce header
+            let header = wallet.x402_pay_from_challenge(&challenge_json, &net).await?;
+            println!("X-PAYMENT: {}", header);
+            if *auto_resubmit {
+                let resp2 = client.get(url).header(crate::x402::HEADER_X_PAYMENT, header).send().await?;
+                if !resp2.status().is_success() {
+                    eprintln!("Resubmit failed: {}", resp2.status());
+                    return Err(anyhow::anyhow!("resubmit failed"));
+                }
+                let body = resp2.text().await.unwrap_or_default();
+                println!("{}", body);
+            }
+            return Ok(());
+        }
         Some(Cmd::RepairSpends) => {
             println!("🛠️  Scanning 'spend' CF for malformed entries...");
             let cf = db.db.cf_handle("spend").ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
@@ -975,6 +1023,29 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("❌ bridge_out failed: {}", e);
                 }
             }
+        }
+        Some(Cmd::MetaAuthzCreate { to, amount, valid_after, valid_before, facilitator_kyber_b64, binding_b64, out }) => {
+            // Parse facilitator Kyber PK
+            let fac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(facilitator_kyber_b64.trim())
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(facilitator_kyber_b64.trim()))
+                .map_err(|_| anyhow::anyhow!("invalid base64 for facilitator kyber pk"))?;
+            let fac_pk = pqcrypto_kyber::kyber768::PublicKey::from_bytes(&fac_bytes)
+                .map_err(|_| anyhow::anyhow!("invalid facilitator kyber pk bytes"))?;
+            // Optional binding
+            let binding_opt: Option<[u8;32]> = if let Some(b) = binding_b64 {
+                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(b.trim())
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b.trim()))
+                    .map_err(|_| anyhow::anyhow!("invalid base64 for binding"))?;
+                if raw.len() != 32 { return Err(anyhow::anyhow!("binding must be 32 bytes")); }
+                let mut arr = [0u8;32]; arr.copy_from_slice(&raw); Some(arr)
+            } else { None };
+            let authz = wallet.authorize_meta_transfer(to, *amount, *valid_after, *valid_before, &fac_pk, binding_opt)?;
+            let json = serde_json::to_string_pretty(&authz)?;
+            std::fs::write(out, json)?;
+            println!("✅ Wrote meta authorization JSON");
+            return Ok(());
         }
         // commitment commands removed
         Some(Cmd::MsgSend { text }) => {

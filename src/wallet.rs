@@ -39,6 +39,14 @@ pub struct StealthAddressDoc {
     kyber_pk: Vec<u8>,
     sig: Vec<u8>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyDocV1 {
+    pub chain_id: [u8;32],
+    pub dili_pk: Vec<u8>,
+    pub kyber_pk: Vec<u8>,
+    pub sig: Vec<u8>,
+}
 use anyhow::{Result, Context, anyhow, bail};
 use std::sync::Arc;
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
@@ -79,6 +87,49 @@ pub struct Wallet {
     kyber_pk: KyberPk,
     kyber_sk: KyberSk,
     address: Address,
+}
+
+// ---------------------------------------------------------------------
+// Meta-transfer (EIP-3009-like) authorization document (module scope)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaAuthCoinV1 {
+    pub coin_id: [u8;32],
+    pub receiver_commitment: crate::transfer::ReceiverLockCommitment,
+    /// KEM: Kyber768 ciphertext to facilitator; AEAD: XChaCha20-Poly1305 nonce||ciphertext
+    pub kem_ct: Vec<u8>,
+    pub aead_nonce24: [u8;24],
+    pub unlock_preimage_ct: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaTransferAuthV1 {
+    pub version: u8,
+    pub chain_id: [u8;32],
+    pub from_address: Address,
+    pub from_dili_pk: Vec<u8>,
+    pub to_handle: String,
+    pub total_amount: u64,
+    pub valid_after_epoch: u64,
+    pub valid_before_epoch: u64,
+    pub nonce: [u8;32],
+    pub coins: Vec<MetaAuthCoinV1>,
+    pub sig: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaTransferAuthSignableV1 {
+    pub version: u8,
+    pub chain_id: [u8;32],
+    pub from_address: Address,
+    pub from_dili_pk: Vec<u8>,
+    pub to_handle: String,
+    pub total_amount: u64,
+    pub valid_after_epoch: u64,
+    pub valid_before_epoch: u64,
+    pub nonce: [u8;32],
+    pub coins: Vec<MetaAuthCoinV1>,
 }
 
 impl Wallet {
@@ -375,6 +426,48 @@ impl Wallet {
 
     // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
+    /// Accepts a recipient handle that can be either:
+    /// - A stealth address string (existing formats), or
+    /// - A KeyDoc JSON string: {chain_id,dili_pk,kyber_pk,sig=sign("bind"|chain_id|dili_pk|kyber_pk)}
+    /// Returns (recipient_addr, receiver_kyber_pk) after full verification.
+    fn parse_recipient_handle(&self, handle: &str) -> Result<(Address, KyberPk)> {
+        // 1) Try stealth address first (back-compat)
+        if let Ok(t) = Self::parse_stealth_address(handle) {
+            return Ok(t);
+        }
+
+        // 2) Try KeyDoc JSON (E2EE/OOB). Never published on-chain or network.
+        let s = handle.trim();
+        if s.starts_with('{') && s.ends_with('}') {
+            let doc: KeyDocV1 = serde_json::from_str(s).context("Invalid KeyDoc JSON")?;
+            // Chain binding
+            let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+            let chain_id = store.get_chain_id()?;
+            if doc.chain_id != chain_id { anyhow::bail!("KeyDoc chain_id mismatch"); }
+
+            // Verify signature over "bind"|chain_id|dili_pk|kyber_pk
+            let pk = PublicKey::from_bytes(&doc.dili_pk).map_err(|_| anyhow!("Invalid KeyDoc Dilithium PK"))?;
+            let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk).map_err(|_| anyhow!("Invalid KeyDoc Kyber PK"))?;
+            let mut msg = Vec::with_capacity(4 + 32 + doc.dili_pk.len() + doc.kyber_pk.len());
+            msg.extend_from_slice(b"bind");
+            msg.extend_from_slice(&doc.chain_id);
+            msg.extend_from_slice(&doc.dili_pk);
+            msg.extend_from_slice(&doc.kyber_pk);
+            let sig = DiliDetachedSignature::from_bytes(&doc.sig).map_err(|_| anyhow!("Invalid KeyDoc signature bytes"))?;
+            dili_verify_detached(&sig, &msg, &pk).map_err(|_| anyhow!("KeyDoc signature verification failed"))?;
+
+            let addr = crate::crypto::address_from_pk(&pk);
+            return Ok((addr, kyber_pk));
+        }
+
+        // Friendly hint for future paycode inputs without cached binding
+        if s.starts_with("ucsp1") {
+            anyhow::bail!("Paycode detected but no cached binding. Paste the KeyDoc JSON or use a stealth address.");
+        }
+
+        anyhow::bail!("Invalid recipient handle")
+    }
+
     // ---------------------------------------------------------------------
     // 🪙 UTXO helpers
     // ---------------------------------------------------------------------
@@ -485,7 +578,6 @@ impl Wallet {
                                 if coin_id_bytes.len() == 32 {
                                     let mut coin_id = [0u8; 32];
                                     coin_id.copy_from_slice(&coin_id_bytes);
-                                    
                                     // Check if coin now exists
                                     if let Ok(Some(_coin)) = store.get::<crate::coin::Coin>("coin", &coin_id) {
                                         // Coin is now available - try to rescan the spend
@@ -632,8 +724,9 @@ impl Wallet {
     ) -> Result<SendOutcome> {
         // Accept either a stealth address OR, when provided, derive recipient from batch token
         // Parse paycode (chain-bound Kyber PK + short routing secret). For now accept stealth address V2 as paycode surrogate.
-        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(receiver_paycode)
-            .context("Invalid receiver paycode")?;
+        let (recipient_addr, receiver_kyber_pk) = self
+            .parse_recipient_handle(receiver_paycode)
+            .context("Invalid receiver handle")?;
         let store = self
             ._db
             .upgrade()
@@ -757,7 +850,174 @@ impl Wallet {
         Ok(SendOutcome { spends })
     }
 
+    fn build_receiver_commitment_for_coin(&self, receiver_paycode: &str, coin: &crate::coin::Coin, note_s: &[u8], chain_id: &[u8;32]) -> Result<crate::transfer::ReceiverLockCommitment> {
+        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(receiver_paycode)?;
+        let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+        let value_tag = coin.value.to_le_bytes();
+        let seed = crate::crypto::stealth_seed_v3(
+            shared.as_bytes(),
+            &recipient_addr,
+            ct.as_bytes(),
+            &value_tag,
+            chain_id,
+        );
+        let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
+        let s_next = crate::crypto::derive_next_lock_secret_with_note(
+            shared.as_bytes(),
+            ct.as_bytes(),
+            coin.value,
+            &coin.id,
+            chain_id,
+            note_s,
+        );
+        let next_lock_hash = crate::crypto::lock_hash_from_preimage(chain_id, &coin.id, &s_next);
+        let mut one_time_pk = [0u8; OTP_PK_BYTES]; one_time_pk.copy_from_slice(&ot_pk_bytes);
+        let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES]; kyber_ct.copy_from_slice(ct.as_bytes());
+        Ok(crate::transfer::ReceiverLockCommitment {
+            one_time_pk,
+            kyber_ct,
+            next_lock_hash,
+            commitment_id: crate::crypto::commitment_id_v1(&one_time_pk, &kyber_ct, &next_lock_hash, &coin.id, coin.value, chain_id),
+            amount_le: coin.value,
+        })
+    }
+
+    fn compute_current_unlock_preimage(&self, coin: &crate::coin::Coin, chain_id: &[u8;32], note_s: &[u8]) -> Result<[u8;32]> {
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        if let Some(prev_spend) = store.get_spend_tolerant(&coin.id)? {
+            prev_spend.to.derive_lock_secret(&self.kyber_sk, &coin.id, chain_id, note_s)
+        } else {
+            Ok(self.compute_genesis_lock_secret(&coin.id, chain_id))
+        }
+    }
+
+    /// Produce a signed MetaTransferAuthV1 document for facilitator submission.
+    pub fn authorize_meta_transfer(
+        &self,
+        to_handle: &str,
+        amount: u64,
+        valid_after_epoch: u64,
+        valid_before_epoch: u64,
+        facilitator_kyber_pk: &pqcrypto_kyber::kyber768::PublicKey,
+        note_binding_opt: Option<[u8;32]>,
+    ) -> Result<MetaTransferAuthV1> {
+        if valid_before_epoch <= valid_after_epoch { anyhow::bail!("valid_before_epoch must be > valid_after_epoch"); }
+        let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let chain_id = store.get_chain_id()?;
+        let coins = self.select_inputs(amount)?;
+        let binding = note_binding_opt.unwrap_or([0u8;32]);
+
+        // Prepare per-coin entries
+        let mut out_coins: Vec<MetaAuthCoinV1> = Vec::new();
+        let mut sum: u64 = 0;
+        for coin in coins {
+            let preimage = self.compute_current_unlock_preimage(&coin, &chain_id, if binding == [0u8;32] { &[] } else { &binding })?;
+            sum = sum.saturating_add(coin.value);
+            let rc = self.build_receiver_commitment_for_coin(to_handle, &coin, if binding == [0u8;32] { &[] } else { &binding }, &chain_id)?;
+            // KEM to facilitator and AEAD encrypt the preimage
+            let (kem_ct, key32) = crate::crypto::kem_encapsulate_to_kyber(facilitator_kyber_pk);
+            let mut nonce = [0u8;24]; rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let ct = crate::crypto::aead_encrypt_xchacha(&key32, &nonce, &preimage)?;
+            out_coins.push(MetaAuthCoinV1 { coin_id: coin.id, receiver_commitment: rc, kem_ct: kem_ct.to_vec(), aead_nonce24: nonce, unlock_preimage_ct: ct });
+            if sum >= amount { break; }
+        }
+        if sum < amount { anyhow::bail!("Insufficient funds: need {} have {}", amount, sum); }
+
+        // Build signable and sign with Dilithium
+        let mut rng_nonce = [0u8;32]; rand::rngs::OsRng.fill_bytes(&mut rng_nonce);
+        let signable = MetaTransferAuthSignableV1 {
+            version: 1,
+            chain_id,
+            from_address: self.address,
+            from_dili_pk: self.pk.as_bytes().to_vec(),
+            to_handle: to_handle.to_string(),
+            total_amount: amount,
+            valid_after_epoch,
+            valid_before_epoch,
+            nonce: rng_nonce,
+            coins: out_coins.clone(),
+        };
+        let bytes = bincode::serialize(&signable)?;
+        let mut dom = Vec::with_capacity(16 + bytes.len());
+        dom.extend_from_slice(b"meta-authz.sign.v1");
+        dom.extend_from_slice(&bytes);
+        let sig = dili_detached_sign(&dom, &self.sk);
+
+        Ok(MetaTransferAuthV1 {
+            version: 1,
+            chain_id,
+            from_address: self.address,
+            from_dili_pk: self.pk.as_bytes().to_vec(),
+            to_handle: to_handle.to_string(),
+            total_amount: amount,
+            valid_after_epoch,
+            valid_before_epoch,
+            nonce: rng_nonce,
+            coins: out_coins,
+            sig: sig.as_bytes().to_vec(),
+        })
+    }
+
     // Deprecated wrappers removed; use send_with_paycode_and_note
+
+    /// Simple wrapper: pay using a recipient handle (stealth address or KeyDoc JSON) with empty note.
+    pub async fn pay(
+        &self,
+        to: &str,
+        amount: u64,
+        network: &crate::network::NetHandle,
+    ) -> Result<SendOutcome> {
+        self.send_with_paycode_and_note(to, amount, network, &[]).await
+    }
+
+    /// x402 helper: pay with an explicit binding (note_s) to tie spends to an invoice/resource.
+    pub async fn pay_with_binding(
+        &self,
+        to: &str,
+        amount: u64,
+        network: &crate::network::NetHandle,
+        binding32: &[u8; 32],
+    ) -> Result<SendOutcome> {
+        self.send_with_paycode_and_note(to, amount, network, binding32).await
+    }
+
+    /// x402 client: handle a 402 challenge JSON and perform payment, returning an encoded receipt header value.
+    pub async fn x402_pay_from_challenge(
+        &self,
+        challenge_json: &str,
+        network: &crate::network::NetHandle,
+    ) -> Result<String> {
+        let ch: crate::x402::X402Challenge = serde_json::from_str(challenge_json)
+            .context("invalid x402 challenge json")?;
+        if ch.methods.is_empty() { anyhow::bail!("no methods in challenge"); }
+        // Pick first unchained method
+        let method = ch.methods.iter().find(|m| m.chain == "unchained")
+            .ok_or_else(|| anyhow::anyhow!("unchained method not offered"))?;
+        let binding = crate::x402::binding_bytes_from_b64(&method.note_binding_b64)?;
+        let note = binding; // 32 bytes
+        let outcome = self.send_with_paycode_and_note(&method.recipient, method.amount, network, &note).await?;
+        let spend_hashes: Vec<String> = outcome.spends.iter().map(|sp| {
+            let mut txh = Vec::new();
+            txh.extend_from_slice(&sp.root);
+            txh.extend_from_slice(&sp.nullifier);
+            txh.extend_from_slice(&sp.commitment);
+            txh.extend_from_slice(&sp.to.canonical_bytes());
+            hex::encode(crate::crypto::blake3_hash(&txh))
+        }).collect();
+        let any = crate::x402::X402AnyReceipt::Unchained {
+            invoice_id: ch.invoice_id,
+            spend_hashes,
+            amount: method.amount,
+            binding_b64: method.note_binding_b64.clone(),
+        };
+        let json = serde_json::to_vec(&any)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+    }
+
+    /// Check if a stealth output is addressed to this wallet (public accessor; hides secret fields).
+    pub fn is_output_for_me(&self, out: &crate::transfer::StealthOutput, chain_id32: &[u8; 32]) -> bool {
+        out.is_for_receiver(&self.kyber_sk, &self.pk, chain_id32).is_ok()
+    }
 
     // (Legacy transfers listing removed)
 
@@ -865,8 +1125,8 @@ pub struct HtlcRefundsDoc { pub refunds: Vec<HtlcRefundsDocEntry> }
 
 impl Wallet {
     pub fn plan_htlc_offer(&self, amount: u64, paycode: &str, timeout_epoch: u64) -> Result<HtlcPlanDoc> {
-        // Validate paycode parseable up-front
-        let _ = Self::parse_stealth_address(paycode).context("Invalid receiver paycode")?;
+        // Validate recipient handle (stealth address or KeyDoc JSON) up-front
+        let _ = self.parse_recipient_handle(paycode).context("Invalid receiver handle")?;
         let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
         let coins = self.select_inputs(amount)?;
         let chain_id = store.get_chain_id()?;
@@ -883,8 +1143,9 @@ impl Wallet {
         refund_secrets_out: Option<&str>,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(&plan.paycode)
-            .context("Invalid receiver paycode in plan")?;
+        let (recipient_addr, receiver_kyber_pk) = self
+            .parse_recipient_handle(&plan.paycode)
+            .context("Invalid receiver handle in plan")?;
         let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
         // Build lookup for ch_claim per coin
         let mut ch_claim_map: std::collections::HashMap<[u8;32],[u8;32]> = std::collections::HashMap::new();
@@ -986,7 +1247,7 @@ impl Wallet {
         network: &crate::network::NetHandle,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(paycode)?;
+        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(paycode)?;
         let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
         let chain_id = store.get_chain_id()?;
         let mut spends = Vec::new();
@@ -1049,7 +1310,7 @@ impl Wallet {
         network: &crate::network::NetHandle,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = Self::parse_stealth_address(paycode)?;
+        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(paycode)?;
         let store = self._db.upgrade().ok_or_else(|| anyhow!("Database connection dropped"))?;
         let chain_id = store.get_chain_id()?;
         let mut spends = Vec::new();
