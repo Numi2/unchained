@@ -385,6 +385,7 @@ impl Miner {
             anchor.num, difficulty, mem_kib
         );
         // Track progress window for attempts/sec feedback without being too chatty
+        const PROGRESS_LOG_INTERVAL_ATTEMPTS: u64 = 10_000;
         let mut last_progress_instant = std::time::Instant::now();
         let mut last_progress_attempts = 0u64;
 
@@ -465,19 +466,21 @@ impl Miner {
             if attempts % self.cfg.check_interval_attempts == 0 {
                 // Less noisy progress indicator
                 miner_routine!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
-                // Print a concise human-facing progress update every ~3 seconds
-                let elapsed = last_progress_instant.elapsed();
-                if elapsed >= std::time::Duration::from_secs(2) {
-                    let delta_attempts = attempts.saturating_sub(last_progress_attempts);
-                    let rate = if elapsed.as_secs_f64() > 0.0 {
-                        delta_attempts as f64 / elapsed.as_secs_f64()
-                    } else { 0.0 };
-                    println!(
-                        "⏳ Mining epoch #{}: {} attempts (≈{:.1}/s)",
-                        anchor.num, attempts, rate
-                    );
-                    last_progress_instant = std::time::Instant::now();
-                    last_progress_attempts = attempts;
+                // Only emit the human-facing progress log on 10k-attempt boundaries
+                if attempts % PROGRESS_LOG_INTERVAL_ATTEMPTS == 0 {
+                    let elapsed = last_progress_instant.elapsed();
+                    if elapsed >= std::time::Duration::from_secs(2) {
+                        let delta_attempts = attempts.saturating_sub(last_progress_attempts);
+                        let rate = if elapsed.as_secs_f64() > 0.0 {
+                            delta_attempts as f64 / elapsed.as_secs_f64()
+                        } else { 0.0 };
+                        println!(
+                            "⏳ Mining epoch #{}: {} attempts (≈{:.1}/s)",
+                            anchor.num, attempts, rate
+                        );
+                        last_progress_instant = std::time::Instant::now();
+                        last_progress_attempts = attempts;
+                    }
                 }
 
                 // NEW: abort early if the chain has already advanced.

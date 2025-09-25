@@ -105,29 +105,7 @@ pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
     *Hasher::new_derive_key("unchained-v1").update(data).finalize().as_bytes()
 }
 
-pub fn dilithium3_keypair() -> (PublicKey, SecretKey) {
-    // Bleeding-edge deterministic only: generating with a fixed zero seed is disallowed.
-    // Callers must use dilithium3_seeded_keypair with an explicit seed.
-    panic!("Use dilithium3_seeded_keypair with an explicit seed");
-}
-
-/// Deterministically generate a Dilithium3 keypair from a 32-byte seed.
-/// Note: liboqs removed. We derive a deterministic keypair via BLAKE3 XOF.
-pub fn dilithium3_seeded_keypair(seed32: [u8; 32]) -> (PublicKey, SecretKey) {
-    let mut hasher = blake3::Hasher::new_keyed(&seed32);
-    hasher.update(b"unchained-dili-otp-v1");
-    let mut out = vec![0u8; DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES];
-    hasher.finalize_xof().fill(&mut out);
-    let (pkb, skb) = out.split_at(DILITHIUM3_PK_BYTES);
-    let pk = PublicKey::from_bytes(pkb).expect("invalid Dilithium3 public key bytes");
-    let sk = SecretKey::from_bytes(skb).expect("invalid Dilithium3 secret key bytes");
-    (pk, sk)
-}
-
-/// Derive deterministic one-time "public key" bytes from a 32-byte seed.
-/// This avoids relying on Dilithium's randomized key generation and keeps
-/// stealth outputs Kyber-bound. The produced bytes are fixed-size and
-/// opaque; they MUST NOT be interpreted as a real Dilithium key.
+/// Derive deterministic one-time "public key" bytes from a 32-byte seed obtained from stealth seed derivations.
 pub fn derive_one_time_pk_bytes(seed32: [u8; 32]) -> [u8; OTP_PK_BYTES] {
     let mut hasher = blake3::Hasher::new_keyed(&seed32);
     hasher.update(b"unchained-otp-bytes.v1");

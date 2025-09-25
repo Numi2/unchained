@@ -291,17 +291,11 @@ impl Wallet {
 
         // --- Brand new wallet ---
         println!("✨ No wallet found, creating a new one...");
-        // Deterministic-only: derive seed for wallet master key deterministically from passphrase and salt
+        // Generate fresh Dilithium3 and Kyber keypairs for the new wallet
         let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
-            .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
-        let mut seed = [0u8; 32];
-        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(passphrase.as_bytes(), &salt, &mut seed)
-            .map_err(|e| anyhow!("Argon2id seed derivation failed: {}", e))?;
-        let (pk, sk) = crypto::dilithium3_seeded_keypair(seed);
+        let (pk, sk) = pqcrypto_dilithium::dilithium3::keypair();
         let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
         let address = crypto::address_from_pk(&pk);
 

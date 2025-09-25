@@ -294,12 +294,25 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     // Deterministically compute expected consensus parameters for this height.
     let (exp_diff, exp_mem) = if anchor.num % RETARGET_INTERVAL == 0 {
         // Collect the last RETARGET_INTERVAL anchors ending at prev
-        let mut recent: Vec<Anchor> = Vec::new();
+        let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
         let start = anchor.num.saturating_sub(RETARGET_INTERVAL);
+        let mut missing_from: Option<u64> = None;
         for n in start..anchor.num {
-            if let Ok(Some(a)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                recent.push(a);
+            match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                Ok(Some(a)) => recent.push(a),
+                Ok(None) => {
+                    if missing_from.is_none() {
+                        missing_from = Some(n);
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("DB error reading epoch {}: {}", n, e));
+                }
             }
+        }
+        if recent.len() as u64 != RETARGET_INTERVAL {
+            let gap_start = missing_from.unwrap_or(start);
+            return Err(format!("Retarget window incomplete starting at {}", gap_start));
         }
         calculate_retarget_consensus(&recent)
     } else {
@@ -356,8 +369,13 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
     match validate_anchor(a, db) {
         Ok(()) => AnchorClass::Valid,
         Err(e) => {
-            if e.starts_with("Previous anchor ") { 
-                return AnchorClass::MissingParent(a.num.saturating_sub(1)); 
+            if let Some(rest) = e.strip_prefix("Retarget window incomplete starting at ") {
+                if let Ok(missing_from) = rest.trim().parse::<u64>() {
+                    return AnchorClass::MissingParent(missing_from);
+                }
+            }
+            if e.starts_with("Previous anchor ") {
+                return AnchorClass::MissingParent(a.num.saturating_sub(1));
             }
             // Other mismatches may still be valid on a different parent/window. Buffer for reorg.
             AnchorClass::PossiblyAltFork
@@ -792,7 +810,8 @@ pub async fn spawn(
     const LATEST_GLOBAL_THROTTLE_MS: u64 = 1000; // minimum gap between our latest responses
     const PENDING_SPEND_TTL_SECS: u64 = 15;
     const PENDING_PROOF_TTL_SECS: u64 = 30;
-    const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on hash mismatch
+const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on hash mismatch
+const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget window when historical data is missing
     // Global aggregation cadence for alt-fork summaries
     const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
     // Throttle noisy reorg logs (per-height)
@@ -1750,7 +1769,7 @@ pub async fn spawn(
                                                 // capacity is enforced internally by OrphanBuffer
                                             }
                                         }
-                                        AnchorClass::MissingParent(_parent_h) => {
+                                        AnchorClass::MissingParent(parent_h) => {
                                             // Check per-peer contribution limits first
                                             if !allow_peer_orphan_contribution(peer_id) {
                                                 net_routine!("⚠️ Peer {} exceeded orphan contribution limit, dropping anchor {}", peer_id, a.num);
@@ -1759,9 +1778,13 @@ pub async fn spawn(
                                             
                                             // Log details about missing previous anchor
                                             if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
-                                                if a.num == latest.num + 1 || a.num == latest.num + 2 {
+                                                let retarget_gap = parent_h.saturating_add(1) != a.num;
+                                                if retarget_gap {
+                                                    net_log!("⏳ Epoch {} awaiting historical anchors starting at {} to complete retarget window", 
+                                                        a.num, parent_h);
+                                                } else if a.num == latest.num + 1 || a.num == latest.num + 2 {
                                                     net_log!("⚠️  Epoch {} missing or divergent parent. Looking for parent at {}", 
-                                                        a.num, a.num - 1);
+                                                        a.num, a.num.saturating_sub(1));
                                                     // Check if we have the previous epoch with a different hash
                                                     if let Ok(Some(stored_prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
                                                         net_log!("❌ Hash mismatch at epoch {}: stored hash {}, anchor observed child {}",
@@ -1801,7 +1824,13 @@ pub async fn spawn(
                                                 state.peer_confirmed_tip = true;
                                             }
                                             if a.num > 0 {
-                                                request_aligned_range(&command_tx, a.num, REORG_BACKFILL);
+                                                let retarget_gap = parent_h.saturating_add(1) != a.num;
+                                                let backfill_window = if retarget_gap {
+                                                    RETARGET_BACKFILL
+                                                } else {
+                                                    REORG_BACKFILL
+                                                };
+                                                request_aligned_range(&command_tx, parent_h, backfill_window);
                                             }
                                             needs_reorg_check = true;
                                         },
