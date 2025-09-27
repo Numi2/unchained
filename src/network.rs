@@ -768,8 +768,8 @@ pub async fn spawn(
     net_log!("🆔 Local peer ID: {}", peer_id);
     
     let mut qcfg = quic::Config::new(&id_keys);
-    qcfg.keep_alive_interval = std::time::Duration::from_secs(15);
-    qcfg.max_idle_timeout = 120;
+    qcfg.keep_alive_interval = std::time::Duration::from_secs(10);
+    qcfg.max_idle_timeout = 300;
     let transport = quic::tokio::Transport::new(qcfg)
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -1459,6 +1459,11 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         // Rate-limit self address advertisement to avoid connect storms
         const PEER_ADDR_ADVERTISE_MIN_SECS: u64 = 60;
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
+        // Flapping detection and quarantine controls
+        const FLAP_WINDOW_SECS: u64 = 60;
+        const FLAP_THRESHOLD: u32 = 3;
+        const QUARANTINE_MIN_SECS: u64 = 300;   // 5 minutes
+        const QUARANTINE_MAX_SECS: u64 = 1800;  // 30 minutes cap
         let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
         // Opportunistic dialing of stored peer addresses and periodic bootstrap nudges
         const KNOWN_ADDR_REFRESH_SECS: u64 = 60;
@@ -1469,6 +1474,12 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         let mut last_known_addrs_refresh: Instant = Instant::now() - std::time::Duration::from_secs(KNOWN_ADDR_REFRESH_SECS);
         let mut last_bootstrap_redial: Instant = Instant::now() - std::time::Duration::from_secs(BOOTSTRAP_REDIAL_INTERVAL_SECS);
         let mut recent_peer_disconnects: HashMap<PeerId, Instant> = HashMap::new();
+        // Track disconnect frequency to detect flapping peers
+        let mut flapping_counts: HashMap<PeerId, (u32, Instant)> = HashMap::new();
+        // Temporarily quarantine peers that flap to avoid dial storms
+        let mut quarantined_peers: HashMap<PeerId, Instant> = HashMap::new();
+        // Escalating quarantine durations per peer
+        let mut quarantine_exp: HashMap<PeerId, u64> = HashMap::new();
         // Periodic retry timer to flush pending publishes even without connection events
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
@@ -1479,6 +1490,15 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             if let Some(pid) = peer_id { dialing_peers.remove(&pid); }
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            // Drop connections from quarantined peers (temporary ban due to flapping)
+                            quarantined_peers.retain(|_, until| Instant::now() < *until);
+                            if let Some(until) = quarantined_peers.get(&peer_id) {
+                                net_routine!("🚫 Quarantined peer {} attempted connection (until {:?})", peer_id, until);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                if let Ok(mut set) = connected_peers.lock() { set.remove(&peer_id); crate::metrics::PEERS.set(set.len() as i64); }
+                                dialing_peers.remove(&peer_id);
+                                continue;
+                            }
                             // Immediately drop connections from banned peers
                             if banned_peer_ids.contains(&peer_id) {
                                 let _ = swarm.disconnect_peer_id(peer_id);
@@ -1665,6 +1685,23 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     crate::metrics::PEERS.set(set.len() as i64);
                                 }
                             }
+                            // Update flapping counters and quarantine if necessary
+                            let now = Instant::now();
+                            let entry = flapping_counts.entry(peer_id).or_insert((0, now));
+                            // Reset the window if elapsed
+                            if now.duration_since(entry.1) > std::time::Duration::from_secs(FLAP_WINDOW_SECS) {
+                                *entry = (0, now);
+                            }
+                            entry.0 = entry.0.saturating_add(1);
+                            if entry.0 >= FLAP_THRESHOLD {
+                                let base = quarantine_exp.get(&peer_id).copied().unwrap_or(QUARANTINE_MIN_SECS);
+                                let dur_secs = std::cmp::min(base, QUARANTINE_MAX_SECS);
+                                quarantined_peers.insert(peer_id, now + std::time::Duration::from_secs(dur_secs));
+                                quarantine_exp.insert(peer_id, std::cmp::min(dur_secs.saturating_mul(2), QUARANTINE_MAX_SECS));
+                                net_log!("🛑 Quarantining peer {} for {}s due to flapping ({} disconnects/{:?})", peer_id, dur_secs, entry.0, std::time::Duration::from_secs(FLAP_WINDOW_SECS));
+                                // Reset counter for next window
+                                *entry = (0, now);
+                            }
                             // Record recent disconnect to avoid immediate re-dials
                             recent_peer_disconnects.insert(peer_id, Instant::now());
                             // Allow re-dial in the future
@@ -1778,6 +1815,9 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         // Avoid redundant dials or dialing above capacity
                                         let already_connected = connected_peers.lock().map(|s| s.contains(&remote_pid)).unwrap_or(false);
                                         if already_connected || dialing_peers.contains(&remote_pid) { continue; }
+                                        // Skip quarantined peers
+                                        quarantined_peers.retain(|_, until| Instant::now() < *until);
+                                        if quarantined_peers.contains_key(&remote_pid) { continue; }
                                         let under_cap = connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize;
                                         if !under_cap { continue; }
                                         // TTL de-dup on dials
@@ -3048,6 +3088,9 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 // Skip if already connected or dialing
                                 let already_connected = connected_peers.lock().map(|s| s.contains(&remote_pid)).unwrap_or(false);
                                 if already_connected || dialing_peers.contains(&remote_pid) { continue; }
+                                // Skip quarantined peers
+                                quarantined_peers.retain(|_, until| now < *until);
+                                if quarantined_peers.contains_key(&remote_pid) { continue; }
                                 // TTL de-dup on dials
                                 recent_peer_dials.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(PEER_DIAL_DEDUP_SECS));
                                 if recent_peer_dials.contains_key(&remote_pid) { continue; }
@@ -3163,6 +3206,10 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 if let Some(id_str) = addr.split("/p2p/").last() {
                                     if let Ok(pid) = PeerId::from_str(id_str) {
                                         if banned_peer_ids.contains(&pid) { continue; }
+                                        // Skip quarantined bootstraps
+                                        if let Some(until) = quarantined_peers.get(&pid) {
+                                            if Instant::now() < *until { continue; }
+                                        }
                                         if let Some(t) = recent_peer_disconnects.get(&pid) {
                                             if Instant::now().duration_since(*t) < std::time::Duration::from_secs(30) { recently_closed = true; }
                                         }
