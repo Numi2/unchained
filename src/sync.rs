@@ -447,7 +447,7 @@ pub async fn spawn_headers_skeleton(
                     if let Some(last) = seg.headers.last() {
                         if last.is_better_chain(&current_best) {
                             for a in &seg.headers {
-                                if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                // Store headers by hash only; do not write canonical epoch-by-height in skeleton sync
                                 if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 crate::metrics::HEADERS_ANCHORS_STORED.inc();
                             }
