@@ -7,7 +7,6 @@ pub struct Params {
     pub mem_kib: u32,
 }
 
-// ---------- Consensus constants (v1) ----------
 pub const GENESIS_PARAMS: Params = Params {
     difficulty: 2,
     mem_kib: 16_192,

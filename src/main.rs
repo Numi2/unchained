@@ -341,7 +341,13 @@ async fn main() -> anyhow::Result<()> {
     
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
-    let net = network::spawn(cfg.net.clone(), cfg.p2p.clone(), cfg.offers.clone(), db.clone(), sync_state.clone()).await?;
+    let net = network::spawn(
+        cfg.net.clone(),
+        cfg.p2p.clone(),
+        cfg.offers.clone(),
+        db.clone(),
+        sync_state.clone(),
+    ).await?;
     // Kick off headers-first skeleton sync in the background (additive protocol, safe if peers don't support it)
     {
         let db_h = db.clone();

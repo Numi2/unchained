@@ -5,6 +5,9 @@ use crate::{
 };
 use crate::consensus::{
     calculate_retarget_consensus,
+    validate_header_params,
+    ConsensusError,
+    Params,
     TARGET_LEADING_ZEROS,
     DEFAULT_MEM_KIB,
     RETARGET_INTERVAL,
@@ -99,6 +102,120 @@ const ORPHAN_HEIGHT_COOLDOWN_SECS: u64 = 1; // Reduced cooldown for faster proce
 const REORG_MIN_GAP_MS: u64 = 100; // Reduced for faster reorg attempts during sync
 const MAX_BFS_WIDTH_PER_HEIGHT: usize = 64; // Increased BFS frontier cap
 const MAX_REORG_STEPS: usize = 12096; // Increased for larger reorgs during sync
+const MAX_REORG_DEPTH: u64 = 128;
+const MIN_REORG_WORK_MARGIN: u128 = 1; // Minimum cumulative work delta required to adopt alternate branch
+
+#[derive(Debug)]
+enum SegmentValidationError {
+    NonSequential { expected: u64, got: u64 },
+    MissingWindowAnchor { height: u64, missing: u64 },
+    IncompleteWindow { height: u64, have: u64 },
+    Consensus { height: u64, err: ConsensusError },
+    Storage(String),
+}
+
+fn log_segment_error(context: &str, err: &SegmentValidationError) {
+    match err {
+        SegmentValidationError::NonSequential { expected, got } => {
+            net_log!("⛔ {}: non-sequential anchor heights (expected {} got {})", context, expected, got);
+        }
+        SegmentValidationError::MissingWindowAnchor { height, missing } => {
+            net_log!(
+                "⛔ {}: retarget window for height {} missing ancestor at {}",
+                context, height, missing
+            );
+        }
+        SegmentValidationError::IncompleteWindow { height, have } => {
+            net_log!(
+                "⛔ {}: retarget window for height {} incomplete (have {} of {})",
+                context,
+                height,
+                have,
+                RETARGET_INTERVAL
+            );
+        }
+        SegmentValidationError::Consensus { height, err } => {
+            net_log!("⛔ {}: consensus params mismatch at height {}: {}", context, height, err);
+        }
+        SegmentValidationError::Storage(e) => {
+            net_log!("⛔ {}: storage error: {}", context, e);
+        }
+    }
+}
+
+fn gather_retarget_window(
+    db: &Store,
+    parent: &Anchor,
+    processed: &HashMap<u64, Anchor>,
+    height: u64,
+) -> Result<Vec<Anchor>, SegmentValidationError> {
+    if RETARGET_INTERVAL == 0 || height % RETARGET_INTERVAL != 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut window = Vec::with_capacity(RETARGET_INTERVAL as usize);
+    let start = height.saturating_sub(RETARGET_INTERVAL);
+    for h in start..height {
+        if let Some(anchor) = processed.get(&h) {
+            window.push(anchor.clone());
+            continue;
+        }
+        if h == parent.num {
+            window.push(parent.clone());
+            continue;
+        }
+        match db.get::<Anchor>("epoch", &h.to_le_bytes()) {
+            Ok(Some(anchor)) => window.push(anchor),
+            Ok(None) => {
+                return Err(SegmentValidationError::MissingWindowAnchor { height, missing: h });
+            }
+            Err(e) => return Err(SegmentValidationError::Storage(e.to_string())),
+        }
+    }
+
+    if window.len() as u64 != RETARGET_INTERVAL {
+        return Err(SegmentValidationError::IncompleteWindow {
+            height,
+            have: window.len() as u64,
+        });
+    }
+
+    Ok(window)
+}
+
+fn validate_segment_consensus(
+    db: &Store,
+    parent: &Anchor,
+    segment: &[Anchor],
+) -> Result<(), SegmentValidationError> {
+    let mut prev = parent.clone();
+    let mut processed: HashMap<u64, Anchor> = HashMap::new();
+
+    for anchor in segment {
+        let expected = prev.num.saturating_add(1);
+        if anchor.num != expected {
+            return Err(SegmentValidationError::NonSequential { expected, got: anchor.num });
+        }
+
+        let window = gather_retarget_window(db, &prev, &processed, anchor.num)?;
+        let params = Params {
+            difficulty: anchor.difficulty as u32,
+            mem_kib: anchor.mem_kib,
+        };
+
+        if let Err(err) = validate_header_params(Some(&prev), anchor.num, &window, params) {
+            return Err(SegmentValidationError::Consensus {
+                height: anchor.num,
+                err,
+            });
+        }
+
+        processed.insert(anchor.num, anchor.clone());
+        prev = anchor.clone();
+    }
+
+    Ok(())
+}
 
 #[allow(dead_code)]
 fn try_publish_gossip(
@@ -845,6 +962,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         let mut near_parent = current_latest.clone();
         let mut near_chain: Vec<Anchor> = Vec::new();
         let mut h_near = current_latest.num.saturating_add(1);
+        let mut near_depth: u64 = 0;
         loop {
             let Some(cands) = orphan_buf.by_height.get(&h_near) else { break; };
             if cands.is_empty() { break; }
@@ -862,11 +980,37 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
             if let Some(next) = linked {
                 near_chain.push(next.clone());
                 near_parent = next;
+                if near_parent.num > current_latest.num {
+                    near_depth = near_parent.num.saturating_sub(current_latest.num);
+                }
                 h_near = h_near.saturating_add(1);
             } else { break; }
         }
         if let Some(near_tip) = near_chain.last() {
-            if near_tip.cumulative_work > current_latest.cumulative_work {
+            if near_depth > MAX_REORG_DEPTH {
+                net_log!(
+                    "⛔ Reorg: sequential catch-up depth {} exceeds max {}",
+                    near_depth,
+                    MAX_REORG_DEPTH
+                );
+            } else {
+                let delta = near_tip.cumulative_work.saturating_sub(current_latest.cumulative_work);
+                let expected_unit = Anchor::expected_work_for_difficulty(current_latest.difficulty);
+                let alpha = expected_unit / 2;
+                let required_margin = std::cmp::max(
+                    MIN_REORG_WORK_MARGIN,
+                    alpha.saturating_mul(near_depth as u128),
+                );
+                if delta < required_margin {
+                    net_log!(
+                        "ℹ️  Reorg: sequential catch-up tip #{} Δwork {} below required {}",
+                        near_tip.num,
+                        delta,
+                        required_margin
+                    );
+                } else if let Err(err) = validate_segment_consensus(&db, &current_latest, &near_chain) {
+                    log_segment_error("Reorg validation", &err);
+                } else if near_tip.cumulative_work > current_latest.cumulative_work {
                 let (Some(epoch_cf), Some(anchor_cf), Some(sel_cf), Some(leaves_cf), Some(coin_cf), Some(coin_epoch_cf), Some(spend_cf), Some(nullifier_cf), Some(commitment_used_cf)) = (
                     db.db.cf_handle("epoch"),
                     db.db.cf_handle("anchor"),
@@ -952,6 +1096,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             selected_ids.len()
                         );
                         let _ = command_tx.send(NetworkCommand::RequestEpochLeaves(alt.num));
+                        return false;
                     }
                     parent = alt.clone();
                 }
@@ -962,6 +1107,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                 net_log!("🔁 Reorg adopted up to epoch {} (sequential catch-up)", near_tip.num);
                 return true;
             }
+        }
         }
         let Some(&max_buf_height) = orphan_buf.by_height.keys().max() else { return false };
         if max_buf_height <= current_latest.num { return false; }
@@ -1031,6 +1177,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         for p in &parent_candidates { node_by_hash.insert(p.hash, p.clone()); }
         let mut frontier: Vec<Anchor> = parent_candidates.clone();
         let mut last_frontier: Vec<Anchor> = Vec::new();
+        let mut max_depth: u64 = 0;
         let mut advanced = false;
         let mut steps: usize = 0;
         for height in first_height..=max_buf_height {
@@ -1069,9 +1216,14 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                 }
             }
             last_frontier = deduped.clone();
-            frontier = deduped;
+            frontier = deduped.clone();
             advanced = true;
             steps = steps.saturating_add(1);
+            if let Some(first) = deduped.first() {
+                if first.num > fork_height {
+                    max_depth = max_depth.max(first.num.saturating_sub(fork_height));
+                }
+            }
         }
         if !advanced {
             let now = std::time::Instant::now();
@@ -1120,10 +1272,43 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         chosen_chain = chain_rev;
         if chosen_chain.is_empty() { return false; }
 
+        if max_depth > MAX_REORG_DEPTH {
+            net_log!(
+                "⛔ Reorg: candidate branch depth {} exceeds max allowed {}",
+                max_depth,
+                MAX_REORG_DEPTH
+            );
+            return false;
+        }
+
         let Some(seg_tip) = chosen_chain.last() else { return false; };
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
             net_routine!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
+            return false;
+        }
+
+        {
+            let delta = seg_tip.cumulative_work.saturating_sub(current_latest.cumulative_work);
+            let expected_unit = Anchor::expected_work_for_difficulty(current_latest.difficulty);
+            let alpha = expected_unit / 2; // 0.5 × expected work at current difficulty
+            let required_margin = std::cmp::max(
+                MIN_REORG_WORK_MARGIN,
+                alpha.saturating_mul(max_depth as u128),
+            );
+            if delta < required_margin {
+                net_log!(
+                    "ℹ️  Reorg: candidate tip #{} does not exceed depth-weighted margin (Δ={} < required {})",
+                    seg_tip.num,
+                    delta,
+                    required_margin
+                );
+                return false;
+            }
+        }
+
+        if let Err(err) = validate_segment_consensus(&db, &current_latest, &chosen_chain) {
+            log_segment_error("Reorg validation", &err);
             return false;
         }
 
@@ -1238,6 +1423,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                 );
                 // Request authoritative sorted leaves so we can serve proofs and backfill indices
                 let _ = command_tx.send(NetworkCommand::RequestEpochLeaves(alt.num));
+                return false;
             }
 
             // Advance parent
