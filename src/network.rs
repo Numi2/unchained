@@ -436,7 +436,7 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         (prev.difficulty, prev.mem_kib)
     };
     if anchor.difficulty != exp_diff || anchor.mem_kib != exp_mem {
-        net_log!(
+        net_routine!(
             "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
             anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
         );
@@ -493,6 +493,9 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
             }
             if e.starts_with("Previous anchor ") {
                 return AnchorClass::MissingParent(a.num.saturating_sub(1));
+            }
+            if e.starts_with("Consensus params mismatch") || e.starts_with("Invalid cumulative work") || e.contains("Anchor hash mismatch") {
+                return AnchorClass::Fatal;
             }
             // Other mismatches may still be valid on a different parent/window. Buffer for reorg.
             AnchorClass::PossiblyAltFork
@@ -2078,7 +2081,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             needs_reorg_check = true;
                                         },
                                         AnchorClass::Fatal => {
-                                            net_log!("❌ Anchor validation from {} failed: fatal", peer_id);
+                                            net_routine!("❌ Anchor validation from {} failed: fatal", peer_id);
                                             crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
                                             score.record_validation_failure();
                                         }
