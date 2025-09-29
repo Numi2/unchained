@@ -75,6 +75,79 @@ use net_routine;
 const CONSENSUS_MISMATCH_LOG_THROTTLE_SECS: u64 = 30;
 static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+// Global consensus-mismatch aggregation to prevent log spam across many heights
+const CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS: u64 = 5;
+struct ConsensusMismatchAgg {
+    last_summary: Instant,
+    total_events: u64,
+    unique_heights: HashSet<u64>,
+    printed_window_detail: bool,
+    first_height_in_window: Option<u64>,
+    last_height_in_window: Option<u64>,
+    last_detail: Option<(u64, usize, u32, usize, u32)>,
+}
+static CONSENSUS_MISMATCH_AGG: Lazy<Mutex<ConsensusMismatchAgg>> = Lazy::new(|| {
+    Mutex::new(ConsensusMismatchAgg {
+        last_summary: Instant::now(),
+        total_events: 0,
+        unique_heights: HashSet::new(),
+        printed_window_detail: false,
+        first_height_in_window: None,
+        last_height_in_window: None,
+        last_detail: None,
+    })
+});
+
+fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_diff: usize, got_mem: u32) {
+    let now = Instant::now();
+    let mut print_detail_now: Option<String> = None;
+    let mut summary_now: Option<String> = None;
+
+    if let Ok(mut agg) = CONSENSUS_MISMATCH_AGG.lock() {
+        agg.total_events = agg.total_events.saturating_add(1);
+        agg.unique_heights.insert(height);
+        if agg.first_height_in_window.is_none() {
+            agg.first_height_in_window = Some(height);
+        }
+        agg.last_height_in_window = Some(height);
+        agg.last_detail = Some((height, exp_diff, exp_mem, got_diff, got_mem));
+
+        if !agg.printed_window_detail {
+            print_detail_now = Some(format!(
+                "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
+                height, exp_diff, exp_mem, got_diff, got_mem
+            ));
+            agg.printed_window_detail = true;
+        }
+
+        if now.duration_since(agg.last_summary).as_secs() >= CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS {
+            let total = agg.total_events;
+            let unique = agg.unique_heights.len();
+            let first = agg.first_height_in_window.unwrap_or(height);
+            let last = agg.last_height_in_window.unwrap_or(height);
+            let tail = if let Some((h, ed, em, gd, gm)) = agg.last_detail {
+                format!(" Last mismatch: #{} exp(diff {}, mem {}), got(diff {}, mem {}).", h, ed, em, gd, gm)
+            } else { String::new() };
+
+            summary_now = Some(format!(
+                "❌ Consensus mismatches: {} events across {} heights in last {}s ({}..{}).{}",
+                total, unique, CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS, first, last, tail
+            ));
+
+            agg.last_summary = now;
+            agg.total_events = 0;
+            agg.unique_heights.clear();
+            agg.printed_window_detail = false;
+            agg.first_height_in_window = None;
+            agg.last_height_in_window = None;
+            agg.last_detail = None;
+        }
+    }
+
+    if let Some(msg) = summary_now { net_log!("{}", msg); }
+    else if let Some(msg) = print_detail_now { net_log!("{}", msg); }
+}
+
 // Typed classification for ingress anchors to improve fork reconciliation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnchorClass {
@@ -443,7 +516,7 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         (prev.difficulty, prev.mem_kib)
     };
     if anchor.difficulty != exp_diff || anchor.mem_kib != exp_mem {
-        // Throttle noisy consensus mismatch logs per epoch height to avoid spam
+        // Throttle per-height logs and aggregate globally to reduce spam
         let now = Instant::now();
         let mut allow_log = true;
         if let Ok(mut map) = LAST_CONSENSUS_MISMATCH_LOGS.lock() {
@@ -453,12 +526,8 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
             }
             if allow_log { map.insert(anchor.num, now); }
         }
-        if allow_log {
-            net_log!(
-                "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
-                anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
-            );
-        }
+        // Always record into the aggregator; it will decide when to print
+        record_consensus_mismatch(anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib);
         return Err(format!(
             "Consensus params mismatch. Expected difficulty={}, mem_kib={}, got difficulty={}, mem_kib={}",
             exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
@@ -2273,6 +2342,54 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 st.peer_confirmed_tip = true;
                                             }
                                             needs_reorg_check = true;
+
+                                            // Aggressively penalize consensus-parameter mismatches even when treated as alt-fork
+                                            let mut applied_extra_penalty = false;
+                                            let mut is_consensus_mismatch = false;
+                                            // Best-effort local recomputation of expected params
+                                            let (exp_diff_opt, exp_mem_opt) = if a.num == 0 {
+                                                (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
+                                            } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                if a.num % RETARGET_INTERVAL == 0 {
+                                                    let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
+                                                    let start = a.num.saturating_sub(RETARGET_INTERVAL);
+                                                    let mut complete = true;
+                                                    for n in start..a.num {
+                                                        match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                                                            Ok(Some(x)) => recent.push(x),
+                                                            _ => { complete = false; break; }
+                                                        }
+                                                    }
+                                                    if complete && recent.len() as u64 == RETARGET_INTERVAL {
+                                                        let (d, m) = calculate_retarget_consensus(&recent);
+                                                        (Some(d), Some(m))
+                                                    } else { (None, None) }
+                                                } else {
+                                                    (Some(prev.difficulty), Some(prev.mem_kib))
+                                                }
+                                            } else { (None, None) };
+
+                                            if let (Some(ed), Some(em)) = (exp_diff_opt, exp_mem_opt) {
+                                                if a.difficulty != ed || a.mem_kib != em { is_consensus_mismatch = true; }
+                                            }
+
+                                            if is_consensus_mismatch {
+                                                net_log!(
+                                                    "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}. Applying heavier penalty",
+                                                    peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
+                                                );
+                                                crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                // Apply extra strikes to hasten ban
+                                                score.record_validation_failure();
+                                                score.record_validation_failure();
+                                                score.record_validation_failure();
+                                                applied_extra_penalty = true;
+                                            }
+
+                                            // If now banned due to accumulated failures, disconnect immediately
+                                            if applied_extra_penalty && score.is_banned() {
+                                                let _ = swarm.disconnect_peer_id(peer_id);
+                                            }
                                         },
                                         AnchorClass::Fatal => {
                                             net_log!("❌ Anchor validation from {} failed: fatal", peer_id);
