@@ -561,6 +561,8 @@ fn command_key(cmd: &NetworkCommand) -> Option<String> {
         NetworkCommand::RequestEpochLeaves(n) => Some(format!("leaves:{}", n)),
         NetworkCommand::RequestEpochSelected(n) => Some(format!("selected:{}", n)),
         NetworkCommand::RequestEpochCandidates(h) => Some(format!("cands:{}", hex::encode(&h[..8]))),
+        NetworkCommand::GossipPqhs2Init { to_peer, .. } => Some(format!("pqhs2-init:{}", to_peer)),
+        NetworkCommand::GossipPqhs2Resp { to_peer, .. } => Some(format!("pqhs2-resp:{}", to_peer)),
         _ => None,
     }
 }
@@ -736,6 +738,9 @@ enum NetworkCommand {
     GossipEpochCandidatesResponse(EpochCandidatesResponse),
     GossipRateLimited(RateLimitedMessage),
     GossipOffer(crate::wallet::OfferDocV1),
+    // Queueable PQ handshake v2 messages (to avoid AllQueuesFull drops)
+    GossipPqhs2Init { to_peer: String, payload: Vec<u8> },
+    GossipPqhs2Resp { to_peer: String, payload: Vec<u8> },
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
@@ -3265,6 +3270,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
                             NetworkCommand::GossipOffer(ofr) => (TOP_OFFERS_V1, bincode::serialize(&ofr).ok()),
+                            NetworkCommand::GossipPqhs2Init { payload, .. } => (TOP_PQHS2_INIT, Some(payload.clone())),
+                            NetworkCommand::GossipPqhs2Resp { payload, .. } => (TOP_PQHS2_RESP, Some(payload.clone())),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                             NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
                             NetworkCommand::RequestEpochByHash(hash) => (TOP_EPOCH_BY_HASH_REQUEST, bincode::serialize(&EpochByHash{ hash: *hash }).ok()),

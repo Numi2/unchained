@@ -17,7 +17,7 @@ sync_timeout_secs = 1800
 
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
-public_ip = "193.71.140.215"
+
 
 # Bootstrap nodes to connect to - add your seed nodes here for public deployment
 bootstrap = [ "/ip4/34.51.236.130/udp/31000/quic-v1/p2p/12D3KooWKt5kcwVA6SkDUmMGfmr3ouS9ydhHHgYPzSzuYHuvrhJg",
