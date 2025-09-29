@@ -2277,7 +2277,54 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         AnchorClass::Fatal => {
                                             net_log!("❌ Anchor validation from {} failed: fatal", peer_id);
                                             crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                            // Always record a failure
                                             score.record_validation_failure();
+
+                                            // Penalize consensus-parameter mismatches more aggressively
+                                            let mut applied_extra_penalty = false;
+                                            let mut is_consensus_mismatch = false;
+                                            // Best-effort local recomputation of expected params
+                                            let (exp_diff_opt, exp_mem_opt) = if a.num == 0 {
+                                                (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
+                                            } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                if a.num % RETARGET_INTERVAL == 0 {
+                                                    let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
+                                                    let start = a.num.saturating_sub(RETARGET_INTERVAL);
+                                                    let mut complete = true;
+                                                    for n in start..a.num {
+                                                        match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
+                                                            Ok(Some(x)) => recent.push(x),
+                                                            _ => { complete = false; break; }
+                                                        }
+                                                    }
+                                                    if complete && recent.len() as u64 == RETARGET_INTERVAL {
+                                                        let (d, m) = calculate_retarget_consensus(&recent);
+                                                        (Some(d), Some(m))
+                                                    } else { (None, None) }
+                                                } else {
+                                                    (Some(prev.difficulty), Some(prev.mem_kib))
+                                                }
+                                            } else { (None, None) };
+
+                                            if let (Some(ed), Some(em)) = (exp_diff_opt, exp_mem_opt) {
+                                                if a.difficulty != ed || a.mem_kib != em { is_consensus_mismatch = true; }
+                                            }
+
+                                            if is_consensus_mismatch {
+                                                net_log!(
+                                                    "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}. Applying heavier penalty",
+                                                    peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
+                                                );
+                                                // Apply extra strikes to hasten ban
+                                                score.record_validation_failure();
+                                                score.record_validation_failure();
+                                                applied_extra_penalty = true;
+                                            }
+
+                                            // If now banned due to accumulated failures, disconnect immediately
+                                            if applied_extra_penalty && score.is_banned() {
+                                                let _ = swarm.disconnect_peer_id(peer_id);
+                                            }
                                         }
                                     }
                                 },
