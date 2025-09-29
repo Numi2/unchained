@@ -77,6 +77,7 @@ static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> = Lazy::
 
 // Global consensus-mismatch aggregation to prevent log spam across many heights
 const CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS: u64 = 5;
+const CONSENSUS_MISMATCH_BAN_SECS: u64 = 24 * 60 * 60; // 24 hours
 struct ConsensusMismatchAgg {
     last_summary: Instant,
     total_events: u64,
@@ -390,6 +391,10 @@ impl PeerScore {
         if self.validation_failures >= self.max_validation_failures {
             self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(self.ban_duration_secs));
         }
+    }
+
+    fn ban_for(&mut self, secs: u64) {
+        self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(secs));
     }
 
     fn is_banned(&mut self) -> bool {
@@ -2382,7 +2387,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 // Apply extra strikes to hasten ban
                                                 score.record_validation_failure();
                                                 score.record_validation_failure();
-                                                score.record_validation_failure();
+                                                score.ban_for(CONSENSUS_MISMATCH_BAN_SECS);
                                                 applied_extra_penalty = true;
                                             }
 
@@ -2435,6 +2440,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 // Apply extra strikes to hasten ban
                                                 score.record_validation_failure();
                                                 score.record_validation_failure();
+                                                // Immediate 24h ban for consensus mismatch
+                                                score.ban_for(CONSENSUS_MISMATCH_BAN_SECS);
                                                 applied_extra_penalty = true;
                                             }
 

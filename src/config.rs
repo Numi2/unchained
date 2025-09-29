@@ -49,6 +49,7 @@ pub struct P2p {
     pub max_validation_failures_per_peer: u32,
     #[serde(default = "default_peer_ban_duration_secs")]
     pub peer_ban_duration_secs: u64,
+    // Removed consensus_mismatch_ban_secs; hard-coded in network layer
     #[serde(default = "default_rate_limit_window_secs")]
     pub rate_limit_window_secs: u64,
     #[serde(default = "default_max_messages_per_window")]
