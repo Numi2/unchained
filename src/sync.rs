@@ -131,21 +131,19 @@ pub fn spawn(
                                     // Clean up old recovery requests
                                     recovery_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(RECOVERY_REQUEST_INTERVAL_MS * 5));
                                     
-                                    // 1) Pull the direct parent of our local tip first
-                                    if local_epoch > 0 {
-                                        let parent = local_epoch;
-                                        if !recovery_requests.contains_key(&parent) {
-                                            request_epoch_bypass(&net, parent).await;
-                                            recovery_requests.insert(parent, now);
-                                            failed_epochs.insert(parent, now);
-                                        }
-                                        // 2) Also request a compact headers backfill around the parent to seed validation
-                                        // Use small window to avoid flooding
-                                        let window: u64 = 32;
-                                        let start = parent.saturating_sub(window);
-                                        let count = (parent.saturating_sub(start)).saturating_add(1) as u32;
-                                        net.request_epoch_headers_range(start, count).await;
+                                    // 1) Pull the direct child of our local tip first (next expected epoch)
+                                    let child = local_epoch.saturating_add(1);
+                                    if !recovery_requests.contains_key(&child) {
+                                        request_epoch_bypass(&net, child).await;
+                                        recovery_requests.insert(child, now);
+                                        failed_epochs.insert(child, now);
                                     }
+                                    // 2) Also request a compact headers backfill around that area to seed validation
+                                    // Use small window to avoid flooding
+                                    let window: u64 = 32;
+                                    let start = child.saturating_sub(window);
+                                    let count = (child.saturating_sub(start)).saturating_add(1) as u32;
+                                    net.request_epoch_headers_range(start, count).await;
 
                                     // 3) Request immediate next epochs with bypass mechanism to push forward
                                     let recovery_end = (local_epoch + RECOVERY_EPOCH_BATCH_SIZE).min(highest_seen);

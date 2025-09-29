@@ -35,6 +35,9 @@ use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use rocksdb::WriteBatch;
 use crate::metrics;
+use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
+use pqcrypto_traits::kem::{PublicKey as KyberPkTrait, SharedSecret as _, Ciphertext as _};
+use rand::RngCore as _;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -113,7 +116,7 @@ fn try_publish_gossip(
             || es.contains("InsufficientPeersForTopic")
             || es.contains("NoPeersSubscribedToTopic");
         // Treat temporary queue saturation as benign for noisy contexts
-        if (context == "epoch-leaves" || context == "epoch-leaves-req") && es.contains("AllQueuesFull") { return; }
+        if (context == "epoch-leaves" || context == "epoch-leaves-req" || context == "peer-addr") && es.contains("AllQueuesFull") { return; }
         if !is_insufficient {
             eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
@@ -154,6 +157,9 @@ const TOP_EPOCH_CANDIDATES_REQUEST: &str = "unchained/epoch_candidates_request/v
 const TOP_EPOCH_CANDIDATES_RESPONSE: &str = "unchained/epoch_candidates_response/v1"; // payload: EpochCandidatesResponse
 // Additive offers topic for signed offers (no renames to existing topics)
 const TOP_OFFERS_V1: &str = "unchained/offers/v1"; // payload: OfferDocV1
+// Pure post-quantum handshake (Kyber-only), additive topics
+const TOP_PQHS_INIT: &str = "unchained/handshake_pq/init/v1";
+const TOP_PQHS_RESP: &str = "unchained/handshake_pq/resp/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitedMessage {
@@ -172,6 +178,46 @@ struct PeerScore {
     ban_duration_secs: u64,
     rate_limit_window_secs: u64,
     max_messages_per_window: u32,
+}
+
+// --- Pure Post-Quantum Handshake (Kyber-only) ---
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PqhsInit {
+    // Sender's ephemeral Kyber public key bytes
+    kyber_pk: Vec<u8>,
+    // 8-byte random nonce to bind transcript
+    nonce8: [u8;8],
+    // Sender's PeerId as string for targeting (defense-in-depth)
+    to_peer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PqhsResp {
+    // Responder's Kyber encapsulation to initiator's pk
+    kem_ct: Vec<u8>,
+    // Responder's nonce contribution
+    nonce8: [u8;8],
+    // Responder's PeerId for targeting
+    to_peer: String,
+}
+
+#[derive(Clone)]
+struct PqhsState {
+    kyber_pk: KyberPk,
+    kyber_sk: KyberSk,
+}
+
+impl PqhsState {
+    fn new() -> Self {
+        let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
+        Self { kyber_pk, kyber_sk }
+    }
+}
+
+fn kdf_b3(label: &str, parts: &[&[u8]]) -> [u8;32] {
+    let mut h = blake3::Hasher::new_derive_key(label);
+    for p in parts { h.update(p); }
+    *h.finalize().as_bytes()
 }
 
 impl PeerScore {
@@ -432,7 +478,8 @@ fn command_key(cmd: &NetworkCommand) -> Option<String> {
         // For direct requests, bypass queue-level dedup/backoff entirely
         NetworkCommand::RequestEpochDirect(_n) => None,
         NetworkCommand::RequestEpochHeadersRange(range) => Some(format!("hdr:{}:{}", range.start_height, range.count)),
-        NetworkCommand::RequestEpochByHash(h) => Some(format!("epoch_by_hash:{}", hex::encode(&h[..8]))),
+        // Parent-by-hash can be extremely spammy during forks; throttle by full hash
+        NetworkCommand::RequestEpochByHash(h) => Some(format!("epoch_by_hash:{}", hex::encode(h))),
         NetworkCommand::RequestCoin(id) => Some(format!("coin:{}", hex::encode(&id[..8]))),
         NetworkCommand::RequestLatestEpoch => Some("latest".to_string()),
         NetworkCommand::RequestCoinProof(id) => Some(format!("proof:{}", hex::encode(&id[..8]))),
@@ -648,6 +695,7 @@ pub async fn spawn(
     let id_keys = load_or_create_peer_identity()?;
     let peer_id = PeerId::from(id_keys.public());
     net_log!("🆔 Local peer ID: {}", peer_id);
+    let pqhs = Arc::new(PqhsState::new());
     
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
@@ -683,6 +731,8 @@ pub async fn spawn(
         TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
         TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
         TOP_OFFERS_V1,
+        // PQ handshake topics (pure post-quantum)
+        TOP_PQHS_INIT, TOP_PQHS_RESP,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -694,6 +744,12 @@ pub async fn spawn(
         libp2p::swarm::Config::with_tokio_executor()
             .with_idle_connection_timeout(std::time::Duration::from_secs(555))
     );
+
+    // In-memory session keys per peer (pure PQ); used for future encryption layers
+    let session_keys: Arc<Mutex<HashMap<PeerId, ([u8;32], std::time::Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_inits: Arc<Mutex<HashMap<PeerId, ([u8;8], std::time::Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    const SESSION_TTL_SECS: u64 = 6 * 60 * 60; // 6 hours
+    const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
     
     let mut port = net_cfg.listen_port;
     loop {
@@ -820,6 +876,29 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
     const REORG_LOG_THROTTLE_SECS: u64 = 30;
     static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    // Throttle noisy per-(height,parent) fork parent mismatch logs and per-height unknown-parent logs
+    static LAST_FORK_PARENT_LOGS: Lazy<Mutex<std::collections::HashMap<(u64, [u8;8]), std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_UNKNOWN_PARENT_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    // Short-window tracker for peers repeatedly sending divergent parents at the same height
+    static DIVERGENT_PARENT_EVENTS: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    const DIVERGENT_WINDOW_SECS: u64 = 15;
+    const DIVERGENT_THRESHOLD: u32 = 8;
+
+    fn note_divergent_parent_event(peer_id: &PeerId, height: u64) -> u32 {
+        let now = std::time::Instant::now();
+        if let Ok(mut map) = DIVERGENT_PARENT_EVENTS.lock() {
+            map.retain(|_, (t, _)| now.duration_since(*t) < std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS));
+            let key = (peer_id.clone(), height);
+            let entry = map.entry(key).or_insert((now, 0));
+            if now.duration_since(entry.0) >= std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS) {
+                *entry = (now, 0);
+            }
+            entry.1 = entry.1.saturating_add(1);
+            entry.1
+        } else { 0 }
+    }
+    // Throttle fork/unknown-parent logs additionally by epoch hash to avoid repeated spam for same child
+    static LAST_FORK_CHILD_LOGS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     
     // Aggregate alternate-fork events per height and periodically emit a summary
     struct AltForkAgg {
@@ -1308,6 +1387,19 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     set.insert(peer_id);
                                     crate::metrics::PEERS.set(set.len() as i64);
                                 }
+                                // Initiate pure PQ handshake to this peer
+                                let mut nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce);
+                                let init = PqhsInit {
+                                    kyber_pk: pqhs.kyber_pk.as_bytes().to_vec(),
+                                    nonce8: nonce,
+                                    to_peer: peer_id.to_string(),
+                                };
+                                if let Ok(data) = bincode::serialize(&init) {
+                                    try_publish_gossip(&mut swarm, TOP_PQHS_INIT, data, "pqhs-init");
+                                }
+                                if let Ok(mut pending) = pending_inits.lock() {
+                                    pending.insert(peer_id, (nonce, std::time::Instant::now()));
+                                }
                             } else {
                                 net_routine!("🤝 Additional conn to {} ({} active)", peer_id, *entry);
                             }
@@ -1474,11 +1566,25 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     crate::metrics::PEERS.set(set.len() as i64);
                                 }
                             }
+                            // Drop session key for fully disconnected peers
+                            if fully_disconnected {
+                                let _ = session_keys.lock().map(|mut m| { m.remove(&peer_id); });
+                                let _ = pending_inits.lock().map(|mut m| { m.remove(&peer_id); });
+                            }
                             // Allow re-dial in the future
                             dialing_peers.remove(&peer_id);
                         },
                         SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
                             let Some(peer_id) = message.source else { continue };
+                            // Expire old session keys
+                            if let Ok(mut map) = session_keys.lock() {
+                                let now = std::time::Instant::now();
+                                map.retain(|_, (_k, t)| now.duration_since(*t) < std::time::Duration::from_secs(SESSION_TTL_SECS));
+                            }
+                            if let Ok(mut map) = pending_inits.lock() {
+                                let now = std::time::Instant::now();
+                                map.retain(|_, (_, t)| now.duration_since(*t) < std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS));
+                            }
                             if banned_peer_ids.contains(&peer_id) { continue; }
                             let topic_str = message.topic.as_str();
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
@@ -1486,6 +1592,61 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
                             match topic_str {
+                                TOP_PQHS_INIT => {
+                                    if let Ok(msg) = bincode::deserialize::<PqhsInit>(&message.data) {
+                                        // Ignore if not targeted at us
+                                        if msg.to_peer != swarm.local_peer_id().to_string() { continue; }
+                                        // Deduplicate repeated init by same peer within timeout
+                                        let mut allow = true;
+                                        if let Ok(mut pending) = pending_inits.lock() {
+                                            let now = std::time::Instant::now();
+                                            pending.retain(|_, (_, t)| now.duration_since(*t) < std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS));
+                                            if pending.contains_key(&peer_id) { allow = false; }
+                                            if allow { pending.insert(peer_id, (msg.nonce8, now)); }
+                                        }
+                                        if !allow { continue; }
+                                        // Parse initiator kyber pk
+                                        let Ok(init_pk) = KyberPk::from_bytes(&msg.kyber_pk) else { continue };
+                                        // Encapsulate and derive shared secret
+                                        let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&init_pk);
+                                        // Combine nonces into transcript
+                                        let mut resp_nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut resp_nonce);
+                                        // Derive session key as BLAKE3 over shared||nonces||peer ids
+                                        let sess = kdf_b3("unchained.pqhs.session.v1", &[
+                                            shared.as_bytes(),
+                                            &msg.nonce8,
+                                            &resp_nonce,
+                                            swarm.local_peer_id().to_bytes().as_slice(),
+                                            peer_id.to_bytes().as_slice(),
+                                        ]);
+                                        if let Ok(mut map) = session_keys.lock() { map.insert(peer_id, (sess, std::time::Instant::now())); }
+                                        // Respond with KEM ciphertext and responder nonce
+                                        let resp = PqhsResp { kem_ct: ct.as_bytes().to_vec(), nonce8: resp_nonce, to_peer: peer_id.to_string() };
+                                        if let Ok(data) = bincode::serialize(&resp) {
+                                            try_publish_gossip(&mut swarm, TOP_PQHS_RESP, data, "pqhs-resp");
+                                        }
+                                    }
+                                },
+                                TOP_PQHS_RESP => {
+                                    if let Ok(resp) = bincode::deserialize::<PqhsResp>(&message.data) {
+                                        if resp.to_peer != swarm.local_peer_id().to_string() { continue; }
+                                        // Decapsulate with our kyber sk
+                                        if let Ok(shared_key32) = crate::crypto::kem_decapsulate_kyber(&pqhs.kyber_sk, &resp.kem_ct) {
+                                            // We don't have initiator nonce here; handshake was initiated by us and included a nonce; use zeros if absent
+                                            let zero = if let Ok(mut pending) = pending_inits.lock() {
+                                                pending.remove(&peer_id).map(|(n, _)| n).unwrap_or([0u8;8])
+                                            } else { [0u8;8] };
+                                            let sess = kdf_b3("unchained.pqhs.session.v1", &[
+                                                &shared_key32,
+                                                &zero,
+                                                &resp.nonce8,
+                                                swarm.local_peer_id().to_bytes().as_slice(),
+                                                peer_id.to_bytes().as_slice(),
+                                            ]);
+                                            if let Ok(mut map) = session_keys.lock() { map.insert(peer_id, (sess, std::time::Instant::now())); }
+                                        }
+                                    }
+                                },
                                 TOP_OFFERS_V1 => {
                                     if let Ok(offer) = bincode::deserialize::<crate::wallet::OfferDocV1>(&message.data) {
                                         // Verify signature and maker binding before accepting/relaying
@@ -1621,19 +1782,88 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                     net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, linked to expected parent)", 
                                                         a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
                                                 } else {
-                                                    net_log!("🔀 Received fork epoch {} (hash: {}, cum_work: {}, diff: {}, linked to parent {} ≠ expected {})", 
-                                                        a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty, 
-                                                        hex::encode(&p_hash[..8]), hex::encode(&latest.hash[..8]));
-                                                    // Request the exact parent by hash to enable reorg
-                                                    let _ = command_tx.send(NetworkCommand::RequestEpochByHash(p_hash));
-                                                    // Also request aligned range for additional context
-                                                    request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
+                                                    // Throttle this per-(height,parent) to avoid spam
+                                                    let now = std::time::Instant::now();
+                                                    let mut allow_log = true;
+                                                    let mut short: [u8;8] = [0;8]; short.copy_from_slice(&p_hash[..8]);
+                                                    if let Ok(mut map) = LAST_FORK_PARENT_LOGS.lock() {
+                                                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                        if let Some(last) = map.get(&(a.num, short)) {
+                                                            if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                                                        }
+                                                        if allow_log { map.insert((a.num, short), now); }
+                                                    }
+                                                    if allow_log {
+                                                        // Per-child hash throttle to suppress repeated identical lines
+                                                        let mut allow_hash_log = true;
+                                                        if let Ok(mut map) = LAST_FORK_CHILD_LOGS.lock() {
+                                                            map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                            allow_hash_log = !map.contains_key(&a.hash);
+                                                            if allow_hash_log { map.insert(a.hash, now); }
+                                                        }
+                                                        if allow_hash_log {
+                                                            net_log!("🔀 Received fork epoch {} (hash: {}, cum_work: {}, diff: {}, linked to parent {} ≠ expected {})", 
+                                                                a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty, 
+                                                                hex::encode(&p_hash[..8]), hex::encode(&latest.hash[..8]));
+                                                        }
+                                                    }
+                                                    // Track divergent-parent spam per-peer/height and gate requests
+                                                    let div_count = note_divergent_parent_event(&peer_id, a.num);
+                                                    if div_count < DIVERGENT_THRESHOLD {
+                                                        // Request the exact parent by hash to enable reorg (dedup by recent-hash map)
+                                                        let mut allow_req = true;
+                                                        if let Ok(mut m) = RECENT_HASH_REQS.lock() {
+                                                            m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(HASH_REQ_DEDUP_SECS));
+                                                            allow_req = !m.contains_key(&p_hash);
+                                                            if allow_req { m.insert(p_hash, now); }
+                                                        }
+                                                        if allow_req {
+                                                            let _ = command_tx.send(NetworkCommand::RequestEpochByHash(p_hash));
+                                                        }
+                                                        // Also request aligned range for additional context
+                                                        request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
+                                                    } else {
+                                                        net_log!("🚫 Peer {} spamming divergent parent at height {} ({} in {}s) — penalizing", peer_id, a.num, div_count, DIVERGENT_WINDOW_SECS);
+                                                        crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                        score.record_validation_failure();
+                                                        continue;
+                                                    }
                                                 }
                                             } else {
-                                                net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)", 
-                                                    a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
-                                                // Parent missing: explicitly request backfill around parent height
-                                                request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
+                                                // Throttle unknown-parent logs per height
+                                                let now = std::time::Instant::now();
+                                                let mut allow_log = true;
+                                                if let Ok(mut map) = LAST_UNKNOWN_PARENT_LOGS.lock() {
+                                                    map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                    if let Some(last) = map.get(&a.num) {
+                                                        if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                                                    }
+                                                    if allow_log { map.insert(a.num, now); }
+                                                }
+                                                if allow_log {
+                                                    // Per-child hash throttle to suppress repeated identical lines
+                                                    let mut allow_hash_log = true;
+                                                    if let Ok(mut map) = LAST_FORK_CHILD_LOGS.lock() {
+                                                        map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                        allow_hash_log = !map.contains_key(&a.hash);
+                                                        if allow_hash_log { map.insert(a.hash, now); }
+                                                    }
+                                                    if allow_hash_log {
+                                                        net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)", 
+                                                            a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
+                                                    }
+                                                }
+                                                // Guard against spam before requesting backfill
+                                                let div_count = note_divergent_parent_event(&peer_id, a.num);
+                                                if div_count < DIVERGENT_THRESHOLD {
+                                                    // Explicit backfill around parent height
+                                                    request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
+                                                } else {
+                                                    net_log!("🚫 Peer {} spamming parent-unknown at height {} ({} in {}s) — penalizing", peer_id, a.num, div_count, DIVERGENT_WINDOW_SECS);
+                                                    crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                    score.record_validation_failure();
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
@@ -1832,6 +2062,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 } else {
                                                     REORG_BACKFILL
                                                 };
+                                                // Request parent directly to avoid dedup latency, and also header range for context
+                                                let _ = command_tx.send(NetworkCommand::RequestEpochDirect(parent_h));
                                                 request_aligned_range(&command_tx, parent_h, backfill_window);
                                             }
                                             needs_reorg_check = true;
@@ -2463,6 +2695,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 },
                                 TOP_EPOCH_BY_HASH_RESPONSE => if let Ok(a) = bincode::deserialize::<Anchor>(&message.data) {
                                     net_routine!("📥 Received epoch {} by hash from peer: {}", a.num, peer_id);
+                                    // Persist by-hash for immediate parent linkage during reorg
+                                    let _ = db.put("anchor", &a.hash, &a);
                                     // Buffer and trigger reorg attempt
                                     let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
                                     let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
