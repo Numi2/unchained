@@ -1253,8 +1253,16 @@ mod tests {
         assert_eq!(st.fee_basis_points, 10);
     }
 
-    fn dummy_wallet() -> crate::wallet::Wallet { panic!("not used in this unit test") }
-    fn dummy_net() -> crate::network::NetHandle { panic!("not used in this unit test") }
+    fn dummy_wallet() -> crate::wallet::Wallet {
+        // Create an ephemeral wallet in a temp DB with a fixed passphrase for CI
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("WALLET_PASSPHRASE", "test-passphrase");
+        let db = crate::storage::Store::open(&tmp.path().to_string_lossy()).unwrap();
+        crate::wallet::Wallet::load_or_create(Arc::new(db)).unwrap()
+    }
+    fn dummy_net() -> crate::network::NetHandle {
+        crate::network::testing_stub_handle()
+    }
 }
 
 

@@ -37,9 +37,6 @@ use rocksdb::WriteBatch;
 use crate::metrics;
 use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
 use pqcrypto_traits::kem::{PublicKey as KyberPkTrait, SharedSecret as _, Ciphertext as _};
-use pqcrypto_dilithium::dilithium3::{PublicKey as DiliPk, DetachedSignature as DiliDetachedSignature};
-use pqcrypto_dilithium::dilithium3::{detached_sign as dili_detached_sign, verify_detached_signature as dili_verify_detached};
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
 use rand::RngCore as _;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
@@ -160,9 +157,9 @@ const TOP_EPOCH_CANDIDATES_REQUEST: &str = "unchained/epoch_candidates_request/v
 const TOP_EPOCH_CANDIDATES_RESPONSE: &str = "unchained/epoch_candidates_response/v1"; // payload: EpochCandidatesResponse
 // Additive offers topic for signed offers (no renames to existing topics)
 const TOP_OFFERS_V1: &str = "unchained/offers/v1"; // payload: OfferDocV1
-// PQ Handshake v2 (Kyber + Dilithium-authenticated) topics
-const TOP_PQHS2_INIT: &str = "unchained/handshake_pq2/init/v1";
-const TOP_PQHS2_RESP: &str = "unchained/handshake_pq2/resp/v1";
+// Pure post-quantum handshake (Kyber-only), additive topics
+const TOP_PQHS_INIT: &str = "unchained/handshake_pq/init/v1";
+const TOP_PQHS_RESP: &str = "unchained/handshake_pq/resp/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitedMessage {
@@ -183,37 +180,25 @@ struct PeerScore {
     max_messages_per_window: u32,
 }
 
-// (v1 Kyber-only handshake removed)
-
-// --- Pure Post-Quantum Handshake v2 (Kyber + Dilithium signatures) ---
+// --- Pure Post-Quantum Handshake (Kyber-only) ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pqhs2Init {
+struct PqhsInit {
     // Sender's ephemeral Kyber public key bytes
     kyber_pk: Vec<u8>,
     // 8-byte random nonce to bind transcript
     nonce8: [u8;8],
-    // Target PeerId
+    // Sender's PeerId as string for targeting (defense-in-depth)
     to_peer: String,
-    // Sender's Dilithium3 public key bytes
-    dili_pk: Vec<u8>,
-    // Detached signature over domain-separated transcript
-    sig: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pqhs2Resp {
+struct PqhsResp {
     // Responder's Kyber encapsulation to initiator's pk
     kem_ct: Vec<u8>,
-    // Echo of initiator's nonce to bind the same transcript
-    initiator_nonce8: [u8;8],
     // Responder's nonce contribution
     nonce8: [u8;8],
-    // Target PeerId (the initiator)
+    // Responder's PeerId for targeting
     to_peer: String,
-    // Responder's Dilithium3 public key bytes
-    dili_pk: Vec<u8>,
-    // Detached signature over domain-separated transcript
-    sig: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -233,65 +218,6 @@ fn kdf_b3(label: &str, parts: &[&[u8]]) -> [u8;32] {
     let mut h = blake3::Hasher::new_derive_key(label);
     for p in parts { h.update(p); }
     *h.finalize().as_bytes()
-}
-
-// Build domain-separated signable transcripts for PQHS v2
-fn pqhs2_init_signable(signer: &PeerId, peer: &PeerId, kyber_pk: &[u8], nonce8: &[u8;8]) -> Vec<u8> {
-    fn lp(len: usize) -> [u8;4] { (len as u32).to_le_bytes() }
-    let mut out = Vec::with_capacity(64 + kyber_pk.len());
-    out.extend_from_slice(b"unchained.pqhs2.init.v1");
-    let a = signer.to_bytes();
-    let b = peer.to_bytes();
-    out.extend_from_slice(&lp(a.len())); out.extend_from_slice(&a);
-    out.extend_from_slice(&lp(b.len())); out.extend_from_slice(&b);
-    out.extend_from_slice(&lp(kyber_pk.len())); out.extend_from_slice(kyber_pk);
-    out.extend_from_slice(nonce8);
-    out
-}
-
-fn pqhs2_resp_signable(signer: &PeerId, peer: &PeerId, kem_ct: &[u8], initiator_nonce8: &[u8;8], resp_nonce8: &[u8;8]) -> Vec<u8> {
-    fn lp(len: usize) -> [u8;4] { (len as u32).to_le_bytes() }
-    let mut out = Vec::with_capacity(64 + kem_ct.len());
-    out.extend_from_slice(b"unchained.pqhs2.resp.v1");
-    let a = signer.to_bytes();
-    let b = peer.to_bytes();
-    out.extend_from_slice(&lp(a.len())); out.extend_from_slice(&a);
-    out.extend_from_slice(&lp(b.len())); out.extend_from_slice(&b);
-    out.extend_from_slice(&lp(kem_ct.len())); out.extend_from_slice(kem_ct);
-    out.extend_from_slice(initiator_nonce8);
-    out.extend_from_slice(resp_nonce8);
-    out
-}
-
-// Persisted Dilithium identity for network-level authentication (separate from libp2p Ed25519)
-const DILI3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
-const DILI3_SK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
-
-fn load_or_create_dili_identity() -> anyhow::Result<(pqcrypto_dilithium::dilithium3::PublicKey, pqcrypto_dilithium::dilithium3::SecretKey)> {
-    use std::path::Path;
-    let path = "network_dili.key";
-    if Path::new(path).exists() {
-        let key_data = std::fs::read(path)?;
-        if key_data.len() != DILI3_PK_BYTES + DILI3_SK_BYTES { return Err(anyhow::anyhow!("invalid network_dili.key length")); }
-        let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&key_data[..DILI3_PK_BYTES])
-            .map_err(|_| anyhow::anyhow!("invalid Dilithium3 PK bytes"))?;
-        let sk = pqcrypto_dilithium::dilithium3::SecretKey::from_bytes(&key_data[DILI3_PK_BYTES..])
-            .map_err(|_| anyhow::anyhow!("invalid Dilithium3 SK bytes"))?;
-        return Ok((pk, sk));
-    }
-    let (pk, sk) = pqcrypto_dilithium::dilithium3::keypair();
-    let mut buf = Vec::with_capacity(DILI3_PK_BYTES + DILI3_SK_BYTES);
-    buf.extend_from_slice(pk.as_bytes());
-    buf.extend_from_slice(sk.as_bytes());
-    std::fs::write(path, &buf)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok((pk, sk))
 }
 
 impl PeerScore {
@@ -703,28 +629,6 @@ pub struct Network {
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
 
-#[cfg(test)]
-pub fn testing_stub_handle() -> NetHandle {
-    use tokio::sync::{broadcast, mpsc};
-    let (spend_tx, _) = broadcast::channel(1);
-    let (anchor_tx, _) = broadcast::channel(1);
-    let (proof_tx, _) = broadcast::channel(1);
-    let (offers_tx, _) = broadcast::channel::<crate::wallet::OfferDocV1>(1);
-    let (rate_limited_tx, _) = broadcast::channel(1);
-    let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
-    let (command_tx, _) = mpsc::unbounded_channel();
-    Arc::new(Network{
-        anchor_tx,
-        proof_tx,
-        spend_tx,
-        rate_limited_tx,
-        headers_tx,
-        offers_tx,
-        command_tx,
-        connected_peers: Arc::new(Mutex::new(HashSet::new())),
-    })
-}
-
 #[derive(Debug, Clone)]
 enum NetworkCommand {
     GossipAnchor(Anchor),
@@ -792,11 +696,6 @@ pub async fn spawn(
     let peer_id = PeerId::from(id_keys.public());
     net_log!("🆔 Local peer ID: {}", peer_id);
     let pqhs = Arc::new(PqhsState::new());
-    // Load Dilithium identity for PQHS v2 (Dilithium-authenticated handshake)
-    let (dili_pk_net, dili_sk_net) = match load_or_create_dili_identity() {
-        Ok(v) => v,
-        Err(e) => { eprintln!("failed to load Dilithium network identity: {}", e); return Err(e); }
-    };
     
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
@@ -832,8 +731,8 @@ pub async fn spawn(
         TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
         TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
         TOP_OFFERS_V1,
-        // PQ handshake v2 topics (Dilithium-authenticated)
-        TOP_PQHS2_INIT, TOP_PQHS2_RESP,
+        // PQ handshake topics (pure post-quantum)
+        TOP_PQHS_INIT, TOP_PQHS_RESP,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -1488,22 +1387,19 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     set.insert(peer_id);
                                     crate::metrics::PEERS.set(set.len() as i64);
                                 }
-                                // Initiate PQ handshake v2 (Dilithium-authenticated); also send v1 for backward compatibility
+                                // Initiate pure PQ handshake to this peer
                                 let mut nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce);
-                                // v2 init
-                                let init2_signable = pqhs2_init_signable(&swarm.local_peer_id(), &peer_id, pqhs.kyber_pk.as_bytes(), &nonce);
-                                let sig2 = dili_detached_sign(&init2_signable, &dili_sk_net);
-                                let init2 = Pqhs2Init {
+                                let init = PqhsInit {
                                     kyber_pk: pqhs.kyber_pk.as_bytes().to_vec(),
                                     nonce8: nonce,
                                     to_peer: peer_id.to_string(),
-                                    dili_pk: DiliPk::from_bytes(dili_pk_net.as_bytes()).unwrap_or(dili_pk_net.clone()).as_bytes().to_vec(),
-                                    sig: sig2.as_bytes().to_vec(),
                                 };
-                                if let Ok(data2) = bincode::serialize(&init2) {
-                                    try_publish_gossip(&mut swarm, TOP_PQHS2_INIT, data2, "pqhs2-init");
+                                if let Ok(data) = bincode::serialize(&init) {
+                                    try_publish_gossip(&mut swarm, TOP_PQHS_INIT, data, "pqhs-init");
                                 }
-                                if let Ok(mut pending) = pending_inits.lock() { pending.insert(peer_id, (nonce, std::time::Instant::now())); }
+                                if let Ok(mut pending) = pending_inits.lock() {
+                                    pending.insert(peer_id, (nonce, std::time::Instant::now()));
+                                }
                             } else {
                                 net_routine!("🤝 Additional conn to {} ({} active)", peer_id, *entry);
                             }
@@ -1696,85 +1592,56 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
                             
                             match topic_str {
-                                TOP_PQHS2_INIT => {
-                                    if let Ok(msg) = bincode::deserialize::<Pqhs2Init>(&message.data) {
+                                TOP_PQHS_INIT => {
+                                    if let Ok(msg) = bincode::deserialize::<PqhsInit>(&message.data) {
+                                        // Ignore if not targeted at us
                                         if msg.to_peer != swarm.local_peer_id().to_string() { continue; }
-                                        // Parse initiator keys
-                                        let Ok(init_pk) = KyberPk::from_bytes(&msg.kyber_pk) else { continue };
-                                        let Ok(remote_dili_pk) = DiliPk::from_bytes(&msg.dili_pk) else { continue };
-                                        // Verify Dilithium signature over transcript
-                                        let signable = pqhs2_init_signable(&peer_id, swarm.local_peer_id(), &msg.kyber_pk, &msg.nonce8);
-                                        if let Ok(sig) = DiliDetachedSignature::from_bytes(&msg.sig) {
-                                            if dili_verify_detached(&sig, &signable, &remote_dili_pk).is_err() { continue; }
-                                        } else { continue; }
-                                        // Rate limit duplicate inits
+                                        // Deduplicate repeated init by same peer within timeout
                                         let mut allow = true;
                                         if let Ok(mut pending) = pending_inits.lock() {
                                             let now = std::time::Instant::now();
                                             pending.retain(|_, (_, t)| now.duration_since(*t) < std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS));
                                             if pending.contains_key(&peer_id) { allow = false; }
-                                            if allow { pending.insert(peer_id, (msg.nonce8, std::time::Instant::now())); }
+                                            if allow { pending.insert(peer_id, (msg.nonce8, now)); }
                                         }
                                         if !allow { continue; }
+                                        // Parse initiator kyber pk
+                                        let Ok(init_pk) = KyberPk::from_bytes(&msg.kyber_pk) else { continue };
                                         // Encapsulate and derive shared secret
                                         let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&init_pk);
-                                        // Responder nonce
+                                        // Combine nonces into transcript
                                         let mut resp_nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut resp_nonce);
-                                        // Sign response transcript
-                                        let signable_resp = pqhs2_resp_signable(swarm.local_peer_id(), &peer_id, ct.as_bytes(), &msg.nonce8, &resp_nonce);
-                                        let sig = dili_detached_sign(&signable_resp, &dili_sk_net);
-                                        let resp = Pqhs2Resp {
-                                            kem_ct: ct.as_bytes().to_vec(),
-                                            initiator_nonce8: msg.nonce8,
-                                            nonce8: resp_nonce,
-                                            to_peer: peer_id.to_string(),
-                                            dili_pk: dili_pk_net.as_bytes().to_vec(),
-                                            sig: sig.as_bytes().to_vec(),
-                                        };
-                                        // Derive session key bound to roles (initiator -> responder) and nonces
-                                        let sess = kdf_b3("unchained.pqhs2.session.v1", &[
-                                            // Kyber shared secret
+                                        // Derive session key as BLAKE3 over shared||nonces||peer ids
+                                        let sess = kdf_b3("unchained.pqhs.session.v1", &[
                                             shared.as_bytes(),
-                                            // Initiator/responder libp2p PeerIds (fixed order)
-                                            peer_id.to_bytes().as_slice(),                 // initiator
-                                            swarm.local_peer_id().to_bytes().as_slice(),   // responder
-                                            // Initiator/responder nonces (fixed order)
-                                            &msg.nonce8,                                   // initiator nonce
-                                            &resp_nonce,                                    // responder nonce
-                                            // Dilithium public keys (fixed order)
-                                            remote_dili_pk.as_bytes(),                      // initiator
-                                            dili_pk_net.as_bytes(),                          // responder
+                                            &msg.nonce8,
+                                            &resp_nonce,
+                                            swarm.local_peer_id().to_bytes().as_slice(),
+                                            peer_id.to_bytes().as_slice(),
                                         ]);
                                         if let Ok(mut map) = session_keys.lock() { map.insert(peer_id, (sess, std::time::Instant::now())); }
-                                        if let Ok(data) = bincode::serialize(&resp) { try_publish_gossip(&mut swarm, TOP_PQHS2_RESP, data, "pqhs2-resp"); }
+                                        // Respond with KEM ciphertext and responder nonce
+                                        let resp = PqhsResp { kem_ct: ct.as_bytes().to_vec(), nonce8: resp_nonce, to_peer: peer_id.to_string() };
+                                        if let Ok(data) = bincode::serialize(&resp) {
+                                            try_publish_gossip(&mut swarm, TOP_PQHS_RESP, data, "pqhs-resp");
+                                        }
                                     }
                                 },
-                                TOP_PQHS2_RESP => {
-                                    if let Ok(resp) = bincode::deserialize::<Pqhs2Resp>(&message.data) {
+                                TOP_PQHS_RESP => {
+                                    if let Ok(resp) = bincode::deserialize::<PqhsResp>(&message.data) {
                                         if resp.to_peer != swarm.local_peer_id().to_string() { continue; }
-                                        // Verify responder signature
-                                        let Ok(remote_dili_pk) = DiliPk::from_bytes(&resp.dili_pk) else { continue };
-                                        let signable = pqhs2_resp_signable(&peer_id, swarm.local_peer_id(), &resp.kem_ct, &resp.initiator_nonce8, &resp.nonce8);
-                                        let Ok(sig) = DiliDetachedSignature::from_bytes(&resp.sig) else { continue };
-                                        if dili_verify_detached(&sig, &signable, &remote_dili_pk).is_err() { continue; }
-                                        // Decapsulate raw Kyber shared secret and derive session key bound to roles and nonces
-                                        if let Ok(ct) = pqcrypto_kyber::kyber768::Ciphertext::from_bytes(&resp.kem_ct) {
-                                            let shared = pqcrypto_kyber::kyber768::decapsulate(&ct, &pqhs.kyber_sk);
-                                            let initiator_nonce = if let Ok(mut pending) = pending_inits.lock() {
+                                        // Decapsulate with our kyber sk
+                                        if let Ok(shared_key32) = crate::crypto::kem_decapsulate_kyber(&pqhs.kyber_sk, &resp.kem_ct) {
+                                            // We don't have initiator nonce here; handshake was initiated by us and included a nonce; use zeros if absent
+                                            let zero = if let Ok(mut pending) = pending_inits.lock() {
                                                 pending.remove(&peer_id).map(|(n, _)| n).unwrap_or([0u8;8])
                                             } else { [0u8;8] };
-                                            let sess = kdf_b3("unchained.pqhs2.session.v1", &[
-                                                // Kyber shared secret
-                                                shared.as_bytes(),
-                                                // Initiator/responder libp2p PeerIds (fixed order)
-                                                swarm.local_peer_id().to_bytes().as_slice(),  // initiator
-                                                peer_id.to_bytes().as_slice(),                // responder
-                                                // Initiator/responder nonces (fixed order)
-                                                &initiator_nonce,                              // initiator nonce
-                                                &resp.nonce8,                                  // responder nonce
-                                                // Dilithium public keys (fixed order)
-                                                dili_pk_net.as_bytes(),                         // initiator
-                                                remote_dili_pk.as_bytes(),                      // responder
+                                            let sess = kdf_b3("unchained.pqhs.session.v1", &[
+                                                &shared_key32,
+                                                &zero,
+                                                &resp.nonce8,
+                                                swarm.local_peer_id().to_bytes().as_slice(),
+                                                peer_id.to_bytes().as_slice(),
                                             ]);
                                             if let Ok(mut map) = session_keys.lock() { map.insert(peer_id, (sess, std::time::Instant::now())); }
                                         }
@@ -3688,87 +3555,4 @@ impl OrphanBuffer {
         }
         true
     }
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use pqcrypto_kyber::kyber768;
-	use pqcrypto_dilithium::dilithium3;
-
-	fn kdf_roles(shared: &[u8], initiator_peer: &PeerId, responder_peer: &PeerId, init_nonce: &[u8;8], resp_nonce: &[u8;8], initiator_dpk: &DiliPk, responder_dpk: &DiliPk) -> [u8;32] {
-		kdf_b3("unchained.pqhs2.session.v1", &[
-			shared,
-			initiator_peer.to_bytes().as_slice(),
-			responder_peer.to_bytes().as_slice(),
-			init_nonce,
-			resp_nonce,
-			initiator_dpk.as_bytes(),
-			responder_dpk.as_bytes(),
-		])
-	}
-
-	#[test]
-	fn pqhs2_session_keys_match_and_sig_verifies() {
-		// Generate identities
-		let id_i = identity::Keypair::generate_ed25519();
-		let id_r = identity::Keypair::generate_ed25519();
-		let peer_i = PeerId::from(id_i.public());
-		let peer_r = PeerId::from(id_r.public());
-		// Kyber keypairs
-		let (pk_i, sk_i) = kyber768::keypair();
-		let (pk_r, sk_r) = kyber768::keypair();
-		// Dilithium identities
-		let (dpk_i, dsk_i) = dilithium3::keypair();
-		let (dpk_r, dsk_r) = dilithium3::keypair();
-
-		// Initiator builds init and signs
-		let mut nonce_i = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce_i);
-		let init_signable = pqhs2_init_signable(&peer_i, &peer_r, pk_i.as_bytes(), &nonce_i);
-		let sig_i = dili_detached_sign(&init_signable, &dsk_i);
-		assert!(dili_verify_detached(&DiliDetachedSignature::from_bytes(sig_i.as_bytes()).unwrap(), &init_signable, &dpk_i).is_ok());
-
-		// Responder encapsulates and signs response
-		let (shared_r, ct) = kyber768::encapsulate(&pk_i);
-		let mut nonce_r = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce_r);
-		let resp_signable = pqhs2_resp_signable(&peer_r, &peer_i, ct.as_bytes(), &nonce_i, &nonce_r);
-		let sig_r = dili_detached_sign(&resp_signable, &dsk_r);
-		assert!(dili_verify_detached(&DiliDetachedSignature::from_bytes(sig_r.as_bytes()).unwrap(), &resp_signable, &dpk_r).is_ok());
-		let sess_r = kdf_roles(shared_r.as_bytes(), &peer_i, &peer_r, &nonce_i, &nonce_r, &dpk_i, &dpk_r);
-
-		// Initiator decapsulates and derives session
-		let ct_parsed = kyber768::Ciphertext::from_bytes(ct.as_bytes()).unwrap();
-		let shared_i = kyber768::decapsulate(&ct_parsed, &sk_i);
-		let sess_i = kdf_roles(shared_i.as_bytes(), &peer_i, &peer_r, &nonce_i, &nonce_r, &dpk_i, &dpk_r);
-		assert_eq!(sess_i, sess_r);
-	}
-
-	#[test]
-	fn pqhs2_rejects_bad_signature() {
-		let id_i = identity::Keypair::generate_ed25519();
-		let id_r = identity::Keypair::generate_ed25519();
-		let peer_i = PeerId::from(id_i.public());
-		let peer_r = PeerId::from(id_r.public());
-		let (pk_i, sk_i) = kyber768::keypair();
-		let (pk_r, _sk_r) = kyber768::keypair();
-		let (dpk_i, _dsk_i) = dilithium3::keypair();
-		let (dpk_r, _dsk_r) = dilithium3::keypair();
-
-		let mut nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce);
-		let mut bogus_sig = vec![0u8; pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES];
-		rand::rngs::OsRng.fill_bytes(&mut bogus_sig);
-		let init = Pqhs2Init {
-			kyber_pk: pk_r.as_bytes().to_vec(),
-			nonce8: nonce,
-			to_peer: peer_r.to_string(),
-			dili_pk: dpk_i.as_bytes().to_vec(),
-			sig: bogus_sig,
-		};
-		// Verifier should fail
-		let signable = pqhs2_init_signable(&peer_i, &peer_r, &init.kyber_pk, &init.nonce8);
-		let parsed_pk = DiliPk::from_bytes(&init.dili_pk).unwrap();
-		assert!(DiliDetachedSignature::from_bytes(&init.sig).is_ok());
-		let sig = DiliDetachedSignature::from_bytes(&init.sig).unwrap();
-		assert!(dili_verify_detached(&sig, &signable, &parsed_pk).is_err());
-	}
 }
