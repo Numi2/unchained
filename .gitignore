@@ -3,6 +3,8 @@ peer_identity.key
 pq_identity.enc
 node_kyber.enc
 context.md
+network_dili.key
+src/network/runtime.rs
 data/
 test_stealth_address.txt
 .test_stealth_address.txt
