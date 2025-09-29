@@ -579,7 +579,9 @@ const BACKOFF_CAP_MS: u64 = 16000;
 
 fn command_key(cmd: &NetworkCommand) -> Option<String> {
     match cmd {
-        NetworkCommand::RequestEpoch(n) | NetworkCommand::RequestEpochDirect(n) => Some(format!("epoch:{}", n)),
+        NetworkCommand::RequestEpoch(n) => Some(format!("epoch:{}", n)),
+        // Do not assign a dedup/backoff key to RequestEpochDirect; it must bypass
+        NetworkCommand::RequestEpochDirect(_n) => None,
         NetworkCommand::RequestEpochHeadersRange(range) => Some(format!("hdr:{}:{}", range.start_height, range.count)),
         NetworkCommand::RequestEpochByHash(h) => Some(format!("epoch_by_hash:{}", hex::encode(&h[..8]))),
         NetworkCommand::RequestCoin(id) => Some(format!("coin:{}", hex::encode(&id[..8]))),
