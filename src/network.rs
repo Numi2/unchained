@@ -20,6 +20,8 @@ use libp2p::{
     gossipsub,
     identity, quic, PeerId, Swarm, Transport, Multiaddr,
     futures::StreamExt, core::muxing::StreamMuxerBox, swarm::SwarmEvent,
+    request_response::{self, ProtocolSupport, Behaviour as RequestResponse, Event as RequestResponseEvent, Message},
+    StreamProtocol,
 };
 use libp2p::gossipsub::{
     IdentTopic, MessageAuthenticity, IdentityTransform,
@@ -38,6 +40,13 @@ use serde::{Serialize, Deserialize};
 use once_cell::sync::Lazy;
 use rocksdb::WriteBatch;
 use crate::metrics;
+
+// Combined network behavior for gossipsub and handshakes
+#[derive(libp2p::swarm::NetworkBehaviour)]
+pub struct CombinedBehaviour {
+    pub gossipsub: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>,
+    pub handshake: RequestResponse<request_response::json::codec::Codec<HandshakeRequest, HandshakeResponse>>,
+}
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -219,12 +228,12 @@ fn validate_segment_consensus(
 
 #[allow(dead_code)]
 fn try_publish_gossip(
-    swarm: &mut Swarm<Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>>,
+    swarm: &mut Swarm<CombinedBehaviour>,
     topic: &str,
     data: Vec<u8>,
     context: &str,
 ) {
-    if let Err(e) = swarm.behaviour_mut().publish(IdentTopic::new(topic), data) {
+    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(topic), data) {
         let es = e.to_string();
         let is_insufficient = es.contains("InsufficientPeers")
             || es.contains("InsufficientPeersForTopic")
@@ -276,6 +285,24 @@ const TOP_OFFERS_V1: &str = "unchained/offers/v1"; // payload: OfferDocV1
 pub struct RateLimitedMessage {
     pub content: String,
 }
+
+// Handshake protocol messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeRequest {
+    pub version: u32,
+    pub peer_id: String,
+    pub latest_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeResponse {
+    pub version: u32,
+    pub latest_epoch: Option<u64>,
+    pub accepted: bool,
+}
+
+// Use the built-in JSON codec for simplicity
+pub type HandshakeCodec = request_response::json::codec::Codec<HandshakeRequest, HandshakeResponse>;
 
 // Removed unused TopicQuota
 
@@ -698,6 +725,7 @@ pub struct Network {
     offers_tx: broadcast::Sender<crate::wallet::OfferDocV1>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
+    handshake_tx: mpsc::UnboundedSender<(PeerId, HandshakeRequest)>,
 }
 
 #[derive(Debug, Clone)]
@@ -727,6 +755,7 @@ enum NetworkCommand {
     RequestEpochCandidates([u8; 32]),
     RequestEpochDirect(u64),  // Bypass deduplication
     RedialBootstraps,
+    InitiateHandshake(PeerId),
 }
 
 fn load_or_create_peer_identity() -> anyhow::Result<identity::Keypair> {
@@ -769,7 +798,8 @@ pub async fn spawn(
     
     let mut qcfg = quic::Config::new(&id_keys);
     qcfg.keep_alive_interval = std::time::Duration::from_secs(10);
-    qcfg.max_idle_timeout = 300;
+    // libp2p-quic expects max_idle_timeout in milliseconds. 300_000 ms = 300s.
+    qcfg.max_idle_timeout = 300_000;
     let transport = quic::tokio::Transport::new(qcfg)
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -789,6 +819,15 @@ pub async fn spawn(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
     ).map_err(|e| anyhow::anyhow!(e))?;
+    
+    // Create handshake request-response protocol
+    let handshake_protocol = StreamProtocol::new("/unchained/handshake/1.0.0");
+    let handshake_config = request_response::Config::default();
+    let handshake = RequestResponse::with_codec(
+        request_response::json::codec::Codec::default(),
+        std::iter::once((handshake_protocol, ProtocolSupport::Full)),
+        handshake_config,
+    );
     for t in [
         TOP_ANCHOR, TOP_COIN, TOP_SPEND,
         TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
@@ -808,9 +847,15 @@ pub async fn spawn(
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
+    // Create combined behavior instance
+    let behaviour = CombinedBehaviour {
+        gossipsub: gs,
+        handshake,
+    };
+
     let mut swarm = Swarm::new(
         transport,
-        gs,
+        behaviour,
         peer_id,
         libp2p::swarm::Config::with_tokio_executor()
             .with_idle_connection_timeout(std::time::Duration::from_secs(555))
@@ -898,7 +943,8 @@ pub async fn spawn(
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (headers_tx, _headers_rx) = broadcast::channel::<EpochHeadersBatch>(1024);
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), headers_tx: headers_tx.clone(), offers_tx: offers_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let (handshake_tx, mut handshake_rx) = mpsc::unbounded_channel();
+    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), headers_tx: headers_tx.clone(), offers_tx: offers_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone(), handshake_tx: handshake_tx.clone() });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
@@ -1551,6 +1597,14 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     }
                                 }
                             }
+                        // Initiate proper handshake with newly connected peer
+                        let latest_epoch = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|a| a.num);
+                        let handshake_req = HandshakeRequest {
+                            version: 1,
+                            peer_id: peer_id.to_string(),
+                            latest_epoch,
+                        };
+                        let _ = handshake_tx.send((peer_id, handshake_req));
                             let mut still_pending = VecDeque::new();
                             while let Some(cmd) = pending_commands.pop_front() {
                                 let (t, data) = match &cmd {
@@ -1576,6 +1630,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                                     NetworkCommand::RequestEpochDirect(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     NetworkCommand::RedialBootstraps => (TOP_ANCHOR, None), // no-op for pending queue
+                                    NetworkCommand::InitiateHandshake(_) => (TOP_ANCHOR, None), // handled separately
                                     // commitment gossip removed
                                 };
                                 // Local fast-path: directly serve proof to local subscribers when we request it
@@ -1591,8 +1646,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             let _ = proof_tx.send(resp.clone());
                                                             if let Ok(bytes) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
                                                             }
                                                             responded_local = true;
@@ -1605,8 +1660,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             let _ = proof_tx.send(resp.clone());
                                                             if let Ok(bytes) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
                                                             }
                                                             responded_local = true;
@@ -1621,8 +1676,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                                 let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                                 let _ = proof_tx.send(resp.clone());
                                                                 if let Ok(bytes) = bincode::serialize(&resp) {
-                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
-                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                    swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                    swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
                                                                     crate::metrics::PROOFS_SERVED.inc();
                                                                 }
                                                                 responded_local = true;
@@ -1644,8 +1699,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                                     let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                                     let _ = proof_tx.send(resp.clone());
                                                                     if let Ok(bytes) = bincode::serialize(&resp) {
-                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
-                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
+                                                                        swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), bytes.clone()).ok();
+                                                                        swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), bytes).ok();
                                                                         crate::metrics::PROOFS_SERVED.inc();
                                                                     }
                                                                 }
@@ -1658,7 +1713,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     }
                                 }
                                 if let Some(d) = data {
-                                    if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
+                                    if swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(t), d).is_err() {
                                         still_pending.push_back(cmd);
                                     }
                                 }
@@ -1684,30 +1739,42 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     set.remove(&peer_id);
                                     crate::metrics::PEERS.set(set.len() as i64);
                                 }
+                                // Update flapping counters and quarantine if necessary (only when fully disconnected)
+                                let now = Instant::now();
+                                let entry = flapping_counts.entry(peer_id).or_insert((0, now));
+                                // Reset the window if elapsed
+                                if now.duration_since(entry.1) > std::time::Duration::from_secs(FLAP_WINDOW_SECS) {
+                                    *entry = (0, now);
+                                }
+                                entry.0 = entry.0.saturating_add(1);
+                                // Detect if this peer is one of the configured bootstraps
+                                let is_bootstrap = net_cfg.bootstrap.iter().any(|addr| {
+                                    if let Some(id_str) = addr.split("/p2p/").last() {
+                                        if let Ok(pid) = PeerId::from_str(id_str) { return pid == peer_id; }
+                                    }
+                                    false
+                                });
+                                if entry.0 >= FLAP_THRESHOLD {
+                                    if !is_bootstrap {
+                                        let base = quarantine_exp.get(&peer_id).copied().unwrap_or(QUARANTINE_MIN_SECS);
+                                        let dur_secs = std::cmp::min(base, QUARANTINE_MAX_SECS);
+                                        quarantined_peers.insert(peer_id, now + std::time::Duration::from_secs(dur_secs));
+                                        quarantine_exp.insert(peer_id, std::cmp::min(dur_secs.saturating_mul(2), QUARANTINE_MAX_SECS));
+                                        net_log!("🛑 Quarantining peer {} for {}s due to flapping ({} disconnects/{:?})", peer_id, dur_secs, entry.0, std::time::Duration::from_secs(FLAP_WINDOW_SECS));
+                                    } else {
+                                        net_log!("⚠️  Bootstrap peer {} disconnecting frequently; skipping quarantine", peer_id);
+                                    }
+                                    // Reset counter for next window
+                                    *entry = (0, now);
+                                }
+                                // Record recent disconnect to avoid immediate re-dials
+                                recent_peer_disconnects.insert(peer_id, Instant::now());
                             }
-                            // Update flapping counters and quarantine if necessary
-                            let now = Instant::now();
-                            let entry = flapping_counts.entry(peer_id).or_insert((0, now));
-                            // Reset the window if elapsed
-                            if now.duration_since(entry.1) > std::time::Duration::from_secs(FLAP_WINDOW_SECS) {
-                                *entry = (0, now);
-                            }
-                            entry.0 = entry.0.saturating_add(1);
-                            if entry.0 >= FLAP_THRESHOLD {
-                                let base = quarantine_exp.get(&peer_id).copied().unwrap_or(QUARANTINE_MIN_SECS);
-                                let dur_secs = std::cmp::min(base, QUARANTINE_MAX_SECS);
-                                quarantined_peers.insert(peer_id, now + std::time::Duration::from_secs(dur_secs));
-                                quarantine_exp.insert(peer_id, std::cmp::min(dur_secs.saturating_mul(2), QUARANTINE_MAX_SECS));
-                                net_log!("🛑 Quarantining peer {} for {}s due to flapping ({} disconnects/{:?})", peer_id, dur_secs, entry.0, std::time::Duration::from_secs(FLAP_WINDOW_SECS));
-                                // Reset counter for next window
-                                *entry = (0, now);
-                            }
-                            // Record recent disconnect to avoid immediate re-dials
-                            recent_peer_disconnects.insert(peer_id, Instant::now());
                             // Allow re-dial in the future
                             dialing_peers.remove(&peer_id);
                         },
-                        SwarmEvent::Behaviour(GossipsubEvent::Message { message, .. }) => {
+                        SwarmEvent::Behaviour(event) => match event {
+                            CombinedBehaviourEvent::Gossipsub(GossipsubEvent::Message { message, .. }) => {
                             let Some(peer_id) = message.source else { continue };
                             if banned_peer_ids.contains(&peer_id) { continue; }
                             let topic_str = message.topic.as_str();
@@ -2236,7 +2303,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 }
                                             }
                                             if let Ok(data) = bincode::serialize(&EpochTxn { epoch_hash: req.epoch_hash, coins }) {
-                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_TXN), data).ok();
+                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_EPOCH_TXN), data).ok();
                                             }
                                         }
                                     }
@@ -2498,11 +2565,11 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 TOP_SPEND_REQUEST => if let Ok(coin_id) = bincode::deserialize::<[u8;32]>(&message.data) {
                                     if let Ok(Some(sp)) = db.get_spend_tolerant(&coin_id) {
                                         if let Ok(data) = bincode::serialize(&Some(sp)) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
                                         }
                                     } else {
                                         if let Ok(data) = bincode::serialize(&Option::<Spend>::None) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_SPEND_RESPONSE), data).ok();
                                         }
                                     }
                                 },
@@ -2637,7 +2704,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         if throttled { continue; }
                                         if allow_log { net_routine!("📤 Sending latest epoch {} to peer", anchor.num); }
                                         if let Ok(data) = bincode::serialize(&anchor) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
                                     } else {
                                         if allow_log { net_routine!("⚠️  No latest epoch found to send"); }
@@ -2648,7 +2715,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
                                         net_routine!("📤 Sending epoch {} to peer", n);
                                         if let Ok(data) = bincode::serialize(&anchor) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_ANCHOR), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_ANCHOR), data).ok();
                                         }
                                     } else { net_routine!("⚠️  Epoch {} not found", n); }
                                 },
@@ -2667,7 +2734,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     if !batch.is_empty() {
                                         let resp = EpochHeadersBatch { start_height: start, headers: batch };
                                         if let Ok(data) = bincode::serialize(&resp) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_HEADERS_RESPONSE), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_EPOCH_HEADERS_RESPONSE), data).ok();
                                         }
                                     }
                                 },
@@ -2680,7 +2747,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     if let Ok(Some(anchor)) = db.get::<Anchor>("anchor", &req.hash) {
                                         net_routine!("📤 Sending epoch {} (hash: {}) to peer", anchor.num, hex::encode(&req.hash[..8]));
                                         if let Ok(data) = bincode::serialize(&anchor) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_BY_HASH_RESPONSE), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_EPOCH_BY_HASH_RESPONSE), data).ok();
                                         }
                                     } else {
                                         net_routine!("⚠️  Epoch with hash {} not found", hex::encode(&req.hash[..8]));
@@ -2700,7 +2767,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {
                                     if let Ok(Some(coin)) = db.get::<Coin>("coin", &id) {
                                         if let Ok(data) = bincode::serialize(&coin) {
-                                            swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN), data).ok();
+                                            swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN), data).ok();
                                         }
                                     } else {
                                         // Try to reconstruct coin if possible from epoch selection meta
@@ -2742,7 +2809,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_levels(&levels, &target_leaf) {
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
                                                                 let _ = proof_tx.send(resp);
                                                                 responded = true;
@@ -2755,7 +2822,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
                                                                 let _ = proof_tx.send(resp);
                                                                 responded = true;
@@ -2770,7 +2837,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                             if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
                                                                 let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                                 if let Ok(data) = bincode::serialize(&resp) {
-                                                                    swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
+                                                                    swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data).ok();
                                                                     crate::metrics::PROOFS_SERVED.inc();
                                                                     let _ = proof_tx.send(resp);
                                                                     responded = true;
@@ -2792,8 +2859,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                                 if let Some(proof) = crate::epoch::MerkleTree::build_proof(&set, &coin.id) {
                                                                     let resp = CoinProofResponse { coin, anchor: anchor.clone(), proof };
                                                                     if let Ok(data) = bincode::serialize(&resp) {
-                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
-                                                                        swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
+                                                                        swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
+                                                                        swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
                                                                         crate::metrics::PROOFS_SERVED.inc();
                                                                         let _ = proof_tx.send(resp);
                                                                     }
@@ -2878,8 +2945,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                         if let Some(proof) = crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &target_leaf) {
                                                             let resp = CoinProofResponse { coin: coin.clone(), anchor: anchor.clone(), proof };
                                                             if let Ok(data) = bincode::serialize(&resp) {
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
-                                                                swarm.behaviour_mut().publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE), data.clone()).ok();
+                                                                swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_COIN_PROOF_RESPONSE_URGENT), data).ok();
                                                                 crate::metrics::PROOFS_SERVED.inc();
                                                                 let _ = proof_tx.send(resp);
                                                                 satisfied.push(*coin_id);
@@ -2997,6 +3064,37 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 // Commitment request/response removed to prevent metadata leakage.
                                 _ => {}
                             }
+                            },
+                            CombinedBehaviourEvent::Handshake(RequestResponseEvent::Message { peer, message, .. }) => {
+                                match message {
+                                    Message::Request { request, channel, .. } => {
+                                        // Handle incoming handshake request
+                                        let latest_epoch = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|a| a.num);
+                                        let response = HandshakeResponse {
+                                            version: 1,
+                                            latest_epoch,
+                                            accepted: true, // Accept all handshakes for now
+                                        };
+                                        let _ = swarm.behaviour_mut().handshake.send_response(channel, response);
+                                        net_log!("🤝 Completed handshake with peer: {} (their epoch: {:?})", peer, request.latest_epoch);
+                                    }
+                                    request_response::Message::Response { response, .. } => {
+                                        // Handle handshake response
+                                        if response.accepted {
+                                            net_log!("✅ Handshake accepted by peer: {} (their epoch: {:?})", peer, response.latest_epoch);
+                                        } else {
+                                            net_log!("❌ Handshake rejected by peer: {}", peer);
+                                        }
+                                    }
+                                }
+                            },
+                            CombinedBehaviourEvent::Handshake(RequestResponseEvent::OutboundFailure { peer, error, .. }) => {
+                                net_log!("❌ Handshake failed with peer {}: {:?}", peer, error);
+                            },
+                            CombinedBehaviourEvent::Handshake(RequestResponseEvent::InboundFailure { peer, error, .. }) => {
+                                net_log!("❌ Inbound handshake failed with peer {}: {:?}", peer, error);
+                            },
+                            _ => {}
                         },
                         _ => {}
                     }
@@ -3143,9 +3241,10 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             NetworkCommand::GossipEpochLeaves(bundle) => (TOP_EPOCH_LEAVES, bincode::serialize(&bundle).ok()),
                             NetworkCommand::RequestEpochDirect(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                             NetworkCommand::RedialBootstraps => (TOP_ANCHOR, None), // no-op for pending queue
+                            NetworkCommand::InitiateHandshake(_) => (TOP_ANCHOR, None), // handled separately
                         };
                         if let Some(d) = data {
-                            if swarm.behaviour_mut().publish(IdentTopic::new(t), d).is_err() {
+                            if swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(t), d).is_err() {
                                 metrics::NET_PUBLISH_FAILS.inc();
                                 // Increase backoff on failure
                                 if let Some(key) = command_key(&cmd) {
@@ -3169,6 +3268,10 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                     pending_commands = still_pending;
                     metrics::NET_PENDING_COMMANDS.set(pending_commands.len() as i64);
                 },
+                Some((peer_id, handshake_req)) = handshake_rx.recv() => {
+                    // Send handshake request to peer
+                    let _ = swarm.behaviour_mut().handshake.send_request(&peer_id, handshake_req);
+                },
                 Some(command) = command_rx.recv() => {
                     match &command {
                         NetworkCommand::RequestEpochSelected(epoch_num) => {
@@ -3179,7 +3282,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
                                 if !map.contains_key(epoch_num) {
                                     if let Ok(data) = bincode::serialize(epoch_num) {
-                                        if swarm.behaviour_mut().publish(IdentTopic::new(TOP_EPOCH_SELECTED_REQUEST), data).is_err() {
+                                        if swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(TOP_EPOCH_SELECTED_REQUEST), data).is_err() {
                                             // keep in queue if publish failed
                                             pending_commands.push_back(command.clone());
                                         } else {
