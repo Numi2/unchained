@@ -1881,7 +1881,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 }
                                             }
                                             if a.num > 0 {
-                                                request_aligned_range(&command_tx, a.num, REORG_BACKFILL);
+                                                request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
                                             }
                                             if let Ok(mut agg) = ALT_FORK_AGG.lock() {
                                                 let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(60);
