@@ -1,4 +1,4 @@
-use crate::{storage::Store, epoch::Anchor, network::NetHandle, consensus::{RETARGET_INTERVAL, validate_header_params, Params}};
+use crate::{storage::Store, epoch::Anchor, network::NetHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::{sync::{broadcast::Receiver, Semaphore}, task, time::{interval, Duration}};
@@ -131,27 +131,16 @@ pub fn spawn(
                                     // Clean up old recovery requests
                                     recovery_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_millis(RECOVERY_REQUEST_INTERVAL_MS * 5));
                                     
-                                    // 1) Pull the direct child of our local tip first (next expected epoch)
-                                    let child = local_epoch.saturating_add(1);
-                                    if !recovery_requests.contains_key(&child) {
-                                        request_epoch_bypass(&net, child).await;
-                                        recovery_requests.insert(child, now);
-                                        failed_epochs.insert(child, now);
-                                    }
-                                    // 2) Also request a compact headers backfill around that area to seed validation
-                                    // Use small window to avoid flooding
-                                    let window: u64 = 32;
-                                    let start = child.saturating_sub(window);
-                                    let count = (child.saturating_sub(start)).saturating_add(1) as u32;
-                                    net.request_epoch_headers_range(start, count).await;
-
-                                    // 3) Request immediate next epochs with bypass mechanism to push forward
+                                    // Request immediate next epochs with bypass mechanism
                                     let recovery_end = (local_epoch + RECOVERY_EPOCH_BATCH_SIZE).min(highest_seen);
                                     for n in (local_epoch + 1)..=recovery_end {
                                         if !recovery_requests.contains_key(&n) {
+                                            // Use direct network bypass to avoid deduplication
                                             request_epoch_bypass(&net, n).await;
                                             recovery_requests.insert(n, now);
                                             failed_epochs.insert(n, now);
+                                            
+                                            // Small delay to avoid overwhelming
                                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                         }
                                     }
@@ -458,7 +447,7 @@ pub async fn spawn_headers_skeleton(
                     if let Some(last) = seg.headers.last() {
                         if last.is_better_chain(&current_best) {
                             for a in &seg.headers {
-                                // Store headers by hash only; do not write canonical epoch-by-height in skeleton sync
+                                if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 crate::metrics::HEADERS_ANCHORS_STORED.inc();
                             }
@@ -480,55 +469,6 @@ pub async fn spawn_headers_skeleton(
                                     highest_req = highest_req.saturating_add(range_size);
                                     let _ = db_headers.put_headers_cursor(highest_req, highest_stored);
                                     outstanding = highest_req.saturating_sub(highest_stored);
-                                }
-
-                                // Fast-path: if this segment continues our canonical tip contiguously,
-                                // adopt headers into canonical epoch heights and advance latest.
-                                if let Ok(Some(mut latest)) = db_headers.get::<Anchor>("epoch", b"latest") {
-                                    // Find the first header in this segment that is the immediate successor to latest
-                                    if let Some(start_idx) = seg.headers.iter().position(|h| h.num == latest.num.saturating_add(1)) {
-                                        for a in &seg.headers[start_idx..] {
-                                            // Validate parent linkage (hash) and cumulative work step
-                                            let mut h = blake3::Hasher::new();
-                                            h.update(&a.merkle_root); h.update(&latest.hash);
-                                            let linked = *h.finalize().as_bytes() == a.hash;
-                                            if !linked { break; }
-
-                                            let expected_work = Anchor::expected_work_for_difficulty(a.difficulty);
-                                            if a.cumulative_work != latest.cumulative_work.saturating_add(expected_work) { break; }
-
-                                            // Validate retarget parameters when required
-                                            if a.num % RETARGET_INTERVAL == 0 {
-                                                // Build window of last RETARGET_INTERVAL anchors ending at parent
-                                                let start = a.num.saturating_sub(RETARGET_INTERVAL);
-                                                let mut window: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
-                                                let mut missing = false;
-                                                for n in start..a.num {
-                                                    match db_headers.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                                        Ok(Some(x)) => window.push(x),
-                                                        _ => { missing = true; break; }
-                                                    }
-                                                }
-                                                if missing { break; }
-                                                let got = Params { difficulty: a.difficulty as u32, mem_kib: a.mem_kib };
-                                                if validate_header_params(Some(&latest), a.num, &window, got).is_err() { break; }
-                                            } else {
-                                                // Between retargets, enforce params inheritance
-                                                if a.difficulty as u32 != latest.difficulty as u32 || a.mem_kib != latest.mem_kib { break; }
-                                            }
-
-                                            // Commit to canonical height and advance latest
-                                            if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); break; }
-                                            if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); break; }
-                                            if db_headers.put("epoch", b"latest", a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); break; }
-                                            latest = a.clone();
-
-                                            // Request leaves/selected for proofs/indexes (dedup handled in network layer)
-                                            // Best-effort; ignore errors
-                                            let _ = net.request_epoch_leaves(a.num).await;
-                                            let _ = net.request_epoch_selected(a.num).await;
-                                        }
-                                    }
                                 }
                             }
                         }
