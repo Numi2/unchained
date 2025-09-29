@@ -23,6 +23,8 @@ use libp2p::{
     request_response::{self, ProtocolSupport, Behaviour as RequestResponse, Event as RequestResponseEvent, Message},
     StreamProtocol,
 };
+use libp2p::identify;
+use libp2p::ping;
 use libp2p::gossipsub::{
     IdentTopic, MessageAuthenticity, IdentityTransform,
     AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent,
@@ -46,6 +48,8 @@ use crate::metrics;
 pub struct CombinedBehaviour {
     pub gossipsub: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter>,
     pub handshake: RequestResponse<request_response::json::codec::Codec<HandshakeRequest, HandshakeResponse>>,
+    pub identify: identify::Behaviour,
+    pub ping: ping::Behaviour,
 }
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
@@ -847,10 +851,16 @@ pub async fn spawn(
         gs.subscribe(&IdentTopic::new(t))?;
     }
 
+    // Identify and Ping behaviours to keep connections alive and discover addrs
+    let identify = identify::Behaviour::new(identify::Config::new("unchained/1.0.0".into(), id_keys.public()));
+    let ping = ping::Behaviour::new(ping::Config::new());
+
     // Create combined behavior instance
     let behaviour = CombinedBehaviour {
         gossipsub: gs,
         handshake,
+        identify,
+        ping,
     };
 
     let mut swarm = Swarm::new(
@@ -3077,11 +3087,27 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         };
                                         let _ = swarm.behaviour_mut().handshake.send_response(channel, response);
                                         net_log!("🤝 Completed handshake with peer: {} (their epoch: {:?})", peer, request.latest_epoch);
+                                        // Seed network view from the peer's advertised tip (non-authoritative)
+                                        if let Some(n) = request.latest_epoch {
+                                            if let Ok(mut st) = sync_state.lock() {
+                                                if n > st.highest_seen_epoch { st.highest_seen_epoch = n; }
+                                            }
+                                        }
+                                        // Prompt peers to gossip latest anchor immediately after handshake
+                                        let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
                                     }
                                     request_response::Message::Response { response, .. } => {
                                         // Handle handshake response
                                         if response.accepted {
                                             net_log!("✅ Handshake accepted by peer: {} (their epoch: {:?})", peer, response.latest_epoch);
+                                            // Seed network view from the peer's response (non-authoritative)
+                                            if let Some(n) = response.latest_epoch {
+                                                if let Ok(mut st) = sync_state.lock() {
+                                                    if n > st.highest_seen_epoch { st.highest_seen_epoch = n; }
+                                                }
+                                            }
+                                            // Prompt peers to gossip latest anchor immediately after handshake
+                                            let _ = command_tx.send(NetworkCommand::RequestLatestEpoch);
                                         } else {
                                             net_log!("❌ Handshake rejected by peer: {}", peer);
                                         }
