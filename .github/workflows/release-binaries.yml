@@ -105,19 +105,19 @@ jobs:
           Copy-Item -Path target/release/inspect_db.exe -Destination "$dist/inspect_db.exe" -Force
           Copy-Item -Path config.toml -Destination "$dist/config.toml" -Force
           Copy-Item -Path README.md -Destination "$dist/README.md" -Force
-          Copy-Item -Path unchained-run.bat -Destination "$dist/unchained-run.bat" -Force
+          # Normalize .bat to CRLF to ensure it runs on Windows
+          $bat = Get-Content -Raw -Path unchained-run.bat
+          $bat = $bat -replace "`n", "`r`n"
+          Set-Content -Path "$dist/unchained-run.bat" -Value $bat -NoNewline -Encoding ascii
           # Bundle a zip with exe + config + README + launcher (flattened)
           $zipPath = "target/release/unchained-windows-x86_64.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path "$dist/*" -DestinationPath $zipPath
 
-      - name: Compute release metadata
-        id: meta
-        shell: pwsh
+      - name: Smoke test .bat launcher
+        shell: cmd
         run: |
-          $short = $env:GITHUB_SHA.Substring(0,7)
-          "tag=auto-main-$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "name=Main build $short" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          cd /d %GITHUB_WORKSPACE%\dist\windows && unchained-run.bat --version
 
       - name: Create Release and Upload Assets (.exe)
         uses: softprops/action-gh-release@v2
@@ -129,6 +129,16 @@ jobs:
             target/release/unchained.exe
             target/release/inspect_db.exe
             target/release/unchained-windows-x86_64.zip
-            unchained-run.bat
+            dist/windows/unchained-run.bat
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $short = $env:GITHUB_SHA.Substring(0,7)
+          "tag=auto-main-$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "name=Main build $short" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      

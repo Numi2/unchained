@@ -71,6 +71,10 @@ macro_rules! net_routine {
 #[allow(unused_imports)]
 use net_routine;
 
+// Module-level throttle for consensus mismatch logs (per-epoch)
+const CONSENSUS_MISMATCH_LOG_THROTTLE_SECS: u64 = 30;
+static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 // Typed classification for ingress anchors to improve fork reconciliation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnchorClass {
@@ -439,10 +443,22 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         (prev.difficulty, prev.mem_kib)
     };
     if anchor.difficulty != exp_diff || anchor.mem_kib != exp_mem {
-        net_log!(
-            "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
-            anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
-        );
+        // Throttle noisy consensus mismatch logs per epoch height to avoid spam
+        let now = Instant::now();
+        let mut allow_log = true;
+        if let Ok(mut map) = LAST_CONSENSUS_MISMATCH_LOGS.lock() {
+            map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS));
+            if let Some(last) = map.get(&anchor.num) {
+                if now.duration_since(*last) < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS) { allow_log = false; }
+            }
+            if allow_log { map.insert(anchor.num, now); }
+        }
+        if allow_log {
+            net_log!(
+                "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
+                anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
+            );
+        }
         return Err(format!(
             "Consensus params mismatch. Expected difficulty={}, mem_kib={}, got difficulty={}, mem_kib={}",
             exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
