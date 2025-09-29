@@ -1671,7 +1671,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                     if db.put("epoch", b"latest", &a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                                 } else {
                                                     // Parent missing or mismatch: request targeted backfill and do not advance latest
-                                                    request_aligned_range(&command_tx, a.num, REORG_BACKFILL);
+                                                    request_aligned_range(&command_tx, a.num - 1, REORG_BACKFILL);
                                                 }
                                                 let _ = anchor_tx.send(a.clone());
 
