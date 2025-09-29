@@ -3338,6 +3338,17 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                 }
                             }
                         }
+                        NetworkCommand::InitiateHandshake(peer_id) => {
+                            // Create and send a handshake request to the specified peer
+                            let latest_epoch = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|a| a.num);
+                            let handshake_req = HandshakeRequest {
+                                version: 1,
+                                peer_id: peer_id.to_string(),
+                                latest_epoch,
+                            };
+                            let _ = swarm.behaviour_mut().handshake.send_request(&peer_id, handshake_req);
+                            net_log!("🤝 Initiated handshake with peer: {}", peer_id);
+                        }
                         _ => {
                             // For other commands, push to pending to be published via gossipsub
                             let mut allow_enqueue = true;
@@ -3485,6 +3496,16 @@ impl Network {
         self.connected_peers.lock().map(|s| s.len()).unwrap_or(0)
     }
     pub async fn redial_bootstraps(&self) { let _ = self.command_tx.send(NetworkCommand::RedialBootstraps); }
+    
+    /// Initiate a handshake with a specific peer
+    pub async fn initiate_handshake(&self, peer_id: PeerId) {
+        let _ = self.command_tx.send(NetworkCommand::InitiateHandshake(peer_id));
+    }
+    
+    /// Send a handshake request directly to a peer
+    pub async fn send_handshake_request(&self, peer_id: PeerId, request: HandshakeRequest) {
+        let _ = self.handshake_tx.send((peer_id, request));
+    }
 }
 
 #[derive(Debug)]
