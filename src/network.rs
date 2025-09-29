@@ -3087,6 +3087,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         };
                                         let _ = swarm.behaviour_mut().handshake.send_response(channel, response);
                                         net_log!("🤝 Completed handshake with peer: {} (their epoch: {:?})", peer, request.latest_epoch);
+                                        // Consider one successful handshake as sufficient peer confirmation
+                                        if let Ok(mut st) = sync_state.lock() { st.peer_confirmed_tip = true; }
                                         // Seed network view from the peer's advertised tip (non-authoritative)
                                         if let Some(n) = request.latest_epoch {
                                             if let Ok(mut st) = sync_state.lock() {
@@ -3100,6 +3102,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                         // Handle handshake response
                                         if response.accepted {
                                             net_log!("✅ Handshake accepted by peer: {} (their epoch: {:?})", peer, response.latest_epoch);
+                                            // Consider one successful handshake as sufficient peer confirmation
+                                            if let Ok(mut st) = sync_state.lock() { st.peer_confirmed_tip = true; }
                                             // Seed network view from the peer's response (non-authoritative)
                                             if let Some(n) = response.latest_epoch {
                                                 if let Ok(mut st) = sync_state.lock() {
