@@ -1073,7 +1073,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
     // Short-window tracker for peers repeatedly sending divergent parents at the same height
     static DIVERGENT_PARENT_EVENTS: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const DIVERGENT_WINDOW_SECS: u64 = 15;
-    const DIVERGENT_THRESHOLD: u32 = 8;
+    const DIVERGENT_THRESHOLD: u32 = 5; // tighten threshold to penalize sooner
+    const DIVERGENT_SPAM_BAN_SECS: u64 = 60 * 60; // 1 hour ban for egregious spam
 
     fn note_divergent_parent_event(peer_id: &PeerId, height: u64) -> u32 {
         let now = std::time::Instant::now();
@@ -2048,7 +2049,13 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                     } else {
                                                         net_log!("🚫 Peer {} spamming divergent parent at height {} ({} in {}s) — penalizing", peer_id, a.num, div_count, DIVERGENT_WINDOW_SECS);
                                                         crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                        // Escalate penalties: multiple strikes and temporary ban
                                                         score.record_validation_failure();
+                                                        score.record_validation_failure();
+                                                        score.ban_for(DIVERGENT_SPAM_BAN_SECS);
+                                                        if score.is_banned() {
+                                                            let _ = swarm.disconnect_peer_id(peer_id);
+                                                        }
                                                         continue;
                                                     }
                                                 }
@@ -2084,7 +2091,13 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 } else {
                                                     net_log!("🚫 Peer {} spamming parent-unknown at height {} ({} in {}s) — penalizing", peer_id, a.num, div_count, DIVERGENT_WINDOW_SECS);
                                                     crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                    // Escalate penalties: multiple strikes and temporary ban
                                                     score.record_validation_failure();
+                                                    score.record_validation_failure();
+                                                    score.ban_for(DIVERGENT_SPAM_BAN_SECS);
+                                                    if score.is_banned() {
+                                                        let _ = swarm.disconnect_peer_id(peer_id);
+                                                    }
                                                     continue;
                                                 }
                                             }
@@ -2093,6 +2106,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     if score.check_rate_limit() { net_routine!("⚓ Received anchor for epoch {} from peer: {}", a.num, peer_id); }
                                     match classify_anchor_ingress(&a, &db) {
                                         AnchorClass::Valid => {
+                                            // Only trust network progress on fully Valid anchors
                                             if let Ok(mut st) = sync_state.lock() {
                                                 if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
                                                 st.peer_confirmed_tip = true;
@@ -2272,12 +2286,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 }
                                             }
                                             
-                                            if let Ok(mut state) = sync_state.lock() {
-                                                if a.num > state.highest_seen_epoch {
-                                                    state.highest_seen_epoch = a.num;
-                                                }
-                                                state.peer_confirmed_tip = true;
-                                            }
+                                            // Do not treat MissingParent as confirmation of network tip; wait for Valid linkage
                                             if a.num > 0 {
                                                 let retarget_gap = parent_h.saturating_add(1) != a.num;
                                                 let backfill_window = if retarget_gap {
@@ -2342,10 +2351,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(60);
                                                 agg.retain(|_, v| v.first_seen >= cutoff);
                                             }
-                                            if let Ok(mut st) = sync_state.lock() {
-                                                if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
-                                                st.peer_confirmed_tip = true;
-                                            }
+                                            // Do not mark peer-confirmed or advance highest_seen on alt-fork observations
                                             needs_reorg_check = true;
 
                                             // Aggressively penalize consensus-parameter mismatches even when treated as alt-fork
@@ -3023,10 +3029,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     if is_new {
                                         net_routine!("⏳ Buffered epoch {} from hash request (buffer size: {})", a.num, orphan_buf.len());
                                     }
-                                    if let Ok(mut st) = sync_state.lock() { 
-                                        if a.num > st.highest_seen_epoch { st.highest_seen_epoch = a.num; }
-                                        st.peer_confirmed_tip = true;
-                                    }
+                                    // Do not update sync_state based solely on by-hash responses; wait for Valid classification path
                                     needs_reorg_check = true;
                                 },
                                 TOP_COIN_REQUEST => if let Ok(id) = bincode::deserialize::<[u8; 32]>(&message.data) {

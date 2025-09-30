@@ -118,6 +118,7 @@ jobs:
 
       - name: Smoke test .bat launcher
         shell: cmd
+        
         run: |
           cd /d %GITHUB_WORKSPACE%\dist\windows && unchained-run.bat --version
 
