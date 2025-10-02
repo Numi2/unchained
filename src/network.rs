@@ -495,27 +495,15 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
 
     // Deterministically compute expected consensus parameters for this height.
     let (exp_diff, exp_mem) = if anchor.num % RETARGET_INTERVAL == 0 {
-        // Collect the last RETARGET_INTERVAL anchors ending at prev
-        let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
+        // Use sliding cache (in-memory + RocksDB) for the last RETARGET_INTERVAL anchors
         let start = anchor.num.saturating_sub(RETARGET_INTERVAL);
-        let mut missing_from: Option<u64> = None;
-        for n in start..anchor.num {
-            match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                Ok(Some(a)) => recent.push(a),
-                Ok(None) => {
-                    if missing_from.is_none() {
-                        missing_from = Some(n);
-                    }
-                }
-                Err(e) => {
-                    return Err(format!("DB error reading epoch {}: {}", n, e));
-                }
-            }
-        }
-        if recent.len() as u64 != RETARGET_INTERVAL {
-            let gap_start = missing_from.unwrap_or(start);
-            return Err(format!("Retarget window incomplete starting at {}", gap_start));
-        }
+        let recent = db
+            .get_or_build_retarget_window(anchor.num)
+            .map_err(|e| e.to_string())?;
+        let recent = match recent {
+            Some(w) if w.len() as u64 == RETARGET_INTERVAL => w,
+            _ => return Err(format!("Retarget window incomplete starting at {}", start)),
+        };
         calculate_retarget_consensus(&recent)
     } else {
         (prev.difficulty, prev.mem_kib)
@@ -587,16 +575,68 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
             if e.starts_with("Previous anchor ") {
                 return AnchorClass::MissingParent(a.num.saturating_sub(1));
             }
+            // If consensus parameters are definitively wrong (window known), reject as fatal.
+            if e.contains("Consensus params mismatch") {
+                return AnchorClass::Fatal;
+            }
             // Other mismatches may still be valid on a different parent/window. Buffer for reorg.
             AnchorClass::PossiblyAltFork
         }
     }
 }
 
+// Validate consensus parameters and linkage for a proposed reorg segment before adoption.
+// Ensures deterministic retarget validation only when the parent matches the canonical DB parent.
+fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store) -> Result<(), String> {
+    let mut p = parent.clone();
+    for a in seg {
+        if a.num % RETARGET_INTERVAL == 0 {
+            // Only compute window if we can anchor it to the canonical DB parent at this height.
+            match db.get::<Anchor>("epoch", &p.num.to_le_bytes()) {
+                Ok(Some(db_parent)) if db_parent.hash == p.hash => {
+                    match db.get_or_build_retarget_window(a.num) {
+                        Ok(Some(recent)) if recent.len() as u64 == RETARGET_INTERVAL => {
+                            let (exp_d, exp_m) = calculate_retarget_consensus(&recent);
+                            if a.difficulty != exp_d || a.mem_kib != exp_m {
+                                return Err("Consensus params mismatch in segment".into());
+                            }
+                        }
+                        _ => return Err(format!("Retarget window incomplete starting at {}", a.num.saturating_sub(RETARGET_INTERVAL))),
+                    }
+                }
+                _ => {
+                    // Parent is an alternate not reflected in DB; we cannot determine the window yet.
+                    return Err(format!("Missing retarget window for alternate parent at {}", a.num));
+                }
+            }
+        } else {
+            // Between retargets, parameters must inherit exactly from parent.
+            if a.difficulty != p.difficulty || a.mem_kib != p.mem_kib {
+                return Err("Consensus params mismatch (inherit)".into());
+            }
+        }
+        // Defensive linkage checks
+        let expected = Anchor::expected_work_for_difficulty(a.difficulty);
+        if a.cumulative_work != p.cumulative_work.saturating_add(expected) {
+            return Err("Invalid cumulative work".into());
+        }
+        let mut h = blake3::Hasher::new();
+        h.update(&a.merkle_root);
+        h.update(&p.hash);
+        if *h.finalize().as_bytes() != a.hash {
+            return Err("Anchor hash mismatch".into());
+        }
+        p = a.clone();
+    }
+    Ok(())
+}
+
 // Try to link an anchor to any available parent at H-1 (orphan buffer + DB alternates)
 fn links_to_available_parent(a: &Anchor, orphan_buf: &OrphanBuffer, db: &Store) -> Option<[u8; 32]> {
     let parent_h = a.num.saturating_sub(1);
     let expected = Anchor::expected_work_for_difficulty(a.difficulty);
+    // Use cached linkage if present
+    if let Some(p_hash) = orphan_buf.parent_of.get(&a.hash).copied() { return Some(p_hash); }
     
     // First try orphan buffer parents at H-1
     if let Some(cands) = orphan_buf.by_height.get(&parent_h) {
@@ -651,6 +691,15 @@ fn command_key(cmd: &NetworkCommand) -> Option<String> {
         NetworkCommand::RequestEpochLeaves(n) => Some(format!("leaves:{}", n)),
         NetworkCommand::RequestEpochSelected(n) => Some(format!("selected:{}", n)),
         NetworkCommand::RequestEpochCandidates(h) => Some(format!("cands:{}", hex::encode(&h[..8]))),
+        // Handshake backoff/dedup keyed by short hash of payload
+        NetworkCommand::GossipPqhs2Init(data) => {
+            let key = blake3::hash(&data[..std::cmp::min(64, data.len())]);
+            Some(format!("pqhs2-init:{}", hex::encode(&key.as_bytes()[..8])))
+        }
+        NetworkCommand::GossipPqhs2Resp(data) => {
+            let key = blake3::hash(&data[..std::cmp::min(64, data.len())]);
+            Some(format!("pqhs2-resp:{}", hex::encode(&key.as_bytes()[..8])))
+        }
         _ => None,
     }
 }
@@ -825,6 +874,9 @@ enum NetworkCommand {
     GossipEpochSelectedResponse(SelectedIdsBundle),
     GossipEpochCandidatesResponse(EpochCandidatesResponse),
     GossipRateLimited(RateLimitedMessage),
+    // PQ Handshake v2 gossip messages (queued with retry/backoff)
+    GossipPqhs2Init(Vec<u8>),
+    GossipPqhs2Resp(Vec<u8>),
     GossipOffer(crate::wallet::OfferDocV1),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
@@ -1072,9 +1124,9 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
     static LAST_UNKNOWN_PARENT_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Short-window tracker for peers repeatedly sending divergent parents at the same height
     static DIVERGENT_PARENT_EVENTS: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    const DIVERGENT_WINDOW_SECS: u64 = 15;
-    const DIVERGENT_THRESHOLD: u32 = 5; // tighten threshold to penalize sooner
-    const DIVERGENT_SPAM_BAN_SECS: u64 = 60 * 60; // 1 hour ban for egregious spam
+    const DIVERGENT_WINDOW_SECS: u64 = 10;
+    const DIVERGENT_THRESHOLD: u32 = 3; // aggressive threshold to penalize sooner
+    const DIVERGENT_SPAM_BAN_SECS: u64 = 60 * 60 * 4; // 4 hour ban for spam
 
     fn note_divergent_parent_event(peer_id: &PeerId, height: u64) -> u32 {
         let now = std::time::Instant::now();
@@ -1117,29 +1169,32 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         // This helps initial catch-up by extending the tip sequentially when possible.
         let mut near_parent = current_latest.clone();
         let mut near_chain: Vec<Anchor> = Vec::new();
-        let mut h_near = current_latest.num.saturating_add(1);
         loop {
-            let Some(cands) = orphan_buf.by_height.get(&h_near) else { break; };
-            if cands.is_empty() { break; }
-            let mut linked: Option<Anchor> = None;
-            for alt in cands {
-                let expected_work = Anchor::expected_work_for_difficulty(alt.difficulty);
-                let expected_cum = near_parent.cumulative_work.saturating_add(expected_work);
-                if alt.cumulative_work != expected_cum { continue; }
-                let mut hsh = blake3::Hasher::new();
-                hsh.update(&alt.merkle_root);
-                hsh.update(&near_parent.hash);
-                let recomputed = *hsh.finalize().as_bytes();
-                if alt.hash == recomputed { linked = Some(alt.clone()); break; }
+            let children = orphan_buf.children_of(&near_parent.hash);
+            if children.is_empty() { break; }
+            // Choose the best child (highest cumulative_work)
+            let mut best: Option<Anchor> = None;
+            for ch in children {
+                if ch.num != near_parent.num.saturating_add(1) { continue; }
+                if best.as_ref().map(|b| ch.cumulative_work > b.cumulative_work).unwrap_or(true) {
+                    best = Some(ch);
+                }
             }
-            if let Some(next) = linked {
+            if let Some(next) = best {
                 near_chain.push(next.clone());
                 near_parent = next;
-                h_near = h_near.saturating_add(1);
             } else { break; }
         }
         if let Some(near_tip) = near_chain.last() {
             if near_tip.cumulative_work > current_latest.cumulative_work {
+                // Gate sequential catch-up adoption on consensus validation
+                if let Err(e) = validate_segment_consensus(&current_latest, &near_chain, db) {
+                    net_log!("⛔ Reorg blocked (near-tip): {}", e);
+                    // Proactively backfill near fork point to satisfy window requirements
+                    let start = current_latest.num.saturating_sub(REORG_BACKFILL);
+                    for n in start..=current_latest.num { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+                    return false;
+                }
                 let (Some(epoch_cf), Some(anchor_cf), Some(sel_cf), Some(leaves_cf), Some(coin_cf), Some(coin_epoch_cf), Some(spend_cf), Some(nullifier_cf), Some(commitment_used_cf)) = (
                     db.db.cf_handle("epoch"),
                     db.db.cf_handle("anchor"),
@@ -1306,32 +1361,21 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         let mut last_frontier: Vec<Anchor> = Vec::new();
         let mut advanced = false;
         let mut steps: usize = 0;
-        for height in first_height..=max_buf_height {
+        loop {
             if steps >= MAX_REORG_STEPS { break; }
-            let Some(cands) = orphan_buf.by_height.get(&height) else { break; };
-            if cands.is_empty() { break; }
             let mut next_frontier: Vec<Anchor> = Vec::new();
             for p in &frontier {
-                for alt in cands {
-                    let expected_work = Anchor::expected_work_for_difficulty(alt.difficulty);
-                    let expected_cum = p.cumulative_work.saturating_add(expected_work);
-                    if alt.cumulative_work != expected_cum { continue; }
-                    let mut hsh = blake3::Hasher::new();
-                    hsh.update(&alt.merkle_root);
-                    hsh.update(&p.hash);
-                    let recomputed = *hsh.finalize().as_bytes();
-                    if alt.hash == recomputed {
-                        // Link p -> alt
-                        if !back.contains_key(&alt.hash) { back.insert(alt.hash, p.hash); }
-                        next_frontier.push(alt.clone());
-                        if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
-                    }
+                let mut children = orphan_buf.children_of(&p.hash);
+                // Keep only direct children at H+1
+                children.retain(|c| c.num == p.num.saturating_add(1));
+                for ch in children {
+                    if !back.contains_key(&ch.hash) { back.insert(ch.hash, p.hash); }
+                    next_frontier.push(ch.clone());
+                    if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
                 }
                 if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
             }
-            if next_frontier.is_empty() {
-                break;
-            }
+            if next_frontier.is_empty() { break; }
             // Deduplicate by hash to prevent frontier explosion
             let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
             let mut deduped: Vec<Anchor> = Vec::new();
@@ -1397,6 +1441,15 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
             net_routine!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
                 seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
+            return false;
+        }
+
+        // Gate BFS adoption on consensus validation across the segment using resolved parent
+        if let Err(e) = validate_segment_consensus(resolved_parent.as_ref().unwrap_or(&current_latest), &chosen_chain, db) {
+            net_log!("⛔ Reorg blocked (BFS): {}", e);
+            // Backfill around fork height to complete windows for a future attempt
+            let start = fork_height.saturating_sub(REORG_BACKFILL);
+            for n in start..=fork_height { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
             return false;
         }
 
@@ -1592,7 +1645,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     sig: sig2.as_bytes().to_vec(),
                                 };
                                 if let Ok(data2) = bincode::serialize(&init2) {
-                                    try_publish_gossip(&mut swarm, TOP_PQHS2_INIT, data2, "pqhs2-init");
+                                    // Enqueue for queued publish with retry/backoff to avoid AllQueuesFull drop
+                                    let _ = command_tx.send(NetworkCommand::GossipPqhs2Init(data2));
                                 }
                                 if let Ok(mut pending) = pending_inits.lock() { pending.insert(peer_id, (nonce, std::time::Instant::now())); }
                             } else {
@@ -1637,6 +1691,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                                     NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                                     NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
+                                    NetworkCommand::GossipPqhs2Init(bytes) => (TOP_PQHS2_INIT, Some(bytes.clone())),
+                                    NetworkCommand::GossipPqhs2Resp(bytes) => (TOP_PQHS2_RESP, Some(bytes.clone())),
                                     NetworkCommand::GossipOffer(offer) => (TOP_OFFERS_V1, bincode::serialize(&offer).ok()),
                                     NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                                     NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
@@ -1837,7 +1893,10 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             dili_pk_net.as_bytes(),                          // responder
                                         ]);
                                         if let Ok(mut map) = session_keys.lock() { map.insert(peer_id, (sess, std::time::Instant::now())); }
-                                        if let Ok(data) = bincode::serialize(&resp) { try_publish_gossip(&mut swarm, TOP_PQHS2_RESP, data, "pqhs2-resp"); }
+                                        if let Ok(data) = bincode::serialize(&resp) {
+                                            // Enqueue response for queued publish with retry/backoff
+                                            let _ = command_tx.send(NetworkCommand::GossipPqhs2Resp(data));
+                                        }
                                     }
                                 },
                                 TOP_PQHS2_RESP => {
@@ -2052,6 +2111,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                         // Escalate penalties: multiple strikes and temporary ban
                                                         score.record_validation_failure();
                                                         score.record_validation_failure();
+                                                        score.record_validation_failure();
                                                         score.ban_for(DIVERGENT_SPAM_BAN_SECS);
                                                         if score.is_banned() {
                                                             let _ = swarm.disconnect_peer_id(peer_id);
@@ -2092,6 +2152,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                     net_log!("🚫 Peer {} spamming parent-unknown at height {} ({} in {}s) — penalizing", peer_id, a.num, div_count, DIVERGENT_WINDOW_SECS);
                                                     crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
                                                     // Escalate penalties: multiple strikes and temporary ban
+                                                    score.record_validation_failure();
                                                     score.record_validation_failure();
                                                     score.record_validation_failure();
                                                     score.ban_for(DIVERGENT_SPAM_BAN_SECS);
@@ -2226,7 +2287,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 if let Ok(Some(existing)) = db.get::<Anchor>("epoch", &a.num.to_le_bytes()) {
                                                     if existing.hash != a.hash {
                                                         let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
-                                                        if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now()) {
+                                                        if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now(), &db) {
                                                             net_routine!("🔀 Buffered alternate anchor at height {} (valid but not adopted)", a.num);
                                                         }
                                                     }
@@ -2271,7 +2332,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             if allow_buffer {
                                                 if let Ok(Some(lat2)) = db.get::<Anchor>("epoch", b"latest") {
                                                     let tip = Some(lat2.num);
-                                                    if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now()) {
+                                                    if orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now(), &db) {
                                                         net_routine!("⏳ Buffered orphan anchor for epoch {} (buffer size: {})", a.num, orphan_buf.len());
                                                         // If buffer is getting full, trigger aggressive cleanup and reorg
                                                         if orphan_buf.len() > ORPHAN_TOTAL_CAP * 3 / 4 {
@@ -2318,7 +2379,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 }
                                             }
                                             let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
-                                            let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
+                                            let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now(), &db);
                                             if is_new {
                                                 let now = std::time::Instant::now();
                                                 if let Ok(mut agg) = ALT_FORK_AGG.lock() {
@@ -2362,19 +2423,13 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
                                             } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
                                                 if a.num % RETARGET_INTERVAL == 0 {
-                                                    let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
-                                                    let start = a.num.saturating_sub(RETARGET_INTERVAL);
-                                                    let mut complete = true;
-                                                    for n in start..a.num {
-                                                        match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                                            Ok(Some(x)) => recent.push(x),
-                                                            _ => { complete = false; break; }
-                                                        }
+                                                    match db.get_or_build_retarget_window(a.num) {
+                                                        Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
+                                                            let (d, m) = calculate_retarget_consensus(&w);
+                                                            (Some(d), Some(m))
+                                                        },
+                                                        _ => (None, None),
                                                     }
-                                                    if complete && recent.len() as u64 == RETARGET_INTERVAL {
-                                                        let (d, m) = calculate_retarget_consensus(&recent);
-                                                        (Some(d), Some(m))
-                                                    } else { (None, None) }
                                                 } else {
                                                     (Some(prev.difficulty), Some(prev.mem_kib))
                                                 }
@@ -2416,19 +2471,13 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
                                             } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
                                                 if a.num % RETARGET_INTERVAL == 0 {
-                                                    let mut recent: Vec<Anchor> = Vec::with_capacity(RETARGET_INTERVAL as usize);
-                                                    let start = a.num.saturating_sub(RETARGET_INTERVAL);
-                                                    let mut complete = true;
-                                                    for n in start..a.num {
-                                                        match db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                                            Ok(Some(x)) => recent.push(x),
-                                                            _ => { complete = false; break; }
-                                                        }
+                                                    match db.get_or_build_retarget_window(a.num) {
+                                                        Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
+                                                            let (d, m) = calculate_retarget_consensus(&w);
+                                                            (Some(d), Some(m))
+                                                        },
+                                                        _ => (None, None),
                                                     }
-                                                    if complete && recent.len() as u64 == RETARGET_INTERVAL {
-                                                        let (d, m) = calculate_retarget_consensus(&recent);
-                                                        (Some(d), Some(m))
-                                                    } else { (None, None) }
                                                 } else {
                                                     (Some(prev.difficulty), Some(prev.mem_kib))
                                                 }
@@ -3025,7 +3074,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                     let _ = db.put("anchor", &a.hash, &a);
                                     // Buffer and trigger reorg attempt
                                     let tip = db.get::<Anchor>("epoch", b"latest").ok().flatten().map(|x| x.num);
-                                    let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now());
+                                    let is_new = orphan_buf.insert(a.clone(), tip, ORPHAN_BUFFER_TIP_WINDOW, std::time::Instant::now(), &db);
                                     if is_new {
                                         net_routine!("⏳ Buffered epoch {} from hash request (buffer size: {})", a.num, orphan_buf.len());
                                     }
@@ -3454,6 +3503,8 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                             NetworkCommand::GossipEpochCandidatesResponse(resp) => (TOP_EPOCH_CANDIDATES_RESPONSE, bincode::serialize(&resp).ok()),
                             NetworkCommand::GossipSpend(sp) => (TOP_SPEND, bincode::serialize(&sp).ok()),
                             NetworkCommand::GossipRateLimited(m) => (TOP_RATE_LIMITED, bincode::serialize(&m).ok()),
+                            NetworkCommand::GossipPqhs2Init(bytes) => (TOP_PQHS2_INIT, Some(bytes.clone())),
+                            NetworkCommand::GossipPqhs2Resp(bytes) => (TOP_PQHS2_RESP, Some(bytes.clone())),
                             NetworkCommand::GossipOffer(ofr) => (TOP_OFFERS_V1, bincode::serialize(&ofr).ok()),
                             NetworkCommand::RequestEpoch(n) => (TOP_EPOCH_REQUEST, bincode::serialize(&n).ok()),
                             NetworkCommand::RequestEpochHeadersRange(range) => (TOP_EPOCH_HEADERS_REQUEST, bincode::serialize(&range).ok()),
@@ -3709,6 +3760,12 @@ struct OrphanBuffer {
     inserted_at: std::collections::HashMap<[u8; 32], std::time::Instant>,
     seen_recent: std::collections::HashMap<[u8; 32], std::time::Instant>,
     per_height_cooldown: std::collections::HashMap<u64, std::time::Instant>,
+    // Adjacency: parent_hash -> [child_hash]
+    by_parent: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>>,
+    // Reverse adjacency: child_hash -> parent_hash (if known)
+    parent_of: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    // Fast lookup for anchors by hash
+    by_hash: std::collections::HashMap<[u8; 32], Anchor>,
     total_cap: usize,
     per_height_cap: usize,
     ttl: std::time::Duration,
@@ -3726,6 +3783,9 @@ impl OrphanBuffer {
             inserted_at: std::collections::HashMap::new(),
             seen_recent: std::collections::HashMap::new(),
             per_height_cooldown: std::collections::HashMap::new(),
+            by_parent: std::collections::HashMap::new(),
+            parent_of: std::collections::HashMap::new(),
+            by_hash: std::collections::HashMap::new(),
             total_cap,
             per_height_cap,
             ttl: std::time::Duration::from_secs(ttl_secs),
@@ -3778,6 +3838,20 @@ impl OrphanBuffer {
             removed
         };
         if removed {
+            // Clean adjacency for removed node
+            if let Some(parent_hash) = self.parent_of.remove(&hash) {
+                if let Some(children) = self.by_parent.get_mut(&parent_hash) {
+                    children.retain(|h| *h != hash);
+                    if children.is_empty() { self.by_parent.remove(&parent_hash); }
+                }
+            }
+            if let Some(children) = self.by_parent.remove(&hash) {
+                for ch in children {
+                    if let Some(p) = self.parent_of.get(&ch).copied() {
+                        if p == hash { self.parent_of.remove(&ch); }
+                    }
+                }
+            }
             // now safe to clean maps and possibly remove empty vector
             if let Some(vec2) = self.by_height.get(&height) {
                 if vec2.is_empty() { self.by_height.remove(&height); }
@@ -3791,6 +3865,7 @@ impl OrphanBuffer {
                 if let Some(pos) = self.index_fifo.iter().position(|h| *h == hash) {
                     self.index_fifo.remove(pos);
                 }
+                self.by_hash.remove(&hash);
             }
             return true;
         }
@@ -3829,7 +3904,7 @@ impl OrphanBuffer {
         }
     }
 
-    fn insert(&mut self, anchor: Anchor, local_tip: Option<u64>, tip_window: u64, now: std::time::Instant) -> bool {
+    fn insert(&mut self, anchor: Anchor, local_tip: Option<u64>, tip_window: u64, now: std::time::Instant, db: &Store) -> bool {
         // Only buffer within window of local tip
         if let Some(tip) = local_tip {
             let dist = if anchor.num >= tip { anchor.num - tip } else { tip - anchor.num };
@@ -3866,6 +3941,7 @@ impl OrphanBuffer {
         self.index_fifo.push_back(anchor.hash);
         self.hash_to_height.insert(anchor.hash, anchor.num);
         self.inserted_at.insert(anchor.hash, now);
+        self.by_hash.insert(anchor.hash, anchor.clone());
         self.count += 1;
         self.version = self.version.wrapping_add(1);
         // Global cap enforcement
@@ -3876,7 +3952,87 @@ impl OrphanBuffer {
                 }
             } else { break; }
         }
+        // Update adjacency/link cache once per insert
+        self.update_adjacency_for(&anchor, db);
         true
+    }
+
+    // Record parent->child linkage within buffer (assumes both exist in buffer)
+    fn record_parent_child(&mut self, parent_hash: [u8;32], child_hash: [u8;32]) {
+        // Update parent_of
+        self.parent_of.insert(child_hash, parent_hash);
+        // Update by_parent list with de-dup
+        let entry = self.by_parent.entry(parent_hash).or_insert_with(Vec::new);
+        if !entry.iter().any(|h| *h == child_hash) {
+            entry.push(child_hash);
+        }
+    }
+
+    // Link a child (already in buffer) to available parents at H-1 (buffer-only); also cache DB parent if present
+    fn link_child_to_available_parents(&mut self, child_hash: [u8;32], db: &Store) {
+        let Some(child) = self.by_hash.get(&child_hash).cloned() else { return; };
+        if child.num == 0 { return; }
+        let parent_h = child.num.saturating_sub(1);
+        let expected = Anchor::expected_work_for_difficulty(child.difficulty);
+        // Try buffer parents
+        let mut selected_parent_hash: Option<[u8;32]> = None;
+        if let Some(cands) = self.by_height.get(&parent_h) {
+            for p in cands {
+                if child.cumulative_work != p.cumulative_work.saturating_add(expected) { continue; }
+                let mut h = blake3::Hasher::new();
+                h.update(&child.merkle_root);
+                h.update(&p.hash);
+                if *h.finalize().as_bytes() == child.hash { selected_parent_hash = Some(p.hash); break; }
+            }
+        }
+        if let Some(ph) = selected_parent_hash { self.record_parent_child(ph, child.hash); return; }
+        // Cache DB parent hash if available (no by_parent linkage if parent not buffered)
+        if let Ok(Some(local_parent)) = db.get::<Anchor>("epoch", &parent_h.to_le_bytes()) {
+            if child.cumulative_work == local_parent.cumulative_work.saturating_add(expected) {
+                let mut h = blake3::Hasher::new();
+                h.update(&child.merkle_root);
+                h.update(&local_parent.hash);
+                if *h.finalize().as_bytes() == child.hash {
+                    self.parent_of.insert(child.hash, local_parent.hash);
+                    // also record adjacency under DB parent for BFS traversal
+                    let entry = self.by_parent.entry(local_parent.hash).or_insert_with(Vec::new);
+                    if !entry.iter().any(|h| *h == child.hash) { entry.push(child.hash); }
+                }
+            }
+        }
+    }
+
+    // Link a parent (already in buffer) to any available children at H+1 (buffer-only)
+    fn link_parent_to_available_children(&mut self, parent_hash: [u8;32]) {
+        let Some(parent) = self.by_hash.get(&parent_hash).cloned() else { return; };
+        let child_h = parent.num.saturating_add(1);
+        let mut link_children: Vec<[u8;32]> = Vec::new();
+        if let Some(children) = self.by_height.get(&child_h) {
+            for ch in children {
+                // Verify linkage
+                let expected = Anchor::expected_work_for_difficulty(ch.difficulty);
+                let expected_cum = parent.cumulative_work.saturating_add(expected);
+                if ch.cumulative_work != expected_cum { continue; }
+                let mut h = blake3::Hasher::new();
+                h.update(&ch.merkle_root);
+                h.update(&parent.hash);
+                if *h.finalize().as_bytes() == ch.hash { link_children.push(ch.hash); }
+            }
+        }
+        for ch in link_children { self.record_parent_child(parent.hash, ch); }
+    }
+
+    // Update adjacency for a newly inserted anchor, both as child and as parent
+    fn update_adjacency_for(&mut self, a: &Anchor, db: &Store) {
+        self.link_child_to_available_parents(a.hash, db);
+        self.link_parent_to_available_children(a.hash);
+    }
+
+    // Get buffered children anchors for a parent hash
+    fn children_of(&self, parent_hash: &[u8;32]) -> Vec<Anchor> {
+        if let Some(child_hashes) = self.by_parent.get(parent_hash) {
+            child_hashes.iter().filter_map(|h| self.by_hash.get(h)).cloned().collect()
+        } else { Vec::new() }
     }
 }
 

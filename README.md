@@ -1,6 +1,6 @@
 ## Unchained
 
-### A post‑quantum, privacy‑preserving proof‑of‑work chain you can run today but is still in heavy development -- I tend to push to prod 
+### A post‑quantum safe, proof‑of‑work unchain you can run today but is still in heavy development -- I tend to push to prod
 
 Unchained is a blockchain designed for the next decades of cryptography. It combines:
 - memory‑hard Argon2id proof‑of‑work,
@@ -9,12 +9,12 @@ Unchained is a blockchain designed for the next decades of cryptography. It comb
 - efficient Merkle proofs per epoch,
 - and a simple, production‑oriented node you can compile and mine in minutes.
 
-You get a straightforward UTXO‑style system with private receiving, deterministic verification, and a gossip network that favors practicality over ceremony.
+You get a straightforward UTXO‑style system with private transfers, deterministic verification, and a gossip network that favors practicality over ceremony.
 
 ### Unchained 
-- Post‑quantum by default: Kyber768 (ML‑KEM) for private receiving, and BLAKE3 for fast hashing and domain‑separated derivations throughout.
+- Post‑quantum by default: Kyber768 (ML‑KEM) for private transfers, and BLAKE3 for fast hashing and domain‑separated derivations throughout.
 - Private by design: recipients get coins via stealth outputs; senders don’t reveal long‑term keys. Inclusion is proven via Merkle paths, not global scans.
-- Simple consensus: memory‑hard Argon2id PoW selects coins per epoch; every epoch commits a Merkle root. No heavy scripting, no fragile dependencies.
+- Simple consensus: memory‑hard Argon2id PoW selects coins per epoch; every epoch commits a Merkle root. 
 - Efficient verification: compact proofs; local nodes verify inclusion, nullifier uniqueness, and commitments deterministically.
 
 ---
@@ -47,9 +47,7 @@ source "$HOME/.cargo/env"
 ```bash
 git clone https://github.com/Numi2/unchained.git
 cd unchained
-cargo build --release
-# Start a node; it will create a wallet, sync, and can mine depending on config
-target/release/unchained
+cargo build --release && cargo run --release --bin unchained mine
 ```
 
 The first run will:

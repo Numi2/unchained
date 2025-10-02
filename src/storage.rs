@@ -17,6 +17,33 @@ pub struct Store {
     pub db: DB,
     path: String,
     mirror_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>)>>, // background mirroring
+    retarget_cache_mem: std::sync::Mutex<RetargetCacheMem>,
+}
+
+struct RetargetCacheMem {
+    windows_by_height: std::collections::HashMap<u64, Vec<crate::epoch::Anchor>>, // retarget_height -> window
+    order: std::collections::VecDeque<u64>,
+    capacity: usize,
+}
+
+impl RetargetCacheMem {
+    fn new(capacity: usize) -> Self {
+        Self { windows_by_height: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), capacity }
+    }
+    fn get(&self, height: u64) -> Option<&Vec<crate::epoch::Anchor>> {
+        self.windows_by_height.get(&height)
+    }
+    fn insert(&mut self, height: u64, window: Vec<crate::epoch::Anchor>) {
+        if !self.windows_by_height.contains_key(&height) {
+            self.order.push_back(height);
+            if self.order.len() > self.capacity {
+                if let Some(old) = self.order.pop_front() {
+                    self.windows_by_height.remove(&old);
+                }
+            }
+        }
+        self.windows_by_height.insert(height, window);
+    }
 }
 
 // Global counter to ensure unique database paths
@@ -93,6 +120,8 @@ impl Store {
             "epoch_leaves",   // per-epoch sorted leaf hashes for proofs
             "epoch_levels",   // per-epoch merkle levels for fast proofs
             "coin_epoch",     // coin_id -> epoch number mapping (child epoch that committed the coin)
+            "coin_epoch_by_epoch", // epoch_num||coin_id -> 1 (reverse index for range scans)
+            "retarget_cache",  // retarget_height -> Vec<Anchor> window
             "head",
             "wallet",
             "anchor",
@@ -209,6 +238,12 @@ impl Store {
                 if name == "coin_candidate" {
                     opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
                     opts.set_optimize_filters_for_hits(true);
+                } else if name == "epoch_selected" {
+                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+                    opts.set_optimize_filters_for_hits(true);
+                } else if name == "coin_epoch_by_epoch" {
+                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+                    opts.set_optimize_filters_for_hits(true);
                 }
                 ColumnFamilyDescriptor::new(name.clone(), opts)
             })
@@ -250,6 +285,7 @@ impl Store {
             db,
             path: db_path,
             mirror_tx,
+            retarget_cache_mem: std::sync::Mutex::new(RetargetCacheMem::new(64)),
         };
         
         // Perform initial health check
@@ -355,6 +391,50 @@ impl Store {
         let handle = self.db.cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
         Ok(self.db.get_cf(handle, key)? .map(|v| v.to_vec()))
+    }
+
+    pub fn get_retarget_window_cached(&self, retarget_height: u64) -> Result<Option<Vec<crate::epoch::Anchor>>> {
+        if retarget_height == 0 { return Ok(Some(Vec::new())); }
+        if let Ok(guard) = self.retarget_cache_mem.lock() {
+            if let Some(w) = guard.get(retarget_height) { return Ok(Some(w.clone())); }
+        }
+        let key = retarget_height.to_le_bytes();
+        if let Some(v) = self.get::<Vec<crate::epoch::Anchor>>("retarget_cache", &key)? {
+            if let Ok(mut guard) = self.retarget_cache_mem.lock() {
+                guard.insert(retarget_height, v.clone());
+            }
+            return Ok(Some(v));
+        }
+        Ok(None)
+    }
+
+    pub fn put_retarget_window_cached(&self, retarget_height: u64, window: &[crate::epoch::Anchor]) -> Result<()> {
+        let key = retarget_height.to_le_bytes();
+        let handle = self.db.cf_handle("retarget_cache").ok_or_else(|| anyhow::anyhow!("'retarget_cache' column family missing"))?;
+        let ser = bincode::serialize(window).with_context(|| "Failed to serialize retarget window")?;
+        self.db.put_cf(handle, &key, &ser)?;
+        if let Ok(mut guard) = self.retarget_cache_mem.lock() {
+            guard.insert(retarget_height, window.to_vec());
+        }
+        Ok(())
+    }
+
+    pub fn get_or_build_retarget_window(&self, retarget_height: u64) -> Result<Option<Vec<crate::epoch::Anchor>>> {
+        if let Some(v) = self.get_retarget_window_cached(retarget_height)? { return Ok(Some(v)); }
+        if retarget_height == 0 { return Ok(Some(Vec::new())); }
+        let start = retarget_height.saturating_sub(crate::consensus::RETARGET_INTERVAL);
+        let mut recent: Vec<crate::epoch::Anchor> = Vec::with_capacity(crate::consensus::RETARGET_INTERVAL as usize);
+        for n in start..retarget_height {
+            match self.get::<crate::epoch::Anchor>("epoch", &n.to_le_bytes())? {
+                Some(a) => recent.push(a),
+                None => return Ok(None),
+            }
+        }
+        if recent.len() as u64 == crate::consensus::RETARGET_INTERVAL {
+            self.put_retarget_window_cached(retarget_height, &recent)?;
+            return Ok(Some(recent));
+        }
+        Ok(None)
     }
 
     /// Atomically applies a set of writes.
@@ -708,6 +788,33 @@ impl Store {
             if &k[0..8] != start_key { break; }
             let mut id = [0u8; 32];
             id.copy_from_slice(&k[8..8+32]);
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    pub fn put_coin_epoch_rev(&self, epoch_num: u64, coin_id: &[u8;32]) -> Result<()> {
+        let cf = self.db.cf_handle("coin_epoch_by_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
+        let mut key = Vec::with_capacity(8 + 32);
+        key.extend_from_slice(&epoch_num.to_le_bytes());
+        key.extend_from_slice(coin_id);
+        self.db.put_cf(cf, &key, &[])?;
+        Ok(())
+    }
+
+    pub fn get_coin_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8;32]>> {
+        let cf = self.db.cf_handle("coin_epoch_by_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
+        let start_key = epoch_num.to_le_bytes();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
+        let mut ids: Vec<[u8;32]> = Vec::new();
+        for item in iter {
+            let (k, _v) = item?;
+            if k.len() < 8 + 32 { continue; }
+            if &k[0..8] != start_key { break; }
+            let mut id = [0u8;32];
+            id.copy_from_slice(&k[8..]);
             ids.push(id);
         }
         Ok(ids)

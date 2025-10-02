@@ -372,14 +372,15 @@ impl Manager {
                         };
                         
                         let (difficulty, mem_kib) = if current_epoch > 0 && current_epoch % RETARGET_INTERVAL == 0 {
-                            let mut recent_anchors = Vec::new();
-                            for i in 0..RETARGET_INTERVAL {
-                                let epoch_num = current_epoch.saturating_sub(RETARGET_INTERVAL - i);
-                                if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
-                                    recent_anchors.push(anchor);
+                            let start = current_epoch.saturating_sub(RETARGET_INTERVAL);
+                            let window = self.db.get_or_build_retarget_window(current_epoch).unwrap_or(None);
+                            match window {
+                                Some(w) if w.len() as u64 == RETARGET_INTERVAL => calculate_retarget_consensus(&w),
+                                _ => {
+                                    eprintln!("🔥 Retarget window incomplete starting at {}", start);
+                                    prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
                                 }
                             }
-                            calculate_retarget_consensus(&recent_anchors)
                         } else {
                             prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
                         };
@@ -419,20 +420,36 @@ impl Manager {
 
                         // Persist selected coins into confirmed coin CF and index selected IDs per-epoch
                         if let (Some(coin_cf), Some(coin_epoch_cf)) = (self.db.db.cf_handle("coin"), self.db.db.cf_handle("coin_epoch")) {
+                            let rev_cf_opt = self.db.db.cf_handle("coin_epoch_by_epoch");
+                            // Pre-serialize and reuse buffer for coin bodies
+                            let mut coin_buf: Vec<u8> = Vec::with_capacity(256);
                             for cand in &selected {
-                                // Include creator_pk and lock_hash for spends
                                 let coin = cand.clone().into_confirmed();
-                                if let Ok(bytes) = bincode::serialize(&coin) {
+                                coin_buf.clear();
+                                if bincode::serialize_into(&mut coin_buf, &coin).is_ok() {
+                                    batch.put_cf(coin_cf, &coin.id, &coin_buf);
+                                } else if let Ok(bytes) = bincode::serialize(&coin) {
                                     batch.put_cf(coin_cf, &coin.id, &bytes);
                                 }
                                 // Record the epoch number that committed this coin
                                 batch.put_cf(coin_epoch_cf, &coin.id, &current_epoch.to_le_bytes());
+                                // Reverse index: epoch_num||coin_id -> 1 for range scans
+                                if let Some(rev_cf) = rev_cf_opt {
+                                    let mut key = Vec::with_capacity(8 + 32);
+                                    key.extend_from_slice(&current_epoch.to_le_bytes());
+                                    key.extend_from_slice(&coin.id);
+                                    batch.put_cf(rev_cf, &key, &[]);
+                                }
                             }
                         } else if let Some(coin_cf) = self.db.db.cf_handle("coin") {
                             // Fallback: write coins even if coin_epoch CF is missing (should not happen)
+                            let mut coin_buf: Vec<u8> = Vec::with_capacity(256);
                             for cand in &selected {
                                 let coin = cand.clone().into_confirmed();
-                                if let Ok(bytes) = bincode::serialize(&coin) {
+                                coin_buf.clear();
+                                if bincode::serialize_into(&mut coin_buf, &coin).is_ok() {
+                                    batch.put_cf(coin_cf, &coin.id, &coin_buf);
+                                } else if let Ok(bytes) = bincode::serialize(&coin) {
                                     batch.put_cf(coin_cf, &coin.id, &bytes);
                                 }
                             }
