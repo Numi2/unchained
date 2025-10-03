@@ -72,11 +72,11 @@ macro_rules! net_routine {
 use net_routine;
 
 // Module-level throttle for consensus mismatch logs (per-epoch)
-const CONSENSUS_MISMATCH_LOG_THROTTLE_SECS: u64 = 30;
+const CONSENSUS_MISMATCH_LOG_THROTTLE_SECS: u64 = 60;
 static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Global consensus-mismatch aggregation to prevent log spam across many heights
-const CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS: u64 = 5;
+const CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS: u64 = 15;
 const CONSENSUS_MISMATCH_BAN_SECS: u64 = 24 * 60 * 60; // 24 hours
 struct ConsensusMismatchAgg {
     last_summary: Instant,
@@ -101,7 +101,7 @@ static CONSENSUS_MISMATCH_AGG: Lazy<Mutex<ConsensusMismatchAgg>> = Lazy::new(|| 
 
 fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_diff: usize, got_mem: u32) {
     let now = Instant::now();
-    let mut print_detail_now: Option<String> = None;
+    let print_detail_now: Option<String> = None;
     let mut summary_now: Option<String> = None;
 
     if let Ok(mut agg) = CONSENSUS_MISMATCH_AGG.lock() {
@@ -113,13 +113,8 @@ fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_dif
         agg.last_height_in_window = Some(height);
         agg.last_detail = Some((height, exp_diff, exp_mem, got_diff, got_mem));
 
-        if !agg.printed_window_detail {
-            print_detail_now = Some(format!(
-                "❌ Consensus mismatch at epoch {}: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
-                height, exp_diff, exp_mem, got_diff, got_mem
-            ));
-            agg.printed_window_detail = true;
-        }
+        // Suppress per-event detail; only emit rolling summaries to reduce noise.
+        // Keep the last mismatch detail in memory for the summary tail.
 
         if now.duration_since(agg.last_summary).as_secs() >= CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS {
             let total = agg.total_events;
@@ -568,16 +563,34 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
         Ok(()) => AnchorClass::Valid,
         Err(e) => {
             if let Some(rest) = e.strip_prefix("Retarget window incomplete starting at ") {
-                if let Ok(missing_from) = rest.trim().parse::<u64>() {
-                    return AnchorClass::MissingParent(missing_from);
+                if let Ok(start_h) = rest.trim().parse::<u64>() {
+                    // The error encodes the start of the needed RETARGET_INTERVAL window.
+                    // For fetching the immediate missing parent to enable validation, signal H-1.
+                    let parent_h = a.num.saturating_sub(1);
+                    // If parsing yielded the same parent height already, keep it; otherwise prefer H-1.
+                    return AnchorClass::MissingParent(parent_h.max(start_h));
                 }
             }
             if e.starts_with("Previous anchor ") {
                 return AnchorClass::MissingParent(a.num.saturating_sub(1));
             }
-            // If consensus parameters are definitively wrong (window known), reject as fatal.
+            // Treat consensus-parameter mismatches more cautiously:
+            // - At retarget heights: only Fatal if the local retarget window is complete
+            //   (anchored to our canonical history). Otherwise, this could be valid on an
+            //   alternate parent/window, so classify as PossiblyAltFork.
+            // - Between retargets: parameters inherit from parent. If the peer's parent
+            //   differs, the params may legitimately differ as well; classify as PossiblyAltFork.
             if e.contains("Consensus params mismatch") {
-                return AnchorClass::Fatal;
+                if a.num % RETARGET_INTERVAL == 0 {
+                    match db.get_or_build_retarget_window(a.num) {
+                        Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
+                            return AnchorClass::Fatal;
+                        }
+                        _ => return AnchorClass::PossiblyAltFork,
+                    }
+                } else {
+                    return AnchorClass::PossiblyAltFork;
+                }
             }
             // Other mismatches may still be valid on a different parent/window. Buffer for reorg.
             AnchorClass::PossiblyAltFork
@@ -587,27 +600,113 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
 
 // Validate consensus parameters and linkage for a proposed reorg segment before adoption.
 // Ensures deterministic retarget validation only when the parent matches the canonical DB parent.
-fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store) -> Result<(), String> {
+// Attempt to build the last RETARGET_INTERVAL anchors ending at `end_parent` (height H-1)
+// using a combination of the orphan buffer and DB, verifying linkage at each step.
+fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_buf: &OrphanBuffer) -> Option<Vec<Anchor>> {
+    if end_parent.num < RETARGET_INTERVAL { return None; }
+    let needed = RETARGET_INTERVAL as usize;
+    let mut backward: Vec<Anchor> = Vec::with_capacity(needed);
+    let mut cur: Anchor = end_parent.clone();
+    backward.push(cur.clone());
+    while backward.len() < needed {
+        let next_h = cur.num.saturating_sub(1);
+        // Find a valid parent at next_h that links to `cur`
+        let mut candidate: Option<Anchor> = None;
+        // 1) Use recorded parent mapping from orphan buffer if present
+        if let Some(p_hash) = orphan_buf.parent_of.get(&cur.hash).copied() {
+            if let Some(p) = orphan_buf.by_hash.get(&p_hash).cloned() {
+                if p.num == next_h {
+                    // verify linkage
+                    let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
+                    let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
+                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                        candidate = Some(p);
+                    }
+                }
+            }
+            if candidate.is_none() {
+                if let Ok(Some(p)) = db.get::<Anchor>("anchor", &p_hash) {
+                    if p.num == next_h {
+                        let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
+                        let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
+                        if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                            candidate = Some(p);
+                        }
+                    }
+                }
+            }
+        }
+        // 2) Try DB by height if still unknown
+        if candidate.is_none() {
+            if let Ok(Some(p)) = db.get::<Anchor>("epoch", &next_h.to_le_bytes()) {
+                let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
+                let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
+                if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                    candidate = Some(p);
+                }
+            }
+        }
+        // 3) Try orphans at height next_h
+        if candidate.is_none() {
+            if let Some(cands) = orphan_buf.by_height.get(&next_h) {
+                for p in cands {
+                    let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
+                    let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
+                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                        candidate = Some(p.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(prev) = candidate else { return None; };
+        backward.push(prev.clone());
+        cur = prev;
+    }
+    // We collected [H-1, H-2, ...], reverse to chronological [H-N, ..., H-1]
+    backward.reverse();
+    Some(backward)
+}
+
+fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store, orphan_buf: &OrphanBuffer) -> Result<(), String> {
     let mut p = parent.clone();
     for a in seg {
         if a.num % RETARGET_INTERVAL == 0 {
-            // Only compute window if we can anchor it to the canonical DB parent at this height.
-            match db.get::<Anchor>("epoch", &p.num.to_le_bytes()) {
-                Ok(Some(db_parent)) if db_parent.hash == p.hash => {
-                    match db.get_or_build_retarget_window(a.num) {
-                        Ok(Some(recent)) if recent.len() as u64 == RETARGET_INTERVAL => {
+            // Try canonical DB parent first
+            let mut window_ok: bool = false;
+            if let Ok(Some(db_parent)) = db.get::<Anchor>("epoch", &p.num.to_le_bytes()) {
+                if db_parent.hash == p.hash {
+                    if let Ok(Some(recent)) = db.get_or_build_retarget_window(a.num) {
+                        if recent.len() as u64 == RETARGET_INTERVAL {
                             let (exp_d, exp_m) = calculate_retarget_consensus(&recent);
                             if a.difficulty != exp_d || a.mem_kib != exp_m {
                                 return Err("Consensus params mismatch in segment".into());
                             }
+                            window_ok = true;
                         }
-                        _ => return Err(format!("Retarget window incomplete starting at {}", a.num.saturating_sub(RETARGET_INTERVAL))),
                     }
                 }
-                _ => {
-                    // Parent is an alternate not reflected in DB; we cannot determine the window yet.
-                    return Err(format!("Missing retarget window for alternate parent at {}", a.num));
+            }
+            // Fallback: build window from orphan buffer + DB if canonical window not available
+            if !window_ok {
+                if let Some(recent) = build_retarget_window_from_orphans(&p, db, orphan_buf) {
+                    if recent.len() as u64 == RETARGET_INTERVAL {
+                        let (exp_d, exp_m) = calculate_retarget_consensus(&recent);
+                        if a.difficulty != exp_d || a.mem_kib != exp_m {
+                            return Err("Consensus params mismatch in segment".into());
+                        }
+                        window_ok = true;
+                    }
                 }
+            }
+            if !window_ok {
+                // Preserve original error classes for diagnostics
+                if let Ok(Some(db_parent)) = db.get::<Anchor>("epoch", &p.num.to_le_bytes()) {
+                    if db_parent.hash == p.hash {
+                        return Err(format!("Retarget window incomplete starting at {}", a.num.saturating_sub(RETARGET_INTERVAL)));
+                    }
+                }
+                return Err(format!("Missing retarget window for alternate parent at {}", a.num));
             }
         } else {
             // Between retargets, parameters must inherit exactly from parent.
@@ -668,6 +767,9 @@ const RANGE_REQ_DEDUP_SECS: u64 = 20;
 // Debounce map for epoch-by-hash requests to prevent spam
 static RECENT_HASH_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const HASH_REQ_DEDUP_SECS: u64 = 20;
+// Debounce map for direct parent-by-height requests to avoid spamming the network
+static RECENT_DIRECT_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+const DIRECT_REQ_DEDUP_SECS: u64 = 5;
 
 // Queue-level de-duplication and per-key backoff controls
 static RECENT_ENQUEUED_CMDS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -755,6 +857,39 @@ fn request_aligned_range(command_tx: &mpsc::UnboundedSender<NetworkCommand>, tar
             start_height: aligned_start, 
             count 
         })); 
+    }
+}
+
+// Request an entire historical window ending at `end_height` by issuing a bounded series of
+// aligned range requests (coalesced via RECENT_RANGE_REQS). This ensures we actually cover
+// the trailing portion of the window needed for retarget validation (e.g., 22000..23999).
+fn request_window_chunks(command_tx: &mpsc::UnboundedSender<NetworkCommand>, end_height: u64, window: u64) {
+    if window == 0 { return; }
+    let mut remaining = window;
+    let mut cur_end = end_height;
+    // Issue at most ceil(window/256) requests, from the end backward
+    while remaining > 0 {
+        let chunk = remaining.min(256);
+        let start = cur_end.saturating_sub(chunk - 1);
+        // Align start downward to chunk boundary, but cap count to include cur_end only
+        let aligned_start = (start / HDR_CHUNK) * HDR_CHUNK;
+        let count = (cur_end.saturating_sub(aligned_start) + 1).min(256) as u32;
+        let now = std::time::Instant::now();
+        let mut allow = true;
+        if let Ok(mut m) = RECENT_RANGE_REQS.lock() {
+            m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(RANGE_REQ_DEDUP_SECS));
+            allow = !m.contains_key(&aligned_start);
+            if allow { m.insert(aligned_start, now); }
+        }
+        if allow {
+            let _ = command_tx.send(NetworkCommand::RequestEpochHeadersRange(EpochHeadersRange{
+                start_height: aligned_start,
+                count,
+            }));
+        }
+        if cur_end < chunk { break; }
+        cur_end = cur_end.saturating_sub(chunk);
+        remaining = remaining.saturating_sub(chunk);
     }
 }
 
@@ -1115,6 +1250,9 @@ const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on
 const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget window when historical data is missing
     // Global aggregation cadence for alt-fork summaries
     const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
+    // Throttle proactive retarget prefetch logs (per retarget height)
+    static LAST_RETARGET_PREFETCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    const RETARGET_PREFETCH_LOG_THROTTLE_SECS: u64 = 30;
     // Throttle noisy reorg logs (per-height)
     const REORG_LOG_THROTTLE_SECS: u64 = 30;
     static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -1126,6 +1264,9 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
     static DIVERGENT_PARENT_EVENTS: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const DIVERGENT_WINDOW_SECS: u64 = 10;
     const DIVERGENT_THRESHOLD: u32 = 3; // aggressive threshold to penalize sooner
+    // Per-peer per-height throttle for consensus-mismatch logs
+    static CONS_MISMATCH_PEER_HEIGHT: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    const CONS_MISMATCH_PEER_HEIGHT_TTL_SECS: u64 = 30;
     const DIVERGENT_SPAM_BAN_SECS: u64 = 60 * 60 * 4; // 4 hour ban for spam
 
     fn note_divergent_parent_event(peer_id: &PeerId, height: u64) -> u32 {
@@ -1154,7 +1295,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
     static ALT_FORK_AGG: Lazy<Mutex<std::collections::HashMap<u64, AltForkAgg>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
     // Attempt to reorg to a better chain using buffered anchors.
-    fn attempt_reorg(
+fn attempt_reorg(
         db: &Store,
         orphan_buf: &mut OrphanBuffer,
         anchor_tx: &broadcast::Sender<Anchor>,
@@ -1188,9 +1329,16 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         if let Some(near_tip) = near_chain.last() {
             if near_tip.cumulative_work > current_latest.cumulative_work {
                 // Gate sequential catch-up adoption on consensus validation
-                if let Err(e) = validate_segment_consensus(&current_latest, &near_chain, db) {
+                if let Err(e) = validate_segment_consensus(&current_latest, &near_chain, db, &orphan_buf) {
                     net_log!("⛔ Reorg blocked (near-tip): {}", e);
-                    // Proactively backfill near fork point to satisfy window requirements
+                    // If blocked due to incomplete retarget window, backfill the exact window range
+                    if let Some(rest) = e.strip_prefix("Retarget window incomplete starting at ") {
+                        if let Ok(missing_from) = rest.trim().parse::<u64>() {
+                            let window_end = missing_from.saturating_add(RETARGET_INTERVAL.saturating_sub(1));
+                            request_window_chunks(&command_tx, window_end, RETARGET_INTERVAL);
+                        }
+                    }
+                    // Also backfill near the fork point for context
                     let start = current_latest.num.saturating_sub(REORG_BACKFILL);
                     for n in start..=current_latest.num { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
                     return false;
@@ -1445,7 +1593,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
         }
 
         // Gate BFS adoption on consensus validation across the segment using resolved parent
-        if let Err(e) = validate_segment_consensus(resolved_parent.as_ref().unwrap_or(&current_latest), &chosen_chain, db) {
+        if let Err(e) = validate_segment_consensus(resolved_parent.as_ref().unwrap_or(&current_latest), &chosen_chain, db, &orphan_buf) {
             net_log!("⛔ Reorg blocked (BFS): {}", e);
             // Backfill around fork height to complete windows for a future attempt
             let start = fork_height.saturating_sub(REORG_BACKFILL);
@@ -2306,20 +2454,57 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 continue;
                                             }
                                             
-                                            // Log details about missing previous anchor
+                                            // Log details about missing previous anchor (throttled per height)
                                             if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                                                 let retarget_gap = parent_h.saturating_add(1) != a.num;
                                                 if retarget_gap {
-                                                    net_log!("⏳ Epoch {} awaiting historical anchors starting at {} to complete retarget window", 
-                                                        a.num, parent_h);
+                                                    let now = std::time::Instant::now();
+                                                    static LAST_RETARGET_GAP_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+                                                    let mut allow = true;
+                                                    if let Ok(mut m) = LAST_RETARGET_GAP_LOGS.lock() {
+                                                        m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                        if let Some(prev) = m.get(&a.num) {
+                                                            if now.duration_since(*prev) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow = false; }
+                                                        }
+                                                        if allow { m.insert(a.num, now); }
+                                                    }
+                                                    if allow {
+                                                        // For retarget heights, the needed window starts at (H - RETARGET_INTERVAL).
+                                                        // Otherwise, report the immediate missing height for clarity.
+                                                        let start_at = if a.num % RETARGET_INTERVAL == 0 {
+                                                            a.num.saturating_sub(RETARGET_INTERVAL)
+                                                        } else {
+                                                            parent_h
+                                                        };
+                                                        net_log!(
+                                                            "⏳ Epoch {} awaiting historical anchors starting at {} to complete retarget window",
+                                                            a.num, start_at
+                                                        );
+                                                    }
+                                                    // Proactively backfill the entire retarget window needed for validation
+                                                    // Window covers [parent_h .. parent_h + RETARGET_INTERVAL - 1]
+                                                    let window_end = parent_h.saturating_add(RETARGET_INTERVAL.saturating_sub(1));
+                                                    request_window_chunks(&command_tx, window_end, RETARGET_INTERVAL);
                                                 } else if a.num == latest.num + 1 || a.num == latest.num + 2 {
-                                                    net_log!("⚠️  Epoch {} missing or divergent parent. Looking for parent at {}", 
-                                                        a.num, a.num.saturating_sub(1));
-                                                    // Check if we have the previous epoch with a different hash
-                                                    if let Ok(Some(stored_prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
-                                                        net_log!("❌ Hash mismatch at epoch {}: stored hash {}, anchor observed child {}",
-                                                            a.num - 1, hex::encode(&stored_prev.hash[..8]), 
-                                                            hex::encode(&a.hash[..8]));
+                                                    // Throttle unknown-parent log per height to reduce spam
+                                                    let now = std::time::Instant::now();
+                                                    let mut allow = true;
+                                                    if let Ok(mut m) = LAST_UNKNOWN_PARENT_LOGS.lock() {
+                                                        m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                                                        if let Some(prev) = m.get(&a.num) {
+                                                            if now.duration_since(*prev) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow = false; }
+                                                        }
+                                                        if allow { m.insert(a.num, now); }
+                                                    }
+                                                    if allow {
+                                                        net_log!("⚠️  Epoch {} missing or divergent parent. Looking for parent at {}", 
+                                                            a.num, a.num.saturating_sub(1));
+                                                        // Check if we have the previous epoch with a different hash
+                                                        if let Ok(Some(stored_prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                                            net_log!("❌ Hash mismatch at epoch {}: stored hash {}, anchor observed child {}",
+                                                                a.num - 1, hex::encode(&stored_prev.hash[..8]), 
+                                                                hex::encode(&a.hash[..8]));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2355,9 +2540,44 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                 } else {
                                                     REORG_BACKFILL
                                                 };
-                                                // Request parent directly to avoid dedup latency, and also header range for context
-                                                let _ = command_tx.send(NetworkCommand::RequestEpochDirect(parent_h));
-                                                request_aligned_range(&command_tx, parent_h, backfill_window);
+                                                // Request parent directly to avoid dedup latency (throttled)
+                                                let now = std::time::Instant::now();
+                                                let mut allow_direct = true;
+                                                if let Ok(mut m) = RECENT_DIRECT_REQS.lock() {
+                                                    m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(DIRECT_REQ_DEDUP_SECS));
+                                                    allow_direct = !m.contains_key(&parent_h);
+                                                    if allow_direct { m.insert(parent_h, now); }
+                                                }
+                                                if allow_direct {
+                                                    let _ = command_tx.send(NetworkCommand::RequestEpochDirect(parent_h));
+                                                }
+
+                                                // If this missing-parent occurs at a retarget height boundary, proactively fetch
+                                                // the entire historical window that will be needed to validate params at `a.num`.
+                                                // This reduces oscillation where peers send anchors we classify as alt-fork due to
+                                                // incomplete local history.
+                                                if a.num % RETARGET_INTERVAL == 0 {
+                                                    let window_end = parent_h;
+                                                    // Log once per retarget height to aid debugging
+                                                    let now = std::time::Instant::now();
+                                                    let mut allow_log = true;
+                                                    if let Ok(mut m) = LAST_RETARGET_PREFETCH_LOGS.lock() {
+                                                        m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(RETARGET_PREFETCH_LOG_THROTTLE_SECS));
+                                                        allow_log = !m.contains_key(&a.num);
+                                                        if allow_log { m.insert(a.num, now); }
+                                                    }
+                                                    if allow_log {
+                                                        net_log!(
+                                                            "⏩ Proactively fetching full retarget window ({} epochs ending at {}) for height {}",
+                                                            RETARGET_INTERVAL, window_end, a.num
+                                                        );
+                                                    }
+                                                    request_window_chunks(&command_tx, window_end, RETARGET_INTERVAL);
+                                                }
+
+                                                // Otherwise, backfill a reasonable window ending at parent_h+window-1
+                                                let window_end = parent_h.saturating_add(backfill_window.saturating_sub(1));
+                                                request_window_chunks(&command_tx, window_end, backfill_window);
                                             }
                                             needs_reorg_check = true;
                                         },
@@ -2415,9 +2635,11 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             // Do not mark peer-confirmed or advance highest_seen on alt-fork observations
                                             needs_reorg_check = true;
 
-                                            // Aggressively penalize consensus-parameter mismatches even when treated as alt-fork
+                                            // Be conservative on alt-fork: only apply heavy penalties when
+                                            // the mismatch is provably wrong relative to our anchored window.
                                             let mut applied_extra_penalty = false;
                                             let mut is_consensus_mismatch = false;
+                                            let mut anchored_window = false;
                                             // Best-effort local recomputation of expected params
                                             let (exp_diff_opt, exp_mem_opt) = if a.num == 0 {
                                                 (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
@@ -2426,6 +2648,7 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                                     match db.get_or_build_retarget_window(a.num) {
                                                         Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
                                                             let (d, m) = calculate_retarget_consensus(&w);
+                                                            anchored_window = true; // window anchored to our canonical history
                                                             (Some(d), Some(m))
                                                         },
                                                         _ => (None, None),
@@ -2440,16 +2663,32 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             }
 
                                             if is_consensus_mismatch {
-                                                net_log!(
-                                                    "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}. Applying heavier penalty",
-                                                    peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
-                                                );
-                                                crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
-                                                // Apply extra strikes to hasten ban
-                                                score.record_validation_failure();
-                                                score.record_validation_failure();
-                                                score.ban_for(CONSENSUS_MISMATCH_BAN_SECS);
-                                                applied_extra_penalty = true;
+                                                // Throttle per (peer,height) to reduce noise
+                                                let now = std::time::Instant::now();
+                                                let mut allow = true;
+                                                if let Ok(mut m) = CONS_MISMATCH_PEER_HEIGHT.lock() {
+                                                    m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(CONS_MISMATCH_PEER_HEIGHT_TTL_SECS));
+                                                    let key = (peer_id.clone(), a.num);
+                                                    allow = !m.contains_key(&key);
+                                                    if allow { m.insert(key, now); }
+                                                }
+                                                if allow {
+                                                    net_log!(
+                                                        "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}",
+                                                        peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
+                                                    );
+                                                }
+                                                // Only escalate to heavy penalty when the retarget window is anchored and complete
+                                                if anchored_window && a.num % RETARGET_INTERVAL == 0 {
+                                                    crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
+                                                    score.record_validation_failure();
+                                                    score.record_validation_failure();
+                                                    score.ban_for(CONSENSUS_MISMATCH_BAN_SECS);
+                                                    applied_extra_penalty = true;
+                                                } else {
+                                                    // Soft note only; do not ban for potentially valid alt-fork params
+                                                    // Avoid incrementing failures to prevent accidental bans
+                                                }
                                             }
 
                                             // If now banned due to accumulated failures, disconnect immediately
@@ -2463,42 +2702,64 @@ const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget win
                                             // Always record a failure
                                             score.record_validation_failure();
 
-                                            // Penalize consensus-parameter mismatches more aggressively
-                                            let mut applied_extra_penalty = false;
-                                            let mut is_consensus_mismatch = false;
-                                            // Best-effort local recomputation of expected params
-                                            let (exp_diff_opt, exp_mem_opt) = if a.num == 0 {
-                                                (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
-                                            } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
-                                                if a.num % RETARGET_INTERVAL == 0 {
-                                                    match db.get_or_build_retarget_window(a.num) {
-                                                        Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
-                                                            let (d, m) = calculate_retarget_consensus(&w);
-                                                            (Some(d), Some(m))
-                                                        },
-                                                        _ => (None, None),
-                                                    }
-                                                } else {
-                                                    (Some(prev.difficulty), Some(prev.mem_kib))
+                                        // Penalize consensus-parameter mismatches conservatively; only escalate when provably wrong
+                                        let mut applied_extra_penalty = false;
+                                        let mut is_consensus_mismatch = false;
+                                        let mut anchored_window = false;
+                                        // Best-effort local recomputation of expected params
+                                        let (exp_diff_opt, exp_mem_opt) = if a.num == 0 {
+                                            (Some(TARGET_LEADING_ZEROS), Some(DEFAULT_MEM_KIB))
+                                        } else if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                            if a.num % RETARGET_INTERVAL == 0 {
+                                                match db.get_or_build_retarget_window(a.num) {
+                                                    Ok(Some(w)) if w.len() as u64 == RETARGET_INTERVAL => {
+                                                        let (d, m) = calculate_retarget_consensus(&w);
+                                                        anchored_window = true; // window anchored to our canonical history
+                                                        (Some(d), Some(m))
+                                                    },
+                                                    _ => (None, None),
                                                 }
-                                            } else { (None, None) };
-
-                                            if let (Some(ed), Some(em)) = (exp_diff_opt, exp_mem_opt) {
-                                                if a.difficulty != ed || a.mem_kib != em { is_consensus_mismatch = true; }
+                                            } else {
+                                                (Some(prev.difficulty), Some(prev.mem_kib))
                                             }
+                                        } else { (None, None) };
 
-                                            if is_consensus_mismatch {
+                                        if let (Some(ed), Some(em)) = (exp_diff_opt, exp_mem_opt) {
+                                            if a.difficulty != ed || a.mem_kib != em { is_consensus_mismatch = true; }
+                                        }
+
+                                        if is_consensus_mismatch {
+                                            if anchored_window && a.num % RETARGET_INTERVAL == 0 {
+                                                // Log once even under throttle since we are applying a penalty
                                                 net_log!(
                                                     "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}. Applying heavier penalty",
                                                     peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
                                                 );
+                                                crate::metrics::VALIDATION_FAIL_ANCHOR.inc();
                                                 // Apply extra strikes to hasten ban
                                                 score.record_validation_failure();
                                                 score.record_validation_failure();
                                                 // Immediate 24h ban for consensus mismatch
                                                 score.ban_for(CONSENSUS_MISMATCH_BAN_SECS);
                                                 applied_extra_penalty = true;
+                                            } else {
+                                                // Soft note only; do not ban for potentially valid alt-fork params; throttle per (peer,height)
+                                                let now = std::time::Instant::now();
+                                                let mut allow = true;
+                                                if let Ok(mut m) = CONS_MISMATCH_PEER_HEIGHT.lock() {
+                                                    m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(CONS_MISMATCH_PEER_HEIGHT_TTL_SECS));
+                                                    let key = (peer_id.clone(), a.num);
+                                                    allow = !m.contains_key(&key);
+                                                    if allow { m.insert(key, now); }
+                                                }
+                                                if allow {
+                                                    net_log!(
+                                                        "🚫 Peer {} sent consensus-mismatched anchor #{} (diff {}, mem {}) — expected diff {}, mem {}",
+                                                        peer_id, a.num, a.difficulty, a.mem_kib, exp_diff_opt.unwrap_or_default(), exp_mem_opt.unwrap_or_default()
+                                                    );
+                                                }
                                             }
+                                        }
 
                                             // If now banned due to accumulated failures, disconnect immediately
                                             if applied_extra_penalty && score.is_banned() {

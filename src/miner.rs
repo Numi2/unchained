@@ -374,6 +374,28 @@ impl Miner {
         let creator_address = self.wallet.address();
         let mem_kib = anchor.mem_kib;
         let difficulty = anchor.difficulty;
+        // Safety: at retarget boundaries, only mine when our local retarget window is complete.
+        // This avoids producing anchors with params that will be rejected once history arrives.
+        if anchor.num > 0 && anchor.num % crate::consensus::RETARGET_INTERVAL == 0 {
+            if let Ok(window_opt) = self.db.get_or_build_retarget_window(anchor.num) {
+                let ready = window_opt.as_ref().map(|w| w.len() as u64 == crate::consensus::RETARGET_INTERVAL).unwrap_or(false);
+                if !ready {
+                    println!(
+                        "⏳ Retarget guard: delaying mining for epoch #{} until historical window [{}..{}] is complete",
+                        anchor.num,
+                        anchor.num.saturating_sub(crate::consensus::RETARGET_INTERVAL),
+                        anchor.num.saturating_sub(1)
+                    );
+                    return Ok(());
+                }
+            } else {
+                println!(
+                    "⏳ Retarget guard: delaying mining for epoch #{} (window fetch error)",
+                    anchor.num
+                );
+                return Ok(());
+            }
+        }
         let mut attempts = 0u64;
         let max_attempts = self.cfg.max_attempts;
 

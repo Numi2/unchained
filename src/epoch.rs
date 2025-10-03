@@ -377,8 +377,8 @@ impl Manager {
                             match window {
                                 Some(w) if w.len() as u64 == RETARGET_INTERVAL => calculate_retarget_consensus(&w),
                                 _ => {
-                                    eprintln!("🔥 Retarget window incomplete starting at {}", start);
-                                    prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
+                                    eprintln!("⏳ Retarget window incomplete starting at {} — waiting before emitting retarget epoch {}", start, current_epoch);
+                                    continue;
                                 }
                             }
                         } else {

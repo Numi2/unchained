@@ -264,7 +264,6 @@ async fn main() -> anyhow::Result<()> {
     println!("--- unchained Node ---");
 
     let cli = Cli::parse();
-    if cli.quiet_net { network::set_quiet_logging(true); }
 
     // Try reading config from CLI path, then from the executable directory, else fallback to embedded default
     let mut cfg = match config::load(&cli.config) {
@@ -298,7 +297,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Resolve storage path: if relative, place under user's home at ~/.unchained/unchained_data
+    // Apply quiet logging preference: CLI flag overrides config
+    if cli.quiet_net {
+        network::set_quiet_logging(true);
+    }
     if std::path::Path::new(&cfg.storage.path).is_relative() {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -307,6 +309,11 @@ async fn main() -> anyhow::Result<()> {
             .join(".unchained")
             .join("unchained_data");
         cfg.storage.path = abs.to_string_lossy().into_owned();
+    }
+
+    // If no CLI quiet flag, honor config default
+    if !cli.quiet_net && cfg.net.quiet_by_default {
+        network::set_quiet_logging(true);
     }
 
     let db = match std::panic::catch_unwind(|| storage::open(&cfg.storage)) {

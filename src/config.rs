@@ -41,6 +41,9 @@ pub struct Net {
     /// Optional static ban list of libp2p PeerIds. Connections and dials to these peers are blocked.
     #[serde(default)]
     pub banned_peer_ids: Vec<String>,
+    /// Suppress routine network gossip logs by default (overridden by CLI --quiet-net)
+    #[serde(default)]
+    pub quiet_by_default: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
