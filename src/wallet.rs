@@ -26,24 +26,6 @@ pub struct StealthAddressDocV3 {
     kyber_pk: Vec<u8>,
 }
 
-// Legacy V2 format (Kyber-only)
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct StealthAddressDocV2 {
-    version: u8,
-    recipient_addr: Address,
-    kyber_pk: Vec<u8>,
-}
-
-// Legacy V1 format (Dilithium+Kyber with signature)
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct StealthAddressDoc {
-    version: u8,
-    recipient_addr: Address,
-    dili_pk: Vec<u8>,
-    kyber_pk: Vec<u8>,
-    sig: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyDocV1 {
     pub chain_id: [u8; 32],
@@ -157,72 +139,8 @@ impl Wallet {
         }
 
         if let Some(encoded) = db.get::<Vec<u8>>("wallet", WALLET_KEY)? {
-            // Detect legacy plaintext wallet (pk + sk concatenated)
-            if encoded.len() == DILITHIUM3_PK_BYTES + DILITHIUM3_SK_BYTES {
-                println!("⚠️  Detected legacy plaintext wallet – migrating to encrypted format...");
-                let (pk_bytes, sk_bytes) = encoded.split_at(DILITHIUM3_PK_BYTES);
-                let pk = PublicKey::from_bytes(pk_bytes)
-                    .with_context(|| "Failed to decode public key from wallet")?;
-                let sk = SecretKey::from_bytes(sk_bytes)
-                    .with_context(|| "Failed to decode secret key from wallet")?;
-
-                let passphrase = obtain_passphrase("Set a pass-phrase to encrypt your wallet: ")?;
-                let mut salt = [0u8; SALT_LEN];
-                OsRng.fill_bytes(&mut salt);
-
-                let mut key = [0u8; 32];
-                let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
-                    .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
-                Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-                    .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
-                    .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
-
-                let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-                let mut nonce = [0u8; NONCE_LEN];
-                OsRng.fill_bytes(&mut nonce);
-                // V2: encrypt Dilithium SK + Kyber SK/PK together as one payload
-                let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
-                let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES];
-                dili_sk.copy_from_slice(sk.as_bytes());
-                let mut kyb_sk = [0u8; KYBER768_SK_BYTES];
-                kyb_sk.copy_from_slice(kyber_sk.as_bytes());
-                let mut kyb_pk = [0u8; KYBER768_PK_BYTES];
-                kyb_pk.copy_from_slice(kyber_pk.as_bytes());
-                let secrets = WalletSecretsV2 {
-                    dili_sk,
-                    kyber_sk: kyb_sk,
-                    kyber_pk: kyb_pk,
-                };
-                let plaintext = bincode::serialize(&secrets)?;
-                let ciphertext = cipher
-                    .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
-                    .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
-                // best-effort zeroize
-                key.iter_mut().for_each(|b| *b = 0);
-
-                let mut new_encoded = Vec::with_capacity(
-                    DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len(),
-                );
-                new_encoded.extend_from_slice(pk.as_bytes());
-                new_encoded.push(WALLET_VERSION_WITH_KYBER);
-                new_encoded.extend_from_slice(&salt);
-                new_encoded.extend_from_slice(&nonce);
-                new_encoded.extend_from_slice(&ciphertext);
-                db.put("wallet", WALLET_KEY, &new_encoded)?;
-
-                let address = crypto::address_from_pk(&pk);
-                println!(
-                    "🔐 Wallet migrated and unlocked. Address: {}",
-                    hex::encode(address)
-                );
-                return Ok(Wallet {
-                    _db: Arc::downgrade(&db),
-                    pk,
-                    sk,
-                    kyber_pk,
-                    kyber_sk,
-                    address,
-                });
+            if encoded.len() < DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN {
+                bail!("Unsupported wallet encoding");
             }
 
             // --- Encrypted wallet path ---
@@ -457,50 +375,24 @@ impl Wallet {
                 .decode(s)
                 .map_err(|_| anyhow!("Invalid stealth address encoding"))?,
         };
-        // Try V3, then V2, then V1 legacy for DB compatibility
-        if let Ok(doc3) = bincode::deserialize::<StealthAddressDocV3>(&bytes) {
-            if doc3.version != 3 {
-                bail!("Unsupported stealth address version");
-            }
-            let kyber_pk = KyberPk::from_bytes(&doc3.kyber_pk)
-                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
-            return Ok((doc3.recipient_addr, kyber_pk));
+        let doc = bincode::deserialize::<StealthAddressDocV3>(&bytes)
+            .map_err(|_| anyhow!("Invalid stealth address payload"))?;
+        if doc.version != 3 {
+            bail!("Unsupported stealth address version");
         }
-        if let Ok(doc2) = bincode::deserialize::<StealthAddressDocV2>(&bytes) {
-            if doc2.version != 2 {
-                bail!("Unsupported stealth address version");
-            }
-            let kyber_pk = KyberPk::from_bytes(&doc2.kyber_pk)
-                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address (v2)"))?;
-            return Ok((doc2.recipient_addr, kyber_pk));
-        }
-        if let Ok(doc1) = bincode::deserialize::<StealthAddressDoc>(&bytes) {
-            if doc1.version != 1 {
-                bail!("Unsupported stealth address version");
-            }
-            let dili_pk = PublicKey::from_bytes(&doc1.dili_pk)
-                .map_err(|_| anyhow!("Invalid Dilithium PK in stealth address (v1)"))?;
-            let kyber_pk = KyberPk::from_bytes(&doc1.kyber_pk)
-                .map_err(|_| anyhow!("Invalid Kyber PK in stealth address (v1)"))?;
-            let computed_addr = crypto::address_from_pk(&dili_pk);
-            return Ok((computed_addr, kyber_pk));
-        }
-        bail!("Invalid stealth address payload")
-    }
-
-    /// Backward-compatible wrapper; signature verification removed. Prefer `parse_stealth_address`.
-    pub fn parse_and_verify_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
-        Self::parse_stealth_address(addr_str)
+        let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
+            .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
+        Ok((doc.recipient_addr, kyber_pk))
     }
 
     // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
     /// Accepts a recipient handle that can be either:
-    /// - A stealth address string (existing formats), or
+    /// - A V3 stealth address string, or
     /// - A KeyDoc JSON string: {chain_id,dili_pk,kyber_pk,sig=sign("bind"|chain_id|dili_pk|kyber_pk)}
     /// Returns (recipient_addr, receiver_kyber_pk) after full verification.
     fn parse_recipient_handle(&self, handle: &str) -> Result<(Address, KyberPk)> {
-        // 1) Try stealth address first (back-compat)
+        // 1) Try stealth address first.
         if let Ok(t) = Self::parse_stealth_address(handle) {
             return Ok(t);
         }
@@ -595,7 +487,7 @@ impl Wallet {
                     continue;
                 }
 
-                // Else determine owner via genesis (no legacy transfers)
+                // Otherwise treat coin creation as direct ownership.
                 if coin.creator_address == self.address {
                     utxos.push(coin);
                 }
@@ -623,7 +515,7 @@ impl Wallet {
             {
                 // Persist OTP marker (no SK to store since we use opaque OTP bytes)
                 let pk_hash = crate::crypto::blake3_hash(&spend.to.one_time_pk);
-                // keep index for compatibility with earlier flows
+                // Keep the OTP index so wallet scans remain deterministic.
                 store.put_otp_index(&coin.id, &pk_hash)?;
                 // Invariants: coin exists; spending updates are already recorded under CFs
                 // Nothing to write here; scanning functions will reflect ownership.
@@ -1279,7 +1171,7 @@ impl Wallet {
         for item in iter {
             let (_k, value) = item?;
             if let Ok(spend) = bincode::deserialize::<crate::transfer::Spend>(&value) {
-                // Determine previous owner address (tolerant coin decoding for legacy formats)
+                // Determine previous owner address from the confirmed coin record.
                 let coin = match store.get_coin(&spend.coin_id)? {
                     Some(c) => c,
                     None => {

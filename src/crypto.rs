@@ -119,7 +119,7 @@ pub fn derive_one_time_pk_bytes(seed32: [u8; 32]) -> [u8; OTP_PK_BYTES] {
     out
 }
 
-// [legacy] nullifier_v2 helper removed – V3 hashlock is the only active path.
+// V3 hashlock is the only active nullifier path.
 
 /// Commitment of a stealth output used in spend authorization (V3)
 /// Definition: commit to the Kyber ciphertext only to avoid circular

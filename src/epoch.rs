@@ -526,7 +526,7 @@ impl Manager {
                         } else {
                             crate::metrics::EPOCH_HEIGHT.set(current_epoch as i64);
                             crate::metrics::SELECTED_COINS.set(selected_ids.len() as i64);
-                            // Gossip legacy anchor
+                            // Gossip the canonical anchor.
                             self.net.gossip_anchor(&anchor).await;
                             // Also gossip compact epoch if enabled
                             if self.compact_cfg.enable {

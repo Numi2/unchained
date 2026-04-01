@@ -813,7 +813,7 @@ async fn main() -> anyhow::Result<()> {
                                     .decode(parsed_token.as_str())
                             })
                         {
-                            // legacy batch token removed
+                            // Batch token flow removed.
                         }
                     }
                     let _recipient_addr = if let Some(a) = recipient_addr_opt {

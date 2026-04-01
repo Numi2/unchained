@@ -1106,7 +1106,7 @@ async fn verify_x402_any_receipt(
             }
         }
     } else {
-        // Back-compat with Unchained-only receipt
+        // Native Unchained receipt path
         let receipt = match x402::decode_receipt_header(header_or_body) {
             Ok(r) => r,
             Err(_) => serde_json::from_str::<x402::X402Receipt>(header_or_body)

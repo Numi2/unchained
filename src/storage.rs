@@ -224,7 +224,7 @@ impl Store {
         db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
         db_opts.set_max_subcompactions(4);
 
-        // Discover any existing column families to ensure compatibility with older DBs
+        // Discover any existing column families so we can open previously initialized databases.
         let existing_cfs: Vec<String> = match DB::list_cf(&db_opts, &db_path) {
             Ok(names) => names,
             Err(_)
@@ -643,7 +643,7 @@ impl Store {
         Ok(coins)
     }
 
-    /// Backward-compatible fetch of a confirmed coin by id
+    /// Fetch a confirmed coin by id.
     pub fn get_coin(&self, coin_id: &[u8; 32]) -> Result<Option<crate::coin::Coin>> {
         let cf = self
             .db

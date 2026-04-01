@@ -36,7 +36,7 @@ pub const MIN_ADJ_DEN: u64 = 102;
 pub const RETARGET_UPPER_PCT: u64 = PROTOCOL.retarget_upper_pct;
 pub const RETARGET_LOWER_PCT: u64 = PROTOCOL.retarget_lower_pct;
 
-// ---- Back-compat aliases for existing imports in epoch.rs/network.rs ----
+// Re-exported constants for existing consensus call sites.
 pub const TARGET_LEADING_ZEROS: usize = GENESIS_PARAMS.difficulty as usize;
 pub const DEFAULT_MEM_KIB: u32 = GENESIS_PARAMS.mem_kib;
 

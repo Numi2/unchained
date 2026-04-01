@@ -168,7 +168,6 @@ impl MetricsAggregator {
             VALIDATION_FAIL_TRANSFER
         );
         counter_delta!("unchained_v3_sends_total", V3_SENDS);
-        counter_delta!("unchained_legacy_upgrades_total", LEGACY_UPGRADES);
         counter_delta!("unchained_db_write_failures_total", DB_WRITE_FAILS);
         counter_delta!("unchained_pruned_candidates_total", PRUNED_CANDIDATES);
         counter_delta!("unchained_mining_attempts_total", MINING_ATTEMPTS);
@@ -438,13 +437,6 @@ pub static VALIDATION_FAIL_TRANSFER: Lazy<IntCounter> = Lazy::new(|| {
 });
 pub static V3_SENDS: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new("unchained_v3_sends_total", "Count of V3 hashlock sends").unwrap()
-});
-pub static LEGACY_UPGRADES: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_legacy_upgrades_total",
-        "Count of legacy coins auto-upgraded to V3",
-    )
-    .unwrap()
 });
 pub static DB_WRITE_FAILS: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
