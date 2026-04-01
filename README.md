@@ -31,13 +31,6 @@ Unchained is a post-quantum private asset node.
 
 Edge services include `bridge`, `offers`, and `x402`. They are opt-in and not part of consensus.
 
-## Current Defaults
-
-- No legacy wire compatibility
-- No ambient bridge API by default
-- No ambient offers API by default
-- No consensus tuning through config
-
 ## Build
 
 Use a current stable Rust toolchain.
