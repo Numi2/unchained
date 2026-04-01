@@ -1621,7 +1621,6 @@ pub async fn spawn(
                     Some(coin_cf),
                     Some(coin_epoch_cf),
                     Some(spend_cf),
-                    Some(nullifier_cf),
                     Some(commitment_used_cf),
                 ) = (
                     db.db.cf_handle("epoch"),
@@ -1631,7 +1630,6 @@ pub async fn spawn(
                     db.db.cf_handle("coin"),
                     db.db.cf_handle("coin_epoch"),
                     db.db.cf_handle("spend"),
-                    db.db.cf_handle("nullifier"),
                     db.db.cf_handle("commitment_used"),
                 )
                 else {
@@ -1656,7 +1654,6 @@ pub async fn spawn(
                             batch.delete_cf(coin_epoch_cf, &id);
                             if let Ok(Some(sp)) = db.get::<crate::transfer::Spend>("spend", &id) {
                                 batch.delete_cf(spend_cf, &id);
-                                batch.delete_cf(nullifier_cf, &sp.nullifier);
                                 if sp.unlock_preimage.is_some() {
                                     if let Some(next_lock) = sp.next_lock_hash {
                                         if let Ok(chain_id) = db.get_chain_id() {
@@ -2011,7 +2008,6 @@ pub async fn spawn(
             Some(coin_cf),
             Some(coin_epoch_cf),
             Some(spend_cf),
-            Some(nullifier_cf),
             Some(commitment_used_cf),
         ) = (
             db.db.cf_handle("epoch"),
@@ -2021,7 +2017,6 @@ pub async fn spawn(
             db.db.cf_handle("coin"),
             db.db.cf_handle("coin_epoch"),
             db.db.cf_handle("spend"),
-            db.db.cf_handle("nullifier"),
             db.db.cf_handle("commitment_used"),
         )
         else {
@@ -2053,7 +2048,6 @@ pub async fn spawn(
                     // If we had a spend recorded for this coin on the old branch, remove it and its nullifier
                     if let Ok(Some(sp)) = db.get::<crate::transfer::Spend>("spend", &id) {
                         batch.delete_cf(spend_cf, &id);
-                        batch.delete_cf(nullifier_cf, &sp.nullifier);
                         // Also roll back commitment_used marker deterministically if this was a V3 spend
                         if sp.unlock_preimage.is_some() {
                             if let Some(next_lock) = sp.next_lock_hash {
@@ -3397,19 +3391,17 @@ pub async fn spawn(
 
                                         // If we had buffered spends for this coin due to it being missing, try to validate/apply them now
                                         if let Some(mut queued) = pending_spends.remove(&coin.id) {
-                                            let mut made_progress = true;
-                                            while made_progress {
-                                                made_progress = false;
-                                                let mut remaining: Vec<Spend> = Vec::new();
+                                                let mut made_progress = true;
+                                                while made_progress {
+                                                    made_progress = false;
+                                                    let mut remaining: Vec<Spend> = Vec::new();
                                                 for q in queued.drain(..) {
                                                     if validate_spend(&q, &db).is_ok() {
-                                                        let seen = db.get::<[u8;1]>("nullifier", &q.nullifier).ok().flatten().is_some();
-                                                        if let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier")) {
+                                                        if let Some(sp_cf) = db.db.cf_handle("spend") {
                                                             let mut batch = rocksdb::WriteBatch::default();
                                                             if let Ok(bytes) = bincode::serialize(&q) {
                                                                 batch.put_cf(sp_cf, &q.coin_id, &bytes);
                                                             }
-                                                            if !seen { batch.put_cf(nf_cf, &q.nullifier, &[1u8;1]); }
                                                             if q.unlock_preimage.is_some() {
                                                                 if let Some(next_lock) = q.next_lock_hash {
                                                                     if let (Some(cid_cf), Ok(chain_id)) = (db.db.cf_handle("commitment_used"), db.get_chain_id()) {

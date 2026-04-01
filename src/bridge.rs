@@ -1796,7 +1796,7 @@ async fn bridge_in_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Strin
             }
         }
         if let Some(cf_ev) = svc.db.db.cf_handle("bridge_events") {
-            let recipient_addr = match crate::wallet::Wallet::parse_stealth_address(&r.to_paycode) {
+            let recipient_addr = match crate::wallet::Wallet::parse_address(&r.to_paycode) {
                 Ok((addr, _)) => addr,
                 Err(_) => svc.wallet.address(),
             };
@@ -1959,11 +1959,6 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
         if cid != c.receiver_commitment.commitment_id {
             return Err(anyhow!("receiver commitment_id mismatch"));
         }
-        // Nullifier precheck
-        let nf = crate::crypto::nullifier_from_preimage(&chain_id, &c.coin_id, &p);
-        if svc.db.get::<[u8; 1]>("nullifier", &nf)?.is_some() {
-            continue;
-        }
         let commit_epoch = svc
             .db
             .get_epoch_for_coin(&c.coin_id)?
@@ -1991,6 +1986,9 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
             &chain_id,
         )?;
         let tx = crate::transaction::Tx::single_spend(sp.clone());
+        if tx.validate(&svc.db).is_err() {
+            continue;
+        }
         tx.apply(&svc.db)?;
         svc.net.gossip_tx(&tx).await;
         total = total.saturating_add(c.receiver_commitment.amount_le);
@@ -2015,7 +2013,9 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
         svc.db.db.put_cf(cf, &used_key, &[1u8])?;
     }
     if spend_hashes.is_empty() {
-        return Err(anyhow!("no spends constructed (all nullifiers seen?)"));
+        return Err(anyhow!(
+            "no spends constructed from currently valid authorizations"
+        ));
     }
     Ok(spend_hashes)
 }

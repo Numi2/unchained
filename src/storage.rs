@@ -143,7 +143,7 @@ impl Store {
             "anchor",
             "tx",
             "spend",
-            "nullifier",
+            "nullifier", // legacy CF; no longer canonical in the spend-chain model
             "commitment_used",
             "meta_authz_used", // EIP-3009-style meta-transfer replay protection (from||nonce)
             "otp_sk",

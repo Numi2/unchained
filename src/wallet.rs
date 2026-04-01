@@ -18,7 +18,8 @@ use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberShar
 use pqcrypto_traits::sign::DetachedSignature as _;
 use serde::{Deserialize, Serialize};
 
-// V3 format
+// V3 wire format for recipient addresses. User-facing surfaces call these simply
+// "addresses"; privacy is an inherent property of the address type.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StealthAddressDocV3 {
     version: u8,
@@ -346,22 +347,26 @@ impl Wallet {
     }
 
     // ---------------------------------------------------------------------
-    // Stealth Address: authenticated Kyber key distribution
+    // Address export/import: authenticated Kyber key distribution
     // ---------------------------------------------------------------------
     // Format (bincode then base64-url):
     // { version: u8=1, recipient_addr: [u8;32], dili_pk: [u8;DILITHIUM3_PK_BYTES], kyber_pk: [u8;crypto::KYBER768_PK_BYTES], sig: Dilithium sig over ("stealth_addr_v1" || addr || kyber_pk) }
 
-    pub fn export_stealth_address(&self) -> String {
+    pub fn export_address(&self) -> String {
         let doc = StealthAddressDocV3 {
             version: 3,
             recipient_addr: self.address,
             kyber_pk: self.kyber_pk.as_bytes().to_vec(),
         };
-        let bytes = bincode::serialize(&doc).expect("serialize stealth address v2");
+        let bytes = bincode::serialize(&doc).expect("serialize address doc");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    pub fn parse_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
+    pub fn export_stealth_address(&self) -> String {
+        self.export_address()
+    }
+
+    pub fn parse_address(addr_str: &str) -> Result<(Address, KyberPk)> {
         // Be tolerant to surrounding whitespace and accidental padding from clipboard
         let s = addr_str.trim();
         // Strip common accidental wrappers
@@ -373,27 +378,31 @@ impl Wallet {
             Ok(b) => b,
             Err(_) => base64::engine::general_purpose::URL_SAFE
                 .decode(s)
-                .map_err(|_| anyhow!("Invalid stealth address encoding"))?,
+                .map_err(|_| anyhow!("Invalid address encoding"))?,
         };
         let doc = bincode::deserialize::<StealthAddressDocV3>(&bytes)
-            .map_err(|_| anyhow!("Invalid stealth address payload"))?;
+            .map_err(|_| anyhow!("Invalid address payload"))?;
         if doc.version != 3 {
-            bail!("Unsupported stealth address version");
+            bail!("Unsupported address version");
         }
         let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
-            .map_err(|_| anyhow!("Invalid Kyber PK in stealth address"))?;
+            .map_err(|_| anyhow!("Invalid Kyber PK in address"))?;
         Ok((doc.recipient_addr, kyber_pk))
+    }
+
+    pub fn parse_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
+        Self::parse_address(addr_str)
     }
 
     // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
     /// Accepts a recipient handle that can be either:
-    /// - A V3 stealth address string, or
+    /// - A V3 address string, or
     /// - A KeyDoc JSON string: {chain_id,dili_pk,kyber_pk,sig=sign("bind"|chain_id|dili_pk|kyber_pk)}
     /// Returns (recipient_addr, receiver_kyber_pk) after full verification.
     fn parse_recipient_handle(&self, handle: &str) -> Result<(Address, KyberPk)> {
-        // 1) Try stealth address first.
-        if let Ok(t) = Self::parse_stealth_address(handle) {
+        // 1) Try address first.
+        if let Ok(t) = Self::parse_address(handle) {
             return Ok(t);
         }
 
@@ -432,10 +441,98 @@ impl Wallet {
 
         // Friendly hint for future paycode inputs without cached binding
         if s.starts_with("ucsp1") {
-            anyhow::bail!("Paycode detected but no cached binding. Paste the KeyDoc JSON or use a stealth address.");
+            anyhow::bail!(
+                "Paycode detected but no cached binding. Paste the KeyDoc JSON or use an address."
+            );
         }
 
-        anyhow::bail!("Invalid recipient handle")
+        anyhow::bail!("Invalid recipient address")
+    }
+
+    pub fn validate_recipient_handle(&self, handle: &str) -> Result<()> {
+        self.parse_recipient_handle(handle).map(|_| ())
+    }
+
+    fn build_coin_proof_local(
+        store: &Store,
+        coin: &crate::coin::Coin,
+    ) -> Result<(crate::epoch::Anchor, Vec<([u8; 32], bool)>)> {
+        let commit_epoch = store
+            .get_epoch_for_coin(&coin.id)?
+            .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
+        let anchor: crate::epoch::Anchor = store
+            .get("epoch", &commit_epoch.to_le_bytes())?
+            .ok_or_else(|| anyhow!("Committing anchor not found"))?;
+        let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
+        let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
+            crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
+        } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
+            crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
+        } else {
+            None
+        }
+        .ok_or_else(|| anyhow!("Unable to build local Merkle proof"))?;
+        Ok((anchor, proof))
+    }
+
+    async fn resolve_coin_proof(
+        &self,
+        store: &Store,
+        coin: &crate::coin::Coin,
+        network: &crate::network::NetHandle,
+    ) -> Result<(crate::epoch::Anchor, Vec<([u8; 32], bool)>)> {
+        if let Ok(local) = Self::build_coin_proof_local(store, coin) {
+            return Ok(local);
+        }
+
+        let commit_epoch = store
+            .get_epoch_for_coin(&coin.id)?
+            .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
+        let expected_anchor: crate::epoch::Anchor = store
+            .get("epoch", &commit_epoch.to_le_bytes())?
+            .ok_or_else(|| anyhow!("Committing anchor not found"))?;
+        let mut rx = network.proof_subscribe();
+        network.request_coin_proof(coin.id).await;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "Unable to build Merkle proof for coin {}",
+                    hex::encode(coin.id)
+                ));
+            }
+
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(resp)) => {
+                    if resp.coin.id != coin.id {
+                        continue;
+                    }
+                    if resp.anchor.hash != expected_anchor.hash
+                        || resp.anchor.merkle_root != expected_anchor.merkle_root
+                    {
+                        continue;
+                    }
+                    let leaf = crate::coin::Coin::id_to_leaf_hash(&resp.coin.id);
+                    if !crate::epoch::MerkleTree::verify_proof(
+                        &leaf,
+                        &resp.proof,
+                        &resp.anchor.merkle_root,
+                    ) {
+                        continue;
+                    }
+                    return Ok((expected_anchor, resp.proof));
+                }
+                Ok(Err(_)) => continue,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timed out while requesting Merkle proof for coin {}",
+                        hex::encode(coin.id)
+                    ));
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -735,19 +832,21 @@ impl Wallet {
         }
     }
 
-    /// Deprecated: Use `send_to_stealth_address`.
+    /// Deprecated legacy wrapper.
     pub async fn send_transfer(
         &self,
         _to: crate::crypto::Address,
         _amount: u64,
         _network: &crate::network::NetHandle,
     ) -> Result<Vec<crate::transfer::Spend>> {
-        Err(anyhow!("send_transfer(Address, ...) is deprecated. Use send_to_stealth_address(stealth_address, amount, network)"))
+        Err(anyhow!(
+            "send_transfer(Address, ...) is deprecated. Use send_with_paycode_and_note(address, amount, network, note)"
+        ))
     }
 
-    /// Sends stealth V3 hashlock spends to a recipient using a stealth address or paycode.
-    /// Commitment gossip is removed. The caller must provide an OOB spend note `s_bytes` (opaque secret)
-    /// and a receiver paycode containing receiver Kyber PK and routing tag.
+    /// Sends private V3 hashlock spends to a recipient using an address or recipient document.
+    /// Commitment gossip is removed. The caller must provide an OOB spend note `s_bytes`
+    /// and a receiver handle containing a Kyber public key.
     pub async fn send_with_paycode_and_note(
         &self,
         receiver_paycode: &str,
@@ -755,8 +854,7 @@ impl Wallet {
         network: &crate::network::NetHandle,
         _s_bytes: &[u8],
     ) -> Result<SendOutcome> {
-        // Accept either a stealth address OR, when provided, derive recipient from batch token
-        // Parse paycode (chain-bound Kyber PK + short routing secret). For now accept stealth address V2 as paycode surrogate.
+        // Accept either an address or a verified recipient document.
         let (recipient_addr, receiver_kyber_pk) = self
             .parse_recipient_handle(receiver_paycode)
             .context("Invalid receiver handle")?;
@@ -764,7 +862,7 @@ impl Wallet {
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        // Re-select inputs robustly: newest-first, owned by us, spendable now, and nullifier unseen
+        // Re-select inputs robustly: newest-first and currently spendable by us.
         let chain_id_sel = store.get_chain_id()?;
         let mut candidates = self.list_unspent()?;
         let mut candidates_with_epoch: Vec<(crate::coin::Coin, u64)> =
@@ -789,27 +887,16 @@ impl Wallet {
                 continue;
             }
 
-            // Ensure we can derive the unlock preimage at this moment
-            let unlock_preimage = if let Some(prev_spend) = store.get_spend(&coin.id)? {
-                match prev_spend.to.derive_lock_secret(
-                    &self.kyber_sk,
-                    &coin.id,
-                    &chain_id_sel,
-                    _s_bytes,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => continue,
+            // Ensure we can derive the current lock secret before selecting the coin.
+            if let Some(prev_spend) = store.get_spend(&coin.id)? {
+                if prev_spend
+                    .to
+                    .derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id_sel, _s_bytes)
+                    .is_err()
+                {
+                    continue;
                 }
-            } else {
-                self.compute_genesis_lock_secret(&coin.id, &chain_id_sel)
-            };
-            // Pre-check nullifier uniqueness to avoid selecting already-spent hops
-            let nullifier =
-                crate::crypto::nullifier_from_preimage(&chain_id_sel, &coin.id, &unlock_preimage);
-            if store.get::<[u8; 1]>("nullifier", &nullifier)?.is_some() {
-                continue;
             }
-
             coins_to_spend.push(coin);
             total_selected = total_selected.saturating_add(coins_to_spend.last().unwrap().value);
             if total_selected >= amount {
@@ -869,11 +956,9 @@ impl Wallet {
                 ),
                 amount_le: coin.value,
             };
-            // Resolve anchor and proof against genesis only
-            let anchor_used: crate::epoch::Anchor = store
-                .get("epoch", &0u64.to_le_bytes())?
-                .ok_or_else(|| anyhow!("Genesis anchor not found"))?;
-            let proof_used: Option<Vec<([u8; 32], bool)>> = Some(Vec::new());
+            let (anchor_used, proof_vec) = self
+                .resolve_coin_proof(store.as_ref(), &coin, network)
+                .await?;
 
             // Determine correct unlock preimage for the coin being spent (genesis or previous spend)
             let unlock_preimage = if let Some(prev_spend) = store.get_spend(&coin.id)? {
@@ -887,9 +972,6 @@ impl Wallet {
             };
 
             // Build and broadcast spend (V3 hashlock)
-            let proof_vec = proof_used
-                .clone()
-                .ok_or_else(|| anyhow!("missing proof after local or network path"))?;
             let mut spend = crate::transfer::Spend::create_hashlock(
                 coin.id,
                 &anchor_used,
@@ -1072,7 +1154,7 @@ impl Wallet {
 
     // Deprecated wrappers removed; use send_with_paycode_and_note
 
-    /// Simple wrapper: pay using a recipient handle (stealth address or KeyDoc JSON) with empty note.
+    /// Simple wrapper: pay using a recipient handle (address or KeyDoc JSON) with empty note.
     pub async fn pay(
         &self,
         to: &str,
@@ -1180,6 +1262,7 @@ impl Wallet {
                     }
                 };
                 let prev_owner_addr = coin.creator_address;
+                let commit_epoch = store.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
 
                 // Compute transfer_hash for display from stable fields only (no signatures in V3)
                 let mut txh = Vec::with_capacity(32 + 32 + 32 + spend.to.canonical_bytes().len());
@@ -1195,7 +1278,7 @@ impl Wallet {
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,
-                        timestamp: std::time::SystemTime::now(),
+                        commit_epoch,
                         is_sender: true,
                         amount: coin.value,
                         counterparty: recipient_addr,
@@ -1213,7 +1296,7 @@ impl Wallet {
                     history.push(TransactionRecord {
                         coin_id: spend.coin_id,
                         transfer_hash: tx_hash,
-                        timestamp: std::time::SystemTime::now(),
+                        commit_epoch,
                         is_sender: false,
                         amount: coin.value,
                         counterparty: prev_owner_addr,
@@ -1222,6 +1305,11 @@ impl Wallet {
             }
         }
 
+        history.sort_by(|a, b| {
+            b.commit_epoch
+                .cmp(&a.commit_epoch)
+                .then(b.coin_id.cmp(&a.coin_id))
+        });
         Ok(history)
     }
 
@@ -1333,21 +1421,7 @@ impl Wallet {
             let coin = store
                 .get::<crate::coin::Coin>("coin", &coin_ent.coin_id)?
                 .ok_or_else(|| anyhow!("Coin not found for plan coin_id"))?;
-            let commit_epoch = store
-                .get_epoch_for_coin(&coin.id)?
-                .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
-            let anchor: crate::epoch::Anchor = store
-                .get("epoch", &commit_epoch.to_le_bytes())?
-                .ok_or_else(|| anyhow!("Anchor not found"))?;
-            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
-            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
-            } else {
-                None
-            }
-            .ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+            let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Build receiver commitment with composite HTLC next_lock_hash
             let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
@@ -1487,21 +1561,7 @@ impl Wallet {
             }
 
             // Build Merkle proof
-            let commit_epoch = store
-                .get_epoch_for_coin(&coin.id)?
-                .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
-            let anchor: crate::epoch::Anchor = store
-                .get("epoch", &commit_epoch.to_le_bytes())?
-                .ok_or_else(|| anyhow!("Anchor not found"))?;
-            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
-            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
-            } else {
-                None
-            }
-            .ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+            let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Build next receiver commitment (normal next-hop lock)
             let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
@@ -1597,21 +1657,7 @@ impl Wallet {
         for coin in self.list_unspent()? {
             // Focus on coins we can currently spend (either created by us or addressed to us)
             // Build Merkle proof
-            let commit_epoch = store
-                .get_epoch_for_coin(&coin.id)?
-                .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
-            let anchor: crate::epoch::Anchor = store
-                .get("epoch", &commit_epoch.to_le_bytes())?
-                .ok_or_else(|| anyhow!("Anchor not found"))?;
-            let leaf = crate::coin::Coin::id_to_leaf_hash(&coin.id);
-            let proof = if let Some(levels) = store.get_epoch_levels(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
-            } else if let Some(leaves) = store.get_epoch_leaves(anchor.num)? {
-                crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
-            } else {
-                None
-            }
-            .ok_or_else(|| anyhow!("Unable to build Merkle proof"))?;
+            let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Next receiver commitment (normal next-hop lock)
             let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
@@ -1689,7 +1735,7 @@ impl Wallet {
 pub struct TransactionRecord {
     pub coin_id: [u8; 32],
     pub transfer_hash: [u8; 32],
-    pub timestamp: std::time::SystemTime,
+    pub commit_epoch: u64,
     pub is_sender: bool,
     pub amount: u64,
     pub counterparty: crate::crypto::Address,

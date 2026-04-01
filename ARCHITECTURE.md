@@ -1,10 +1,10 @@
 # Unchained Architecture
 
-This repository now treats the system as three separate concerns:
+This repository treats the system as three separate concerns:
 
 - `protocol / consensus core`
 - `wallet / privacy client`
-- `edge services` such as bridge, offers, and x402
+- `edge services`
 
 ## Canonical Rules
 
@@ -18,6 +18,30 @@ Runtime config may tune operational behavior, but it does not redefine:
 - difficulty and memory bounds
 - retarget bands
 
+## Canonical State
+
+The live protocol model is:
+
+- epoch anchors commit mined coins
+- `coin_epoch` binds each coin to the epoch that committed it
+- a spend proves inclusion against that committing epoch
+- the latest spend stored under `coin_id` defines current ownership
+- `Tx` is the canonical persistence, validation, and gossip unit
+
+The current system is therefore a private spend chain over stable coin identities. It is not yet a global note commitment tree with append-only note creation.
+
+## Privacy Model
+
+Wallet privacy comes from private recipient addresses, Kyber-derived one-time outputs, and hashlock-based ownership transfer.
+
+Important consequence:
+
+- deterministic nullifiers remain in the transaction data for domain-separated spend identity
+- the node does not persist a global nullifier set as canonical state
+- replay prevention comes from the current lock state on the coin plus the latest confirmed spend record
+
+This removes flat nullifier-set growth from the live path. In the current model, persisting every historic nullifier is redundant state.
+
 ## Validation Model
 
 Spend validation is commit-epoch aware:
@@ -25,41 +49,33 @@ Spend validation is commit-epoch aware:
 - each coin is bound to the epoch that committed it
 - spends validate inclusion against that epoch's Merkle root
 - wallets and validators share the same Merkle proof model
-
-This replaces the previous genesis-only validation path, which was incompatible with the epoch-root design.
-
-## Canonical Transactions
-
-State transitions now flow through a canonical transaction object in [src/transaction.rs](/Users/home/unchgit/unchained/src/transaction.rs).
-
-- `Tx` is the canonical persistence unit
-- wallet, bridge, and network ingress all validate and persist through `Tx`
-- canonical transaction propagation happens on `unchained/tx/v1`
-- spend records are retained only as an internal derived index for wallet/state queries
-
-This is the protocol model. There is no compatibility layer.
-
-## Documentation Policy
-
-The authoritative documents are:
-
-- [README.md](/Users/home/unchgit/unchained/README.md) for operators and contributors
-- [ARCHITECTURE.md](/Users/home/unchgit/unchained/ARCHITECTURE.md) for system boundaries
-
-Older design notes, research essays, and feature-specific guides are archival material unless they are explicitly rewritten to match the live code.
+- when local proof material is missing, clients can request a proof from peers and verify it against the stored committing anchor
 
 ## Service Boundary
 
-Auxiliary HTTP surfaces are opt-in:
+Auxiliary HTTP and discovery surfaces are opt-in:
 
 - offers API requires `[offers].api_enabled = true`
 - bridge/x402 RPC requires `[bridge].bridge_enabled = true` or `[bridge].x402_enabled = true`
 
 The node should not expose non-consensus APIs by default.
 
-## Next Steps
+## Product Surface
 
-- replace chained spend records with canonical transaction batches
-- move bridge execution to an external relayer boundary
-- define a global note commitment tree and nullifier set as the canonical state root
-- split signer authority from consensus node runtime
+The public CLI is intentionally phrased in product terms:
+
+- `node start` is the explicit runtime entrypoint
+- `wallet receive`, `wallet send`, `wallet balance`, and `wallet history` are the primary wallet journeys
+- `offers`, `message`, and `x402` are grouped as edge-service commands
+- `advanced` contains protocol and maintenance tooling
+- older flat command names remain only as compatibility aliases
+
+## If Re-Architecting Further
+
+If Unchained moves to a full shielded-note design, the right target is:
+
+- one global note commitment tree
+- one compact spent-set commitment or accumulator
+- zero-knowledge spend proofs that prove note inclusion and spent-set non-membership
+
+That future design should not reintroduce an unbounded RocksDB nullifier column as the canonical state root. A real note-pool architecture needs a committed spent-set design, not flat storage growth.

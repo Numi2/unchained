@@ -324,16 +324,10 @@ impl Spend {
             return Err(anyhow!("Amount mismatch with coin value"));
         }
 
-        // 5) Nullifier unseen (DB collision check)
-        if db
-            .get::<[u8; 1]>("nullifier", &self.nullifier)
-            .context("Failed to query nullifier")?
-            .is_some()
-        {
-            return Err(anyhow!("Nullifier already seen (double spend)"));
-        }
-
-        // 6) Authorization: require V3 hashlock, potentially HTLC-gated by epoch
+        // 5) Authorization: require V3 hashlock, potentially HTLC-gated by epoch.
+        // Current ownership is serialized by the latest spend stored under coin_id,
+        // so we do not need to persist a separate global nullifier set for replay
+        // prevention in this spend-chain model.
         let preimage = self
             .unlock_preimage
             .ok_or_else(|| anyhow!("V3 hashlock preimage required"))?;
@@ -434,14 +428,12 @@ impl Spend {
         db: &crate::storage::Store,
         batch: &mut rocksdb::WriteBatch,
     ) -> Result<()> {
-        let (Some(sp_cf), Some(nf_cf)) = (db.db.cf_handle("spend"), db.db.cf_handle("nullifier"))
-        else {
+        let Some(sp_cf) = db.db.cf_handle("spend") else {
             return Err(anyhow!("Column family missing"));
         };
         let cid_cf = db.db.cf_handle("commitment_used");
         let bytes = bincode::serialize(self).context("serialize spend")?;
         batch.put_cf(sp_cf, &self.coin_id, &bytes);
-        batch.put_cf(nf_cf, &self.nullifier, &[1u8; 1]);
         if self.unlock_preimage.is_some() {
             if let Some(cf) = cid_cf {
                 let chain_id = db.get_chain_id()?;

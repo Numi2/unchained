@@ -9,19 +9,20 @@ Unchained is a post-quantum private asset node.
 - Hashing: BLAKE3
 - Network transport: libp2p over QUIC
 - Persistence: RocksDB
-- Recipient privacy: Kyber768-based stealth outputs
+- Recipient privacy: Kyber768-based private addresses and opaque one-time outputs
 - Signatures: Dilithium3
 - Canonical state transition: [`Tx`](/Users/home/unchgit/unchained/src/transaction.rs)
 
-## Protocol
+## Protocol Posture
 
 - Consensus rules are protocol-locked in [`src/protocol.rs`](/Users/home/unchgit/unchained/src/protocol.rs).
-- Runtime config does not redefine consensus parameters.
 - Coins are committed by epoch anchors.
-- Spend validation is commit-epoch aware.
-- Transaction propagation uses `unchained/tx/v1`.
-- `Tx` is the canonical wire, validation, and persistence unit.
-- Spend records are internal derived indexes, not the protocol surface.
+- Spends validate inclusion against the epoch that committed the coin.
+- Ownership is serialized by `coin_id -> latest spend`, not by an append-only note pool.
+- Each spend still carries a deterministic nullifier on the wire, but the node does not persist a global nullifier set for replay prevention in the current spend-chain model.
+- Canonical transaction propagation happens on `unchained/tx/v1`.
+
+This is a private transfer system, but it is not yet a full global shielded-note tree with zero-knowledge spend proofs. The public CLI therefore leads with wallet user journeys such as `wallet receive` and `wallet send`, while retaining older flat aliases for compatibility.
 
 ## Architecture
 
@@ -29,7 +30,7 @@ Unchained is a post-quantum private asset node.
 - `wallet / privacy client`
 - `edge services`
 
-Edge services include `bridge`, `offers`, and `x402`. They are opt-in and not part of consensus.
+Edge services include `offers`, `message`, `bridge`, and `x402`. They are opt-in and not part of consensus.
 
 ## Build
 
@@ -46,25 +47,27 @@ Useful commands:
 cargo fmt
 cargo check
 cargo test
-cargo run --release --bin unchained
-cargo run --release --bin unchained mine
+cargo run --release --bin unchained -- node start
+cargo run --release --bin unchained -- wallet receive
 ```
 
 ## CLI
 
-Current operator and wallet commands include:
+The primary user journeys are:
 
-- `mine`
-- `peer-id`
-- `stealth-address`
-- `proof`
-- `send`
-- `balance`
-- `history`
-- `offer-watch`
-- `msg-send`
-- `msg-listen`
-- `x402-pay`
+- `node start`
+- `wallet receive`
+- `wallet send`
+- `wallet balance`
+- `wallet history`
+- `offers watch`
+- `message send`
+- `message listen`
+- `x402 pay`
+
+Operational and protocol-maintenance workflows live under `advanced`.
+
+Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, `msg-send`, `msg-listen`, and `x402-pay`.
 
 ## Docs
 

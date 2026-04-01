@@ -1,6 +1,6 @@
 use anyhow;
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
@@ -42,15 +42,65 @@ fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prompt_line(prompt: &str) -> anyhow::Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn load_receiver_code(input: &str) -> anyhow::Result<String> {
+    let cleaned = input
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .to_string();
+    if cleaned.eq_ignore_ascii_case("test") {
+        return Ok(std::fs::read_to_string("test_stealth_address.txt")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default());
+    }
+    if let Some(path) = cleaned.strip_prefix("file:") {
+        return Ok(std::fs::read_to_string(
+            path.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_matches('`'),
+        )?
+        .trim()
+        .to_string());
+    }
+    Ok(cleaned)
+}
+
+fn short_hex(bytes: &[u8]) -> String {
+    let full = hex::encode(bytes);
+    if full.len() <= 16 {
+        full
+    } else {
+        format!("{}..{}", &full[..8], &full[full.len() - 8..])
+    }
+}
+
+fn short_text(value: &str) -> String {
+    if value.len() <= 18 {
+        value.to_string()
+    } else {
+        format!("{}..{}", &value[..10], &value[value.len() - 8..])
+    }
+}
+
 #[derive(Parser)]
 #[command(
     author,
     version,
-    about = "Unchained blockchain node and wallet CLI (Post‑Quantum Hardened)",
-    long_about = "Run an Unchained node: mine, sync, and send hashlock transfers with Kyber stealth receiving.\n\
-\nSending accepts a single receiver code (stealth address or batch token). Use flags for automation or run interactively for a guided flow.",
+    about = "Private node and wallet CLI for Unchained",
+    long_about = "Run an Unchained node: start the runtime explicitly, manage a wallet, and send private hashlock transfers.\n\
+\nSending accepts a single receiver address or verified recipient document. Use flags for automation or run interactively for a guided flow.",
     help_template = "{name} {version}\n{about}\n\nUSAGE:\n  {usage}\n\nOPTIONS:\n{options}\n\nCOMMANDS:\n{subcommands}\n\n{after-help}",
-    after_help = "Examples:\n  unchained stealth-address\n  unchained send --to <STEALTH_ADDR> --amount 100\n  unchained send  # guided flow\n  unchained make-commitment-request --stealth <STEALTH_ADDR> --amount 100\n  unchained serve-commitments\n"
+    after_help = "Examples:\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n  unchained x402 pay --url https://example.com/protected\n"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
@@ -66,30 +116,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Node lifecycle and identity commands
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+    /// Wallet commands
+    Wallet {
+        #[command(subcommand)]
+        cmd: WalletCmd,
+    },
+    /// Offer market commands
+    Offers {
+        #[command(subcommand)]
+        cmd: OffersCmd,
+    },
+    /// Messaging commands
+    Message {
+        #[command(subcommand)]
+        cmd: MessageCmd,
+    },
+    /// x402 payment commands
+    X402 {
+        #[command(subcommand)]
+        cmd: X402Cmd,
+    },
+    /// Advanced protocol and maintenance commands
+    Advanced {
+        #[command(subcommand)]
+        cmd: AdvancedCmd,
+    },
     /// Start mining and block production (runs epoch manager and miners)
+    #[command(hide = true)]
     Mine,
     /// Print the local libp2p peer ID and exit
+    #[command(hide = true)]
     PeerId,
-    /// Export your stealth receiving address (base64-url)
-    StealthAddress,
+    /// Export your private receiving address (base64-url)
+    #[command(alias = "stealth-address", hide = true)]
+    Address(ReceiveArgs),
     /// Request a coin proof and verify it locally
-    Proof {
-        #[arg(long)]
-        coin_id: String,
-    },
-    /// Send coins to a receiver paycode with an OOB spend note
-    Send {
-        /// Receiver paycode (base64-url): contains chain_id binding, receiver Kyber PK, and routing tag
-        #[arg(long)]
-        paycode: String,
-        /// Amount to send
-        #[arg(long)]
-        amount: u64,
-        /// OOB spend note secret `s` as hex or base64-url; if omitted, a random 32-byte secret is generated and printed
-        #[arg(long)]
-        note: Option<String>,
-    },
+    #[command(hide = true)]
+    Proof(ProofArgs),
+    /// Send coins to a receiver address with an out-of-band spend note
+    #[command(hide = true)]
+    Send(SendArgs),
     /// HTLC: Sender precomputes ch_refund (and optionally secrets) from plan
+    #[command(hide = true)]
     HtlcRefundPrepare {
         /// Plan JSON from HtlcPlan
         #[arg(long)]
@@ -104,18 +177,17 @@ enum Cmd {
         #[arg(long)]
         out_secrets: Option<String>,
     },
-    Balance,
-    History,
+    /// Show the wallet balance
+    #[command(hide = true)]
+    Balance(BalanceArgs),
+    /// Show wallet transaction history
+    #[command(hide = true)]
+    History(HistoryArgs),
     /// x402: Pay a 402 challenge at a protected URL and print X-PAYMENT header
-    X402Pay {
-        /// URL to the protected resource (server will return 402 with challenge)
-        #[arg(long)]
-        url: String,
-        /// Optional: auto-resubmit and print resource body after paying
-        #[arg(long, default_value_t = true)]
-        auto_resubmit: bool,
-    },
+    #[command(hide = true)]
+    X402Pay(X402PayArgs),
     /// HTLC: Plan an offer (sender) and output a JSON plan
+    #[command(hide = true)]
     HtlcPlan {
         #[arg(long)]
         paycode: String,
@@ -129,6 +201,7 @@ enum Cmd {
         out: String,
     },
     /// HTLC: Receiver computes claim CHs from claim secret and writes JSON
+    #[command(hide = true)]
     HtlcClaimPrepare {
         /// Claim secret s_claim (hex or base64-url)
         #[arg(long)]
@@ -141,6 +214,7 @@ enum Cmd {
         out: String,
     },
     /// HTLC: Execute sender offer (build spends with HTLC locks) using plan and receiver claim doc
+    #[command(hide = true)]
     HtlcOfferExecute {
         #[arg(long)]
         plan: String,
@@ -154,6 +228,7 @@ enum Cmd {
         refund_secrets_out: Option<String>,
     },
     /// HTLC: Execute claim spends before timeout with claim secret
+    #[command(hide = true)]
     HtlcClaim {
         #[arg(long)]
         timeout: u64,
@@ -167,6 +242,7 @@ enum Cmd {
         paycode: String,
     },
     /// HTLC: Execute refund at/after timeout with refund secret
+    #[command(hide = true)]
     HtlcRefund {
         #[arg(long)]
         timeout: u64,
@@ -180,6 +256,7 @@ enum Cmd {
         paycode: String,
     },
     /// Offer: Create and sign an offer from an HTLC plan
+    #[command(hide = true)]
     OfferCreate {
         /// Receiver paycode
         #[arg(long)]
@@ -201,33 +278,24 @@ enum Cmd {
         out: String,
     },
     /// Offer: Publish a signed offer to the network
+    #[command(hide = true)]
     OfferPublish {
         /// Input offer JSON path
         #[arg(long)]
         input: String,
     },
     /// Offer: Watch incoming offers (prints JSON lines)
-    OfferWatch {
-        /// Exit after receiving N offers (optional)
-        #[arg(long)]
-        count: Option<u64>,
-        /// Minimum amount filter
-        #[arg(long)]
-        min_amount: Option<u64>,
-        /// Filter by maker address (hex)
-        #[arg(long)]
-        maker: Option<String>,
-        /// Resume from millis cursor
-        #[arg(long)]
-        since: Option<u128>,
-    },
+    #[command(hide = true)]
+    OfferWatch(OfferWatchArgs),
     /// Offer: Verify a signed offer file
+    #[command(hide = true)]
     OfferVerify {
         /// Input offer JSON path
         #[arg(long)]
         input: String,
     },
     /// Offer: Accept a signed offer file (deterministic secrets policy)
+    #[command(hide = true)]
     OfferAccept {
         /// Input offer JSON path
         #[arg(long)]
@@ -243,6 +311,7 @@ enum Cmd {
         refund_secrets_out: Option<String>,
     },
     /// Offer: Prepare receiver claim CHs from an offer and claim secret
+    #[command(hide = true)]
     OfferAcceptPrepare {
         /// Input offer JSON path
         #[arg(long)]
@@ -255,40 +324,37 @@ enum Cmd {
         out: String,
     },
     /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
+    #[command(hide = true)]
     RepairSpends,
     // Commitment request/response tooling removed
     /// P2P: Send a short text message (topic limited to 2 msgs/24h)
-    MsgSend {
-        /// Message text to send; if omitted, you will be prompted
-        #[arg(long)]
-        text: Option<String>,
-    },
+    #[command(hide = true)]
+    MsgSend(MessageSendArgs),
     /// P2P: Listen for incoming messages on the 24h-limited topic
-    MsgListen {
-        /// Exit after receiving a single message
-        #[arg(long, default_value_t = false)]
-        once: bool,
-        /// Exit after receiving this many messages
-        #[arg(long)]
-        count: Option<u64>,
-    },
+    #[command(hide = true)]
+    MsgListen(MessageListenArgs),
     /// Re-gossip all spends from local DB (sender-side recovery)
+    #[command(hide = true)]
     ReplaySpends,
     /// Rescan local spends against this wallet (receiver-side recovery)
+    #[command(hide = true)]
     RescanWallet,
     /// Export all anchors into a compressed snapshot file
+    #[command(hide = true)]
     ExportAnchors {
         /// Output file path (e.g. anchors_snapshot.zst)
         #[arg(long)]
         out: String,
     },
     /// Import anchors from a compressed snapshot file
+    #[command(hide = true)]
     ImportAnchors {
         /// Input snapshot file path
         #[arg(long)]
         input: String,
     },
     /// Bridge: Lock UNCH on Unchained for a Sui recipient
+    #[command(hide = true)]
     BridgeOut {
         /// Sui recipient address (0x-prefixed lowercase hex)
         #[arg(long)]
@@ -301,6 +367,7 @@ enum Cmd {
         prewarm_secs: u64,
     },
     /// Meta: Create a signed authorization for facilitator to submit spends (EIP-3009-like)
+    #[command(hide = true)]
     MetaAuthzCreate {
         /// Receiver paycode (base64-url)
         #[arg(long)]
@@ -326,11 +393,633 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Start the node runtime
+    Start {
+        /// Force mining on for this run
+        #[arg(long, default_value_t = false)]
+        mine: bool,
+    },
+    /// Print the local libp2p peer ID and shareable multiaddr
+    PeerId,
+}
+
+#[derive(Args, Clone)]
+struct ReceiveArgs {
+    /// Print only the address
+    #[arg(long, default_value_t = false)]
+    plain: bool,
+    /// Output machine-readable JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// Copy the address to the clipboard
+    #[arg(long, default_value_t = false)]
+    copy: bool,
+}
+
+#[derive(Args, Clone)]
+struct SendArgs {
+    /// Receiver address or verified recipient document; if omitted, you will be prompted
+    #[arg(long = "to", alias = "paycode")]
+    to: Option<String>,
+    /// Amount to send; if omitted, you will be prompted
+    #[arg(long)]
+    amount: Option<u64>,
+    /// Out-of-band spend note as hex or base64-url
+    #[arg(long)]
+    note: Option<String>,
+    /// Write the shareable receiver note bundle to a file
+    #[arg(long)]
+    note_out: Option<String>,
+    /// Copy the receiver note to the clipboard
+    #[arg(long, default_value_t = false)]
+    copy_note: bool,
+    /// Render the receiver note as a terminal QR code
+    #[arg(long, default_value_t = false)]
+    show_note_qr: bool,
+    /// Output machine-readable JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone, Default)]
+struct BalanceArgs {
+    /// Output machine-readable JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone, Default)]
+struct HistoryArgs {
+    /// Limit the number of rows shown
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Output machine-readable JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone)]
+struct ProofArgs {
+    #[arg(long)]
+    coin_id: String,
+}
+
+#[derive(Args, Clone)]
+struct OfferWatchArgs {
+    /// Exit after receiving N offers (optional)
+    #[arg(long)]
+    count: Option<u64>,
+    /// Minimum amount filter
+    #[arg(long)]
+    min_amount: Option<u64>,
+    /// Filter by maker address (hex)
+    #[arg(long)]
+    maker: Option<String>,
+    /// Resume from millis cursor
+    #[arg(long)]
+    since: Option<u128>,
+}
+
+#[derive(Args, Clone)]
+struct MessageSendArgs {
+    /// Message text to send; if omitted, you will be prompted
+    #[arg(long)]
+    text: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct MessageListenArgs {
+    /// Exit after receiving a single message
+    #[arg(long, default_value_t = false)]
+    once: bool,
+    /// Exit after receiving this many messages
+    #[arg(long)]
+    count: Option<u64>,
+}
+
+#[derive(Args, Clone)]
+struct X402PayArgs {
+    /// URL to the protected resource (server will return 402 with challenge)
+    #[arg(long)]
+    url: String,
+    /// Auto-resubmit and print the resource body after paying
+    #[arg(long, default_value_t = true)]
+    auto_resubmit: bool,
+}
+
+#[derive(Subcommand)]
+enum WalletCmd {
+    /// Show your shareable receiving address
+    #[command(alias = "address")]
+    Receive(ReceiveArgs),
+    /// Send coins to a receiver, or run a guided send flow
+    Send(SendArgs),
+    /// Show wallet balance and spendable outputs
+    Balance(BalanceArgs),
+    /// Show wallet transaction history
+    History(HistoryArgs),
+}
+
+#[derive(Subcommand)]
+enum OffersCmd {
+    /// Watch incoming offers (prints JSON lines)
+    Watch(OfferWatchArgs),
+    /// Create and sign an offer from an HTLC plan
+    Create {
+        /// Receiver paycode
+        #[arg(long)]
+        paycode: String,
+        /// Amount to offer
+        #[arg(long)]
+        amount: u64,
+        /// Timeout epoch number T
+        #[arg(long, value_parser = clap::value_parser!(u64))]
+        timeout: u64,
+        /// Optional maker price in basis points (10000 = 100%)
+        #[arg(long)]
+        price_bps: Option<u64>,
+        /// Optional note/label
+        #[arg(long)]
+        note: Option<String>,
+        /// Output JSON path for the signed offer
+        #[arg(long)]
+        out: String,
+    },
+    /// Publish a signed offer to the network
+    Publish {
+        /// Input offer JSON path
+        #[arg(long)]
+        input: String,
+    },
+    /// Verify a signed offer file
+    Verify {
+        /// Input offer JSON path
+        #[arg(long)]
+        input: String,
+    },
+    /// Accept a signed offer file
+    Accept {
+        /// Input offer JSON path
+        #[arg(long)]
+        input: String,
+        /// Claim secret s_claim (hex or base64-url)
+        #[arg(long)]
+        claim_secret: String,
+        /// Refund base (deterministic per-coin), 32-byte hex/base64-url
+        #[arg(long)]
+        refund_base: Option<String>,
+        /// Path to write generated refund secrets per coin
+        #[arg(long)]
+        refund_secrets_out: Option<String>,
+    },
+    /// Prepare receiver claim CHs from an offer and claim secret
+    AcceptPrepare {
+        /// Input offer JSON path
+        #[arg(long)]
+        input: String,
+        /// Claim secret s_claim (hex or base64-url)
+        #[arg(long)]
+        claim_secret: String,
+        /// Output JSON file to write claim CHs
+        #[arg(long)]
+        out: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessageCmd {
+    /// Send a short text message on the bounded P2P topic
+    Send(MessageSendArgs),
+    /// Listen for incoming messages on the bounded P2P topic
+    Listen(MessageListenArgs),
+}
+
+#[derive(Subcommand)]
+enum X402Cmd {
+    /// Pay a 402 challenge and optionally fetch the protected resource
+    Pay(X402PayArgs),
+}
+
+#[derive(Subcommand)]
+enum AdvancedCmd {
+    /// Request a coin proof and verify it locally
+    Proof(ProofArgs),
+    /// HTLC: Sender precomputes refund commitments and secrets
+    HtlcRefundPrepare {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        refund_base: Option<String>,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        out_secrets: Option<String>,
+    },
+    /// HTLC: Plan an offer (sender) and output a JSON plan
+    HtlcPlan {
+        #[arg(long)]
+        paycode: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, value_parser = clap::value_parser!(u64))]
+        timeout: u64,
+        #[arg(long)]
+        out: String,
+    },
+    /// HTLC: Receiver computes claim CHs from claim secret
+    HtlcClaimPrepare {
+        #[arg(long)]
+        claim_secret: String,
+        #[arg(long)]
+        coins: String,
+        #[arg(long)]
+        out: String,
+    },
+    /// HTLC: Execute sender offer using a plan and receiver claim doc
+    HtlcOfferExecute {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        claims: String,
+        #[arg(long)]
+        refund_base: Option<String>,
+        #[arg(long)]
+        refund_secrets_out: Option<String>,
+    },
+    /// HTLC: Execute claim spends before timeout
+    HtlcClaim {
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long)]
+        claim_secret: String,
+        #[arg(long)]
+        refunds: String,
+        #[arg(long)]
+        paycode: String,
+    },
+    /// HTLC: Execute refund at or after timeout
+    HtlcRefund {
+        #[arg(long)]
+        timeout: u64,
+        #[arg(long)]
+        refund_secret: String,
+        #[arg(long)]
+        claims: String,
+        #[arg(long)]
+        paycode: String,
+    },
+    /// Scan and repair malformed spend entries
+    RepairSpends,
+    /// Re-gossip all spends from local DB
+    ReplaySpends,
+    /// Rescan local spends against this wallet
+    RescanWallet,
+    /// Export all anchors into a compressed snapshot file
+    ExportAnchors {
+        #[arg(long)]
+        out: String,
+    },
+    /// Import anchors from a compressed snapshot file
+    ImportAnchors {
+        #[arg(long)]
+        input: String,
+    },
+    /// Lock UNCH on Unchained for a Sui recipient
+    BridgeOut {
+        #[arg(long)]
+        sui_recipient: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value_t = 12)]
+        prewarm_secs: u64,
+    },
+    /// Create a signed authorization for facilitator submission
+    MetaAuthzCreate {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        valid_after: u64,
+        #[arg(long)]
+        valid_before: u64,
+        #[arg(long)]
+        facilitator_kyber_b64: String,
+        #[arg(long)]
+        binding_b64: Option<String>,
+        #[arg(long)]
+        out: String,
+    },
+}
+
+fn print_receive_output(wallet: &wallet::Wallet, args: &ReceiveArgs) -> anyhow::Result<()> {
+    let address = wallet.export_address();
+    let copied = if args.copy {
+        copy_to_clipboard(&address).is_ok()
+    } else {
+        false
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "address": address,
+                "copied": copied,
+            })
+        );
+        return Ok(());
+    }
+
+    if args.plain {
+        println!("{address}");
+        return Ok(());
+    }
+
+    println!("Receive");
+    println!();
+    println!("{address}");
+    println!();
+    if let Err(e) = print_qr_to_terminal(&address) {
+        eprintln!("QR unavailable: {e}");
+    }
+    if args.copy {
+        if copied {
+            println!();
+            println!("Copied to clipboard.");
+        } else {
+            println!();
+            println!("Clipboard unavailable.");
+        }
+    }
+    Ok(())
+}
+
+fn parse_note_bytes(note: Option<&str>) -> anyhow::Result<(Vec<u8>, bool, String)> {
+    use rand::RngCore;
+
+    let bytes = if let Some(note) = note {
+        let t = note.trim();
+        if let Ok(b) = hex::decode(t.trim_start_matches("0x")) {
+            b
+        } else if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t) {
+            b
+        } else {
+            anyhow::bail!("Invalid note encoding; use hex or base64-url")
+        }
+    } else {
+        let mut s = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut s);
+        s.to_vec()
+    };
+
+    let note_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+    Ok((bytes, note.is_none(), note_b64))
+}
+
+fn write_note_bundle(path: &str, note_b64: &str, to: &str, amount: u64) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "note": note_b64,
+        "encoding": "base64url",
+        "to": to,
+        "amount": amount,
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+    Ok(())
+}
+
+async fn run_send_flow(
+    wallet: &Arc<wallet::Wallet>,
+    net: &network::NetHandle,
+    args: &SendArgs,
+) -> anyhow::Result<()> {
+    let guided = args.to.is_none() || args.amount.is_none();
+    if guided && !atty::is(atty::Stream::Stdin) {
+        anyhow::bail!(
+            "Interactive send requires a TTY. Pass --to and --amount in non-interactive mode."
+        );
+    }
+    let to_raw = match &args.to {
+        Some(to) => to.clone(),
+        None => prompt_line("Receiver address: ")?,
+    };
+    let to = load_receiver_code(&to_raw)?;
+    if to.is_empty() {
+        anyhow::bail!("Address cannot be empty");
+    }
+    wallet.validate_recipient_handle(&to)?;
+
+    let amount = match args.amount {
+        Some(amount) => amount,
+        None => {
+            let raw = prompt_line("Amount: ")?;
+            raw.parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid amount"))?
+        }
+    };
+    if amount == 0 {
+        anyhow::bail!("Amount must be greater than 0");
+    }
+
+    if guided {
+        println!();
+        println!(
+            "Ready to send {amount} coin{}.",
+            if amount == 1 { "" } else { "s" }
+        );
+        println!("Recipient: {}", short_text(&to));
+        let confirm = prompt_line("Broadcast now? [Y/n]: ")?;
+        if matches!(confirm.to_ascii_lowercase().as_str(), "n" | "no") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let (note_bytes, note_generated, note_b64) = parse_note_bytes(args.note.as_deref())?;
+    if let Some(path) = &args.note_out {
+        write_note_bundle(path, &note_b64, &to, amount)?;
+    }
+    if args.copy_note {
+        let _ = copy_to_clipboard(&note_b64);
+    }
+
+    let outcome = wallet
+        .send_with_paycode_and_note(&to, amount, net, &note_bytes)
+        .await?;
+
+    if args.json {
+        let spends: Vec<serde_json::Value> = outcome
+            .spends
+            .iter()
+            .map(|sp| {
+                serde_json::json!({
+                    "coin_id": hex::encode(sp.coin_id),
+                    "commitment": hex::encode(sp.commitment),
+                    "nullifier": hex::encode(sp.nullifier),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "to": to,
+                "amount": amount,
+                "spend_count": outcome.spends.len(),
+                "note": note_b64,
+                "note_generated": note_generated,
+                "note_out": args.note_out,
+                "spends": spends,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Sent");
+    println!();
+    println!(
+        "Broadcast {} spend{} for {} coin{}.",
+        outcome.spends.len(),
+        if outcome.spends.len() == 1 { "" } else { "s" },
+        amount,
+        if amount == 1 { "" } else { "s" }
+    );
+    println!("Recipient: {}", short_text(&to));
+    println!();
+    println!("Share this receiver note privately:");
+    println!("{note_b64}");
+    if args.copy_note {
+        println!("Copied receiver note to clipboard.");
+    }
+    if args.show_note_qr || guided {
+        println!();
+        let _ = print_qr_to_terminal(&note_b64);
+    }
+    if let Some(path) = &args.note_out {
+        println!();
+        println!("Saved note bundle to {path}");
+    }
+    println!();
+    println!("Track confirmation with `unchained wallet history`.");
+    Ok(())
+}
+
+fn print_balance_output(wallet: &wallet::Wallet, args: &BalanceArgs) -> anyhow::Result<()> {
+    let balance = wallet.balance()?;
+    let outputs = wallet.list_unspent()?.len();
+    let address = wallet.export_address();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "balance": balance,
+                "spendable_outputs": outputs,
+                "address": address,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Wallet");
+    println!();
+    println!(
+        "Spendable balance: {balance} coin{}",
+        if balance == 1 { "" } else { "s" }
+    );
+    println!("Spendable outputs: {outputs}");
+    println!("Receive: `unchained wallet receive`");
+    Ok(())
+}
+
+fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> anyhow::Result<()> {
+    let mut history = wallet.get_transaction_history()?;
+    if let Some(limit) = args.limit {
+        history.truncate(limit);
+    }
+
+    if args.json {
+        let rows: Vec<serde_json::Value> = history
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "coin_id": hex::encode(record.coin_id),
+                    "transfer_hash": hex::encode(record.transfer_hash),
+                    "epoch": record.commit_epoch,
+                    "direction": if record.is_sender { "out" } else { "in" },
+                    "amount": record.amount,
+                    "counterparty": hex::encode(record.counterparty),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(rows));
+        return Ok(());
+    }
+
+    if history.is_empty() {
+        println!("No wallet history yet.");
+        return Ok(());
+    }
+
+    println!("History");
+    println!();
+    for record in history {
+        let direction = if record.is_sender { "Sent" } else { "Received" };
+        println!(
+            "{} {} coin{} at epoch #{} with {}",
+            direction,
+            record.amount,
+            if record.amount == 1 { "" } else { "s" },
+            record.commit_epoch,
+            short_hex(&record.counterparty)
+        );
+        println!("  coin {}", short_hex(&record.coin_id));
+        println!("  tx   {}", short_hex(&record.transfer_hash));
+    }
+    Ok(())
+}
+
+fn print_peer_id_output(cfg: &config::Config) -> anyhow::Result<()> {
+    let id = network::peer_id_string()?;
+    println!("Peer ID");
+    println!();
+    println!("{id}");
+    if let Some(ip) = &cfg.net.public_ip {
+        println!();
+        println!(
+            "Shareable multiaddr: /ip4/{}/udp/{}/quic-v1/p2p/{}",
+            ip, cfg.net.listen_port, id
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("--- unchained Node ---");
-
     let cli = Cli::parse();
+    if cli.cmd.is_none() {
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        println!();
+        println!();
+        println!("Start with `unchained node start` or `unchained wallet receive`.");
+        return Ok(());
+    }
+
+    let node_start_requested = matches!(
+        &cli.cmd,
+        Some(Cmd::Node {
+            cmd: NodeCmd::Start { .. }
+        }) | Some(Cmd::Mine)
+    );
+    let force_mine = matches!(
+        &cli.cmd,
+        Some(Cmd::Mine)
+            | Some(Cmd::Node {
+                cmd: NodeCmd::Start { mine: true }
+            })
+    );
 
     // Try reading config from CLI path, then from the executable directory, else fallback to embedded default
     let mut cfg = match config::load(&cli.config) {
@@ -379,6 +1068,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+    if force_mine {
+        cfg.mining.enabled = true;
+    }
+
+    if matches!(
+        &cli.cmd,
+        Some(Cmd::Node {
+            cmd: NodeCmd::PeerId
+        }) | Some(Cmd::PeerId)
+    ) {
+        print_peer_id_output(&cfg)?;
+        return Ok(());
+    }
 
     // Apply quiet logging preference: CLI flag overrides config
     if cli.quiet_net {
@@ -403,31 +1105,59 @@ async fn main() -> anyhow::Result<()> {
         Ok(db) => db,
         Err(_) => return Err(anyhow::anyhow!("failed to open database")),
     };
-    println!("🗄️  Database opened at '{}'", cfg.storage.path);
 
-    // Auto-import anchors snapshot if DB is empty (no genesis) and a co-located snapshot file exists
-    if db
-        .get::<epoch::Anchor>("epoch", &0u64.to_le_bytes())?
-        .is_none()
-    {
-        // Try well-known relative filenames next to config or working directory
-        let candidates = ["anchors_snapshot.zst", "anchors_snapshot.bin"];
-        for cand in candidates.iter() {
-            if std::path::Path::new(cand).exists() {
-                match db.import_anchors_snapshot(cand) {
-                    Ok(n) if n > 0 => {
-                        println!("📥 Imported {} anchors from '{}'", n, cand);
-                        break;
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
+
+    match &cli.cmd {
+        Some(Cmd::Wallet {
+            cmd: WalletCmd::Receive(args),
+        })
+        | Some(Cmd::Address(args)) => {
+            print_receive_output(wallet.as_ref(), args)?;
+            return Ok(());
+        }
+        Some(Cmd::Wallet {
+            cmd: WalletCmd::Balance(args),
+        })
+        | Some(Cmd::Balance(args)) => {
+            print_balance_output(wallet.as_ref(), args)?;
+            return Ok(());
+        }
+        Some(Cmd::Wallet {
+            cmd: WalletCmd::History(args),
+        })
+        | Some(Cmd::History(args)) => {
+            print_history_output(wallet.as_ref(), args)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    if node_start_requested {
+        println!("Database: {}", cfg.storage.path);
+
+        // Auto-import anchors snapshot if DB is empty (no genesis) and a co-located snapshot file exists
+        if db
+            .get::<epoch::Anchor>("epoch", &0u64.to_le_bytes())?
+            .is_none()
+        {
+            // Try well-known relative filenames next to config or working directory
+            let candidates = ["anchors_snapshot.zst", "anchors_snapshot.bin"];
+            for cand in candidates.iter() {
+                if std::path::Path::new(cand).exists() {
+                    match db.import_anchors_snapshot(cand) {
+                        Ok(n) if n > 0 => {
+                            println!("Imported {} anchors from '{}'", n, cand);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Snapshot import from '{}' failed: {}", cand, e),
                     }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("⚠️  Snapshot import from '{}' failed: {}", cand, e),
                 }
             }
         }
     }
-
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let wallet = Arc::new(wallet::Wallet::load_or_create(db.clone())?);
 
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
 
@@ -497,147 +1227,133 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle CLI commands
     match &cli.cmd {
-        Some(Cmd::Mine) => {
-            // Start epoch manager only when actively mining or running as a block producer
-            let epoch_mgr = epoch::Manager::new(
-                db.clone(),
-                cfg.epoch.clone(),
-                cfg.net.clone(),
-                net.clone(),
-                coin_rx,
-                shutdown_tx.subscribe(),
-                sync_state.clone(),
-                cfg.compact.clone(),
-            );
-            epoch_mgr.spawn_loop();
-
-            // --- Active Synchronization Before Mining ---
-            println!("🔄 Initiating synchronization with the network...");
-            net.request_latest_epoch().await;
-
-            let mut anchor_rx = net.anchor_subscribe();
-            let poll_interval_ms: u64 = 500;
-            let max_attempts: u64 =
-                ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
-            let mut synced = false;
-            let mut attempt: u64 = 0;
-            let mut last_local_displayed: u64 = u64::MAX; // force initial print once we have network view
-            while attempt < max_attempts {
-                let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
-                let peer_confirmed = sync_state
-                    .lock()
-                    .map(|s| s.peer_confirmed_tip)
-                    .unwrap_or(false);
-                let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
-                let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
-
-                // When bootstrap peers are configured, require a peer-confirmed tip before declaring sync
-                if highest_seen > 0
-                    && local_epoch >= highest_seen
-                    && (cfg.net.bootstrap.is_empty() || peer_confirmed)
-                {
-                    println!(
-                        "✅ Synchronization complete. Local epoch is {}.",
-                        local_epoch
-                    );
-                    if let Ok(mut st) = sync_state.lock() {
-                        st.synced = true;
-                    }
-                    synced = true;
-                    break;
-                }
-                if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
-                    println!(
-                        "✅ No peers responded; proceeding with local chain at epoch {}.",
-                        local_epoch
-                    );
-                    if let Ok(mut st) = sync_state.lock() {
-                        st.synced = true;
-                        if st.highest_seen_epoch == 0 {
-                            st.highest_seen_epoch = local_epoch;
-                        }
-                    }
-                    synced = true;
-                    break;
-                }
-                if highest_seen > 0 {
-                    if last_local_displayed != local_epoch || attempt == 0 {
-                        if cfg.net.bootstrap.is_empty() {
-                            println!(
-                                "⏳ Syncing... local epoch: {}, network epoch: {}",
-                                local_epoch, highest_seen
-                            );
-                        } else {
-                            println!(
-                                "⏳ Syncing... local {}, network {}, peer-confirmed: {}",
-                                local_epoch, highest_seen, peer_confirmed
-                            );
-                        }
-                        last_local_displayed = local_epoch;
-                    }
-                } else {
-                    println!(
-                        "⏳ Waiting for network response... (attempt {})",
-                        attempt + 1
-                    );
-                }
-
-                tokio::select! {
-                    Ok(_a) = anchor_rx.recv() => { continue; }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
-                }
-            }
-            if !synced {
-                println!(
-                    "⚠️  Could not sync with network after {}s.",
-                    cfg.net.sync_timeout_secs
+        Some(Cmd::Node {
+            cmd: NodeCmd::Start { .. },
+        })
+        | Some(Cmd::Mine) => {
+            if cfg.mining.enabled {
+                // Start epoch manager only when actively mining or running as a block producer
+                let epoch_mgr = epoch::Manager::new(
+                    db.clone(),
+                    cfg.epoch.clone(),
+                    cfg.net.clone(),
+                    net.clone(),
+                    coin_rx,
+                    shutdown_tx.subscribe(),
+                    sync_state.clone(),
+                    cfg.compact.clone(),
                 );
-                // Only allow starting as a new chain when there are no bootstrap peers and no network view
-                let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
-                if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
-                    if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                epoch_mgr.spawn_loop();
+
+                // --- Active Synchronization Before Mining ---
+                println!("Syncing with the network before mining...");
+                net.request_latest_epoch().await;
+
+                let mut anchor_rx = net.anchor_subscribe();
+                let poll_interval_ms: u64 = 500;
+                let max_attempts: u64 =
+                    ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
+                let mut synced = false;
+                let mut attempt: u64 = 0;
+                let mut last_local_displayed: u64 = u64::MAX; // force initial print once we have network view
+                while attempt < max_attempts {
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                    let peer_confirmed = sync_state
+                        .lock()
+                        .map(|s| s.peer_confirmed_tip)
+                        .unwrap_or(false);
+                    let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
+                    let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
+
+                    // When bootstrap peers are configured, require a peer-confirmed tip before declaring sync
+                    if highest_seen > 0
+                        && local_epoch >= highest_seen
+                        && (cfg.net.bootstrap.is_empty() || peer_confirmed)
+                    {
+                        println!("Synchronized at epoch {}.", local_epoch);
+                        if let Ok(mut st) = sync_state.lock() {
+                            st.synced = true;
+                        }
+                        synced = true;
+                        break;
+                    }
+                    if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
+                        println!(
+                            "No peers responded; using local chain at epoch {}.",
+                            local_epoch
+                        );
                         if let Ok(mut st) = sync_state.lock() {
                             st.synced = true;
                             if st.highest_seen_epoch == 0 {
-                                st.highest_seen_epoch = latest.num;
+                                st.highest_seen_epoch = local_epoch;
                             }
                         }
-                        println!("✅ Proceeding with local chain at epoch {}.", latest.num);
+                        synced = true;
+                        break;
                     }
-                } else {
-                    println!(
-                        "⛔ Sync not achieved; mining remains disabled until local >= network tip."
-                    );
-                }
-            }
+                    if highest_seen > 0 {
+                        if last_local_displayed != local_epoch || attempt == 0 {
+                            if cfg.net.bootstrap.is_empty() {
+                                println!(
+                                    "Syncing... local epoch {}, network epoch {}",
+                                    local_epoch, highest_seen
+                                );
+                            } else {
+                                println!(
+                                    "Syncing... local {}, network {}, peer-confirmed {}",
+                                    local_epoch, highest_seen, peer_confirmed
+                                );
+                            }
+                            last_local_displayed = local_epoch;
+                        }
+                    } else {
+                        println!("Waiting for network response... attempt {}", attempt + 1);
+                    }
 
-            miner::spawn(
-                cfg.mining.clone(),
-                db.clone(),
-                net.clone(),
-                wallet.clone(),
-                coin_tx,
-                shutdown_tx.subscribe(),
-                sync_state.clone(),
-            );
-        }
-        Some(Cmd::PeerId) => {
-            let id = network::peer_id_string()?;
-            println!("🆔 Peer ID: {}", id);
-            if let Some(ip) = &cfg.net.public_ip {
-                println!(
-                    "📫 Multiaddr: /ip4/{}/udp/{}/quic-v1/p2p/{}",
-                    ip, cfg.net.listen_port, id
+                    tokio::select! {
+                        Ok(_a) = anchor_rx.recv() => { continue; }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
+                    }
+                }
+                if !synced {
+                    println!(
+                        "Could not sync with the network after {}s.",
+                        cfg.net.sync_timeout_secs
+                    );
+                    // Only allow starting as a new chain when there are no bootstrap peers and no network view
+                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
+                    if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
+                        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
+                            if let Ok(mut st) = sync_state.lock() {
+                                st.synced = true;
+                                if st.highest_seen_epoch == 0 {
+                                    st.highest_seen_epoch = latest.num;
+                                }
+                            }
+                            println!("Proceeding with local chain at epoch {}.", latest.num);
+                        }
+                    } else {
+                        println!("Mining remains disabled until local state catches up to the network tip.");
+                    }
+                }
+
+                miner::spawn(
+                    cfg.mining.clone(),
+                    db.clone(),
+                    net.clone(),
+                    wallet.clone(),
+                    coin_tx,
+                    shutdown_tx.subscribe(),
+                    sync_state.clone(),
                 );
+            } else {
+                println!("Starting node with mining disabled.");
             }
-            return Ok(());
         }
-        Some(Cmd::StealthAddress) => {
-            let stealth = wallet.export_stealth_address();
-            println!("{}", stealth);
-            return Ok(());
-        }
-        Some(Cmd::Proof { coin_id }) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::Proof(ProofArgs { coin_id }),
+        })
+        | Some(Cmd::Proof(ProofArgs { coin_id })) => {
             // Parse coin id
             let id_vec =
                 hex::decode(coin_id).map_err(|e| anyhow::anyhow!("Invalid coin_id hex: {}", e))?;
@@ -671,238 +1387,23 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Cmd::Send {
-            paycode,
-            amount,
-            note,
-        }) => {
-            let net = net.clone();
-            let (stealth, amount, _batch_token) = if true {
-                // New non-interactive path handled below. Keep interactive flow for now but deprecated.
-                (paycode.trim().to_string(), *amount, String::new())
-            } else {
-                // Fallback to interactive flow
-                // Enable quiet network logging for interactive send
-                network::set_quiet_logging(true);
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                println!("\n\n\n");
-                println!("{}", "=".repeat(60));
-                println!("💰 Guided Send (interactive)");
-                println!("{}", "=".repeat(60));
-                println!("This walkthrough has 3 short steps:");
-                println!("  1) Paste the receiver code (stealth address or a batch token)");
-                println!("  2) Enter the amount to send");
-                println!(
-                    "  3) Build and broadcast the spend(s) — commitments are fetched automatically"
-                );
-                println!();
-                println!("⏸️  Pausing network activity for clean input...");
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                // Prompt for stealth address (reuse existing interactive UI)
-                println!("STEP 1/3 — Receiver code");
-                println!("📤 Paste the receiver code and press Enter.");
-                println!("   The receiver code can be either: \n   • a stealth address (base64‑url), or\n   • a batch token (base64‑url) they generated for this payment.");
-                println!("   Tips:\n   • Paste in chunks if needed.\n   • Or type 'file:/path/to/code.txt' to load from file\n   • Or type 'test' to use 'test_stealth_address.txt'.");
-                print!("   Address: ");
-                io::stdout().flush()?;
-                let mut stealth = String::new();
-                let mut chunk_count = 0;
-                loop {
-                    chunk_count += 1;
-                    print!("   Address chunk {} (leave empty to finish): ", chunk_count);
-                    io::stdout().flush()?;
-                    let mut chunk = String::new();
-                    io::stdin().read_line(&mut chunk)?;
-                    let chunk = chunk.trim();
-                    if chunk.is_empty() {
-                        if chunk_count == 1 {
-                            eprintln!("   ❌ Address cannot be empty");
-                            return Ok(());
-                        }
-                        break;
-                    }
-                    stealth.push_str(chunk);
-                    if chunk.ends_with("==") || chunk.ends_with("=") || chunk.len() < 100 {
-                        print!("   ✅ Address appears complete. Press Enter to continue, or type 'more' to add more: ");
-                        io::stdout().flush()?;
-                        let mut c = String::new();
-                        io::stdin().read_line(&mut c)?;
-                        if c.trim() != "more" {
-                            break;
-                        }
-                    }
-                    println!(
-                        "   📝 Added chunk {} ({} chars total)",
-                        chunk_count,
-                        stealth.len()
-                    );
-                }
-                let stealth = stealth
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim_matches('`')
-                    .to_string();
-                let stealth = if stealth == "test" {
-                    std::fs::read_to_string("test_stealth_address.txt")
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_default()
-                } else if stealth.starts_with("file:") {
-                    let filename = stealth[5..]
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .trim_matches('`')
-                        .to_string();
-                    std::fs::read_to_string(&filename)
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_default()
-                } else {
-                    stealth
-                };
-                if stealth.is_empty() {
-                    eprintln!("❌ Stealth address cannot be empty");
-                    return Ok(());
-                }
-                if !stealth
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '=')
-                {
-                    eprintln!("❌ Invalid code format. Expected base64-url safe characters only.");
-                    return Ok(());
-                }
-                println!("   ✅ Code accepted ({} characters)", stealth.len());
-                println!();
-                println!("STEP 2/3 — Amount");
-                print!("💰 Enter amount to send: ");
-                io::stdout().flush()?;
-                let mut amount_str = String::new();
-                io::stdin().read_line(&mut amount_str)?;
-                let amount: u64 = amount_str
-                    .trim()
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid amount"))?;
-                if amount == 0 {
-                    eprintln!("❌ Amount must be greater than 0");
-                    return Ok(());
-                }
-                // Build or request batch token interactively
-                let mut token = String::new();
-                {
-                    println!("\nAuto‑obtaining receiver commitments (if needed)");
-                    println!("   If your receiver code was a batch token, we will use it directly.\n   Otherwise, we'll request commitments over P2P for up to 12 seconds, with an offline QR fallback.");
-                    let _coins = wallet.select_inputs(amount)?;
-                    // commitment request/response flow removed
-                    use rand::RngCore as _;
-                    let mut rng_tag = [0u8; 32];
-                    rand::rngs::OsRng.fill_bytes(&mut rng_tag);
-                    // Try interpret the code as a batch token first
-                    let recipient_addr_opt: Option<crate::crypto::Address> = None;
-                    if base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(stealth.as_str())
-                        .is_ok()
-                        || base64::engine::general_purpose::URL_SAFE
-                            .decode(stealth.as_str())
-                            .is_ok()
-                    {
-                        let parsed_token = stealth.clone();
-                        if let Ok(_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .decode(parsed_token.as_str())
-                            .or_else(|_| {
-                                base64::engine::general_purpose::URL_SAFE
-                                    .decode(parsed_token.as_str())
-                            })
-                        {
-                            // Batch token flow removed.
-                        }
-                    }
-                    let _recipient_addr = if let Some(a) = recipient_addr_opt {
-                        a
-                    } else {
-                        let (a, _k) = wallet::Wallet::parse_stealth_address(&stealth)?;
-                        a
-                    };
-                    let used_network = false;
-                    if net.peer_count() > 0 {
-                        println!("   ⏳ Requesting commitments from peers (12s timeout)...");
-                        // removed
-                    }
-                    if !used_network {
-                        let req_b64 = "<commitment flow removed>".to_string();
-                        println!("   📱 No P2P response yet — using offline exchange.");
-                        println!(
-                            "   Show this QR to the receiver so they can generate a batch token:"
-                        );
-                        if let Err(e) = print_qr_to_terminal(&req_b64) {
-                            eprintln!("(QR unavailable: {})", e);
-                        }
-                        match copy_to_clipboard(&req_b64) {
-                            Ok(()) => println!("   📋 Copied request to clipboard"),
-                            Err(_) => eprintln!("   (clipboard unavailable)"),
-                        }
-                        println!(
-                            "\n   Or share this code if QR is not convenient:\n   {}\n",
-                            req_b64
-                        );
-                        print!("🔒 Paste the receiver's batch token here and press Enter: ");
-                        io::stdout().flush()?;
-                        let mut tok = String::new();
-                        io::stdin().read_line(&mut tok)?;
-                        token = tok.trim().to_string();
-                    }
-                }
-                (stealth, amount, token)
-            };
-
-            // Non-interactive send execution (or interactive result)
-            println!("\nSTEP 4/4 — Build and broadcast");
-            println!("   Preparing spends and submitting to the network...");
-            // Execute new send using paycode and OOB note
-            use rand::RngCore;
-            let s_bytes: Vec<u8> = if let Some(n) = note {
-                let t = n.trim();
-                if let Ok(b) = hex::decode(t.trim_start_matches("0x")) {
-                    b
-                } else if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t) {
-                    b
-                } else {
-                    anyhow::bail!("Invalid note encoding; use hex or base64-url")
-                }
-            } else {
-                let mut s = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut s);
-                println!("🔑 Generated random spend note s: {}", hex::encode(s));
-                s.to_vec()
-            };
-            let outcome: anyhow::Result<wallet::SendOutcome> = wallet
-                .send_with_paycode_and_note(&stealth, amount, &net, &s_bytes)
-                .await;
-            match outcome {
-                Ok(outcome) => {
-                    let total = outcome.spends.len();
-                    println!(
-                        "✅ Done. Built and broadcast {} spend{}",
-                        total,
-                        if total == 1 { "" } else { "s" }
-                    );
-                    for (i, s) in outcome.spends.iter().enumerate() {
-                        println!(
-                            "   • Spend {}: coin {} → commitment {}",
-                            i + 1,
-                            hex::encode(s.coin_id),
-                            hex::encode(s.commitment)
-                        );
-                    }
-                    println!("\nYou can watch for confirmations in the logs or with 'unchained history'.");
-                }
-                Err(e) => {
-                    eprintln!("❌ Send failed: {}", e);
-                    return Err(e);
-                }
-            }
+        Some(Cmd::Wallet {
+            cmd: WalletCmd::Send(args),
+        })
+        | Some(Cmd::Send(args)) => {
+            run_send_flow(&wallet, &net, args).await?;
             return Ok(());
         }
-        Some(Cmd::HtlcPlan {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcPlan {
+                    paycode,
+                    amount,
+                    timeout,
+                    out,
+                },
+        })
+        | Some(Cmd::HtlcPlan {
             paycode,
             amount,
             timeout,
@@ -914,7 +1415,15 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote HTLC plan to {} (timeout epoch {})", out, timeout);
             return Ok(());
         }
-        Some(Cmd::HtlcClaimPrepare {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcClaimPrepare {
+                    claim_secret,
+                    coins,
+                    out,
+                },
+        })
+        | Some(Cmd::HtlcClaimPrepare {
             claim_secret,
             coins,
             out,
@@ -952,7 +1461,16 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote HTLC claim CHs to {}", out);
             return Ok(());
         }
-        Some(Cmd::HtlcOfferExecute {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcOfferExecute {
+                    plan,
+                    claims,
+                    refund_base,
+                    refund_secrets_out,
+                },
+        })
+        | Some(Cmd::HtlcOfferExecute {
             plan,
             claims,
             refund_base,
@@ -991,7 +1509,16 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Some(Cmd::HtlcRefundPrepare {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcRefundPrepare {
+                    plan,
+                    refund_base,
+                    out,
+                    out_secrets,
+                },
+        })
+        | Some(Cmd::HtlcRefundPrepare {
             plan,
             refund_base,
             out,
@@ -1040,7 +1567,16 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote HTLC refund CHs to {}", out);
             return Ok(());
         }
-        Some(Cmd::HtlcClaim {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcClaim {
+                    timeout,
+                    claim_secret,
+                    refunds,
+                    paycode,
+                },
+        })
+        | Some(Cmd::HtlcClaim {
             timeout,
             claim_secret,
             refunds,
@@ -1081,7 +1617,16 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Some(Cmd::HtlcRefund {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::HtlcRefund {
+                    timeout,
+                    refund_secret,
+                    claims,
+                    paycode,
+                },
+        })
+        | Some(Cmd::HtlcRefund {
             timeout,
             refund_secret,
             claims,
@@ -1122,7 +1667,18 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Some(Cmd::OfferCreate {
+        Some(Cmd::Offers {
+            cmd:
+                OffersCmd::Create {
+                    paycode,
+                    amount,
+                    timeout,
+                    price_bps,
+                    note,
+                    out,
+                },
+        })
+        | Some(Cmd::OfferCreate {
             paycode,
             amount,
             timeout,
@@ -1137,13 +1693,25 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote signed offer to {}", out);
             return Ok(());
         }
-        Some(Cmd::OfferVerify { input }) => {
+        Some(Cmd::Offers {
+            cmd: OffersCmd::Verify { input },
+        })
+        | Some(Cmd::OfferVerify { input }) => {
             let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             println!("✅ Offer signature and maker address verified");
             return Ok(());
         }
-        Some(Cmd::OfferAccept {
+        Some(Cmd::Offers {
+            cmd:
+                OffersCmd::Accept {
+                    input,
+                    claim_secret,
+                    refund_base,
+                    refund_secrets_out,
+                },
+        })
+        | Some(Cmd::OfferAccept {
             input,
             claim_secret,
             refund_base,
@@ -1207,7 +1775,10 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Some(Cmd::OfferPublish { input }) => {
+        Some(Cmd::Offers {
+            cmd: OffersCmd::Publish { input },
+        })
+        | Some(Cmd::OfferPublish { input }) => {
             let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             // Publish via network
@@ -1217,12 +1788,21 @@ async fn main() -> anyhow::Result<()> {
             println!("📢 Published offer to network");
             return Ok(());
         }
-        Some(Cmd::OfferWatch {
+        Some(Cmd::Offers {
+            cmd:
+                OffersCmd::Watch(OfferWatchArgs {
+                    count,
+                    min_amount,
+                    maker,
+                    since: _,
+                }),
+        })
+        | Some(Cmd::OfferWatch(OfferWatchArgs {
             count,
             min_amount,
             maker,
             since: _,
-        }) => {
+        })) => {
             // Local subscribe; apply filters; since is not used in local mode
             let mut rx = net.offers_subscribe();
             let mut remaining = *count;
@@ -1245,7 +1825,15 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::OfferAcceptPrepare {
+        Some(Cmd::Offers {
+            cmd:
+                OffersCmd::AcceptPrepare {
+                    input,
+                    claim_secret,
+                    out,
+                },
+        })
+        | Some(Cmd::OfferAcceptPrepare {
             input,
             claim_secret,
             out,
@@ -1282,47 +1870,10 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote claim CHs for {} coins", doc.claims.len());
             return Ok(());
         }
-        Some(Cmd::Balance) => {
-            match wallet.balance() {
-                Ok(balance) => {
-                    println!("💰 Wallet balance: {} coins", balance);
-                    println!("📍 Address: {}", hex::encode(wallet.address()));
-                }
-                Err(e) => {
-                    eprintln!("❌ Failed to get balance: {}", e);
-                    return Err(e);
-                }
-            }
-            return Ok(());
-        }
-        Some(Cmd::History) => {
-            match wallet.get_transaction_history() {
-                Ok(history) => {
-                    println!("📜 Transaction history:");
-                    if history.is_empty() {
-                        println!("  No transactions found");
-                    } else {
-                        for (i, record) in history.iter().enumerate() {
-                            let direction = if record.is_sender { "→" } else { "←" };
-                            println!(
-                                "  {} {} {} {} (coin: {})",
-                                i + 1,
-                                direction,
-                                hex::encode(record.counterparty),
-                                record.amount,
-                                hex::encode(record.coin_id)
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ Failed to get history: {}", e);
-                    return Err(e);
-                }
-            }
-            return Ok(());
-        }
-        Some(Cmd::X402Pay { url, auto_resubmit }) => {
+        Some(Cmd::X402 {
+            cmd: X402Cmd::Pay(X402PayArgs { url, auto_resubmit }),
+        })
+        | Some(Cmd::X402Pay(X402PayArgs { url, auto_resubmit })) => {
             // Fetch challenge
             let client = reqwest::Client::new();
             let resp = client.get(url).send().await?;
@@ -1351,7 +1902,10 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::RepairSpends) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::RepairSpends,
+        })
+        | Some(Cmd::RepairSpends) => {
             println!("🛠️  Scanning 'spend' CF for malformed entries...");
             let cf = db
                 .db
@@ -1395,17 +1949,31 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Some(Cmd::ExportAnchors { out }) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::ExportAnchors { out },
+        })
+        | Some(Cmd::ExportAnchors { out }) => {
             let written = db.export_anchors_snapshot(out)?;
             println!("✅ Exported {} anchors to {}", written, out);
             return Ok(());
         }
-        Some(Cmd::ImportAnchors { input }) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::ImportAnchors { input },
+        })
+        | Some(Cmd::ImportAnchors { input }) => {
             let added = db.import_anchors_snapshot(input)?;
             println!("✅ Imported {} anchors from {}", added, input);
             return Ok(());
         }
-        Some(Cmd::BridgeOut {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::BridgeOut {
+                    sui_recipient,
+                    amount,
+                    prewarm_secs,
+                },
+        })
+        | Some(Cmd::BridgeOut {
             sui_recipient,
             amount,
             prewarm_secs,
@@ -1464,7 +2032,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Cmd::MetaAuthzCreate {
+        Some(Cmd::Advanced {
+            cmd:
+                AdvancedCmd::MetaAuthzCreate {
+                    to,
+                    amount,
+                    valid_after,
+                    valid_before,
+                    facilitator_kyber_b64,
+                    binding_b64,
+                    out,
+                },
+        })
+        | Some(Cmd::MetaAuthzCreate {
             to,
             amount,
             valid_after,
@@ -1511,15 +2091,19 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         // commitment commands removed
-        Some(Cmd::MsgSend { text }) => {
+        Some(Cmd::Message {
+            cmd: MessageCmd::Send(MessageSendArgs { text }),
+        })
+        | Some(Cmd::MsgSend(MessageSendArgs { text })) => {
             let message = if let Some(t) = text {
                 t.clone()
             } else {
-                print!("📝 Enter message to send (max a few KB): ");
-                io::stdout().flush()?;
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-                line.trim().to_string()
+                if !atty::is(atty::Stream::Stdin) {
+                    anyhow::bail!(
+                        "Interactive message send requires a TTY. Pass --text in non-interactive mode."
+                    );
+                }
+                prompt_line("Message: ")?
             };
             if message.is_empty() {
                 println!("Nothing to send.");
@@ -1527,10 +2111,14 @@ async fn main() -> anyhow::Result<()> {
             }
             let msg = RateLimitedMessage { content: message };
             net.gossip_rate_limited(msg).await;
-            println!("📤 Message submitted to P2P topic (subject to 2 msgs/24h outbound limit)");
+            println!("Message submitted to the shared topic.");
+            println!("Outbound rate limit: 2 messages per 24h.");
             return Ok(());
         }
-        Some(Cmd::MsgListen { once, count }) => {
+        Some(Cmd::Message {
+            cmd: MessageCmd::Listen(MessageListenArgs { once, count }),
+        })
+        | Some(Cmd::MsgListen(MessageListenArgs { once, count })) => {
             println!("👂 Listening for P2P messages (24h-limited topic). Press Ctrl+C to exit.");
             let mut rx = net.rate_limited_subscribe();
             let mut remaining = count.unwrap_or(u64::MAX);
@@ -1550,7 +2138,10 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::ReplaySpends) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::ReplaySpends,
+        })
+        | Some(Cmd::ReplaySpends) => {
             let cf = db
                 .db
                 .cf_handle("spend")
@@ -1568,7 +2159,10 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Re-gossiped {} transactions", replayed);
             return Ok(());
         }
-        Some(Cmd::RescanWallet) => {
+        Some(Cmd::Advanced {
+            cmd: AdvancedCmd::RescanWallet,
+        })
+        | Some(Cmd::RescanWallet) => {
             let cf = db
                 .db
                 .cf_handle("spend")
@@ -1585,131 +2179,30 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Rescanned {} spends for this wallet", scanned);
             return Ok(());
         }
-        // commitment request removed
-        None => {
-            // No command specified, start mining if enabled
-            if cfg.mining.enabled {
-                // Start epoch manager only when mining
-                let epoch_mgr = epoch::Manager::new(
-                    db.clone(),
-                    cfg.epoch.clone(),
-                    cfg.net.clone(),
-                    net.clone(),
-                    coin_rx,
-                    shutdown_tx.subscribe(),
-                    sync_state.clone(),
-                    cfg.compact.clone(),
-                );
-                epoch_mgr.spawn_loop();
-
-                // --- Active Synchronization Before Mining ---
-                println!("🔄 Initiating synchronization with the network...");
-                net.request_latest_epoch().await;
-
-                let mut anchor_rx = net.anchor_subscribe();
-                let poll_interval_ms: u64 = 500;
-                let max_attempts: u64 =
-                    ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
-                let mut synced = false;
-                let mut attempt: u64 = 0;
-                let mut last_local_displayed: u64 = u64::MAX;
-                while attempt < max_attempts {
-                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
-                    let peer_confirmed = sync_state
-                        .lock()
-                        .map(|s| s.peer_confirmed_tip)
-                        .unwrap_or(false);
-                    let latest_opt = db.get::<epoch::Anchor>("epoch", b"latest").unwrap_or(None);
-                    let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
-
-                    if highest_seen > 0
-                        && local_epoch >= highest_seen
-                        && (cfg.net.bootstrap.is_empty() || peer_confirmed)
-                    {
-                        println!(
-                            "✅ Synchronization complete. Local epoch is {}.",
-                            local_epoch
-                        );
-                        if let Ok(mut st) = sync_state.lock() {
-                            st.synced = true;
-                        }
-                        synced = true;
-                        break;
-                    }
-                    if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
-                        println!(
-                            "✅ No peers responded; proceeding with local chain at epoch {}.",
-                            local_epoch
-                        );
-                        if let Ok(mut st) = sync_state.lock() {
-                            st.synced = true;
-                            if st.highest_seen_epoch == 0 {
-                                st.highest_seen_epoch = local_epoch;
-                            }
-                        }
-                        synced = true;
-                        break;
-                    }
-
-                    if highest_seen > 0 {
-                        if last_local_displayed != local_epoch || attempt == 0 {
-                            if cfg.net.bootstrap.is_empty() {
-                                println!(
-                                    "⏳ Syncing... local epoch: {}, network epoch: {}",
-                                    local_epoch, highest_seen
-                                );
-                            } else {
-                                println!(
-                                    "⏳ Syncing... local {}, network {}, peer-confirmed: {}",
-                                    local_epoch, highest_seen, peer_confirmed
-                                );
-                            }
-                            last_local_displayed = local_epoch;
-                        }
-                    } else {
-                        println!(
-                            "⏳ Waiting for network response... (attempt {})",
-                            attempt + 1
-                        );
-                    }
-
-                    tokio::select! {
-                        Ok(_a) = anchor_rx.recv() => { continue; }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
-                    }
-                }
-                if !synced {
-                    println!(
-                        "⚠️  Could not sync with network after {}s.",
-                        cfg.net.sync_timeout_secs
-                    );
-                    let highest_seen = sync_state.lock().map(|s| s.highest_seen_epoch).unwrap_or(0);
-                    if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
-                        if let Ok(Some(latest)) = db.get::<epoch::Anchor>("epoch", b"latest") {
-                            if let Ok(mut st) = sync_state.lock() {
-                                st.synced = true;
-                                if st.highest_seen_epoch == 0 {
-                                    st.highest_seen_epoch = latest.num;
-                                }
-                            }
-                            println!("✅ Proceeding with local chain at epoch {}.", latest.num);
-                        }
-                    } else {
-                        println!("⛔ Sync not achieved; mining remains disabled until local >= network tip.");
-                    }
-                }
-
-                miner::spawn(
-                    cfg.mining.clone(),
-                    db.clone(),
-                    net.clone(),
-                    wallet.clone(),
-                    coin_tx,
-                    shutdown_tx.subscribe(),
-                    sync_state.clone(),
-                );
-            }
+        Some(Cmd::Node {
+            cmd: NodeCmd::PeerId,
+        })
+        | Some(Cmd::PeerId)
+        | Some(Cmd::Wallet {
+            cmd: WalletCmd::Receive(_),
+        })
+        | Some(Cmd::Wallet {
+            cmd: WalletCmd::Balance(_),
+        })
+        | Some(Cmd::Wallet {
+            cmd: WalletCmd::History(_),
+        })
+        | Some(Cmd::Address(_))
+        | Some(Cmd::Balance(_))
+        | Some(Cmd::History(_)) => {
+            unreachable!("handled before network startup")
         }
+        None => return Ok(()),
+        // commitment request removed
+    }
+
+    if !node_start_requested {
+        return Ok(());
     }
 
     let _metrics_bind = cfg.metrics.bind.clone();
@@ -1734,38 +2227,40 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    println!("\n🚀 unchained node is running!");
-    println!("   📡 unchained listening on port {}", cfg.net.listen_port);
+    println!();
+    println!("Unchained node is running.");
+    println!("Listening on port {}", cfg.net.listen_port);
     if let Some(public_ip) = cfg.net.public_ip {
-        println!("   📢 Public IP announced as: {public_ip}");
+        println!("Public IP: {public_ip}");
     }
-    println!("   📊 Epoch length: {} seconds", cfg.epoch.seconds);
+    println!("Epoch length: {} seconds", cfg.epoch.seconds);
     println!(
-        "   ⛏️  Mining: {}",
-        if matches!(cli.cmd, Some(Cmd::Mine)) || cfg.mining.enabled {
+        "Mining: {}",
+        if cfg.mining.enabled {
             "enabled"
         } else {
             "disabled"
         }
     );
     println!(
-        "   🎯 Epoch coin cap: {}",
+        "Epoch coin cap: {}",
         crate::protocol::CURRENT.max_coins_per_epoch
     );
-    println!("   Press Ctrl+C to stop");
+    println!("Press Ctrl+C to stop.");
 
     match signal::ctrl_c().await {
         Ok(()) => {
-            println!("\n🛑 Shutdown signal received, cleaning up...");
+            println!();
+            println!("Shutdown signal received. Cleaning up...");
             let _ = shutdown_tx.send(());
-            println!("⏳ Waiting for tasks to shutdown gracefully...");
+            println!("Waiting for tasks to shut down gracefully...");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             if let Err(e) = db.close() {
                 eprintln!("Warning: Database cleanup failed: {e}");
             } else {
-                println!("✅ Database closed cleanly");
+                println!("Database closed cleanly.");
             }
-            println!("👋 unchained node stopped");
+            println!("Unchained node stopped.");
             Ok(())
         }
         Err(err) => {
