@@ -1,5 +1,5 @@
-
 use crate::epoch::Anchor;
+use crate::protocol::CURRENT as PROTOCOL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Params {
@@ -8,20 +8,20 @@ pub struct Params {
 }
 
 pub const GENESIS_PARAMS: Params = Params {
-    difficulty: 2,
-    mem_kib: 16_192,
+    difficulty: PROTOCOL.genesis_difficulty,
+    mem_kib: PROTOCOL.genesis_mem_kib,
 };
 
-pub const RETARGET_INTERVAL: u64 = 2000;
-pub const TARGET_COINS_PER_EPOCH: u64 = 11;
+pub const RETARGET_INTERVAL: u64 = PROTOCOL.retarget_interval;
+pub const TARGET_COINS_PER_EPOCH: u64 = PROTOCOL.target_coins_per_epoch;
 
 // Difficulty bounds
-pub const DIFFICULTY_MIN: u32 = 1;
-pub const DIFFICULTY_MAX: u32 = 12;
+pub const DIFFICULTY_MIN: u32 = PROTOCOL.difficulty_min;
+pub const DIFFICULTY_MAX: u32 = PROTOCOL.difficulty_max;
 
 // Memory bounds (KiB)
-pub const MIN_MEM_KIB: u32 = 16_192;
-pub const MAX_MEM_KIB: u32 = 512_007;
+pub const MIN_MEM_KIB: u32 = PROTOCOL.min_mem_kib;
+pub const MAX_MEM_KIB: u32 = PROTOCOL.max_mem_kib;
 
 // Fixed-point scale (6 decimals)
 pub const PRECISION: u64 = 1_000_000;
@@ -33,8 +33,8 @@ pub const MIN_ADJ_NUM: u64 = 100;
 pub const MIN_ADJ_DEN: u64 = 102;
 
 // Difficulty retarget bands (% of target)
-pub const RETARGET_UPPER_PCT: u64 = 110;
-pub const RETARGET_LOWER_PCT: u64 = 90;
+pub const RETARGET_UPPER_PCT: u64 = PROTOCOL.retarget_upper_pct;
+pub const RETARGET_LOWER_PCT: u64 = PROTOCOL.retarget_lower_pct;
 
 // ---- Back-compat aliases for existing imports in epoch.rs/network.rs ----
 pub const TARGET_LEADING_ZEROS: usize = GENESIS_PARAMS.difficulty as usize;
@@ -50,15 +50,22 @@ impl core::fmt::Display for ConsensusError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ConsensusError::ParamMismatch { expected, got } => {
-                write!(f, "consensus params mismatch: expected={:?} got={:?}", expected, got)
+                write!(
+                    f,
+                    "consensus params mismatch: expected={:?} got={:?}",
+                    expected, got
+                )
             }
             ConsensusError::WindowSize { expected, got } => {
-                write!(f, "retarget window size mismatch: expected={} got={}", expected, got)
+                write!(
+                    f,
+                    "retarget window size mismatch: expected={} got={}",
+                    expected, got
+                )
             }
         }
     }
 }
-
 
 impl std::error::Error for ConsensusError {}
 
@@ -152,12 +159,13 @@ pub fn expected_params(
         return Ok(GENESIS_PARAMS);
     }
 
-    let parent_params = parent.map(params_from_anchor).ok_or_else(|| {
-        ConsensusError::WindowSize {
-            expected: RETARGET_INTERVAL,
-            got: window.len() as u64,
-        }
-    })?;
+    let parent_params =
+        parent
+            .map(params_from_anchor)
+            .ok_or_else(|| ConsensusError::WindowSize {
+                expected: RETARGET_INTERVAL,
+                got: window.len() as u64,
+            })?;
 
     if height % RETARGET_INTERVAL != 0 {
         return Ok(clamp_params(parent_params));
@@ -208,7 +216,13 @@ mod tests {
 
     #[test]
     fn genesis_fixed() {
-        assert_eq!(GENESIS_PARAMS, Params { difficulty: 2, mem_kib: 16_192 });
+        assert_eq!(
+            GENESIS_PARAMS,
+            Params {
+                difficulty: 2,
+                mem_kib: 16_192
+            }
+        );
         assert_eq!(TARGET_LEADING_ZEROS, 2usize);
         assert_eq!(DEFAULT_MEM_KIB, 16_192u32);
     }

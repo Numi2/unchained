@@ -1,34 +1,41 @@
+use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
-use argon2::{Argon2, Params, Version, Algorithm};
-use pqcrypto_dilithium::dilithium3::{
-    PublicKey, SecretKey,
-};
+use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey};
 
-use anyhow::{Result, anyhow};
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
-use libp2p::identity;
-use rcgen::{CertificateParams, KeyPair, SanType};
-use rustls::{ClientConfig, ServerConfig, RootCertStore};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::sync::Arc;
-use once_cell::sync::OnceCell;
-use zeroize::Zeroizing;
 use anyhow::bail;
-use chacha20poly1305::{aead::{Aead, NewAead}, XChaCha20Poly1305, Key, XNonce};
+use anyhow::{anyhow, Result};
 use atty;
+use chacha20poly1305::{
+    aead::{Aead, NewAead},
+    Key, XChaCha20Poly1305, XNonce,
+};
+use libp2p::identity;
+use once_cell::sync::OnceCell;
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+use rcgen::{CertificateParams, KeyPair, SanType};
 use rpassword;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::sync::Arc;
 use webpki_roots;
+use zeroize::Zeroizing;
 // liboqs usage removed
 
 // Constants for post-quantum crypto primitives ensure type safety and clarity.
-pub const DILITHIUM3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
-pub const DILITHIUM3_SK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
-pub const DILITHIUM3_SIG_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES;
+pub const DILITHIUM3_PK_BYTES: usize =
+    pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
+pub const DILITHIUM3_SK_BYTES: usize =
+    pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
+pub const DILITHIUM3_SIG_BYTES: usize =
+    pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES;
 
 // Kyber768 sizes for ciphertext and public key
-pub const KYBER768_CT_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
-pub const KYBER768_PK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_PUBLICKEYBYTES;
-pub const KYBER768_SK_BYTES: usize = pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_SECRETKEYBYTES;
+pub const KYBER768_CT_BYTES: usize =
+    pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_CIPHERTEXTBYTES;
+pub const KYBER768_PK_BYTES: usize =
+    pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_PUBLICKEYBYTES;
+pub const KYBER768_SK_BYTES: usize =
+    pqcrypto_kyber::ffi::PQCLEAN_KYBER768_CLEAN_CRYPTO_SECRETKEYBYTES;
 
 /// Size of opaque one-time public key bytes used in V3 signatureless transfers.
 /// This is intentionally decoupled from Dilithium key sizes even if currently equal.
@@ -38,13 +45,10 @@ pub const OTP_PK_BYTES: usize = DILITHIUM3_PK_BYTES;
 /// This provides a fixed-size, user-friendly identifier.
 pub type Address = [u8; 32];
 
-
-
 // -----------------------------------------------------------------------------
 // Unified passphrase handling (cached once per process)
 // -----------------------------------------------------------------------------
 static UNIFIED_PASSPHRASE: OnceCell<Zeroizing<String>> = OnceCell::new();
-
 
 pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<String>> {
     if let Some(existing) = UNIFIED_PASSPHRASE.get() {
@@ -81,8 +85,6 @@ pub fn address_from_bytes(bytes: &[u8]) -> Address {
         .as_bytes()
 }
 
-
-
 /// Computes the Argon2id hash for Proof-of-Work.
 /// Consensus parameters: lanes must be 1. Salt = BLAKE3(header)[0..16].
 pub fn argon2id_pow(input: &[u8], mem_kib: u32) -> Result<[u8; 32]> {
@@ -102,7 +104,10 @@ pub fn argon2id_pow(input: &[u8], mem_kib: u32) -> Result<[u8; 32]> {
 
 /// Hashes arbitrary data with a domain-specific key for internal consistency.
 pub fn blake3_hash(data: &[u8]) -> [u8; 32] {
-    *Hasher::new_derive_key("unchained-v1").update(data).finalize().as_bytes()
+    *Hasher::new_derive_key("unchained-v1")
+        .update(data)
+        .finalize()
+        .as_bytes()
 }
 
 /// Derive deterministic one-time "public key" bytes from a 32-byte seed obtained from stealth seed derivations.
@@ -123,35 +128,29 @@ pub fn commitment_of_stealth_ct(kyber_ct_bytes: &[u8]) -> [u8; 32] {
     blake3_hash(kyber_ct_bytes)
 }
 
-/// Length-prefixed stealth seed derivation bound to chain id and algo tags.
-/// TAG = "unchained-stealth-v1|mlkem768|mldsa65"
-/// seed32 = BLAKE3(TAG || lp(ss)||ss || lp(recv_pk)||recv_pk || lp(ct)||ct || lp(value_tag)||value_tag || chain_id32)
-pub fn stealth_seed_v1(ss: &[u8], recv_dili_pk_bytes: &[u8], kyber_ct_bytes: &[u8], value_tag: &[u8], chain_id32: &[u8; 32]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
-    let mut h = Hasher::new();
-    h.update(b"unchained-stealth-v1|mlkem768|mldsa65");
-    h.update(&lp(ss.len()));          h.update(ss);
-    h.update(&lp(recv_dili_pk_bytes.len())); h.update(recv_dili_pk_bytes);
-    h.update(&lp(kyber_ct_bytes.len()));     h.update(kyber_ct_bytes);
-    h.update(&lp(value_tag.len()));   h.update(value_tag);
-    h.update(chain_id32);
-    let out = h.finalize();
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&out.as_bytes()[..32]);
-    seed
-}
-
 /// V3: Length-prefixed stealth seed derivation bound to chain id using Kyber only.
 /// TAG = "unchained-stealth-v3|mlkem768"
 /// seed32 = BLAKE3(TAG || lp(ss)||ss || lp(receiver_binding)||receiver_binding || lp(ct)||ct || lp(value_tag)||value_tag || chain_id32)
-pub fn stealth_seed_v3(ss: &[u8], receiver_binding: &[u8], kyber_ct_bytes: &[u8], value_tag: &[u8], chain_id32: &[u8; 32]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+pub fn stealth_seed_v3(
+    ss: &[u8],
+    receiver_binding: &[u8],
+    kyber_ct_bytes: &[u8],
+    value_tag: &[u8],
+    chain_id32: &[u8; 32],
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"unchained-stealth-v3|mlkem768");
-    h.update(&lp(ss.len()));          h.update(ss);
-    h.update(&lp(receiver_binding.len())); h.update(receiver_binding);
-    h.update(&lp(kyber_ct_bytes.len()));     h.update(kyber_ct_bytes);
-    h.update(&lp(value_tag.len()));   h.update(value_tag);
+    h.update(&lp(ss.len()));
+    h.update(ss);
+    h.update(&lp(receiver_binding.len()));
+    h.update(receiver_binding);
+    h.update(&lp(kyber_ct_bytes.len()));
+    h.update(kyber_ct_bytes);
+    h.update(&lp(value_tag.len()));
+    h.update(value_tag);
     h.update(chain_id32);
     let out = h.finalize();
     let mut seed = [0u8; 32];
@@ -171,13 +170,13 @@ pub fn generate_self_signed_cert(_id_keys: &identity::Keypair) -> Result<(Vec<u8
         // Simple static hostname for P2P authentication
         SanType::DnsName("p2p.local".try_into()?),
     ];
-    
+
     // Generate a new Ed25519 keypair for the certificate
-    // Note: For simplicity, we generate a separate key for TLS rather than 
+    // Note: For simplicity, we generate a separate key for TLS rather than
     // trying to convert the libp2p key format, which is complex
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
-    
+
     Ok((cert.der().to_vec(), key_pair.serialize_der()))
 }
 
@@ -189,26 +188,33 @@ pub fn create_pq_client_config() -> Result<Arc<ClientConfig>> {
 
     // Build client config with post-quantum support
     // The aws_lc_rs provider includes Kyber hybrids when prefer-post-quantum is enabled
-    let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
 
     Ok(Arc::new(config))
 }
 
 /// Create a post-quantum aware Rustls server configuration
-pub fn create_pq_server_config(cert_der: Vec<u8>, private_key_der: Vec<u8>) -> Result<Arc<ServerConfig>> {
+pub fn create_pq_server_config(
+    cert_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+) -> Result<Arc<ServerConfig>> {
     // Parse the certificate and private key using the new API
     let cert_chain = vec![CertificateDer::from(cert_der)];
     let private_key = PrivateKeyDer::try_from(private_key_der)
         .map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
 
     // Build server config with post-quantum support
-    let mut config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)?;
+    let mut config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, private_key)?;
 
     // Prefer PQ/hybrid KEX via aws-lc provider. Set ALPN for HTTP/1.1.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -220,21 +226,6 @@ pub fn create_pq_server_config(cert_der: Vec<u8>, private_key_der: Vec<u8>) -> R
 // Signatureless spend helpers (BLAKE3 + Kyber)
 // -----------------------------------------------------------------------------
 
-/// Legacy: Compute the lock hash H_lock = BLAKE3_k("unchained.lock.v1", preimage)
-pub fn lock_hash(preimage: &[u8]) -> [u8; 32] {
-    *Hasher::new_derive_key("unchained.lock.v1").update(preimage).finalize().as_bytes()
-}
-
-/// Legacy: Compute nullifier for signatureless spend: N = BLAKE3("unchained.nullifier.v3" || chain_id32 || coin_id || preimage)
-pub fn compute_nullifier_v3(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u8; 32]) -> [u8; 32] {
-    let mut h = Hasher::new();
-    h.update(b"unchained.nullifier.v3");
-    h.update(chain_id32);
-    h.update(coin_id);
-    h.update(preimage);
-    *h.finalize().as_bytes()
-}
-
 // New derivations (nf/lh/pre/vt) with explicit domains and arguments
 
 /// Compute preimage p for a payment: p = BLAKE3("pre" || chain_id32 || coin_id || amount_le || lp(ss)||ss || lp(s)||s)
@@ -244,8 +235,10 @@ pub fn compute_preimage_v1(
     amount_le: u64,
     shared_secret: &[u8],
     note_s: &[u8],
- ) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"pre");
     h.update(chain_id32);
@@ -259,8 +252,14 @@ pub fn compute_preimage_v1(
 }
 
 /// Compute lock hash from preimage: lh = BLAKE3("lh" || chain_id32 || coin_id || lp(p)||p)
-pub fn lock_hash_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+pub fn lock_hash_from_preimage(
+    chain_id32: &[u8; 32],
+    coin_id: &[u8; 32],
+    preimage: &[u8],
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"lh");
     h.update(chain_id32);
@@ -271,8 +270,14 @@ pub fn lock_hash_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preima
 }
 
 /// Compute nullifier from preimage: nf = BLAKE3("nf" || chain_id32 || coin_id || lp(p)||p)
-pub fn nullifier_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+pub fn nullifier_from_preimage(
+    chain_id32: &[u8; 32],
+    coin_id: &[u8; 32],
+    preimage: &[u8],
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"nf");
     h.update(chain_id32);
@@ -283,8 +288,14 @@ pub fn nullifier_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preima
 }
 
 /// Commitment hash for HTLC preimages: ch = BLAKE3("ch" || chain_id32 || coin_id || lp(p)||p)
-pub fn commitment_hash_from_preimage(chain_id32: &[u8; 32], coin_id: &[u8; 32], preimage: &[u8]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+pub fn commitment_hash_from_preimage(
+    chain_id32: &[u8; 32],
+    coin_id: &[u8; 32],
+    preimage: &[u8],
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"ch");
     h.update(chain_id32);
@@ -315,7 +326,9 @@ pub fn htlc_lock_hash(
 
 /// View tag (1 byte) for receiver-side filtering: vt = BLAKE3("vt" || lp(ss)||ss)[0]
 pub fn view_tag(shared_secret: &[u8]) -> u8 {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"vt");
     h.update(&lp(shared_secret.len()));
@@ -325,12 +338,22 @@ pub fn view_tag(shared_secret: &[u8]) -> u8 {
 
 /// Derive the next lock preimage from Kyber shared secret and context.
 /// s_next = BLAKE3("unchained.locksecret.v1|mlkem768" || lp(ss)||ss || lp(ct)||ct || amount_le || coin_id || chain_id)
-pub fn derive_next_lock_secret(shared: &[u8], kyber_ct_bytes: &[u8], amount_le: u64, coin_id: &[u8;32], chain_id32: &[u8;32]) -> [u8;32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+pub fn derive_next_lock_secret(
+    shared: &[u8],
+    kyber_ct_bytes: &[u8],
+    amount_le: u64,
+    coin_id: &[u8; 32],
+    chain_id32: &[u8; 32],
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"unchained.locksecret.v1|mlkem768");
-    h.update(&lp(shared.len())); h.update(shared);
-    h.update(&lp(kyber_ct_bytes.len())); h.update(kyber_ct_bytes);
+    h.update(&lp(shared.len()));
+    h.update(shared);
+    h.update(&lp(kyber_ct_bytes.len()));
+    h.update(kyber_ct_bytes);
     h.update(&amount_le.to_le_bytes());
     h.update(coin_id);
     h.update(chain_id32);
@@ -345,19 +368,24 @@ pub fn derive_next_lock_secret_with_note(
     shared: &[u8],
     kyber_ct_bytes: &[u8],
     amount_le: u64,
-    coin_id: &[u8;32],
-    chain_id32: &[u8;32],
+    coin_id: &[u8; 32],
+    chain_id32: &[u8; 32],
     note_s: &[u8],
-) -> [u8;32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"unchained.locksecret.v2|mlkem768");
-    h.update(&lp(shared.len())); h.update(shared);
-    h.update(&lp(kyber_ct_bytes.len())); h.update(kyber_ct_bytes);
+    h.update(&lp(shared.len()));
+    h.update(shared);
+    h.update(&lp(kyber_ct_bytes.len()));
+    h.update(kyber_ct_bytes);
     h.update(&amount_le.to_le_bytes());
     h.update(coin_id);
     h.update(chain_id32);
-    h.update(&lp(note_s.len())); h.update(note_s);
+    h.update(&lp(note_s.len()));
+    h.update(note_s);
     *h.finalize().as_bytes()
 }
 
@@ -371,7 +399,9 @@ use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
 /// Derive a 32-byte AEAD key from a Kyber shared secret using domain-separated BLAKE3.
 #[inline]
 pub fn derive_meta_authz_aead_key(shared_secret: &[u8]) -> [u8; 32] {
-    fn lp(len: usize) -> [u8; 4] { (len as u32).to_le_bytes() }
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut h = Hasher::new();
     h.update(b"meta-authz.aead.key.v1");
     h.update(&lp(shared_secret.len()));
@@ -380,16 +410,26 @@ pub fn derive_meta_authz_aead_key(shared_secret: &[u8]) -> [u8; 32] {
 }
 
 /// AEAD encrypt with XChaCha20-Poly1305. Returns ciphertext bytes.
-pub fn aead_encrypt_xchacha(key32: &[u8; 32], nonce24: &[u8; 24], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn aead_encrypt_xchacha(
+    key32: &[u8; 32],
+    nonce24: &[u8; 24],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
-    Ok(cipher.encrypt(XNonce::from_slice(nonce24), plaintext)
+    Ok(cipher
+        .encrypt(XNonce::from_slice(nonce24), plaintext)
         .map_err(|e| anyhow::anyhow!("AEAD encrypt: {}", e))?)
 }
 
 /// AEAD decrypt with XChaCha20-Poly1305. Returns plaintext bytes.
-pub fn aead_decrypt_xchacha(key32: &[u8; 32], nonce24: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub fn aead_decrypt_xchacha(
+    key32: &[u8; 32],
+    nonce24: &[u8; 24],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
-    Ok(cipher.decrypt(XNonce::from_slice(nonce24), ciphertext)
+    Ok(cipher
+        .decrypt(XNonce::from_slice(nonce24), ciphertext)
         .map_err(|_| anyhow::anyhow!("AEAD decrypt failed"))?)
 }
 
@@ -412,7 +452,11 @@ pub fn kem_decapsulate_kyber(sk: &KyberSk, kem_ct_bytes: &[u8]) -> Result<[u8; 3
 
 /// Derive the genesis lock secret deterministically from Dilithium SK, coin id and chain id.
 /// s0 = BLAKE3("unchained.lockseed.genesis.v1" || sk_bytes || coin_id || chain_id)
-pub fn derive_genesis_lock_secret(dili_sk: &SecretKey, coin_id: &[u8;32], chain_id32: &[u8;32]) -> [u8;32] {
+pub fn derive_genesis_lock_secret(
+    dili_sk: &SecretKey,
+    coin_id: &[u8; 32],
+    chain_id32: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(b"unchained.lockseed.genesis.v1");
     h.update(dili_sk.as_bytes());
@@ -441,11 +485,3 @@ pub fn commitment_id_v1(
     h.update(chain_id32);
     *h.finalize().as_bytes()
 }
-
-/// Legacy nullifier wrapper for clarity. Uses the pre-image direct domain.
-#[inline]
-pub fn compute_nullifier_legacy(preimage: &[u8], coin_id: &[u8; 32], chain_id32: &[u8; 32]) -> [u8; 32] {
-    compute_nullifier_v3(preimage, coin_id, chain_id32)
-}
-
-    

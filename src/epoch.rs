@@ -1,59 +1,76 @@
-use crate::{storage::Store, network::NetHandle, coin::{Coin, CoinCandidate}};
 use crate::consensus::{
-    calculate_retarget_consensus,
-    TARGET_LEADING_ZEROS,
-    DEFAULT_MEM_KIB,
-    RETARGET_INTERVAL,
+    calculate_retarget_consensus, DEFAULT_MEM_KIB, RETARGET_INTERVAL, TARGET_LEADING_ZEROS,
 };
-use tokio::{sync::{broadcast, mpsc}, time};
+use crate::protocol::CURRENT as PROTOCOL;
+use crate::sync::SyncState;
+use crate::{
+    coin::{Coin, CoinCandidate},
+    network::NetHandle,
+    storage::Store,
+};
+use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
-use crate::sync::SyncState;
-use rocksdb::WriteBatch;
+use tokio::{
+    sync::{broadcast, mpsc},
+    time,
+};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Anchor {
-    pub num:          u64,
-    pub hash:         [u8; 32],
-    pub merkle_root:  [u8; 32],
-    pub difficulty:   usize,
-    pub coin_count:   u32,
+    pub num: u64,
+    pub hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub difficulty: usize,
+    pub coin_count: u32,
     pub cumulative_work: u128,
-    pub mem_kib:      u32,
+    pub mem_kib: u32,
 }
 
 impl Anchor {
     pub fn expected_work_for_difficulty(difficulty: usize) -> u128 {
-        if difficulty == 0 { 1 } else { 1u128 << (difficulty * 8) }
+        if difficulty == 0 {
+            1
+        } else {
+            1u128 << (difficulty * 8)
+        }
     }
-    
+
     pub fn is_better_chain(&self, current_best: &Option<Anchor>) -> bool {
         match current_best {
             None => true,
             Some(best) => {
-                if self.cumulative_work > best.cumulative_work { return true; }
-                if self.cumulative_work == best.cumulative_work && self.num > best.num { return true; }
+                if self.cumulative_work > best.cumulative_work {
+                    return true;
+                }
+                if self.cumulative_work == best.cumulative_work && self.num > best.num {
+                    return true;
+                }
                 // Deterministic tie-break: at equal work and height, prefer lexicographically smaller hash
-                if self.cumulative_work == best.cumulative_work && self.num == best.num && self.hash < best.hash { return true; }
+                if self.cumulative_work == best.cumulative_work
+                    && self.num == best.num
+                    && self.hash < best.hash
+                {
+                    return true;
+                }
                 false
             }
         }
     }
-
 }
-
-    
 
 pub struct MerkleTree;
 impl MerkleTree {
     /// Build all Merkle levels from sorted leaves. levels[0] = sorted leaves, levels.last()[0] = root.
-    pub fn build_levels_from_sorted_leaves(sorted_leaves: &[[u8; 32]]) -> Vec<Vec<[u8;32]>> {
-        let mut levels: Vec<Vec<[u8;32]>> = Vec::new();
-        if sorted_leaves.is_empty() { return levels; }
-        let mut level: Vec<[u8;32]> = sorted_leaves.to_vec();
+    pub fn build_levels_from_sorted_leaves(sorted_leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
+        let mut levels: Vec<Vec<[u8; 32]>> = Vec::new();
+        if sorted_leaves.is_empty() {
+            return levels;
+        }
+        let mut level: Vec<[u8; 32]> = sorted_leaves.to_vec();
         levels.push(level.clone());
         while level.len() > 1 {
-            let mut next_level: Vec<[u8;32]> = Vec::with_capacity(level.len().div_ceil(2));
+            let mut next_level: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
             for chunk in level.chunks(2) {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&chunk[0]);
@@ -67,12 +84,19 @@ impl MerkleTree {
     }
 
     /// Build proof using precomputed levels and target leaf hash. levels[0] must contain target_leaf.
-    pub fn build_proof_from_levels(levels: &Vec<Vec<[u8;32]>>, target_leaf: &[u8;32]) -> Option<Vec<([u8;32], bool)>> {
-        if levels.is_empty() { return None; }
+    pub fn build_proof_from_levels(
+        levels: &Vec<Vec<[u8; 32]>>,
+        target_leaf: &[u8; 32],
+    ) -> Option<Vec<([u8; 32], bool)>> {
+        if levels.is_empty() {
+            return None;
+        }
         let mut index = levels[0].iter().position(|h| h == target_leaf)?;
-        let mut proof: Vec<([u8;32], bool)> = Vec::new();
-        for level in &levels[..levels.len()-1] {
-            if level.is_empty() { return None; }
+        let mut proof: Vec<([u8; 32], bool)> = Vec::new();
+        for level in &levels[..levels.len() - 1] {
+            if level.is_empty() {
+                return None;
+            }
             let (sibling_hash, sibling_is_left) = if index % 2 == 0 {
                 let sib = *level.get(index + 1).unwrap_or(&level[index]);
                 (sib, false)
@@ -90,7 +114,9 @@ impl MerkleTree {
     /// - Sorts leaves ascending to obtain a canonical order
     /// - Reduces pairwise (duplicate last when odd) using BLAKE3
     pub fn build_root(coin_ids: &HashSet<[u8; 32]>) -> [u8; 32] {
-        if coin_ids.is_empty() { return [0u8; 32]; }
+        if coin_ids.is_empty() {
+            return [0u8; 32];
+        }
         let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
         leaves.sort();
         Self::compute_root_from_sorted_leaves(&leaves)
@@ -100,7 +126,9 @@ impl MerkleTree {
     /// Compute Merkle root from a precomputed sorted leaf list.
     /// The `sorted_leaves` slice MUST be sorted ascending.
     pub fn compute_root_from_sorted_leaves(sorted_leaves: &[[u8; 32]]) -> [u8; 32] {
-        if sorted_leaves.is_empty() { return [0u8; 32]; }
+        if sorted_leaves.is_empty() {
+            return [0u8; 32];
+        }
         let mut level: Vec<[u8; 32]> = sorted_leaves.to_vec();
         while level.len() > 1 {
             let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
@@ -118,7 +146,9 @@ impl MerkleTree {
         coin_ids: &HashSet<[u8; 32]>,
         target_id: &[u8; 32],
     ) -> Option<Vec<([u8; 32], bool)>> {
-        if coin_ids.is_empty() { return None; }
+        if coin_ids.is_empty() {
+            return None;
+        }
         let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
         leaves.sort();
         let leaf_hash = Coin::id_to_leaf_hash(target_id);
@@ -153,9 +183,11 @@ impl MerkleTree {
         sorted_leaves: &[[u8; 32]],
         target_leaf: &[u8; 32],
     ) -> Option<Vec<([u8; 32], bool)>> {
-        if sorted_leaves.is_empty() { return None; }
+        if sorted_leaves.is_empty() {
+            return None;
+        }
         let mut index = sorted_leaves.iter().position(|h| h == target_leaf)?;
-        let mut level: Vec<[u8;32]> = sorted_leaves.to_vec();
+        let mut level: Vec<[u8; 32]> = sorted_leaves.to_vec();
         let mut proof: Vec<([u8; 32], bool)> = Vec::new();
         while level.len() > 1 {
             let (sibling_hash, sibling_is_left) = if index % 2 == 0 {
@@ -183,13 +215,11 @@ impl MerkleTree {
     /// reject pathological inputs without affecting valid trees.
     pub const MAX_PROOF_DEPTH: usize = 64;
 
-    pub fn verify_proof(
-        leaf_hash: &[u8; 32],
-        proof: &[( [u8; 32], bool )],
-        root: &[u8; 32],
-    ) -> bool {
+    pub fn verify_proof(leaf_hash: &[u8; 32], proof: &[([u8; 32], bool)], root: &[u8; 32]) -> bool {
         // Basic sanity bound: prevents absurdly large proofs from causing CPU burn.
-        if proof.len() > Self::MAX_PROOF_DEPTH { return false; }
+        if proof.len() > Self::MAX_PROOF_DEPTH {
+            return false;
+        }
         let mut computed = *leaf_hash;
         for (sibling, sibling_is_left) in proof {
             let mut hasher = blake3::Hasher::new();
@@ -210,15 +240,19 @@ impl MerkleTree {
     /// - 1 -> 0, 2 -> 1, 3..4 -> 2, 5..8 -> 3, etc.
     #[inline]
     pub fn expected_proof_len(coin_count: u32) -> usize {
-        if coin_count <= 1 { 0 } else { (32 - (coin_count - 1).leading_zeros()) as usize }
+        if coin_count <= 1 {
+            0
+        } else {
+            (32 - (coin_count - 1).leading_zeros()) as usize
+        }
     }
 }
 
 pub struct Manager {
-    db:   Arc<Store>,
-    cfg:  crate::config::Epoch,
+    db: Arc<Store>,
+    cfg: crate::config::Epoch,
     net_cfg: crate::config::Net,
-    net:  NetHandle,
+    net: NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
     coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -227,17 +261,27 @@ pub struct Manager {
 }
 impl Manager {
     pub fn new(
-        db: Arc<Store>, 
-        cfg: crate::config::Epoch, 
+        db: Arc<Store>,
+        cfg: crate::config::Epoch,
         net_cfg: crate::config::Net,
-        net: NetHandle, 
+        net: NetHandle,
         coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
         shutdown_rx: broadcast::Receiver<()>,
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
         compact_cfg: crate::config::Compact,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
-        Self { db, cfg, net_cfg, net, anchor_tx, coin_rx, shutdown_rx, sync_state, compact_cfg }
+        Self {
+            db,
+            cfg,
+            net_cfg,
+            net,
+            anchor_tx,
+            coin_rx,
+            shutdown_rx,
+            sync_state,
+            compact_cfg,
+        }
     }
 
     pub fn spawn_loop(mut self) {
@@ -254,18 +298,21 @@ impl Manager {
 
                 let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
                 let sync_start = tokio::time::Instant::now();
-                
+
                 while sync_start.elapsed() < sync_timeout {
                     if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                       if latest_anchor.num > 0 {
-                           current_epoch = latest_anchor.num + 1;
-                           println!("✅ Network synchronization complete! Starting from epoch {}", current_epoch);
-                           break;
-                       }
+                        if latest_anchor.num > 0 {
+                            current_epoch = latest_anchor.num + 1;
+                            println!(
+                                "✅ Network synchronization complete! Starting from epoch {}",
+                                current_epoch
+                            );
+                            break;
+                        }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                 }
-                
+
                 if current_epoch == 0 {
                     if self.net_cfg.bootstrap.is_empty() {
                         println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis (no bootstrap configured).");
@@ -277,7 +324,10 @@ impl Manager {
 
             let mut buffer: HashSet<[u8; 32]> = HashSet::new();
             // Tick immediately on startup for all cases; no restart grace period
-            let mut ticker = time::interval_at(time::Instant::now(), time::Duration::from_secs(self.cfg.seconds));
+            let mut ticker = time::interval_at(
+                time::Instant::now(),
+                time::Duration::from_secs(self.cfg.seconds),
+            );
             // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Periodic candidate pull during the entire epoch interval
@@ -291,7 +341,7 @@ impl Manager {
                         println!("🛑 Epoch manager received shutdown signal");
                         break;
                     }
-                    Some(id) = self.coin_rx.recv() => { 
+                    Some(id) = self.coin_rx.recv() => {
                         buffer.insert(id);
                         crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
                     },
@@ -322,7 +372,7 @@ impl Manager {
                                 continue;
                             }
                         }
-                    
+
 
                         if current_epoch == 0 && buffer.is_empty() {
                             if self.net_cfg.bootstrap.is_empty() {
@@ -333,7 +383,7 @@ impl Manager {
                                 continue;
                             }
                         }
-                        
+
 
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
@@ -341,7 +391,7 @@ impl Manager {
                         // Use canonical fair selection that ensures diversity across creators
                         let mut selected: Vec<CoinCandidate> = Vec::new();
                         if let Some(prev) = &prev_anchor {
-                            let cap = self.cfg.max_coins_per_epoch as usize;
+                            let cap = PROTOCOL.max_coins_per_epoch as usize;
                             let (list, _total) = crate::epoch::select_candidates_for_epoch(&self.db, prev, cap, Some(&buffer));
                             selected = list;
                         }
@@ -370,7 +420,7 @@ impl Manager {
                             if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
                             *h.finalize().as_bytes()
                         };
-                        
+
                         let (difficulty, mem_kib) = if current_epoch > 0 && current_epoch % RETARGET_INTERVAL == 0 {
                             let start = current_epoch.saturating_sub(RETARGET_INTERVAL);
                             let window = self.db.get_or_build_retarget_window(current_epoch).unwrap_or(None);
@@ -384,20 +434,20 @@ impl Manager {
                         } else {
                             prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
                         };
-                        
+
                         let current_work = Anchor::expected_work_for_difficulty(difficulty);
                         let cumulative_work = prev_anchor.as_ref().map_or(current_work, |p| p.cumulative_work.saturating_add(current_work));
-                        
-                        let anchor = Anchor { 
-                            num: current_epoch, 
+
+                        let anchor = Anchor {
+                            num: current_epoch,
                             hash,
                             merkle_root,
-                            difficulty, 
-                            coin_count: selected_ids.len() as u32, 
-                            cumulative_work, 
+                            difficulty,
+                            coin_count: selected_ids.len() as u32,
+                            cumulative_work,
                             mem_kib,
                         };
-                        
+
                         let mut batch = WriteBatch::default();
                         let serialized_anchor = match bincode::serialize(&anchor) {
                             Ok(data) => data,
@@ -406,7 +456,7 @@ impl Manager {
                                 continue;
                             }
                         };
-                        
+
                         let epoch_cf = match self.db.db.cf_handle("epoch") {
                             Some(cf) => cf,
                             None => {
@@ -414,7 +464,7 @@ impl Manager {
                                 continue;
                             }
                         };
-                        
+
                         batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
                         batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
 
@@ -465,11 +515,11 @@ impl Manager {
                         }
                         if let Err(e) = self.db.store_epoch_leaves(current_epoch, &leaves) { eprintln!("⚠️ Failed to store epoch leaves: {}", e); }
                         if let Err(e) = self.db.store_epoch_levels(current_epoch, &levels) { eprintln!("⚠️ Failed to store epoch levels: {}", e); }
-                        
+
                         if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
                             batch.put_cf(anchor_cf, &hash, &serialized_anchor);
                         }
-                        
+
                         if let Err(e) = self.db.write_batch(batch) {
                             eprintln!("🔥 Failed to write new epoch to DB: {e}");
                             continue;
@@ -562,11 +612,13 @@ pub fn select_candidates_for_epoch(
         Err(_) => Vec::new(),
     };
     // Track existing candidate IDs to avoid O(n^2) scans during merge
-    let mut candidate_ids: std::collections::HashSet<[u8;32]> =
+    let mut candidate_ids: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::from_iter(candidates.iter().map(|c| c.id));
     if let Some(buf) = buffer {
         for id in buf.iter() {
-            if candidate_ids.contains(id) { continue; }
+            if candidate_ids.contains(id) {
+                continue;
+            }
             let key = crate::storage::Store::candidate_key(&parent.hash, id);
             if let Ok(Some(c)) = db.get::<crate::coin::CoinCandidate>("coin_candidate", &key) {
                 candidate_ids.insert(c.id);
@@ -583,7 +635,13 @@ pub fn select_candidates_for_epoch(
     let mut filtered: Vec<crate::coin::CoinCandidate> = Vec::new();
     let mut total_candidates = 0usize;
     for cand in candidates.into_iter() {
-        if parent.difficulty > 0 && !cand.pow_hash.iter().take(parent.difficulty).all(|b| *b == 0) {
+        if parent.difficulty > 0
+            && !cand
+                .pow_hash
+                .iter()
+                .take(parent.difficulty)
+                .all(|b| *b == 0)
+        {
             continue;
         }
         total_candidates += 1;
@@ -596,24 +654,30 @@ pub fn select_candidates_for_epoch(
     // Fair, round-based selection across creators while preserving global order.
     use std::collections::{HashMap, HashSet};
     let mut picked: Vec<crate::coin::CoinCandidate> = Vec::with_capacity(cap);
-    let mut by_creator: HashMap<[u8;32], usize> = HashMap::new();
+    let mut by_creator: HashMap<[u8; 32], usize> = HashMap::new();
     let mut round: usize = 0;
-    let mut picked_ids: HashSet<[u8;32]> = HashSet::new();
+    let mut picked_ids: HashSet<[u8; 32]> = HashSet::new();
 
     while picked.len() < cap {
         let mut advanced = false;
         for c in filtered.iter() {
-            if picked.len() >= cap { break; }
+            if picked.len() >= cap {
+                break;
+            }
             let cnt = *by_creator.get(&c.creator_address).unwrap_or(&0);
             if cnt == round && !picked_ids.contains(&c.id) {
                 picked.push(c.clone());
                 picked_ids.insert(c.id);
                 by_creator.insert(c.creator_address, cnt + 1);
                 advanced = true;
-                if picked.len() >= cap { break; }
+                if picked.len() >= cap {
+                    break;
+                }
             }
         }
-        if !advanced { break; }
+        if !advanced {
+            break;
+        }
         round += 1;
     }
 

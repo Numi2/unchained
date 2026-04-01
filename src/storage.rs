@@ -1,12 +1,12 @@
-use rocksdb::{Options, DB, ColumnFamilyDescriptor, WriteBatch, WriteOptions};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::fs;
-use serde::{Serialize, de::DeserializeOwned};
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use hex;
-use std::sync::Arc;
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use serde::Deserialize;
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
+use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 // use std::process; // removed unused
 
 // Using bincode for fast, compact binary serialization instead of JSON.
@@ -28,7 +28,11 @@ struct RetargetCacheMem {
 
 impl RetargetCacheMem {
     fn new(capacity: usize) -> Self {
-        Self { windows_by_height: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), capacity }
+        Self {
+            windows_by_height: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity,
+        }
     }
     fn get(&self, height: u64) -> Option<&Vec<crate::epoch::Anchor>> {
         self.windows_by_height.get(&height)
@@ -62,27 +66,39 @@ impl Store {
     pub fn health_check(&self) -> Result<()> {
         // Check basic connectivity
         let test_key = b"health_check";
-        self.db.put(test_key, b"ok").with_context(|| "Database write test failed")?;
-        let value = self.db.get(test_key).with_context(|| "Database read test failed")?;
+        self.db
+            .put(test_key, b"ok")
+            .with_context(|| "Database write test failed")?;
+        let value = self
+            .db
+            .get(test_key)
+            .with_context(|| "Database read test failed")?;
         if value.as_deref() != Some(b"ok") {
             anyhow::bail!("Database read/write consistency check failed");
         }
-        self.db.delete(test_key).with_context(|| "Database delete test failed")?;
+        self.db
+            .delete(test_key)
+            .with_context(|| "Database delete test failed")?;
         Ok(())
     }
-    
+
     /// Create backup of critical blockchain data
     pub fn create_backup(&self) -> Result<String> {
-        let backup_dir = format!("{}/backups/{}", self.path, chrono::Utc::now().format("%Y%m%d_%H%M%S"));
-        std::fs::create_dir_all(&backup_dir).with_context(|| "Failed to create backup directory")?;
-        
+        let backup_dir = format!(
+            "{}/backups/{}",
+            self.path,
+            chrono::Utc::now().format("%Y%m%d_%H%M%S")
+        );
+        std::fs::create_dir_all(&backup_dir)
+            .with_context(|| "Failed to create backup directory")?;
+
         // Backup critical column families
         for cf_name in ["epoch", "wallet"] {
             if let Some(cf_handle) = self.db.cf_handle(cf_name) {
                 let iter = self.db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start);
                 let cf_backup_dir = format!("{backup_dir}/{cf_name}");
                 std::fs::create_dir_all(&cf_backup_dir)?;
-                
+
                 for (i, item) in iter.enumerate() {
                     let (key, value) = item?;
                     let backup_file = format!("{cf_backup_dir}/{i:05}.dat");
@@ -91,62 +107,63 @@ impl Store {
                 }
             }
         }
-        
+
         // Also backup coins directory using cross-platform approach
         let coins_backup = format!("{backup_dir}/coins");
         if let Err(e) = copy_dir_all(&self.coins_dir(), &coins_backup) {
             eprintln!("Warning: Coins backup failed: {e}");
         }
-        
+
         println!("✅ Backup created at: {backup_dir}");
         Ok(backup_dir)
     }
-    
+
     pub fn open(base_path: &str) -> Result<Self> {
         // Increment counter for tracking (helps with debugging)
         let _instance_id = DB_INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-        
+
         // Use base path directly for production, but ensure clean state
         let db_path = base_path.to_string();
-        
+
         // Do not delete RocksDB LOCK file; if present and DB open fails, surface error to caller
-        
+
         let cf_names = [
             "default",
             "epoch",
             "coin",
             "coin_candidate",
-            "epoch_selected", // per-epoch selected coin IDs
-            "epoch_leaves",   // per-epoch sorted leaf hashes for proofs
-            "epoch_levels",   // per-epoch merkle levels for fast proofs
-            "coin_epoch",     // coin_id -> epoch number mapping (child epoch that committed the coin)
+            "epoch_selected",      // per-epoch selected coin IDs
+            "epoch_leaves",        // per-epoch sorted leaf hashes for proofs
+            "epoch_levels",        // per-epoch merkle levels for fast proofs
+            "coin_epoch", // coin_id -> epoch number mapping (child epoch that committed the coin)
             "coin_epoch_by_epoch", // epoch_num||coin_id -> 1 (reverse index for range scans)
-            "retarget_cache",  // retarget_height -> Vec<Anchor> window
+            "retarget_cache", // retarget_height -> Vec<Anchor> window
             "head",
             "wallet",
             "anchor",
+            "tx",
             "spend",
             "nullifier",
             "commitment_used",
-            "meta_authz_used",  // EIP-3009-style meta-transfer replay protection (from||nonce)
+            "meta_authz_used", // EIP-3009-style meta-transfer replay protection (from||nonce)
             "otp_sk",
             "otp_index",
             "peers",
             "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
-            "meta",                 // miscellaneous metadata (e.g., cursors)
+            "meta",                // miscellaneous metadata (e.g., cursors)
             // Offer discovery CFs
-            "offers",               // id -> OfferStored
-            "offers_quota",         // day||peer_hash -> u64 count
+            "offers",       // id -> OfferStored
+            "offers_quota", // day||peer_hash -> u64 count
             // Bridge-related CFs
-            "bridge_state",           // serialized BridgeState summary
-            "bridge_pending",         // op_id -> PendingBridgeOp
-            "bridge_processed_sui",   // sui_tx_hash -> 1
-            "bridge_locked",          // coin_id -> op_id
-            "bridge_op_coins",        // op_id -> Vec<coin_id>
-            "bridge_events",          // append-only event log (key: millis||rand)
-            "bridge_invoices",        // invoice_id -> X402InvoiceRecord
+            "bridge_state",         // serialized BridgeState summary
+            "bridge_pending",       // op_id -> PendingBridgeOp
+            "bridge_processed_sui", // sui_tx_hash -> 1
+            "bridge_locked",        // coin_id -> op_id
+            "bridge_op_coins",      // op_id -> Vec<coin_id>
+            "bridge_events",        // append-only event log (key: millis||rand)
+            "bridge_invoices",      // invoice_id -> X402InvoiceRecord
         ];
-        
+
         // Configure column family options with sane production defaults
         let mut cf_opts = Options::default();
         // Enable Bloom filters and prefix extractor for better prefix seeks (coin_candidate: 32-byte epoch_hash)
@@ -166,37 +183,37 @@ impl Store {
         cf_opts.set_max_write_buffer_number(2);
         // Target file size for compaction levels
         cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
-        // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
+                                                             // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        
+
         // Organize files into meaningful subdirectories under the chosen db_path
         let wal_dir = format!("{db_path}/logs");
         let backup_dir = format!("{db_path}/backups");
         std::fs::create_dir_all(&db_path).ok();
         std::fs::create_dir_all(&wal_dir).ok();
         std::fs::create_dir_all(&backup_dir).ok();
-        
+
         // Custom file organization
         db_opts.set_wal_dir(&wal_dir); // Put WAL files in /logs subdirectory
-        
+
         // Production-leaning durability settings: rely on WAL + periodic fsync
         db_opts.set_use_fsync(false);
         db_opts.set_bytes_per_sync(8 * 1024 * 1024);
         db_opts.set_wal_bytes_per_sync(8 * 1024 * 1024);
         db_opts.set_db_write_buffer_size(256 * 1024 * 1024);
         db_opts.set_max_background_jobs(8);
-        
+
         // More forgiving compaction thresholds
         db_opts.set_level_zero_slowdown_writes_trigger(20);
         db_opts.set_level_zero_stop_writes_trigger(36);
         db_opts.set_max_open_files(512);
-        
+
         // Additional file management settings
         db_opts.set_recycle_log_file_num(4);
-        
+
         // WAL and cleanup tuned for throughput
         db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
         db_opts.set_manual_wal_flush(false);
@@ -206,7 +223,7 @@ impl Store {
         db_opts.set_wal_ttl_seconds(24 * 60 * 60);
         db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
         db_opts.set_max_subcompactions(4);
-        
+
         // Discover any existing column families to ensure compatibility with older DBs
         let existing_cfs: Vec<String> = match DB::list_cf(&db_opts, &db_path) {
             Ok(names) => names,
@@ -287,10 +304,12 @@ impl Store {
             mirror_tx,
             retarget_cache_mem: std::sync::Mutex::new(RetargetCacheMem::new(64)),
         };
-        
+
         // Perform initial health check
-        store.health_check().with_context(|| "Database health check failed during initialization")?;
-        
+        store
+            .health_check()
+            .with_context(|| "Database health check failed during initialization")?;
+
         println!("✅ Database opened successfully ");
         Ok(store)
     }
@@ -300,7 +319,9 @@ impl Store {
         let data_to_store = bincode::serialize(value)
             .with_context(|| format!("Failed to serialize value for key '{key:?}' in CF '{cf}'"))?;
 
-        let handle = self.db.cf_handle(cf)
+        let handle = self
+            .db
+            .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
 
         // Use default write options; rely on WAL fsync policy
@@ -321,10 +342,10 @@ impl Store {
         Ok(())
     }
 
-
-
     pub fn get<T: DeserializeOwned + 'static>(&self, cf: &str, key: &[u8]) -> Result<Option<T>> {
-        let handle = self.db.cf_handle(cf)
+        let handle = self
+            .db
+            .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
 
         match self.db.get_cf(handle, key)? {
@@ -341,7 +362,8 @@ impl Store {
                     Ok(deser) => Ok(Some(deser)),
                     Err(_) => Err(anyhow::anyhow!(
                         "Failed to deserialize value for key '{:?}' in CF '{}'",
-                        key, cf
+                        key,
+                        cf
                     )),
                 }
             }
@@ -349,54 +371,56 @@ impl Store {
         }
     }
 
-    /// Specialized tolerant getter for `spend` CF that never errors on deserialization issues.
-    /// Returns Ok(None) when bytes are malformed instead of bailing.
-    pub fn get_spend_tolerant(&self, key: &[u8]) -> Result<Option<crate::transfer::Spend>> {
-        let handle = self.db.cf_handle("spend")
+    pub fn get_spend(&self, key: &[u8]) -> Result<Option<crate::transfer::Spend>> {
+        let handle = self
+            .db
+            .cf_handle("spend")
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", "spend"))?;
 
         match self.db.get_cf(handle, key)? {
             Some(value) => {
-                // Try compressed then plain
                 if let Ok(decompressed) = zstd::decode_all(&value[..]) {
                     if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
                         return Ok(Some(sp));
                     }
                 }
-                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&value[..]) {
-                    return Ok(Some(sp));
-                }
-                // Malformed spend bytes: be tolerant and return None without logging to avoid spam in hot paths.
-                Ok(None)
+                Ok(Some(bincode::deserialize::<crate::transfer::Spend>(
+                    &value[..],
+                )?))
             }
             None => Ok(None),
         }
     }
 
-    /// Tolerant decode for arbitrary CF values into Spend (used when iterating CF directly)
-    pub fn decode_spend_bytes_tolerant(&self, bytes: &[u8]) -> Option<crate::transfer::Spend> {
+    pub fn decode_spend_bytes(&self, bytes: &[u8]) -> Result<crate::transfer::Spend> {
         if let Ok(decompressed) = zstd::decode_all(bytes) {
             if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
-                return Some(sp);
+                return Ok(sp);
             }
         }
-        if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(bytes) {
-            return Some(sp);
-        }
-        None
+        Ok(bincode::deserialize::<crate::transfer::Spend>(bytes)?)
     }
 
     /// Fetch raw bytes without attempting to deserialize
     pub fn get_raw_bytes(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let handle = self.db.cf_handle(cf)
+        let handle = self
+            .db
+            .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
-        Ok(self.db.get_cf(handle, key)? .map(|v| v.to_vec()))
+        Ok(self.db.get_cf(handle, key)?.map(|v| v.to_vec()))
     }
 
-    pub fn get_retarget_window_cached(&self, retarget_height: u64) -> Result<Option<Vec<crate::epoch::Anchor>>> {
-        if retarget_height == 0 { return Ok(Some(Vec::new())); }
+    pub fn get_retarget_window_cached(
+        &self,
+        retarget_height: u64,
+    ) -> Result<Option<Vec<crate::epoch::Anchor>>> {
+        if retarget_height == 0 {
+            return Ok(Some(Vec::new()));
+        }
         if let Ok(guard) = self.retarget_cache_mem.lock() {
-            if let Some(w) = guard.get(retarget_height) { return Ok(Some(w.clone())); }
+            if let Some(w) = guard.get(retarget_height) {
+                return Ok(Some(w.clone()));
+            }
         }
         let key = retarget_height.to_le_bytes();
         if let Some(v) = self.get::<Vec<crate::epoch::Anchor>>("retarget_cache", &key)? {
@@ -408,10 +432,18 @@ impl Store {
         Ok(None)
     }
 
-    pub fn put_retarget_window_cached(&self, retarget_height: u64, window: &[crate::epoch::Anchor]) -> Result<()> {
+    pub fn put_retarget_window_cached(
+        &self,
+        retarget_height: u64,
+        window: &[crate::epoch::Anchor],
+    ) -> Result<()> {
         let key = retarget_height.to_le_bytes();
-        let handle = self.db.cf_handle("retarget_cache").ok_or_else(|| anyhow::anyhow!("'retarget_cache' column family missing"))?;
-        let ser = bincode::serialize(window).with_context(|| "Failed to serialize retarget window")?;
+        let handle = self
+            .db
+            .cf_handle("retarget_cache")
+            .ok_or_else(|| anyhow::anyhow!("'retarget_cache' column family missing"))?;
+        let ser =
+            bincode::serialize(window).with_context(|| "Failed to serialize retarget window")?;
         self.db.put_cf(handle, &key, &ser)?;
         if let Ok(mut guard) = self.retarget_cache_mem.lock() {
             guard.insert(retarget_height, window.to_vec());
@@ -419,11 +451,19 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_or_build_retarget_window(&self, retarget_height: u64) -> Result<Option<Vec<crate::epoch::Anchor>>> {
-        if let Some(v) = self.get_retarget_window_cached(retarget_height)? { return Ok(Some(v)); }
-        if retarget_height == 0 { return Ok(Some(Vec::new())); }
+    pub fn get_or_build_retarget_window(
+        &self,
+        retarget_height: u64,
+    ) -> Result<Option<Vec<crate::epoch::Anchor>>> {
+        if let Some(v) = self.get_retarget_window_cached(retarget_height)? {
+            return Ok(Some(v));
+        }
+        if retarget_height == 0 {
+            return Ok(Some(Vec::new()));
+        }
         let start = retarget_height.saturating_sub(crate::consensus::RETARGET_INTERVAL);
-        let mut recent: Vec<crate::epoch::Anchor> = Vec::with_capacity(crate::consensus::RETARGET_INTERVAL as usize);
+        let mut recent: Vec<crate::epoch::Anchor> =
+            Vec::with_capacity(crate::consensus::RETARGET_INTERVAL as usize);
         for n in start..retarget_height {
             match self.get::<crate::epoch::Anchor>("epoch", &n.to_le_bytes())? {
                 Some(a) => recent.push(a),
@@ -441,33 +481,36 @@ impl Store {
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(true); // Force sync for batch writes too
-        // Keep WAL enabled but rely on aggressive cleanup settings
-        
-        self.db.write_opt(batch, &write_opts).with_context(|| "Failed to write batch to database")
+                                   // Keep WAL enabled but rely on aggressive cleanup settings
+
+        self.db
+            .write_opt(batch, &write_opts)
+            .with_context(|| "Failed to write batch to database")
     }
-    
+
     /// Force flush all memtables to disk (useful for ensuring durability)
     pub fn flush(&self) -> Result<()> {
         // Use a simpler, more reliable flush approach
-        self.db.flush()
+        self.db
+            .flush()
             .with_context(|| "Failed to flush database")?;
-        
+
         // Flush WAL to ensure data is persisted
         if let Err(e) = self.db.flush_wal(true) {
             eprintln!("Warning: WAL flush failed (non-critical): {e}");
         }
-            
+
         Ok(())
     }
-    
+
     /// Proper cleanup when dropping the database
     pub fn close(&self) -> Result<()> {
         // Perform final flush before closing
         self.flush()?;
-        
+
         // Cancel all background work to prevent file conflicts
         self.db.cancel_all_background_work(true);
-        
+
         Ok(())
     }
 
@@ -478,12 +521,14 @@ impl Store {
 
     /// Gets all coins owned by a specific address
     pub fn get_coins_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::coin::Coin>> {
-        let cf = self.db.cf_handle("coin")
+        let cf = self
+            .db
+            .cf_handle("coin")
             .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut coins = Vec::new();
-        
+
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
@@ -492,45 +537,54 @@ impl Store {
                 }
             }
         }
-        
+
         Ok(coins)
     }
 
     /// Gets all unspent coins owned by a specific address
-    pub fn get_unspent_coins_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::coin::Coin>> {
+    pub fn get_unspent_coins_by_owner(
+        &self,
+        owner_address: &[u8; 32],
+    ) -> Result<Vec<crate::coin::Coin>> {
         let coins = self.get_coins_by_owner(owner_address)?;
         let mut unspent_coins = Vec::new();
-        
+
         for coin in coins {
             // Check if coin is spent (V3 chain)
-            let recorded_spend: Option<crate::transfer::Spend> = self.get_spend_tolerant(&coin.id)?;
-            if recorded_spend.is_none() { unspent_coins.push(coin); }
+            let recorded_spend: Option<crate::transfer::Spend> = self.get_spend(&coin.id)?;
+            if recorded_spend.is_none() {
+                unspent_coins.push(coin);
+            }
         }
-        
+
         Ok(unspent_coins)
     }
 
     /// Iterates over all coins in the database
     pub fn iterate_coins(&self) -> Result<Vec<crate::coin::Coin>> {
-        let cf = self.db.cf_handle("coin")
+        let cf = self
+            .db
+            .cf_handle("coin")
             .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut coins = Vec::new();
-        
+
         for item in iter {
             let (_key, value) = item?;
             if let Ok(coin) = crate::coin::decode_coin(&value) {
                 coins.push(coin);
             }
         }
-        
+
         Ok(coins)
     }
 
     /// Iterates over all coin candidates in the database
     pub fn iterate_coin_candidates(&self) -> Result<Vec<crate::coin::CoinCandidate>> {
-        let cf = self.db.cf_handle("coin_candidate")
+        let cf = self
+            .db
+            .cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -545,7 +599,7 @@ impl Store {
     }
 
     /// Build the composite key for coin candidates: epoch_hash || coin_id
-    pub fn candidate_key(epoch_hash: &[u8;32], coin_id: &[u8;32]) -> Vec<u8> {
+    pub fn candidate_key(epoch_hash: &[u8; 32], coin_id: &[u8; 32]) -> Vec<u8> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(epoch_hash);
         key.extend_from_slice(coin_id);
@@ -553,8 +607,13 @@ impl Store {
     }
 
     /// Iterate coin candidates by epoch hash using bounded prefix iteration
-    pub fn get_coin_candidates_by_epoch_hash(&self, epoch_hash: &[u8; 32]) -> Result<Vec<crate::coin::CoinCandidate>> {
-        let cf = self.db.cf_handle("coin_candidate")
+    pub fn get_coin_candidates_by_epoch_hash(
+        &self,
+        epoch_hash: &[u8; 32],
+    ) -> Result<Vec<crate::coin::CoinCandidate>> {
+        let cf = self
+            .db
+            .cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
         let mut coins = Vec::new();
         let mut upper = Vec::with_capacity(64);
@@ -570,9 +629,13 @@ impl Store {
         );
         for item in iter {
             let (k, v) = item?;
-            if k.len() < 64 { continue; }
+            if k.len() < 64 {
+                continue;
+            }
             // within bounds due to iterate_upper_bound; keep prefix guard for safety
-            if &k[0..32] != &epoch_hash[..] { break; }
+            if &k[0..32] != &epoch_hash[..] {
+                break;
+            }
             if let Ok(coin) = crate::coin::decode_candidate(&v) {
                 coins.push(coin);
             }
@@ -582,7 +645,9 @@ impl Store {
 
     /// Backward-compatible fetch of a confirmed coin by id
     pub fn get_coin(&self, coin_id: &[u8; 32]) -> Result<Option<crate::coin::Coin>> {
-        let cf = self.db.cf_handle("coin")
+        let cf = self
+            .db
+            .cf_handle("coin")
             .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
         match self.db.get_cf(cf, coin_id)? {
             Some(value) => match crate::coin::decode_coin(&value) {
@@ -596,16 +661,18 @@ impl Store {
     /// Deletes coin candidates older than or equal to a specific epoch hash (best-effort GC)
     /// Keeps candidates for recent epochs to support reorgs
     pub fn prune_old_candidates(&self, keep_epoch_hash: &[u8; 32]) -> Result<()> {
-        let cf = self.db.cf_handle("coin_candidate")
+        let cf = self
+            .db
+            .cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
-        
+
         // Collect all epoch hashes to determine which ones to keep
         let mut epoch_hashes = std::collections::HashSet::new();
         epoch_hashes.insert(keep_epoch_hash.to_vec());
-        
+
         // Keep candidates for the current epoch hash and recent epochs to support reorgs
         // For now, be very conservative and don't prune aggressively
         // This can be made more aggressive later once reorg stability is confirmed
@@ -623,15 +690,19 @@ impl Store {
                 }
             }
         }
-        
+
         self.write_batch(batch)?;
-        if pruned > 0 { crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64); }
+        if pruned > 0 {
+            crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64);
+        }
         Ok(())
     }
 
     /// Store sorted leaf hashes for an epoch for faster proof construction
-    pub fn store_epoch_leaves(&self, epoch_num: u64, leaves: &Vec<[u8;32]>) -> Result<()> {
-        let cf = self.db.cf_handle("epoch_leaves")
+    pub fn store_epoch_leaves(&self, epoch_num: u64, leaves: &Vec<[u8; 32]>) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("epoch_leaves")
             .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
         let key = epoch_num.to_le_bytes();
         let data = bincode::serialize(leaves)?;
@@ -640,8 +711,10 @@ impl Store {
     }
 
     /// Load sorted leaf hashes for an epoch if present
-    pub fn get_epoch_leaves(&self, epoch_num: u64) -> Result<Option<Vec<[u8;32]>>> {
-        let cf = self.db.cf_handle("epoch_leaves")
+    pub fn get_epoch_leaves(&self, epoch_num: u64) -> Result<Option<Vec<[u8; 32]>>> {
+        let cf = self
+            .db
+            .cf_handle("epoch_leaves")
             .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
         let key = epoch_num.to_le_bytes();
         match self.db.get_cf(cf, &key)? {
@@ -651,8 +724,10 @@ impl Store {
     }
 
     /// Store full Merkle levels for an epoch for O(log N) proof generation without recomputation
-    pub fn store_epoch_levels(&self, epoch_num: u64, levels: &Vec<Vec<[u8;32]>>) -> Result<()> {
-        let cf = self.db.cf_handle("epoch_levels")
+    pub fn store_epoch_levels(&self, epoch_num: u64, levels: &Vec<Vec<[u8; 32]>>) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("epoch_levels")
             .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
         let key = epoch_num.to_le_bytes();
         let data = bincode::serialize(levels)?;
@@ -661,8 +736,10 @@ impl Store {
     }
 
     /// Load Merkle levels for an epoch if present. Level 0 must be sorted leaves.
-    pub fn get_epoch_levels(&self, epoch_num: u64) -> Result<Option<Vec<Vec<[u8;32]>>>> {
-        let cf = self.db.cf_handle("epoch_levels")
+    pub fn get_epoch_levels(&self, epoch_num: u64) -> Result<Option<Vec<Vec<[u8; 32]>>>> {
+        let cf = self
+            .db
+            .cf_handle("epoch_levels")
             .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
         let key = epoch_num.to_le_bytes();
         match self.db.get_cf(cf, &key)? {
@@ -684,28 +761,40 @@ impl Store {
     // (moved to module scope below)
 
     /// Store a one-time secret key under pk_hash if absent. Returns Ok(()) even if already present.
-    pub fn put_otp_sk_if_absent(&self, pk_hash: &[u8;32], sk_bytes: &[u8]) -> Result<()> {
-        use rand::RngCore;
-        use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, NewAead}, XNonce, Key};
-        use rand::rngs::OsRng;
+    pub fn put_otp_sk_if_absent(&self, pk_hash: &[u8; 32], sk_bytes: &[u8]) -> Result<()> {
         use argon2::{Argon2, Params};
+        use chacha20poly1305::{
+            aead::{Aead, NewAead},
+            Key, XChaCha20Poly1305, XNonce,
+        };
+        use rand::rngs::OsRng;
+        use rand::RngCore;
 
-        let cf = self.db.cf_handle("otp_sk").ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
-        if self.db.get_cf(cf, pk_hash)?.is_some() { return Ok(()); }
+        let cf = self
+            .db
+            .cf_handle("otp_sk")
+            .ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
+        if self.db.get_cf(cf, pk_hash)?.is_some() {
+            return Ok(());
+        }
 
         // Derive encryption key for OTP SKs from unified passphrase
-        let pass = crate::crypto::unified_passphrase(Some("Enter pass-phrase to protect OTP keys:"))?;
+        let pass =
+            crate::crypto::unified_passphrase(Some("Enter pass-phrase to protect OTP keys:"))?;
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
-        let params = Params::new(256 * 1024, 3, 1, None).map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?; // 256 MiB, 3 iters, lanes=1
+        let params = Params::new(256 * 1024, 3, 1, None)
+            .map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?; // 256 MiB, 3 iters, lanes=1
         let mut key_bytes = [0u8; 32];
         Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into(pass.as_bytes(), &salt, &mut key_bytes)
             .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
 
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let mut nonce = [0u8; 24]; OsRng.fill_bytes(&mut nonce);
-        let ct = cipher.encrypt(XNonce::from_slice(&nonce), sk_bytes)
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let ct = cipher
+            .encrypt(XNonce::from_slice(&nonce), sk_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to encrypt OTP SK: {}", e))?;
         key_bytes.iter_mut().for_each(|b| *b = 0);
 
@@ -716,44 +805,67 @@ impl Store {
     }
 
     /// Retrieve and decrypt a one-time secret key by pk_hash
-    pub fn get_otp_sk(&self, pk_hash: &[u8;32]) -> Result<Option<Vec<u8>>> {
-        use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, NewAead}, XNonce, Key};
+    pub fn get_otp_sk(&self, pk_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         use argon2::{Argon2, Params};
+        use chacha20poly1305::{
+            aead::{Aead, NewAead},
+            Key, XChaCha20Poly1305, XNonce,
+        };
 
-        let cf = self.db.cf_handle("otp_sk").ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
-        let Some(v) = self.db.get_cf(cf, pk_hash)? else { return Ok(None) };
+        let cf = self
+            .db
+            .cf_handle("otp_sk")
+            .ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
+        let Some(v) = self.db.get_cf(cf, pk_hash)? else {
+            return Ok(None);
+        };
         let rec: OtpSkRecordV1 = bincode::deserialize(&v)?;
-        let pass = crate::crypto::unified_passphrase(Some("Enter pass-phrase to unlock OTP keys:"))?;
-        let params = Params::new(256 * 1024, 3, 1, None).map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?;
+        let pass =
+            crate::crypto::unified_passphrase(Some("Enter pass-phrase to unlock OTP keys:"))?;
+        let params = Params::new(256 * 1024, 3, 1, None)
+            .map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?;
         let mut key_bytes = [0u8; 32];
         Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into(pass.as_bytes(), &rec.salt, &mut key_bytes)
             .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let pt = cipher.decrypt(XNonce::from_slice(&rec.nonce), rec.ct.as_ref())
+        let pt = cipher
+            .decrypt(XNonce::from_slice(&rec.nonce), rec.ct.as_ref())
             .map_err(|_| anyhow::anyhow!("Failed to decrypt OTP SK (wrong passphrase?)"))?;
         key_bytes.iter_mut().for_each(|b| *b = 0);
         Ok(Some(pt))
     }
 
     /// Index coin_id -> pk_hash to locate OTP SK for spends later
-    pub fn put_otp_index(&self, coin_id: &[u8;32], pk_hash: &[u8;32]) -> Result<()> {
-        let cf = self.db.cf_handle("otp_index").ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
+    pub fn put_otp_index(&self, coin_id: &[u8; 32], pk_hash: &[u8; 32]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("otp_index")
+            .ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
         self.db.put_cf(cf, coin_id, pk_hash)?;
         Ok(())
     }
 
-    pub fn get_otp_pk_hash_for_coin(&self, coin_id: &[u8;32]) -> Result<Option<[u8;32]>> {
-        let cf = self.db.cf_handle("otp_index").ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
+    pub fn get_otp_pk_hash_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        let cf = self
+            .db
+            .cf_handle("otp_index")
+            .ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
         if let Some(v) = self.db.get_cf(cf, coin_id)? {
-            if v.len() == 32 { let mut h=[0u8;32]; h.copy_from_slice(&v); return Ok(Some(h)); }
+            if v.len() == 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&v);
+                return Ok(Some(h));
+            }
         }
         Ok(None)
     }
 
     /// Persist a peer multiaddr string into the peers CF (deduped by key)
     pub fn store_peer_addr(&self, addr: &str) -> Result<()> {
-        let cf = self.db.cf_handle("peers")
+        let cf = self
+            .db
+            .cf_handle("peers")
             .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
         // Key is the multiaddr string bytes; value empty
         self.db.put_cf(cf, addr.as_bytes(), &[])?;
@@ -762,7 +874,9 @@ impl Store {
 
     /// Load all known peer multiaddr strings
     pub fn load_peer_addrs(&self) -> Result<Vec<String>> {
-        let cf = self.db.cf_handle("peers")
+        let cf = self
+            .db
+            .cf_handle("peers")
             .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut addrs = Vec::new();
@@ -777,24 +891,35 @@ impl Store {
 
     /// Gets selected coin IDs for an epoch
     pub fn get_selected_coin_ids_for_epoch(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
-        let sel_cf = self.db.cf_handle("epoch_selected")
+        let sel_cf = self
+            .db
+            .cf_handle("epoch_selected")
             .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
         let mut ids = Vec::new();
         let start_key = epoch_num.to_le_bytes();
-        let iter = self.db.iterator_cf(sel_cf, rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
+        let iter = self.db.iterator_cf(
+            sel_cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
         for item in iter {
             let (k, _v) = item?;
-            if k.len() < 8 + 32 { continue; }
-            if &k[0..8] != start_key { break; }
+            if k.len() < 8 + 32 {
+                continue;
+            }
+            if &k[0..8] != start_key {
+                break;
+            }
             let mut id = [0u8; 32];
-            id.copy_from_slice(&k[8..8+32]);
+            id.copy_from_slice(&k[8..8 + 32]);
             ids.push(id);
         }
         Ok(ids)
     }
 
-    pub fn put_coin_epoch_rev(&self, epoch_num: u64, coin_id: &[u8;32]) -> Result<()> {
-        let cf = self.db.cf_handle("coin_epoch_by_epoch")
+    pub fn put_coin_epoch_rev(&self, epoch_num: u64, coin_id: &[u8; 32]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("coin_epoch_by_epoch")
             .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
         let mut key = Vec::with_capacity(8 + 32);
         key.extend_from_slice(&epoch_num.to_le_bytes());
@@ -803,17 +928,26 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_coin_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8;32]>> {
-        let cf = self.db.cf_handle("coin_epoch_by_epoch")
+    pub fn get_coin_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+        let cf = self
+            .db
+            .cf_handle("coin_epoch_by_epoch")
             .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
         let start_key = epoch_num.to_le_bytes();
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
-        let mut ids: Vec<[u8;32]> = Vec::new();
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+        let mut ids: Vec<[u8; 32]> = Vec::new();
         for item in iter {
             let (k, _v) = item?;
-            if k.len() < 8 + 32 { continue; }
-            if &k[0..8] != start_key { break; }
-            let mut id = [0u8;32];
+            if k.len() < 8 + 32 {
+                continue;
+            }
+            if &k[0..8] != start_key {
+                break;
+            }
+            let mut id = [0u8; 32];
             id.copy_from_slice(&k[8..]);
             ids.push(id);
         }
@@ -821,8 +955,10 @@ impl Store {
     }
 
     /// Persist a mapping coin_id -> epoch number that committed it
-    pub fn put_coin_epoch(&self, coin_id: &[u8;32], epoch_num: u64) -> Result<()> {
-        let cf = self.db.cf_handle("coin_epoch")
+    pub fn put_coin_epoch(&self, coin_id: &[u8; 32], epoch_num: u64) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("coin_epoch")
             .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&epoch_num.to_le_bytes());
@@ -831,31 +967,39 @@ impl Store {
     }
 
     /// Delete a mapping coin_id -> epoch number (used during reorgs)
-    pub fn delete_coin_epoch(&self, coin_id: &[u8;32]) -> Result<()> {
-        let cf = self.db.cf_handle("coin_epoch")
+    pub fn delete_coin_epoch(&self, coin_id: &[u8; 32]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("coin_epoch")
             .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
         self.db.delete_cf(cf, coin_id)?;
         Ok(())
     }
 
     /// Retrieve epoch number that committed the given coin, if known
-    pub fn get_coin_epoch(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
-        let cf = self.db.cf_handle("coin_epoch")
+    pub fn get_coin_epoch(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
+        let cf = self
+            .db
+            .cf_handle("coin_epoch")
             .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
         match self.db.get_cf(cf, coin_id)? {
             Some(v) => {
-                if v.len() != 8 { return Ok(None); }
+                if v.len() != 8 {
+                    return Ok(None);
+                }
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&v);
                 Ok(Some(u64::from_le_bytes(arr)))
-            },
+            }
             None => Ok(None),
         }
     }
 
     /// Fallback: scan `epoch_selected` to find the epoch that selected this coin
-    pub fn find_coin_epoch_via_scan(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
-        let sel_cf = self.db.cf_handle("epoch_selected")
+    pub fn find_coin_epoch_via_scan(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
+        let sel_cf = self
+            .db
+            .cf_handle("epoch_selected")
             .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
         // Iterate all entries; stop on first matching suffix
         let iter = self.db.iterator_cf(sel_cf, rocksdb::IteratorMode::Start);
@@ -871,14 +1015,19 @@ impl Store {
     }
 
     /// Retrieve the epoch number for a coin using the index or fallback scan
-    pub fn get_epoch_for_coin(&self, coin_id: &[u8;32]) -> Result<Option<u64>> {
-        if let Some(n) = self.get_coin_epoch(coin_id)? { return Ok(Some(n)); }
+    pub fn get_epoch_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
+        if let Some(n) = self.get_coin_epoch(coin_id)? {
+            return Ok(Some(n));
+        }
         self.find_coin_epoch_via_scan(coin_id)
     }
 
     /// Persist headers sync cursor (highest requested and highest stored header heights)
     pub fn put_headers_cursor(&self, highest_requested: u64, highest_stored: u64) -> Result<()> {
-        let cf = self.db.cf_handle("meta").ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
+        let cf = self
+            .db
+            .cf_handle("meta")
+            .ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&highest_requested.to_le_bytes());
         buf[8..].copy_from_slice(&highest_stored.to_le_bytes());
@@ -888,15 +1037,20 @@ impl Store {
 
     /// Load headers sync cursor; returns (highest_requested, highest_stored)
     pub fn get_headers_cursor(&self) -> Result<(u64, u64)> {
-        let cf = self.db.cf_handle("meta").ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
+        let cf = self
+            .db
+            .cf_handle("meta")
+            .ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))?;
         if let Some(v) = self.db.get_cf(cf, b"headers_cursor")? {
             if v.len() == 16 {
-                let mut a=[0u8;8]; a.copy_from_slice(&v[..8]);
-                let mut b=[0u8;8]; b.copy_from_slice(&v[8..]);
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&v[..8]);
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v[8..]);
                 return Ok((u64::from_le_bytes(a), u64::from_le_bytes(b)));
             }
         }
-        Ok((0,0))
+        Ok((0, 0))
     }
 
     /// Convenience: fetch anchor by epoch number
@@ -906,7 +1060,9 @@ impl Store {
 
     /// Gets the total number of coins in the database
     pub fn coin_count(&self) -> Result<u64> {
-        let cf = self.db.cf_handle("coin")
+        let cf = self
+            .db
+            .cf_handle("coin")
             .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -919,7 +1075,9 @@ impl Store {
     pub fn export_anchors_snapshot(&self, out_path: &str) -> Result<usize> {
         use std::io::Write as _;
 
-        let epoch_cf = self.db.cf_handle("epoch")
+        let epoch_cf = self
+            .db
+            .cf_handle("epoch")
             .ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
         let iter = self.db.iterator_cf(epoch_cf, rocksdb::IteratorMode::Start);
 
@@ -927,7 +1085,9 @@ impl Store {
         for item in iter {
             let (k, v) = item?;
             // Only include keys that are exactly 8 bytes (epoch number). Skip the "latest" marker and others.
-            if k.len() != 8 { continue; }
+            if k.len() != 8 {
+                continue;
+            }
             // Tolerant decode: try zstd first, then plain bincode
             let anchor: crate::epoch::Anchor = if let Ok(decompressed) = zstd::decode_all(&v[..]) {
                 match bincode::deserialize(&decompressed) {
@@ -957,16 +1117,21 @@ impl Store {
             anchors: Vec<crate::epoch::Anchor>,
         }
 
-        let chain_id = anchors.first().map(|a| a.hash)
+        let chain_id = anchors
+            .first()
+            .map(|a| a.hash)
             .ok_or_else(|| anyhow::anyhow!("Missing genesis anchor in snapshot export"))?;
         let snapshot = AnchorsSnapshotV1 { chain_id, anchors };
 
-        let raw = bincode::serialize(&snapshot)
-            .context("Failed to serialize anchors snapshot")?;
-        let mut encoder = zstd::Encoder::new(Vec::new(), 10)
-            .context("Failed to create zstd encoder")?;
-        encoder.write_all(&raw).context("Failed to write snapshot to encoder")?;
-        let compressed = encoder.finish().context("Failed to finalize zstd compression")?;
+        let raw = bincode::serialize(&snapshot).context("Failed to serialize anchors snapshot")?;
+        let mut encoder =
+            zstd::Encoder::new(Vec::new(), 10).context("Failed to create zstd encoder")?;
+        encoder
+            .write_all(&raw)
+            .context("Failed to write snapshot to encoder")?;
+        let compressed = encoder
+            .finish()
+            .context("Failed to finalize zstd compression")?;
         std::fs::write(out_path, compressed)
             .with_context(|| format!("Failed to write snapshot file to '{}'", out_path))?;
 
@@ -995,7 +1160,9 @@ impl Store {
             .context("Failed to deserialize anchors snapshot (expected AnchorsSnapshotV1)")?;
 
         // If DB already has a genesis, ensure chain id matches
-        if let Ok(Some(existing_genesis)) = self.get::<crate::epoch::Anchor>("epoch", &0u64.to_le_bytes()) {
+        if let Ok(Some(existing_genesis)) =
+            self.get::<crate::epoch::Anchor>("epoch", &0u64.to_le_bytes())
+        {
             if existing_genesis.hash != snapshot.chain_id {
                 anyhow::bail!("Snapshot chain_id does not match existing database genesis");
             }
@@ -1004,8 +1171,14 @@ impl Store {
         let mut inserted: u64 = 0;
         let mut batch = WriteBatch::default();
 
-        let epoch_cf = self.db.cf_handle("epoch").ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
-        let anchor_cf = self.db.cf_handle("anchor").ok_or_else(|| anyhow::anyhow!("'anchor' column family missing"))?;
+        let epoch_cf = self
+            .db
+            .cf_handle("epoch")
+            .ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
+        let anchor_cf = self
+            .db
+            .cf_handle("anchor")
+            .ok_or_else(|| anyhow::anyhow!("'anchor' column family missing"))?;
 
         let mut highest_num: Option<u64> = None;
         for a in snapshot.anchors.iter() {
@@ -1042,7 +1215,7 @@ impl Store {
         let coin_count = self.coin_count()?;
         let transfer_count = self.spend_count()?;
         let epoch_count = self.epoch_count()?;
-        
+
         Ok(DatabaseStats {
             coin_count,
             transfer_count,
@@ -1052,7 +1225,9 @@ impl Store {
 
     /// Gets the total number of spends in the database
     pub fn spend_count(&self) -> Result<u64> {
-        let cf = self.db.cf_handle("spend")
+        let cf = self
+            .db
+            .cf_handle("spend")
             .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -1062,7 +1237,9 @@ impl Store {
 
     /// Gets the total number of epochs in the database
     pub fn epoch_count(&self) -> Result<u64> {
-        let cf = self.db.cf_handle("epoch")
+        let cf = self
+            .db
+            .cf_handle("epoch")
             .ok_or_else(|| anyhow::anyhow!("'epoch' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -1072,18 +1249,20 @@ impl Store {
 
     /// Deletes coin candidates older than those referenced by the provided epoch hashes.
     /// Keeps candidate entries whose key prefix (epoch_hash) is in `keep_hashes`.
-    pub fn prune_candidates_keep_hashes(&self, keep_hashes: &[[u8;32]]) -> Result<()> {
-        let cf = self.db.cf_handle("coin_candidate")
+    pub fn prune_candidates_keep_hashes(&self, keep_hashes: &[[u8; 32]]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("coin_candidate")
             .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
 
-        let keep: std::collections::HashSet<&[u8;32]> = keep_hashes.iter().collect();
+        let keep: std::collections::HashSet<&[u8; 32]> = keep_hashes.iter().collect();
         for item in iter {
             let (key, _) = item?;
             if key.len() >= 32 {
-                let mut prefix = [0u8;32];
+                let mut prefix = [0u8; 32];
                 prefix.copy_from_slice(&key[0..32]);
                 if !keep.contains(&prefix) {
                     batch.delete_cf(cf, key);
@@ -1092,12 +1271,12 @@ impl Store {
             }
         }
         self.write_batch(batch)?;
-        if pruned > 0 { crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64); }
+        if pruned > 0 {
+            crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64);
+        }
         Ok(())
     }
 }
-
-
 
 /// Database statistics
 #[derive(Debug, Clone)]
@@ -1110,22 +1289,22 @@ pub struct DatabaseStats {
 /// Cross-platform directory copy function for backups
 fn copy_dir_all(src: &str, dst: &str) -> Result<()> {
     use std::path::Path;
-    
+
     let src_path = Path::new(src);
     let dst_path = Path::new(dst);
-    
+
     if !src_path.exists() {
         return Ok(()); // Source doesn't exist, nothing to copy
     }
-    
+
     std::fs::create_dir_all(dst_path)?;
-    
+
     for entry in std::fs::read_dir(src_path)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let src_file = entry.path();
         let dst_file = dst_path.join(entry.file_name());
-        
+
         if file_type.is_dir() {
             copy_dir_all(&src_file.to_string_lossy(), &dst_file.to_string_lossy())?;
         } else {
@@ -1139,11 +1318,17 @@ pub fn open(cfg: &crate::config::Storage) -> Arc<Store> {
     match Store::open(&cfg.path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("❌ Critical: Database failed to open at '{}': {}", cfg.path, e);
+            eprintln!(
+                "❌ Critical: Database failed to open at '{}': {}",
+                cfg.path, e
+            );
             eprintln!("💡 Possible solutions:");
             eprintln!("   - Check if directory exists and is writable");
             eprintln!("   - Verify no other instances are running");
-            eprintln!("   - If previous crash, try removing stale lock: rm {}/LOCK", cfg.path);
+            eprintln!(
+                "   - If previous crash, try removing stale lock: rm {}/LOCK",
+                cfg.path
+            );
             // For genesis deployment, propagate error instead of exiting in library
             panic!("Database open failed: {}", e);
         }

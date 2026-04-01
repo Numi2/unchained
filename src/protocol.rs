@@ -1,0 +1,30 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolRules {
+    pub version: u32,
+    pub genesis_difficulty: u32,
+    pub genesis_mem_kib: u32,
+    pub retarget_interval: u64,
+    pub target_coins_per_epoch: u64,
+    pub max_coins_per_epoch: u32,
+    pub difficulty_min: u32,
+    pub difficulty_max: u32,
+    pub min_mem_kib: u32,
+    pub max_mem_kib: u32,
+    pub retarget_upper_pct: u64,
+    pub retarget_lower_pct: u64,
+}
+
+pub const CURRENT: ProtocolRules = ProtocolRules {
+    version: 1,
+    genesis_difficulty: 2,
+    genesis_mem_kib: 16_192,
+    retarget_interval: 2000,
+    target_coins_per_epoch: 11,
+    max_coins_per_epoch: 111,
+    difficulty_min: 1,
+    difficulty_max: 12,
+    min_mem_kib: 16_192,
+    max_mem_kib: 512_007,
+    retarget_upper_pct: 110,
+    retarget_lower_pct: 90,
+};

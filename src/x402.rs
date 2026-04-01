@@ -90,7 +90,12 @@ pub fn build_challenge(
         recipient_evm: None,
         price_usd_micros: None,
     };
-    X402Challenge { version: VERSION.to_string(), invoice_id, methods: vec![method], resource }
+    X402Challenge {
+        version: VERSION.to_string(),
+        invoice_id,
+        methods: vec![method],
+        resource,
+    }
 }
 
 pub fn encode_receipt_header(r: &X402Receipt) -> Result<String> {
@@ -159,5 +164,3 @@ mod tests {
         assert_eq!(ch.methods[0].chain, "unchained");
     }
 }
-
-

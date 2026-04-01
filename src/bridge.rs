@@ -78,6 +78,12 @@ pub struct BridgeState {
     pub max_bridge_amount: u64,
     pub bridge_fee_basis_points: u64,
     #[serde(default)]
+    pub rate_window_secs: u64,
+    #[serde(default)]
+    pub per_address_daily_cap: u64,
+    #[serde(default)]
+    pub global_daily_cap: u64,
+    #[serde(default)]
     pub epoch_global_volume: u64,
     #[serde(default)]
     pub epoch_number: u64,
@@ -142,6 +148,9 @@ impl BridgeService {
             min_bridge_amount: cfg.min_amount,
             max_bridge_amount: cfg.max_amount,
             bridge_fee_basis_points: cfg.fee_basis_points,
+            rate_window_secs: cfg.rate_window_secs,
+            per_address_daily_cap: cfg.per_address_daily_cap,
+            global_daily_cap: cfg.global_daily_cap,
             epoch_global_volume: 0,
             epoch_number: 0,
             per_addr_window: std::collections::HashMap::new(),
@@ -487,9 +496,12 @@ pub async fn serve(
                                     if let Some(v) = p.fee_basis_points {
                                         st.bridge_fee_basis_points = v;
                                     }
-                                    // Acknowledge caps fields to avoid dead_code warnings (not applied dynamically yet)
-                                    let _ = p.per_address_daily_cap;
-                                    let _ = p.global_daily_cap;
+                                    if let Some(v) = p.per_address_daily_cap {
+                                        st.per_address_daily_cap = v;
+                                    }
+                                    if let Some(v) = p.global_daily_cap {
+                                        st.global_daily_cap = v;
+                                    }
                                     // persist
                                     let _ = svc.persist_state();
                                     json_response(&serde_json::json!({"ok": true}), 200)
@@ -1220,7 +1232,7 @@ async fn verify_unchained_receipt(
     let mut map: std::collections::HashSet<String> = spend_hashes.iter().cloned().collect();
     for item in iter {
         let (_k, v) = item?;
-        if let Some(sp) = store.decode_spend_bytes_tolerant(&v) {
+        if let Ok(sp) = store.decode_spend_bytes(&v) {
             let mut txh = Vec::new();
             txh.extend_from_slice(&sp.root);
             txh.extend_from_slice(&sp.nullifier);
@@ -1311,9 +1323,9 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
             st.min_bridge_amount,
             st.max_bridge_amount,
             st.bridge_fee_basis_points,
-            svc.cfg.rate_window_secs,
-            svc.cfg.per_address_daily_cap,
-            svc.cfg.global_daily_cap,
+            st.rate_window_secs,
+            st.per_address_daily_cap,
+            st.global_daily_cap,
             addr_hex,
         )
     };
@@ -1952,23 +1964,35 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
         if svc.db.get::<[u8; 1]>("nullifier", &nf)?.is_some() {
             continue;
         }
-        // Build spend using genesis anchor
+        let commit_epoch = svc
+            .db
+            .get_epoch_for_coin(&c.coin_id)?
+            .ok_or_else(|| anyhow!("missing coin->epoch index"))?;
         let anchor: crate::epoch::Anchor = svc
             .db
-            .get("epoch", &0u64.to_le_bytes())?
-            .ok_or_else(|| anyhow!("genesis anchor missing"))?;
+            .get("epoch", &commit_epoch.to_le_bytes())?
+            .ok_or_else(|| anyhow!("committing anchor missing"))?;
+        let leaf = crate::coin::Coin::id_to_leaf_hash(&c.coin_id);
+        let proof = if let Some(levels) = svc.db.get_epoch_levels(anchor.num)? {
+            crate::epoch::MerkleTree::build_proof_from_levels(&levels, &leaf)
+        } else if let Some(leaves) = svc.db.get_epoch_leaves(anchor.num)? {
+            crate::epoch::MerkleTree::build_proof_from_leaves(&leaves, &leaf)
+        } else {
+            None
+        }
+        .ok_or_else(|| anyhow!("unable to build Merkle proof"))?;
         let sp = crate::transfer::Spend::create_hashlock(
             c.coin_id,
             &anchor,
-            Vec::new(),
+            proof,
             p,
             &c.receiver_commitment,
             c.receiver_commitment.amount_le,
             &chain_id,
         )?;
-        sp.validate(&svc.db)?;
-        sp.apply(&svc.db)?;
-        svc.net.gossip_spend(&sp).await;
+        let tx = crate::transaction::Tx::single_spend(sp.clone());
+        tx.apply(&svc.db)?;
+        svc.net.gossip_tx(&tx).await;
         total = total.saturating_add(c.receiver_commitment.amount_le);
         let mut txh = Vec::new();
         txh.extend_from_slice(&sp.root);
@@ -2009,7 +2033,7 @@ mod tests {
         // Dummy wallet/net cannot be constructed easily here; skip RPC path; test state accessors
         let svc = BridgeService::new(Arc::new(db), cfg, Arc::new(dummy_wallet()), dummy_net());
         let st = svc.get_status().unwrap();
-        assert!(st.bridge_enabled);
+        assert!(!st.bridge_enabled);
         assert_eq!(st.min_amount, 1);
         assert_eq!(st.max_amount, 1_000_000);
         assert_eq!(st.fee_basis_points, 10);

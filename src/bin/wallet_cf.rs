@@ -6,7 +6,10 @@ const WALLET_CF: &str = "wallet";
 const WALLET_KEY: &[u8] = b"default_keypair";
 
 #[derive(Parser)]
-#[command(about = "Wallet CF helper: backup/restore/delete the wallet record in RocksDB", version)]
+#[command(
+    about = "Wallet CF helper: backup/restore/delete the wallet record in RocksDB",
+    version
+)]
 struct Cli {
     /// Config file path (defaults to devnet.toml for convenience)
     #[arg(short, long, default_value = "devnet.toml")]
@@ -42,25 +45,28 @@ fn main() -> anyhow::Result<()> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
-        let abs = std::path::Path::new(&home).join(".unchained").join("unchained_data");
+        let abs = std::path::Path::new(&home)
+            .join(".unchained")
+            .join("unchained_data");
         cfg.storage.path = abs.to_string_lossy().into_owned();
     }
 
     let db = storage::open(&cfg.storage);
-    let handle = db.db.cf_handle(WALLET_CF).ok_or_else(|| anyhow::anyhow!("'wallet' CF missing"))?;
+    let handle = db
+        .db
+        .cf_handle(WALLET_CF)
+        .ok_or_else(|| anyhow::anyhow!("'wallet' CF missing"))?;
 
     match cli.cmd {
-        Cmd::Backup { out } => {
-            match db.db.get_cf(handle, WALLET_KEY)? {
-                Some(bytes) => {
-                    fs::write(&out, &bytes)?;
-                    println!("✅ Backed up wallet to {} ({} bytes)", out, bytes.len());
-                }
-                None => {
-                    println!("⚠️  No wallet record found to backup");
-                }
+        Cmd::Backup { out } => match db.db.get_cf(handle, WALLET_KEY)? {
+            Some(bytes) => {
+                fs::write(&out, &bytes)?;
+                println!("✅ Backed up wallet to {} ({} bytes)", out, bytes.len());
             }
-        }
+            None => {
+                println!("⚠️  No wallet record found to backup");
+            }
+        },
         Cmd::Restore { r#in } => {
             let bytes = fs::read(&r#in)?;
             db.db.put_cf(handle, WALLET_KEY, &bytes)?;
@@ -74,5 +80,3 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-

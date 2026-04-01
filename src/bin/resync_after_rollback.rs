@@ -1,5 +1,5 @@
-use unchained::{storage, epoch::Anchor, config};
 use rocksdb::WriteBatch;
+use unchained::{config, epoch::Anchor, storage};
 
 fn main() -> anyhow::Result<()> {
     println!("🔄 Post-Rollback Resync Tool");
@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     println!("This tool forces a clean resync after using fix_fork");
     println!("⚠️  WARNING: This will clear all epochs after the rollback point");
     println!();
-    
+
     // Parse command line args
     let args: Vec<String> = std::env::args().collect();
     let keep_up_to = if args.len() > 1 {
@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
         println!("Example: {} 7000", args[0]);
         return Ok(());
     };
-    
+
     // Load config
     let mut cfg = match config::load("config.toml") {
         Ok(c) => c,
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
             config::load_from_str(embedded)?
         }
     };
-    
+
     // Resolve path
     if std::path::Path::new(&cfg.storage.path).is_relative() {
         let home = std::env::var("HOME")
@@ -39,10 +39,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let db = storage::open(&cfg.storage);
-    
+
     // Step 1: Analyze current state
     println!("📊 Analyzing database state...");
-    
+
     let current_latest = match db.get::<Anchor>("epoch", b"latest")? {
         Some(a) => {
             println!("   Current latest: epoch {}", a.num);
@@ -68,18 +68,25 @@ fn main() -> anyhow::Result<()> {
     };
 
     if current_latest.num <= keep_up_to {
-        println!("✅ No cleanup needed - current latest {} <= target {}", current_latest.num, keep_up_to);
+        println!(
+            "✅ No cleanup needed - current latest {} <= target {}",
+            current_latest.num, keep_up_to
+        );
         return Ok(());
     }
 
     println!();
     println!("🎯 This will:");
     println!("   • Keep epochs 0 through {}", keep_up_to);
-    println!("   • Remove epochs {} through {}", keep_up_to + 1, current_latest.num);
+    println!(
+        "   • Remove epochs {} through {}",
+        keep_up_to + 1,
+        current_latest.num
+    );
     println!("   • Clear all associated coins, spends, and indices");
     println!("   • Reset sync state to force full resync from network");
     println!();
-    
+
     print!("Continue? (y/N): ");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
@@ -95,13 +102,28 @@ fn main() -> anyhow::Result<()> {
     let epoch_cf = db.db.cf_handle("epoch").expect("epoch CF missing");
     let anchor_cf = db.db.cf_handle("anchor").expect("anchor CF missing");
     let coin_cf = db.db.cf_handle("coin").expect("coin CF missing");
-    let coin_epoch_cf = db.db.cf_handle("coin_epoch").expect("coin_epoch CF missing");
+    let coin_epoch_cf = db
+        .db
+        .cf_handle("coin_epoch")
+        .expect("coin_epoch CF missing");
     let spend_cf = db.db.cf_handle("spend").expect("spend CF missing");
     let nullifier_cf = db.db.cf_handle("nullifier").expect("nullifier CF missing");
-    let commitment_used_cf = db.db.cf_handle("commitment_used").expect("commitment_used CF missing");
-    let epoch_selected_cf = db.db.cf_handle("epoch_selected").expect("epoch_selected CF missing");
-    let epoch_leaves_cf = db.db.cf_handle("epoch_leaves").expect("epoch_leaves CF missing");
-    let coin_candidate_cf = db.db.cf_handle("coin_candidate").expect("coin_candidate CF missing");
+    let commitment_used_cf = db
+        .db
+        .cf_handle("commitment_used")
+        .expect("commitment_used CF missing");
+    let epoch_selected_cf = db
+        .db
+        .cf_handle("epoch_selected")
+        .expect("epoch_selected CF missing");
+    let epoch_leaves_cf = db
+        .db
+        .cf_handle("epoch_leaves")
+        .expect("epoch_leaves CF missing");
+    let coin_candidate_cf = db
+        .db
+        .cf_handle("coin_candidate")
+        .expect("coin_candidate CF missing");
 
     let mut batch = WriteBatch::default();
     let mut epochs_removed = 0;
@@ -111,8 +133,12 @@ fn main() -> anyhow::Result<()> {
     // Step 1: Remove epochs after keep_up_to
     for epoch_num in (keep_up_to + 1)..=current_latest.num {
         if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
-            println!("   Removing epoch {} (hash: {})", epoch_num, hex::encode(&anchor.hash[..8]));
-            
+            println!(
+                "   Removing epoch {} (hash: {})",
+                epoch_num,
+                hex::encode(&anchor.hash[..8])
+            );
+
             // Remove epoch entry
             batch.delete_cf(epoch_cf, &epoch_num.to_le_bytes());
             batch.delete_cf(anchor_cf, &anchor.hash);
@@ -127,7 +153,8 @@ fn main() -> anyhow::Result<()> {
                     coins_removed += 1;
 
                     // Remove spend if exists
-                    if let Ok(Some(spend)) = db.get::<unchained::transfer::Spend>("spend", &coin_id) {
+                    if let Ok(Some(spend)) = db.get::<unchained::transfer::Spend>("spend", &coin_id)
+                    {
                         batch.delete_cf(spend_cf, &coin_id);
                         batch.delete_cf(nullifier_cf, &spend.nullifier);
                         spends_removed += 1;
@@ -137,12 +164,12 @@ fn main() -> anyhow::Result<()> {
                             if let Some(next_lock) = spend.next_lock_hash {
                                 if let Ok(chain_id) = db.get_chain_id() {
                                     let cid = unchained::crypto::commitment_id_v1(
-                                        &spend.to.one_time_pk, 
-                                        &spend.to.kyber_ct, 
-                                        &next_lock, 
-                                        &spend.coin_id, 
-                                        spend.to.amount_le, 
-                                        &chain_id
+                                        &spend.to.one_time_pk,
+                                        &spend.to.kyber_ct,
+                                        &next_lock,
+                                        &spend.coin_id,
+                                        spend.to.amount_le,
+                                        &chain_id,
                                     );
                                     batch.delete_cf(commitment_used_cf, &cid);
                                 }
@@ -154,9 +181,12 @@ fn main() -> anyhow::Result<()> {
 
             // Remove epoch indices
             let prefix = epoch_num.to_le_bytes();
-            
+
             // Remove selected index entries
-            let iter = db.db.iterator_cf(epoch_selected_cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+            let iter = db.db.iterator_cf(
+                epoch_selected_cf,
+                rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            );
             for item in iter {
                 if let Ok((k, _)) = item {
                     if k.len() >= 8 && &k[0..8] == prefix {
@@ -173,9 +203,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Step 2: Clean up coin candidates that reference removed epochs
-    let iter = db.db.iterator_cf(coin_candidate_cf, rocksdb::IteratorMode::Start);
+    let iter = db
+        .db
+        .iterator_cf(coin_candidate_cf, rocksdb::IteratorMode::Start);
     let mut candidates_to_remove = Vec::new();
-    
+
     for item in iter {
         if let Ok((k, v)) = item {
             if let Ok(candidate) = bincode::deserialize::<unchained::coin::CoinCandidate>(&v) {
@@ -188,7 +220,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    
+
     for key in candidates_to_remove {
         batch.delete_cf(coin_candidate_cf, &key);
     }
@@ -215,10 +247,16 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("🚀 Next steps:");
     println!("   1. Restart your node");
-    println!("   2. The node will automatically sync from epoch {} onwards", keep_up_to + 1);
+    println!(
+        "   2. The node will automatically sync from epoch {} onwards",
+        keep_up_to + 1
+    );
     println!("   3. Monitor sync progress in the logs");
     println!();
-    println!("💡 The node will now accept the network's version of epochs after {}", keep_up_to);
+    println!(
+        "💡 The node will now accept the network's version of epochs after {}",
+        keep_up_to
+    );
 
     Ok(())
 }

@@ -1,9 +1,13 @@
-use unchained::{storage, epoch::Anchor, config};
+use unchained::{config, epoch::Anchor, storage};
 
 fn main() -> anyhow::Result<()> {
     // Parse optional N from CLI: default to config.metrics.last_epochs_to_show (or 10)
     let args: Vec<String> = std::env::args().collect();
-    let n_arg: Option<u64> = if args.len() > 1 { args[1].parse::<u64>().ok() } else { None };
+    let n_arg: Option<u64> = if args.len() > 1 {
+        args[1].parse::<u64>().ok()
+    } else {
+        None
+    };
 
     // Load configuration (same fallback behavior as other tools)
     let mut cfg = match config::load("config.toml") {
@@ -64,8 +68,10 @@ fn main() -> anyhow::Result<()> {
                         for (i, id) in ids.iter().take(preview).enumerate() {
                             println!("     - [{}] {}", i, hex::encode(id));
                         }
-                        if len > preview { println!("     … {} more", len - preview); }
-                        
+                        if len > preview {
+                            println!("     … {} more", len - preview);
+                        }
+
                         // Show creator distribution for this epoch
                         let mut creators = std::collections::HashSet::new();
                         for id in &ids {
@@ -73,9 +79,15 @@ fn main() -> anyhow::Result<()> {
                                 creators.insert(coin.creator_address);
                             }
                         }
-                        println!("   unique_creators: {} ({}% of selected)", 
-                                creators.len(), 
-                                if len > 0 { (creators.len() * 100) / len } else { 0 });
+                        println!(
+                            "   unique_creators: {} ({}% of selected)",
+                            creators.len(),
+                            if len > 0 {
+                                (creators.len() * 100) / len
+                            } else {
+                                0
+                            }
+                        );
                     }
                 }
                 Err(e) => {
@@ -88,7 +100,11 @@ fn main() -> anyhow::Result<()> {
                 Ok(Some(leaves)) => {
                     println!("   leaves: {} ({} bytes each)", leaves.len(), 32);
                     if leaves.len() as u32 != anchor.coin_count {
-                        println!("   ⚠️  leaves/coin_count mismatch: {} vs {}", leaves.len(), anchor.coin_count);
+                        println!(
+                            "   ⚠️  leaves/coin_count mismatch: {} vs {}",
+                            leaves.len(),
+                            anchor.coin_count
+                        );
                     }
                 }
                 Ok(None) => println!("   leaves: none"),
@@ -99,7 +115,9 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        if current == 0 { break; }
+        if current == 0 {
+            break;
+        }
         current = current.saturating_sub(1);
         count += 1;
     }
@@ -110,5 +128,3 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-
