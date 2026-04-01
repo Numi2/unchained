@@ -15,8 +15,6 @@ pub struct Config {
     #[serde(default)]
     pub compact: Compact,
     #[serde(default)]
-    pub wallet: WalletCfg,
-    #[serde(default)]
     pub offers: Offers,
     #[serde(default)]
     pub bridge: BridgeConfig,
@@ -195,12 +193,6 @@ impl Default for Offers {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct WalletCfg {
-    #[serde(default = "default_auto_serve_commitments")]
-    pub auto_serve_commitments: bool,
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct BridgeConfig {
     #[serde(default = "default_sui_rpc_url")]
@@ -314,10 +306,6 @@ fn default_bind() -> String {
 fn default_last_epochs_to_show() -> u64 {
     10
 }
-fn default_auto_serve_commitments() -> bool {
-    true
-}
-
 // Epoch retargeting defaults
 fn default_target_coins() -> u32 {
     11
@@ -541,7 +529,7 @@ fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
     let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "wallet", "offers",
+        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers",
         "bridge",
     ]
     .into_iter()
@@ -613,9 +601,6 @@ fn warn_unknown_keys(val: &TomlValue) {
                     t,
                     &["enable", "prefill_count", "short_id_len", "max_missing_pct"],
                 ),
-                ("wallet", TomlValue::Table(t)) => {
-                    warn_unknown_keys_in(t, &["auto_serve_commitments"])
-                }
                 ("offers", TomlValue::Table(t)) => warn_unknown_keys_in(
                     t,
                     &[

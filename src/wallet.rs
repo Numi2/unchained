@@ -333,19 +333,6 @@ impl Wallet {
         crate::crypto::derive_genesis_lock_secret(&self.sk, coin_id, chain_id32)
     }
 
-    // Removed direct secret key accessor; use sign() instead
-
-    /// Signs a message using the wallet's secret key, returning the detached signature.
-    #[allow(dead_code)]
-    pub fn sign(&self, _message: &[u8]) { /* signatures removed in V3 */
-    }
-
-    /// Verifies a message/signature pair using the wallet's public key.
-    #[allow(dead_code)]
-    pub fn verify(&self, _message: &[u8], _signature: &()) -> bool {
-        false
-    }
-
     // ---------------------------------------------------------------------
     // Address export/import: authenticated Kyber key distribution
     // ---------------------------------------------------------------------
@@ -832,18 +819,6 @@ impl Wallet {
         }
     }
 
-    /// Deprecated legacy wrapper.
-    pub async fn send_transfer(
-        &self,
-        _to: crate::crypto::Address,
-        _amount: u64,
-        _network: &crate::network::NetHandle,
-    ) -> Result<Vec<crate::transfer::Spend>> {
-        Err(anyhow!(
-            "send_transfer(Address, ...) is deprecated. Use send_with_paycode_and_note(address, amount, network, note)"
-        ))
-    }
-
     /// Sends private V3 hashlock spends to a recipient using an address or recipient document.
     /// Commitment gossip is removed. The caller must provide an OOB spend note `s_bytes`
     /// and a receiver handle containing a Kyber public key.
@@ -1311,11 +1286,6 @@ impl Wallet {
                 .then(b.coin_id.cmp(&a.coin_id))
         });
         Ok(history)
-    }
-
-    /// Commitment response builder removed.
-    pub fn build_commitment_response(&self, _req: &()) -> Result<()> {
-        anyhow::bail!("commitment flow removed")
     }
 }
 
