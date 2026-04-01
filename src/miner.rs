@@ -1,11 +1,21 @@
-
-use crate::{storage::Store, crypto, epoch::Anchor, coin::{Coin, CoinCandidate}, network::NetHandle, wallet::Wallet};
-use rand::Rng;
+use crate::{
+    coin::{Coin, CoinCandidate},
+    crypto,
+    epoch::Anchor,
+    network::NetHandle,
+    storage::Store,
+    wallet::Wallet,
+};
 use pqcrypto_traits::sign::PublicKey as _;
+use rand::Rng;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::collections::{VecDeque, HashSet};
-use tokio::{sync::{mpsc, broadcast::Receiver}, task, time::{self, Duration}};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::{
+    sync::{broadcast::Receiver, mpsc},
+    task,
+    time::{self, Duration},
+};
 
 use crate::sync::SyncState;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +50,7 @@ struct Miner {
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>, // new
     current_epoch: Option<u64>,
     last_heartbeat: time::Instant,
+    last_recovery_attempt: Option<time::Instant>,
     consecutive_failures: u32,
     max_consecutive_failures: u32,
     // Track our recently found coin candidates to report selection results next epoch
@@ -67,6 +78,7 @@ impl Miner {
             sync_state,
             current_epoch: None,
             last_heartbeat: time::Instant::now(),
+            last_recovery_attempt: None,
             consecutive_failures: 0,
             max_consecutive_failures: crate::config::default_max_consecutive_failures(),
             recent_candidates: VecDeque::new(),
@@ -98,7 +110,12 @@ impl Miner {
                 break;
             }
 
-            miner_routine!("⌛ Waiting to reach network tip… local {} / net {} (peer-confirmed: {})", local, highest, peer_confirmed);
+            miner_routine!(
+                "⌛ Waiting to reach network tip… local {} / net {} (peer-confirmed: {})",
+                local,
+                highest,
+                peer_confirmed
+            );
             tokio::select! {
                 _ = self.shutdown_rx.recv() => { println!("🛑 Miner received shutdown while waiting for sync"); return; }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -106,7 +123,7 @@ impl Miner {
         }
 
         miner_routine!("⛏️  Starting miner with reconnection and fallback capabilities");
-        
+
         loop {
             match self.try_connect_and_mine().await {
                 Ok(()) => {
@@ -120,9 +137,11 @@ impl Miner {
                         println!("🛑 Miner shut down gracefully");
                         break;
                     }
-                    eprintln!("(attempt {}/{}) : {}", 
-                             self.consecutive_failures, self.max_consecutive_failures, e);
-                    
+                    eprintln!(
+                        "(attempt {}/{}) : {}",
+                        self.consecutive_failures, self.max_consecutive_failures, e
+                    );
+
                     if self.consecutive_failures >= self.max_consecutive_failures {
                         eprintln!("🚨 Too many consecutive failures, restarting miner completely");
                         self.consecutive_failures = 0;
@@ -138,54 +157,69 @@ impl Miner {
                             self.net.request_epoch_headers_range(start, count).await;
                         }
                     }
-                    
+
                     // Exponential backoff: wait longer after each failure
-                    let backoff_duration = Duration::from_secs(2u64.pow(self.consecutive_failures.min(6)));
-                    miner_routine!("⏳ Waiting {} seconds before retry...", backoff_duration.as_secs());
+                    let backoff_duration =
+                        Duration::from_secs(2u64.pow(self.consecutive_failures.min(6)));
+                    miner_routine!(
+                        "⏳ Waiting {} seconds before retry...",
+                        backoff_duration.as_secs()
+                    );
                     time::sleep(backoff_duration).await;
                 }
             }
         }
     }
 
-    async fn try_connect_and_mine(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn try_connect_and_mine(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut anchor_rx = self.net.anchor_subscribe();
-        let mut heartbeat_interval = time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
-        
+        let mut heartbeat_interval =
+            time::interval(Duration::from_secs(self.cfg.heartbeat_interval_secs));
+
         miner_routine!("🔗 Connected to anchor broadcast channel");
-        
+
         // doesn’t have to wait for the next anchor broadcast (which can be several minutes away).
         match self.db.get::<Anchor>("epoch", b"latest") {
             Ok(Some(latest_anchor)) => {
-                miner_routine!("📥 Loaded latest epoch #{} from database", latest_anchor.num);
+                miner_routine!(
+                    "📥 Loaded latest epoch #{} from database",
+                    latest_anchor.num
+                );
                 self.current_epoch = Some(latest_anchor.num);
                 self.last_heartbeat = time::Instant::now();
                 // Guard: do not mine if this local anchor is behind observed network tip
                 let behind_tip = self
                     .sync_state
                     .lock()
-                    .map(|st| st.highest_seen_epoch > 0 && latest_anchor.num < st.highest_seen_epoch)
+                    .map(|st| {
+                        st.highest_seen_epoch > 0 && latest_anchor.num < st.highest_seen_epoch
+                    })
                     .unwrap_or(false);
                 if behind_tip {
                     miner_routine!(
                         "⏭️  Skipping initial mining at local #{} (network observed >= {})",
                         latest_anchor.num,
-                        self.sync_state.lock().map(|st| st.highest_seen_epoch).unwrap_or(0)
+                        self.sync_state
+                            .lock()
+                            .map(|st| st.highest_seen_epoch)
+                            .unwrap_or(0)
                     );
                 } else if let Err(e) = self.mine_epoch(latest_anchor.clone()).await {
                     eprintln!("⚠️  Initial mining attempt failed: {e}");
                 }
-            },
+            }
             Ok(None) => {
                 // No local epochs yet; request latest from network and wait for broadcasts.
                 // In single-node genesis, proceed with anchor stream; epoch manager will create genesis immediately due to immediate ticker.
                 miner_routine!("🌱 No existing epochs found locally. Waiting for epoch manager to create genesis…");
-            },
+            }
             Err(e) => {
                 eprintln!("🔥 Failed to read latest epoch from DB: {e}");
             }
         }
-        
+
         loop {
             tokio::select! {
                 // Handle shutdown signal
@@ -193,14 +227,15 @@ impl Miner {
                     println!("🛑 Miner received shutdown signal");
                     return Err("Shutdown".into());
                 }
-                
+
                 // Handle incoming anchors
                 anchor_result = anchor_rx.recv() => {
                     match anchor_result {
                         Ok(anchor) => {
                             self.last_heartbeat = time::Instant::now();
+                            self.last_recovery_attempt = None;
                             self.consecutive_failures = 0;
-                            
+
                             // Update sync state to reflect the new epoch
                             if let Ok(mut st) = self.sync_state.lock() {
                                 if anchor.num > st.highest_seen_epoch {
@@ -238,7 +273,7 @@ impl Miner {
                                     if *e + 2 < anchor.num { self.recent_candidates.pop_front(); } else { break; }
                                 }
                             }
-                            
+
                              // Ignore historical or non-adopted alternate anchors during reorg replay.
                              // Only mine the adopted tip or newer.
                              let db_latest_num = self
@@ -264,9 +299,9 @@ impl Miner {
                                      continue;
                                  }
                              }
-                             
+
                             miner_routine!("⛏️  New epoch #{}: difficulty={}, mem_kib={}. Mining...", anchor.num, anchor.difficulty, anchor.mem_kib);
-                            
+
                             // Always show wallet balance and address on new epoch
                             if let Ok(balance) = self.wallet.balance() {
                                 println!("💰 Wallet balance: {} coins", balance);
@@ -281,34 +316,19 @@ impl Miner {
                         }
                         Err(RecvError::Lagged(skipped)) => {
                             eprintln!("⚠️  Anchor channel lagged, skipped {skipped} messages");
-                            
-                            // Try to recover by requesting the latest epoch
-                            if let Some(current_epoch) = self.current_epoch {
-                                println!("🔄 Requesting latest epoch to recover from lag");
-                                self.net.request_epoch(current_epoch).await;
-                                // Also request a small window around it in case multiple were missed
-                                let start = current_epoch.saturating_sub(4);
-                                for n in start..current_epoch { self.net.request_epoch(n).await; }
-                                
-                                // Wait a bit for the request to be processed
-                                time::sleep(Duration::from_millis(1000)).await;
-                                
-                                // Try to get the latest epoch from database as fallback
-                                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                                    if latest_anchor.num > current_epoch {
-                                        println!("📥 Recovered latest epoch #{} from database", latest_anchor.num);
-                                        self.current_epoch = Some(latest_anchor.num);
-                                        self.mine_epoch(latest_anchor).await?;
-                                        continue;
-                                    }
-                                }
+                            self.request_recovery("anchor channel lag").await;
+                            if let Some(latest_anchor) = self.latest_anchor_if_newer_than_current()? {
+                                println!("📥 Recovered latest epoch #{} after lag", latest_anchor.num);
+                                self.current_epoch = Some(latest_anchor.num);
+                                self.last_heartbeat = time::Instant::now();
+                                self.last_recovery_attempt = None;
+                                self.mine_epoch(latest_anchor).await?;
                             }
-                            
-                            return Err("Failed to recover from anchor channel lag".into());
+                            continue;
                         }
                     }
                 }
-                
+
                 // Heartbeat monitoring
                 _ = heartbeat_interval.tick() => {
                     // Lightweight keepalive and cross-check of epoch candidates
@@ -322,37 +342,67 @@ impl Miner {
                     }
 
                     let since_last_heartbeat = self.last_heartbeat.elapsed();
-                    // Allow a generous timeout (6× heartbeat interval) so we don’t abort during a long epoch (default epoch length is 222 s).
-                    // This also covers the case where we found a coin early and have to wait the full epoch duration for the next anchor.
                     let timeout_secs = self.cfg.heartbeat_interval_secs * 5;
                     if since_last_heartbeat > Duration::from_secs(timeout_secs) {
                         eprintln!(
-                                " mining for {} seconds",
+                                "⚠️  No anchor progress for {} seconds; requesting recovery",
                             since_last_heartbeat.as_secs()
                         );
-
-                        // Try to recover by requesting the next expected epoch and also the latest tip
-                        if let Some(current_epoch) = self.current_epoch {
-                            let next_epoch = current_epoch + 1;
-                            println!("🔄 creator of circumstances manifesting next epoch #{next_epoch} ");
-                            self.net.request_epoch(next_epoch).await;
-                            // Also pull latest in case we’re more than one epoch behind
-                            self.net.request_latest_epoch().await;
-                            // Request a compact range of headers to quickly catch up
-                            let start = current_epoch.saturating_sub(8);
-                            let count: u32 = (next_epoch - start).min(64) as u32;
-                            self.net.request_epoch_headers_range(start, count).await;
-                            // Nudge network to redial bootstraps if we appear isolated
-                            self.net.request_latest_epoch().await; // cheap keepalive
+                        self.request_recovery("heartbeat timeout").await;
+                        if let Some(latest_anchor) = self.latest_anchor_if_newer_than_current()? {
+                            println!("📥 Resuming mining from recovered epoch #{}", latest_anchor.num);
+                            self.current_epoch = Some(latest_anchor.num);
+                            self.last_heartbeat = time::Instant::now();
+                            self.last_recovery_attempt = None;
+                            self.mine_epoch(latest_anchor).await?;
                         }
-                        return Err("breaking chains".into());
                     }
                 }
             }
         }
     }
 
-    async fn mine_epoch(&mut self, anchor: Anchor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn latest_anchor_if_newer_than_current(
+        &self,
+    ) -> Result<Option<Anchor>, Box<dyn std::error::Error + Send + Sync>> {
+        let latest = self.db.get::<Anchor>("epoch", b"latest")?;
+        Ok(match (self.current_epoch, latest) {
+            (Some(current_epoch), Some(anchor)) if anchor.num > current_epoch => Some(anchor),
+            (None, Some(anchor)) => Some(anchor),
+            _ => None,
+        })
+    }
+
+    async fn request_recovery(&mut self, reason: &str) {
+        let now = time::Instant::now();
+        let min_interval = Duration::from_secs(self.cfg.heartbeat_interval_secs.max(5));
+        if let Some(last) = self.last_recovery_attempt {
+            if now.duration_since(last) < min_interval {
+                return;
+            }
+        }
+
+        miner_routine!("🔄 Recovery requested: {}", reason);
+        self.last_recovery_attempt = Some(now);
+        self.net.request_latest_epoch().await;
+        if let Some(current_epoch) = self.current_epoch {
+            self.net.request_epoch(current_epoch).await;
+            self.net
+                .request_epoch(current_epoch.saturating_add(1))
+                .await;
+            let start = current_epoch.saturating_sub(8);
+            let count: u32 = (current_epoch.saturating_add(1).saturating_sub(start)).min(64) as u32;
+            self.net.request_epoch_headers_range(start, count).await;
+        }
+        if self.net.peer_count() == 0 {
+            self.net.redial_bootstraps().await;
+        }
+    }
+
+    async fn mine_epoch(
+        &mut self,
+        anchor: Anchor,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Subscribe to anchor broadcasts so we can abort immediately when a newer epoch arrives.
         let mut live_anchor_rx = self.net.anchor_subscribe();
 
@@ -378,7 +428,10 @@ impl Miner {
         // This avoids producing anchors with params that will be rejected once history arrives.
         if anchor.num > 0 && anchor.num % crate::consensus::RETARGET_INTERVAL == 0 {
             if let Ok(window_opt) = self.db.get_or_build_retarget_window(anchor.num) {
-                let ready = window_opt.as_ref().map(|w| w.len() as u64 == crate::consensus::RETARGET_INTERVAL).unwrap_or(false);
+                let ready = window_opt
+                    .as_ref()
+                    .map(|w| w.len() as u64 == crate::consensus::RETARGET_INTERVAL)
+                    .unwrap_or(false);
                 if !ready {
                     println!(
                         "⏳ Retarget guard: delaying mining for epoch #{} until historical window [{}..{}] is complete",
@@ -400,7 +453,11 @@ impl Miner {
         let max_attempts = self.cfg.max_attempts;
 
         miner_routine!("🎯 Starting mining for epoch #{}", anchor.num);
-        miner_routine!("⚙️  Mining parameters: difficulty={}, mem_kib={}", difficulty, mem_kib);
+        miner_routine!(
+            "⚙️  Mining parameters: difficulty={}, mem_kib={}",
+            difficulty,
+            mem_kib
+        );
         // Always print a concise start-of-epoch line for better feedback
         println!(
             "⛏️  Mining epoch #{} (difficulty={} zero-bytes, mem={} KiB)",
@@ -411,134 +468,206 @@ impl Miner {
         let mut last_progress_instant = std::time::Instant::now();
         let mut last_progress_attempts = 0u64;
 
+        // Batched hashing: eliminate per-attempt spawn_blocking overhead and allocations
+        let check_every = self.cfg.check_interval_attempts.max(1);
+        let mut next_nonce: u64 = rand::thread_rng().gen();
+        let epoch_hash = anchor.hash;
+        let creator_addr = creator_address;
+
         loop {
-            attempts += 1;
-            if attempts > max_attempts {
-                eprintln!("⚠️  Reached max attempts ({}) for epoch #{}, continuing to next epoch", max_attempts, anchor.num);
-                return Ok(()); // Continue to next epoch
+            if attempts >= max_attempts {
+                eprintln!(
+                    "⚠️  Reached max attempts ({}) for epoch #{}, continuing to next epoch",
+                    max_attempts, anchor.num
+                );
+                return Ok(());
             }
 
-            let nonce: u64 = rand::thread_rng().gen();
-            let header = Coin::header_bytes(&anchor.hash, nonce, &creator_address);
+            let batch_size = std::cmp::min(check_every, max_attempts - attempts);
 
-            // Measure hashing time and offload to blocking thread to avoid starving async runtime.
-            let start = std::time::Instant::now();
-            let pow_hash = if self.cfg.offload_blocking {
+            // Run up to 'batch_size' attempts in a single blocking worker to reduce spawn overhead
+            let (found_opt, batch_attempts) = if self.cfg.offload_blocking {
                 tokio::task::spawn_blocking({
-                    let header = header.clone();
-                    move || crypto::argon2id_pow(&header, mem_kib)
-                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!(format!("join error: {}", e))))?
-            } else {
-                crypto::argon2id_pow(&header, mem_kib)?
-            };
-            crate::metrics::MINING_ATTEMPTS.inc();
-            let elapsed = start.elapsed();
-            crate::metrics::MINING_HASH_TIME_MS.observe(elapsed.as_secs_f64() * 1000.0);
+                    let epoch_hash = epoch_hash;
+                    let creator_addr = creator_addr;
+                    let start_nonce = next_nonce;
+                    move || -> Result<(Option<(u64, [u8; 32])>, u64), anyhow::Error> {
+                        // Reuse fixed header buffer to avoid Vec allocations
+                        let mut header = [0u8; 32 + 8 + 32]; // epoch_hash + nonce + creator_address
+                        header[..32].copy_from_slice(&epoch_hash);
+                        header[40..].copy_from_slice(&creator_addr);
 
-            // Consensus requires Argon2 parameters to be deterministic (lanes=1 enforced in function).
-            {
-                if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
-                    // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
-                    // Finding a coin proves the current epoch is still active.
-                    self.last_heartbeat = time::Instant::now();
+                        let mut nonce = start_nonce;
+                        let mut local_attempts = 0u64;
 
-                    let mut creator_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-                    creator_pk.copy_from_slice(self.wallet.public_key().as_bytes());
-                    let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_address);
-                    // Compute genesis lock for this coin deterministically from our Dilithium SK
-                    let chain_id = self.db.get_chain_id()?;
-                    let s0 = self.wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
-                    let lock_hash = crate::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &s0);
-                    let candidate = CoinCandidate::new(
-                        anchor.hash,
-                        nonce,
-                        creator_address,
-                        creator_pk,
-                        lock_hash,
-                        pow_hash,
-                    );
-                    println!("✅ Found a new coin! ID: {} (attempts: {})", hex::encode(candidate.id), attempts);
-                    crate::metrics::MINING_FOUND.inc();
-                    // Track this candidate to report selection result on next epoch
-                    self.recent_candidates.push_back((anchor.num, candidate.id));
-                    if self.recent_candidates.len() > 64 { self.recent_candidates.pop_front(); }
+                        while local_attempts < batch_size {
+                            // Update nonce in header buffer
+                            header[32..40].copy_from_slice(&nonce.to_le_bytes());
 
-                    // Candidate key: epoch_hash || coin_id for efficient prefix scans
-                    let key = crate::storage::Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-                    if let Err(e) = self.db.put("coin_candidate", &key, &candidate) {
-                        eprintln!("🔥 Failed to save coin to DB: {e}");
-                    } else {
-                        // Force immediate flush to ensure coin is persisted
-                        if let Err(e) = self.db.flush() {
-                            eprintln!("🔥 Failed to flush coin to disk: {e}");
+                            let pow_hash = crate::crypto::argon2id_pow(&header, mem_kib)?;
+                            local_attempts += 1;
+
+                            // Check if we found a valid coin
+                            if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+                                return Ok((Some((nonce, pow_hash)), local_attempts));
+                            }
+
+                            // Sequential nonce to avoid RNG overhead in tight loop
+                            nonce = nonce.wrapping_add(1);
                         }
+                        Ok((None, local_attempts))
                     }
-                    
-                    match self.coin_tx.send(candidate.id) {
-                        Ok(_) => println!("📤 Coin {} sent to epoch manager", hex::encode(candidate.id)),
-                        Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {e}"),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("join error: {}", e))??
+            } else {
+                // Non-blocking version for when offload_blocking is disabled
+                let mut found_opt = None;
+                let mut header = [0u8; 32 + 8 + 32];
+                header[..32].copy_from_slice(&epoch_hash);
+                header[40..].copy_from_slice(&creator_addr);
+
+                let mut nonce = next_nonce;
+                let mut local_attempts = 0u64;
+
+                while local_attempts < batch_size {
+                    header[32..40].copy_from_slice(&nonce.to_le_bytes());
+                    let pow_hash = crypto::argon2id_pow(&header, mem_kib)?;
+                    local_attempts += 1;
+
+                    if pow_hash.iter().take(difficulty).all(|&b| b == 0) {
+                        found_opt = Some((nonce, pow_hash));
+                        break;
                     }
-                    
-                    self.net.gossip_coin(&candidate).await;
-                    return Ok(());
+
+                    nonce = nonce.wrapping_add(1);
+                }
+                (found_opt, local_attempts)
+            };
+
+            attempts += batch_attempts;
+            next_nonce = next_nonce.wrapping_add(batch_attempts);
+
+            // Update metrics for the batch
+            crate::metrics::MINING_ATTEMPTS.inc_by(batch_attempts);
+
+            // Check if we found a valid coin
+            if let Some((nonce, pow_hash)) = found_opt {
+                // Reset heartbeat so we don't trigger timeout while waiting for the next epoch.
+                // Finding a coin proves the current epoch is still active.
+                self.last_heartbeat = time::Instant::now();
+
+                let mut creator_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
+                creator_pk.copy_from_slice(self.wallet.public_key().as_bytes());
+                let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_addr);
+                // Compute genesis lock for this coin deterministically from our Dilithium SK
+                let chain_id = self.db.get_chain_id()?;
+                let s0 = self
+                    .wallet
+                    .compute_genesis_lock_secret(&candidate_id, &chain_id);
+                let lock_hash =
+                    crate::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &s0);
+                let candidate = CoinCandidate::new(
+                    anchor.hash,
+                    nonce,
+                    creator_addr,
+                    creator_pk,
+                    lock_hash,
+                    pow_hash,
+                );
+                println!(
+                    "✅ Found a new coin! ID: {} (attempts: {})",
+                    hex::encode(candidate.id),
+                    attempts
+                );
+                crate::metrics::MINING_FOUND.inc();
+                // Track this candidate to report selection result on next epoch
+                self.recent_candidates.push_back((anchor.num, candidate.id));
+                if self.recent_candidates.len() > 64 {
+                    self.recent_candidates.pop_front();
+                }
+
+                // Candidate key: epoch_hash || coin_id for efficient prefix scans
+                let key =
+                    crate::storage::Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                if let Err(e) = self.db.put("coin_candidate", &key, &candidate) {
+                    eprintln!("🔥 Failed to save coin to DB: {e}");
+                } else {
+                    // Force immediate flush to ensure coin is persisted
+                    if let Err(e) = self.db.flush() {
+                        eprintln!("🔥 Failed to flush coin to disk: {e}");
+                    }
+                }
+
+                match self.coin_tx.send(candidate.id) {
+                    Ok(_) => println!(
+                        "📤 Coin {} sent to epoch manager",
+                        hex::encode(candidate.id)
+                    ),
+                    Err(e) => eprintln!("🔥 Failed to send coin ID to epoch manager: {e}"),
+                }
+
+                self.net.gossip_coin(&candidate).await;
+                return Ok(());
+            }
+
+            // Progress logging (runs once per batch instead of per attempt)
+            miner_routine!(
+                "⏳ Mining progress: {} attempts for epoch #{}",
+                attempts,
+                anchor.num
+            );
+            if attempts % PROGRESS_LOG_INTERVAL_ATTEMPTS == 0 {
+                let elapsed = last_progress_instant.elapsed();
+                if elapsed >= std::time::Duration::from_secs(2) {
+                    let delta_attempts = attempts.saturating_sub(last_progress_attempts);
+                    let rate = if elapsed.as_secs_f64() > 0.0 {
+                        delta_attempts as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "⏳ Mining epoch #{}: {} attempts (≈{:.1}/s)",
+                        anchor.num, attempts, rate
+                    );
+                    last_progress_instant = std::time::Instant::now();
+                    last_progress_attempts = attempts;
                 }
             }
-            
-            // Periodically yield to the scheduler and check if a newer epoch exists.
-            if attempts % self.cfg.check_interval_attempts == 0 {
-                // Less noisy progress indicator
-                miner_routine!("⏳ Mining progress: {} attempts for epoch #{}", attempts, anchor.num);
-                // Only emit the human-facing progress log on 10k-attempt boundaries
-                if attempts % PROGRESS_LOG_INTERVAL_ATTEMPTS == 0 {
-                    let elapsed = last_progress_instant.elapsed();
-                    if elapsed >= std::time::Duration::from_secs(2) {
-                        let delta_attempts = attempts.saturating_sub(last_progress_attempts);
-                        let rate = if elapsed.as_secs_f64() > 0.0 {
-                            delta_attempts as f64 / elapsed.as_secs_f64()
-                        } else { 0.0 };
+
+            // Check for newer epochs (same logic as before, but runs once per batch)
+            match live_anchor_rx.try_recv() {
+                Ok(new_anchor) => {
+                    if new_anchor.num > anchor.num {
                         println!(
-                            "⏳ Mining epoch #{}: {} attempts (≈{:.1}/s)",
-                            anchor.num, attempts, rate
+                            "🔄 Newer epoch #{} detected while mining #{} – switching",
+                            new_anchor.num, anchor.num
                         );
-                        last_progress_instant = std::time::Instant::now();
-                        last_progress_attempts = attempts;
-                    }
-                }
-
-                // NEW: abort early if the chain has already advanced.
-                // First, non-blocking check of the live anchor broadcast channel (fast-path).
-                match live_anchor_rx.try_recv() {
-                    Ok(new_anchor) => {
-                        if new_anchor.num > anchor.num {
-                            // Always print an explicit switch notice; happens infrequently
-                            println!(
-                                "🔄 Newer epoch #{} detected while mining #{} – switching",
-                                new_anchor.num, anchor.num
-                            );
-                            miner_routine!("🔄 Received newer epoch #{} while mining #{} – switching epochs", new_anchor.num, anchor.num);
-                            return Ok(()); // Outer loop will handle the fresh anchor
-                        }
-                    },
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        // Channel closed: treat as abort signal
-                        return Err("Anchor broadcast channel closed".into());
-                    },
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
-                }
-
-                // Slow-path: also verify DB in case we missed the broadcast (unlikely but safe on multi-node).
-                if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
-                    if latest_anchor.num > anchor.num {
-                        miner_routine!("🔄 Detected newer epoch #{} in DB while mining #{}, stopping current mining", latest_anchor.num, anchor.num);
+                        miner_routine!(
+                            "🔄 Received newer epoch #{} while mining #{} – switching epochs",
+                            new_anchor.num,
+                            anchor.num
+                        );
                         return Ok(());
                     }
                 }
-
-                // Let other tasks run so we don’t starve the runtime.
-                tokio::task::yield_now().await;
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return Err("Anchor broadcast channel closed".into());
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
             }
-        }
-        
-    }
 
+            // Slow-path DB check
+            if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                if latest_anchor.num > anchor.num {
+                    miner_routine!("🔄 Detected newer epoch #{} in DB while mining #{}, stopping current mining", latest_anchor.num, anchor.num);
+                    return Ok(());
+                }
+            }
+
+            // Let other tasks run
+            tokio::task::yield_now().await;
+        }
+    }
 }

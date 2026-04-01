@@ -1,46 +1,50 @@
 // network.rs
 
-use crate::{
-    storage::Store, epoch::Anchor, coin::{Coin, CoinCandidate}, transfer::Spend, crypto, config, sync::SyncState,
-};
 use crate::consensus::{
-    calculate_retarget_consensus,
-    TARGET_LEADING_ZEROS,
-    DEFAULT_MEM_KIB,
-    RETARGET_INTERVAL,
-    DIFFICULTY_MIN, DIFFICULTY_MAX,
-    MIN_MEM_KIB, MAX_MEM_KIB,
+    calculate_retarget_consensus, DEFAULT_MEM_KIB, DIFFICULTY_MAX, DIFFICULTY_MIN, MAX_MEM_KIB,
+    MIN_MEM_KIB, RETARGET_INTERVAL, TARGET_LEADING_ZEROS,
 };
-use std::sync::{Arc, Mutex};
+use crate::metrics;
 use crate::wallet::Wallet;
-use libp2p::{
-    gossipsub,
-    identity, quic, PeerId, Swarm, Transport, Multiaddr,
-    futures::StreamExt, core::muxing::StreamMuxerBox, swarm::SwarmEvent,
-};
-use libp2p::gossipsub::{
-    IdentTopic, MessageAuthenticity, IdentityTransform,
-    AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent,
+use crate::{
+    coin::{Coin, CoinCandidate},
+    config, crypto,
+    epoch::Anchor,
+    storage::Store,
+    sync::SyncState,
+    transfer::Spend,
 };
 use bincode;
-use std::collections::{HashMap, VecDeque, HashSet};
-use std::time::Instant;
-use std::str::FromStr;
-use tokio::sync::{broadcast, mpsc};
 use hex;
+use libp2p::gossipsub::{
+    AllowAllSubscriptionFilter, Behaviour as Gossipsub, Event as GossipsubEvent, IdentTopic,
+    IdentityTransform, MessageAuthenticity,
+};
+use libp2p::{
+    core::muxing::StreamMuxerBox, futures::StreamExt, gossipsub, identity, quic, swarm::SwarmEvent,
+    Multiaddr, PeerId, Swarm, Transport,
+};
+use once_cell::sync::Lazy;
+use pqcrypto_dilithium::dilithium3::{
+    detached_sign as dili_detached_sign, verify_detached_signature as dili_verify_detached,
+};
+use pqcrypto_dilithium::dilithium3::{
+    DetachedSignature as DiliDetachedSignature, PublicKey as DiliPk,
+};
+use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as KyberPkTrait, SharedSecret as _};
+use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
+use rand::RngCore as _;
+use rocksdb::WriteBatch;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use serde::{Serialize, Deserialize};
-use once_cell::sync::Lazy;
-use rocksdb::WriteBatch;
-use crate::metrics;
-use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
-use pqcrypto_traits::kem::{PublicKey as KyberPkTrait, SharedSecret as _, Ciphertext as _};
-use pqcrypto_dilithium::dilithium3::{PublicKey as DiliPk, DetachedSignature as DiliDetachedSignature};
-use pqcrypto_dilithium::dilithium3::{detached_sign as dili_detached_sign, verify_detached_signature as dili_verify_detached};
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature as _};
-use rand::RngCore as _;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tokio::sync::{broadcast, mpsc};
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
 /// Toggle routine network message logging. Errors/warnings still log.
@@ -73,7 +77,8 @@ use net_routine;
 
 // Module-level throttle for consensus mismatch logs (per-epoch)
 const CONSENSUS_MISMATCH_LOG_THROTTLE_SECS: u64 = 60;
-static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LAST_CONSENSUS_MISMATCH_LOGS: Lazy<Mutex<HashMap<u64, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Global consensus-mismatch aggregation to prevent log spam across many heights
 const CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS: u64 = 15;
@@ -99,7 +104,13 @@ static CONSENSUS_MISMATCH_AGG: Lazy<Mutex<ConsensusMismatchAgg>> = Lazy::new(|| 
     })
 });
 
-fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_diff: usize, got_mem: u32) {
+fn record_consensus_mismatch(
+    height: u64,
+    exp_diff: usize,
+    exp_mem: u32,
+    got_diff: usize,
+    got_mem: u32,
+) {
     let now = Instant::now();
     let print_detail_now: Option<String> = None;
     let mut summary_now: Option<String> = None;
@@ -116,14 +127,20 @@ fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_dif
         // Suppress per-event detail; only emit rolling summaries to reduce noise.
         // Keep the last mismatch detail in memory for the summary tail.
 
-        if now.duration_since(agg.last_summary).as_secs() >= CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS {
+        if now.duration_since(agg.last_summary).as_secs() >= CONSENSUS_MISMATCH_SUMMARY_WINDOW_SECS
+        {
             let total = agg.total_events;
             let unique = agg.unique_heights.len();
             let first = agg.first_height_in_window.unwrap_or(height);
             let last = agg.last_height_in_window.unwrap_or(height);
             let tail = if let Some((h, ed, em, gd, gm)) = agg.last_detail {
-                format!(" Last mismatch: #{} exp(diff {}, mem {}), got(diff {}, mem {}).", h, ed, em, gd, gm)
-            } else { String::new() };
+                format!(
+                    " Last mismatch: #{} exp(diff {}, mem {}), got(diff {}, mem {}).",
+                    h, ed, em, gd, gm
+                )
+            } else {
+                String::new()
+            };
 
             summary_now = Some(format!(
                 "❌ Consensus mismatches: {} events across {} heights in last {}s ({}..{}).{}",
@@ -140,8 +157,11 @@ fn record_consensus_mismatch(height: u64, exp_diff: usize, exp_mem: u32, got_dif
         }
     }
 
-    if let Some(msg) = summary_now { net_log!("{}", msg); }
-    else if let Some(msg) = print_detail_now { net_log!("{}", msg); }
+    if let Some(msg) = summary_now {
+        net_log!("{}", msg);
+    } else if let Some(msg) = print_detail_now {
+        net_log!("{}", msg);
+    }
 }
 
 // Typed classification for ingress anchors to improve fork reconciliation
@@ -154,19 +174,26 @@ enum AnchorClass {
 }
 
 // Pending compact epochs keyed by epoch hash; TTL is enforced on access
-static PENDING_COMPACTS: Lazy<Mutex<std::collections::HashMap<[u8;32], (CompactEpoch, std::time::Instant)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static PENDING_COMPACTS: Lazy<
+    Mutex<std::collections::HashMap<[u8; 32], (CompactEpoch, std::time::Instant)>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 // Dedup map for epoch txn requests to avoid spamming
-static RECENT_EPOCH_TX_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static EPOCH_TX_REQS_PER_PEER: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_EPOCH_TX_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static EPOCH_TX_REQS_PER_PEER: Lazy<
+    Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const EPOCH_TX_REQ_DEDUP_MS: u64 = 1000;
 const MAX_COMPACT_REQ_BATCH: usize = 132; // 132 is the max number of compact epochs that can be requested in a single batch
-const PENDING_COMPACT_TTL_SECS: u64 = 120;  // Increased for slower sync scenarios
-const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 30;  // More tolerant of missing txs during sync
+const PENDING_COMPACT_TTL_SECS: u64 = 120; // Increased for slower sync scenarios
+const COMPACT_MAX_MISSING_PCT_DEFAULT: u8 = 30; // More tolerant of missing txs during sync
 const MAX_FULL_BODY_REQ_BATCH: usize = 256;
 const EPOCH_TX_REQS_PER_PEER_WINDOW_MS: u64 = 2000;
 const EPOCH_TX_REQS_PER_PEER_MAX: u32 = 8;
 // Candidate request dedup/throttle
-static RECENT_EPOCH_CAND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_EPOCH_CAND_REQS: Lazy<
+    Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const EPOCH_CAND_REQ_DEDUP_MS: u64 = 500;
 const MAX_EPOCH_CAND_RESP: usize = 2048;
 
@@ -192,7 +219,11 @@ fn try_publish_gossip(
             || es.contains("InsufficientPeersForTopic")
             || es.contains("NoPeersSubscribedToTopic");
         // Treat temporary queue saturation as benign for noisy contexts
-        if (context == "epoch-leaves" || context == "epoch-leaves-req" || context == "peer-addr") && es.contains("AllQueuesFull") { return; }
+        if (context == "epoch-leaves" || context == "epoch-leaves-req" || context == "peer-addr")
+            && es.contains("AllQueuesFull")
+        {
+            return;
+        }
         if !is_insufficient {
             eprintln!("⚠️  Failed to publish {} ({}): {}", context, topic, es);
         }
@@ -207,33 +238,33 @@ const TOP_COIN_PROOF_RESPONSE: &str = "unchained/coin_proof_response/v1";
 const TOP_COIN_PROOF_REQUEST_URGENT: &str = "unchained/coin_proof_request/priority/v1";
 const TOP_COIN_PROOF_RESPONSE_URGENT: &str = "unchained/coin_proof_response/priority/v1";
 const TOP_SPEND: &str = "unchained/spend/v2";
-const TOP_SPEND_REQUEST: &str = "unchained/spend_request/v2";    // payload: [u8;32] coin_id
-const TOP_SPEND_RESPONSE: &str = "unchained/spend_response/v2";  // payload: Option<Spend>
+const TOP_SPEND_REQUEST: &str = "unchained/spend_request/v2"; // payload: [u8;32] coin_id
+const TOP_SPEND_RESPONSE: &str = "unchained/spend_response/v2"; // payload: Option<Spend>
 const TOP_EPOCH_REQUEST: &str = "unchained/epoch_request/v1";
 const TOP_COIN_REQUEST: &str = "unchained/coin_request/v1";
 const TOP_LATEST_REQUEST: &str = "unchained/latest_request/v1";
-const TOP_PEER_ADDR: &str = "unchained/peer_addr/v1";            // payload: String multiaddr
-const TOP_EPOCH_LEAVES: &str = "unchained/epoch_leaves/v1";       // payload: EpochLeavesBundle
+const TOP_PEER_ADDR: &str = "unchained/peer_addr/v1"; // payload: String multiaddr
+const TOP_EPOCH_LEAVES: &str = "unchained/epoch_leaves/v1"; // payload: EpochLeavesBundle
 const TOP_EPOCH_LEAVES_REQUEST: &str = "unchained/epoch_leaves_request/v1"; // payload: u64 epoch number
 const TOP_EPOCH_SELECTED_REQUEST: &str = "unchained/epoch_selected_request/v1"; // payload: u64 epoch number
 const TOP_EPOCH_SELECTED_RESPONSE: &str = "unchained/epoch_selected_response/v1"; // payload: SelectedIdsBundle
-// Commitment request/response topics removed to prevent metadata leakage
+                                                                                  // Commitment request/response topics removed to prevent metadata leakage
 const TOP_RATE_LIMITED: &str = "unchained/limited_24h/v1";
 // Headers-first skeleton sync (additive topics; legacy-safe)
-const TOP_EPOCH_HEADERS_REQUEST: &str = "unchained/epoch_headers_request/v1";   // payload: EpochHeadersRange
+const TOP_EPOCH_HEADERS_REQUEST: &str = "unchained/epoch_headers_request/v1"; // payload: EpochHeadersRange
 const TOP_EPOCH_HEADERS_RESPONSE: &str = "unchained/epoch_headers_response/v1"; // payload: EpochHeadersBatch
-const TOP_EPOCH_BY_HASH_REQUEST: &str = "unchained/epoch_header_by_hash_request/v1";   // payload: EpochByHash
+const TOP_EPOCH_BY_HASH_REQUEST: &str = "unchained/epoch_header_by_hash_request/v1"; // payload: EpochByHash
 const TOP_EPOCH_BY_HASH_RESPONSE: &str = "unchained/epoch_header_by_hash_response/v1"; // payload: Anchor
-// Compact epoch relay (additive)
-const TOP_EPOCH_COMPACT: &str = "unchained/epoch_compact/v1";   // payload: CompactEpoch
-const TOP_EPOCH_GET_TXN: &str = "unchained/epoch_get_txn/v1";    // payload: (epoch_hash, indexes)
-const TOP_EPOCH_TXN: &str = "unchained/epoch_txn/v1";            // payload: (epoch_hash, txs)
-// New additive topics for pre-seal candidate pulls
+                                                                                       // Compact epoch relay (additive)
+const TOP_EPOCH_COMPACT: &str = "unchained/epoch_compact/v1"; // payload: CompactEpoch
+const TOP_EPOCH_GET_TXN: &str = "unchained/epoch_get_txn/v1"; // payload: (epoch_hash, indexes)
+const TOP_EPOCH_TXN: &str = "unchained/epoch_txn/v1"; // payload: (epoch_hash, txs)
+                                                      // New additive topics for pre-seal candidate pulls
 const TOP_EPOCH_CANDIDATES_REQUEST: &str = "unchained/epoch_candidates_request/v1"; // payload: [u8;32] epoch_hash
 const TOP_EPOCH_CANDIDATES_RESPONSE: &str = "unchained/epoch_candidates_response/v1"; // payload: EpochCandidatesResponse
-// Additive offers topic for signed offers (no renames to existing topics)
+                                                                                      // Additive offers topic for signed offers (no renames to existing topics)
 const TOP_OFFERS_V1: &str = "unchained/offers/v1"; // payload: OfferDocV1
-// PQ Handshake v2 (Kyber + Dilithium-authenticated) topics
+                                                   // PQ Handshake v2 (Kyber + Dilithium-authenticated) topics
 const TOP_PQHS2_INIT: &str = "unchained/handshake_pq2/init/v1";
 const TOP_PQHS2_RESP: &str = "unchained/handshake_pq2/resp/v1";
 
@@ -264,7 +295,7 @@ struct Pqhs2Init {
     // Sender's ephemeral Kyber public key bytes
     kyber_pk: Vec<u8>,
     // 8-byte random nonce to bind transcript
-    nonce8: [u8;8],
+    nonce8: [u8; 8],
     // Target PeerId
     to_peer: String,
     // Sender's Dilithium3 public key bytes
@@ -278,9 +309,9 @@ struct Pqhs2Resp {
     // Responder's Kyber encapsulation to initiator's pk
     kem_ct: Vec<u8>,
     // Echo of initiator's nonce to bind the same transcript
-    initiator_nonce8: [u8;8],
+    initiator_nonce8: [u8; 8],
     // Responder's nonce contribution
-    nonce8: [u8;8],
+    nonce8: [u8; 8],
     // Target PeerId (the initiator)
     to_peer: String,
     // Responder's Dilithium3 public key bytes
@@ -302,50 +333,80 @@ impl PqhsState {
     }
 }
 
-fn kdf_b3(label: &str, parts: &[&[u8]]) -> [u8;32] {
+fn kdf_b3(label: &str, parts: &[&[u8]]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key(label);
-    for p in parts { h.update(p); }
+    for p in parts {
+        h.update(p);
+    }
     *h.finalize().as_bytes()
 }
 
 // Build domain-separated signable transcripts for PQHS v2
-fn pqhs2_init_signable(signer: &PeerId, peer: &PeerId, kyber_pk: &[u8], nonce8: &[u8;8]) -> Vec<u8> {
-    fn lp(len: usize) -> [u8;4] { (len as u32).to_le_bytes() }
+fn pqhs2_init_signable(
+    signer: &PeerId,
+    peer: &PeerId,
+    kyber_pk: &[u8],
+    nonce8: &[u8; 8],
+) -> Vec<u8> {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut out = Vec::with_capacity(64 + kyber_pk.len());
     out.extend_from_slice(b"unchained.pqhs2.init.v1");
     let a = signer.to_bytes();
     let b = peer.to_bytes();
-    out.extend_from_slice(&lp(a.len())); out.extend_from_slice(&a);
-    out.extend_from_slice(&lp(b.len())); out.extend_from_slice(&b);
-    out.extend_from_slice(&lp(kyber_pk.len())); out.extend_from_slice(kyber_pk);
+    out.extend_from_slice(&lp(a.len()));
+    out.extend_from_slice(&a);
+    out.extend_from_slice(&lp(b.len()));
+    out.extend_from_slice(&b);
+    out.extend_from_slice(&lp(kyber_pk.len()));
+    out.extend_from_slice(kyber_pk);
     out.extend_from_slice(nonce8);
     out
 }
 
-fn pqhs2_resp_signable(signer: &PeerId, peer: &PeerId, kem_ct: &[u8], initiator_nonce8: &[u8;8], resp_nonce8: &[u8;8]) -> Vec<u8> {
-    fn lp(len: usize) -> [u8;4] { (len as u32).to_le_bytes() }
+fn pqhs2_resp_signable(
+    signer: &PeerId,
+    peer: &PeerId,
+    kem_ct: &[u8],
+    initiator_nonce8: &[u8; 8],
+    resp_nonce8: &[u8; 8],
+) -> Vec<u8> {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
     let mut out = Vec::with_capacity(64 + kem_ct.len());
     out.extend_from_slice(b"unchained.pqhs2.resp.v1");
     let a = signer.to_bytes();
     let b = peer.to_bytes();
-    out.extend_from_slice(&lp(a.len())); out.extend_from_slice(&a);
-    out.extend_from_slice(&lp(b.len())); out.extend_from_slice(&b);
-    out.extend_from_slice(&lp(kem_ct.len())); out.extend_from_slice(kem_ct);
+    out.extend_from_slice(&lp(a.len()));
+    out.extend_from_slice(&a);
+    out.extend_from_slice(&lp(b.len()));
+    out.extend_from_slice(&b);
+    out.extend_from_slice(&lp(kem_ct.len()));
+    out.extend_from_slice(kem_ct);
     out.extend_from_slice(initiator_nonce8);
     out.extend_from_slice(resp_nonce8);
     out
 }
 
 // Persisted Dilithium identity for network-level authentication (separate from libp2p Ed25519)
-const DILI3_PK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
-const DILI3_SK_BYTES: usize = pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
+const DILI3_PK_BYTES: usize =
+    pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES;
+const DILI3_SK_BYTES: usize =
+    pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES;
 
-fn load_or_create_dili_identity() -> anyhow::Result<(pqcrypto_dilithium::dilithium3::PublicKey, pqcrypto_dilithium::dilithium3::SecretKey)> {
+fn load_or_create_dili_identity() -> anyhow::Result<(
+    pqcrypto_dilithium::dilithium3::PublicKey,
+    pqcrypto_dilithium::dilithium3::SecretKey,
+)> {
     use std::path::Path;
     let path = "network_dili.key";
     if Path::new(path).exists() {
         let key_data = std::fs::read(path)?;
-        if key_data.len() != DILI3_PK_BYTES + DILI3_SK_BYTES { return Err(anyhow::anyhow!("invalid network_dili.key length")); }
+        if key_data.len() != DILI3_PK_BYTES + DILI3_SK_BYTES {
+            return Err(anyhow::anyhow!("invalid network_dili.key length"));
+        }
         let pk = pqcrypto_dilithium::dilithium3::PublicKey::from_bytes(&key_data[..DILI3_PK_BYTES])
             .map_err(|_| anyhow::anyhow!("invalid Dilithium3 PK bytes"))?;
         let sk = pqcrypto_dilithium::dilithium3::SecretKey::from_bytes(&key_data[DILI3_PK_BYTES..])
@@ -384,7 +445,8 @@ impl PeerScore {
     fn record_validation_failure(&mut self) {
         self.validation_failures += 1;
         if self.validation_failures >= self.max_validation_failures {
-            self.banned_until = Some(Instant::now() + std::time::Duration::from_secs(self.ban_duration_secs));
+            self.banned_until =
+                Some(Instant::now() + std::time::Duration::from_secs(self.ban_duration_secs));
         }
     }
 
@@ -405,7 +467,9 @@ impl PeerScore {
 
     fn check_rate_limit(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.window_start) > std::time::Duration::from_secs(self.rate_limit_window_secs) {
+        if now.duration_since(self.window_start)
+            > std::time::Duration::from_secs(self.rate_limit_window_secs)
+        {
             self.window_start = now;
             self.message_count = 0;
         }
@@ -416,26 +480,42 @@ impl PeerScore {
 
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
     // Use committing epoch if known; fallback to legacy anchor lookup by hash
-    let anchor: Anchor = db.get_epoch_for_coin(&coin.id)
+    let anchor: Anchor = db
+        .get_epoch_for_coin(&coin.id)
         .ok()
         .flatten()
         .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
         .or_else(|| db.get::<Anchor>("anchor", &coin.epoch_hash).ok().flatten())
-        .ok_or_else(|| format!("Coin references non-existent committed epoch (coin_id={})", hex::encode(coin.id)))?;
+        .ok_or_else(|| {
+            format!(
+                "Coin references non-existent committed epoch (coin_id={})",
+                hex::encode(coin.id)
+            )
+        })?;
 
-    if coin.creator_address == [0u8; 32] { return Err("Invalid creator address".into()); }
-    
+    if coin.creator_address == [0u8; 32] {
+        return Err("Invalid creator address".into());
+    }
+
     let mem_kib = anchor.mem_kib;
     let header = Coin::header_bytes(&coin.epoch_hash, coin.nonce, &coin.creator_address);
     let calculated_pow = crypto::argon2id_pow(&header, mem_kib).map_err(|e| e.to_string())?;
-    if calculated_pow != coin.pow_hash { return Err("PoW validation failed".into()); }
-    if !calculated_pow.iter().take(anchor.difficulty).all(|&b| b == 0) {
+    if calculated_pow != coin.pow_hash {
+        return Err("PoW validation failed".into());
+    }
+    if !calculated_pow
+        .iter()
+        .take(anchor.difficulty)
+        .all(|&b| b == 0)
+    {
         return Err(format!(
             "PoW does not meet difficulty: requires {} leading zero bytes",
             anchor.difficulty
         ));
     }
-    if Coin::calculate_id(&coin.epoch_hash, coin.nonce, &coin.creator_address) != coin.id { return Err("Coin ID mismatch".into()); }
+    if Coin::calculate_id(&coin.epoch_hash, coin.nonce, &coin.creator_address) != coin.id {
+        return Err("Coin ID mismatch".into());
+    }
     Ok(())
 }
 
@@ -448,24 +528,16 @@ fn validate_spend(sp: &Spend, db: &Store) -> Result<(), String> {
 }
 
 fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
-    if anchor.hash == [0u8; 32] { return Err("Anchor hash cannot be zero".into()); }
-    if anchor.difficulty == 0 { return Err("Difficulty cannot be zero".into()); }
-    if anchor.mem_kib == 0 { return Err("Memory cannot be zero".into()); }
-    // Special-case genesis: no previous anchor exists. Validate self-consistency only.
-    if anchor.num == 0 {
-        // Check cumulative work matches expected for the given difficulty
-        let expected = Anchor::expected_work_for_difficulty(anchor.difficulty);
-        if anchor.cumulative_work != expected { return Err("Genesis cumulative_work mismatch".into()); }
-        // Recompute hash = blake3(merkle_root)
-        let mut h = blake3::Hasher::new();
-        h.update(&anchor.merkle_root);
-        let recomputed = *h.finalize().as_bytes();
-        if recomputed != anchor.hash { return Err("Genesis hash mismatch".into()); }
-        return Ok(());
+    if anchor.hash == [0u8; 32] {
+        return Err("Anchor hash cannot be zero".into());
     }
-    if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 { return Err("Merkle root cannot be zero when coins are present".into()); }
+    if anchor.difficulty == 0 {
+        return Err("Difficulty cannot be zero".into());
+    }
+    if anchor.mem_kib == 0 {
+        return Err("Memory cannot be zero".into());
+    }
     if anchor.num == 0 {
-        // Enforce consensus-locked parameters for genesis
         if anchor.difficulty != TARGET_LEADING_ZEROS || anchor.mem_kib != DEFAULT_MEM_KIB {
             net_log!(
                 "❌ Consensus mismatch at genesis: expected diff={}, mem_kib={}, got diff={}, mem_kib={}",
@@ -473,15 +545,20 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
             );
             return Err("Consensus params mismatch at genesis".into());
         }
-        if anchor.cumulative_work != Anchor::expected_work_for_difficulty(anchor.difficulty) {
-            return Err("Genesis cumulative work incorrect".into());
+        let expected = Anchor::expected_work_for_difficulty(anchor.difficulty);
+        if anchor.cumulative_work != expected {
+            return Err("Genesis cumulative_work mismatch".into());
         }
-        // For genesis, hash should be BLAKE3(merkle_root)
         let mut h = blake3::Hasher::new();
         h.update(&anchor.merkle_root);
-        let expected = *h.finalize().as_bytes();
-        if anchor.hash != expected { return Err("Anchor hash mismatch".into()); }
+        let recomputed = *h.finalize().as_bytes();
+        if recomputed != anchor.hash {
+            return Err("Genesis hash mismatch".into());
+        }
         return Ok(());
+    }
+    if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 {
+        return Err("Merkle root cannot be zero when coins are present".into());
     }
     let prev: Anchor = db
         .get("epoch", &(anchor.num - 1).to_le_bytes())
@@ -508,14 +585,29 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         let now = Instant::now();
         let mut allow_log = true;
         if let Ok(mut map) = LAST_CONSENSUS_MISMATCH_LOGS.lock() {
-            map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS));
+            map.retain(|_, t| {
+                now.duration_since(*t)
+                    < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS)
+            });
             if let Some(last) = map.get(&anchor.num) {
-                if now.duration_since(*last) < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS) { allow_log = false; }
+                if now.duration_since(*last)
+                    < std::time::Duration::from_secs(CONSENSUS_MISMATCH_LOG_THROTTLE_SECS)
+                {
+                    allow_log = false;
+                }
             }
-            if allow_log { map.insert(anchor.num, now); }
+            if allow_log {
+                map.insert(anchor.num, now);
+            }
         }
         // Always record into the aggregator; it will decide when to print
-        record_consensus_mismatch(anchor.num, exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib);
+        record_consensus_mismatch(
+            anchor.num,
+            exp_diff,
+            exp_mem,
+            anchor.difficulty,
+            anchor.mem_kib,
+        );
         return Err(format!(
             "Consensus params mismatch. Expected difficulty={}, mem_kib={}, got difficulty={}, mem_kib={}",
             exp_diff, exp_mem, anchor.difficulty, anchor.mem_kib
@@ -524,14 +616,19 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     let expected_work = Anchor::expected_work_for_difficulty(anchor.difficulty);
     let expected_cum = prev.cumulative_work.saturating_add(expected_work);
     if anchor.cumulative_work != expected_cum {
-        return Err(format!("Invalid cumulative work. Expected: {}, Got: {}", expected_cum, anchor.cumulative_work));
+        return Err(format!(
+            "Invalid cumulative work. Expected: {}, Got: {}",
+            expected_cum, anchor.cumulative_work
+        ));
     }
     // Recompute anchor hash: BLAKE3(merkle_root || prev.hash)
     let mut h = blake3::Hasher::new();
     h.update(&anchor.merkle_root);
     h.update(&prev.hash);
     let expected = *h.finalize().as_bytes();
-    if anchor.hash != expected { return Err("Anchor hash mismatch".into()); }
+    if anchor.hash != expected {
+        return Err("Anchor hash mismatch".into());
+    }
     Ok(())
 }
 
@@ -602,8 +699,14 @@ fn classify_anchor_ingress(a: &Anchor, db: &Store) -> AnchorClass {
 // Ensures deterministic retarget validation only when the parent matches the canonical DB parent.
 // Attempt to build the last RETARGET_INTERVAL anchors ending at `end_parent` (height H-1)
 // using a combination of the orphan buffer and DB, verifying linkage at each step.
-fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_buf: &OrphanBuffer) -> Option<Vec<Anchor>> {
-    if end_parent.num < RETARGET_INTERVAL { return None; }
+fn build_retarget_window_from_orphans(
+    end_parent: &Anchor,
+    db: &Store,
+    orphan_buf: &OrphanBuffer,
+) -> Option<Vec<Anchor>> {
+    if end_parent.num < RETARGET_INTERVAL {
+        return None;
+    }
     let needed = RETARGET_INTERVAL as usize;
     let mut backward: Vec<Anchor> = Vec::with_capacity(needed);
     let mut cur: Anchor = end_parent.clone();
@@ -618,8 +721,12 @@ fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_bu
                 if p.num == next_h {
                     // verify linkage
                     let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
-                    let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
-                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                    let mut h = blake3::Hasher::new();
+                    h.update(&cur.merkle_root);
+                    h.update(&p.hash);
+                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected)
+                        && *h.finalize().as_bytes() == cur.hash
+                    {
                         candidate = Some(p);
                     }
                 }
@@ -628,8 +735,12 @@ fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_bu
                 if let Ok(Some(p)) = db.get::<Anchor>("anchor", &p_hash) {
                     if p.num == next_h {
                         let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
-                        let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
-                        if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                        let mut h = blake3::Hasher::new();
+                        h.update(&cur.merkle_root);
+                        h.update(&p.hash);
+                        if cur.cumulative_work == p.cumulative_work.saturating_add(expected)
+                            && *h.finalize().as_bytes() == cur.hash
+                        {
                             candidate = Some(p);
                         }
                     }
@@ -640,8 +751,12 @@ fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_bu
         if candidate.is_none() {
             if let Ok(Some(p)) = db.get::<Anchor>("epoch", &next_h.to_le_bytes()) {
                 let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
-                let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
-                if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                let mut h = blake3::Hasher::new();
+                h.update(&cur.merkle_root);
+                h.update(&p.hash);
+                if cur.cumulative_work == p.cumulative_work.saturating_add(expected)
+                    && *h.finalize().as_bytes() == cur.hash
+                {
                     candidate = Some(p);
                 }
             }
@@ -651,15 +766,21 @@ fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_bu
             if let Some(cands) = orphan_buf.by_height.get(&next_h) {
                 for p in cands {
                     let expected = Anchor::expected_work_for_difficulty(cur.difficulty);
-                    let mut h = blake3::Hasher::new(); h.update(&cur.merkle_root); h.update(&p.hash);
-                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected) && *h.finalize().as_bytes() == cur.hash {
+                    let mut h = blake3::Hasher::new();
+                    h.update(&cur.merkle_root);
+                    h.update(&p.hash);
+                    if cur.cumulative_work == p.cumulative_work.saturating_add(expected)
+                        && *h.finalize().as_bytes() == cur.hash
+                    {
                         candidate = Some(p.clone());
                         break;
                     }
                 }
             }
         }
-        let Some(prev) = candidate else { return None; };
+        let Some(prev) = candidate else {
+            return None;
+        };
         backward.push(prev.clone());
         cur = prev;
     }
@@ -668,7 +789,12 @@ fn build_retarget_window_from_orphans(end_parent: &Anchor, db: &Store, orphan_bu
     Some(backward)
 }
 
-fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store, orphan_buf: &OrphanBuffer) -> Result<(), String> {
+fn validate_segment_consensus(
+    parent: &Anchor,
+    seg: &[Anchor],
+    db: &Store,
+    orphan_buf: &OrphanBuffer,
+) -> Result<(), String> {
     let mut p = parent.clone();
     for a in seg {
         if a.num % RETARGET_INTERVAL == 0 {
@@ -703,10 +829,16 @@ fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store, orpha
                 // Preserve original error classes for diagnostics
                 if let Ok(Some(db_parent)) = db.get::<Anchor>("epoch", &p.num.to_le_bytes()) {
                     if db_parent.hash == p.hash {
-                        return Err(format!("Retarget window incomplete starting at {}", a.num.saturating_sub(RETARGET_INTERVAL)));
+                        return Err(format!(
+                            "Retarget window incomplete starting at {}",
+                            a.num.saturating_sub(RETARGET_INTERVAL)
+                        ));
                     }
                 }
-                return Err(format!("Missing retarget window for alternate parent at {}", a.num));
+                return Err(format!(
+                    "Missing retarget window for alternate parent at {}",
+                    a.num
+                ));
             }
         } else {
             // Between retargets, parameters must inherit exactly from parent.
@@ -731,49 +863,66 @@ fn validate_segment_consensus(parent: &Anchor, seg: &[Anchor], db: &Store, orpha
 }
 
 // Try to link an anchor to any available parent at H-1 (orphan buffer + DB alternates)
-fn links_to_available_parent(a: &Anchor, orphan_buf: &OrphanBuffer, db: &Store) -> Option<[u8; 32]> {
+fn links_to_available_parent(
+    a: &Anchor,
+    orphan_buf: &OrphanBuffer,
+    db: &Store,
+) -> Option<[u8; 32]> {
     let parent_h = a.num.saturating_sub(1);
     let expected = Anchor::expected_work_for_difficulty(a.difficulty);
     // Use cached linkage if present
-    if let Some(p_hash) = orphan_buf.parent_of.get(&a.hash).copied() { return Some(p_hash); }
-    
+    if let Some(p_hash) = orphan_buf.parent_of.get(&a.hash).copied() {
+        return Some(p_hash);
+    }
+
     // First try orphan buffer parents at H-1
     if let Some(cands) = orphan_buf.by_height.get(&parent_h) {
         for p in cands {
-            if a.cumulative_work != p.cumulative_work.saturating_add(expected) { continue; }
+            if a.cumulative_work != p.cumulative_work.saturating_add(expected) {
+                continue;
+            }
             let mut h = blake3::Hasher::new();
             h.update(&a.merkle_root);
             h.update(&p.hash);
-            if *h.finalize().as_bytes() == a.hash { return Some(p.hash); }
+            if *h.finalize().as_bytes() == a.hash {
+                return Some(p.hash);
+            }
         }
     }
-    
+
     // If local parent exists but differs by hash, try it too
     if let Ok(Some(local_parent)) = db.get::<Anchor>("epoch", &parent_h.to_le_bytes()) {
         if a.cumulative_work == local_parent.cumulative_work.saturating_add(expected) {
             let mut h = blake3::Hasher::new();
             h.update(&a.merkle_root);
             h.update(&local_parent.hash);
-            if *h.finalize().as_bytes() == a.hash { return Some(local_parent.hash); }
+            if *h.finalize().as_bytes() == a.hash {
+                return Some(local_parent.hash);
+            }
         }
     }
-    
+
     None
 }
 
 // Debounce map for compact range backfill requests with chunk alignment
-static RECENT_RANGE_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_RANGE_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const RANGE_REQ_DEDUP_SECS: u64 = 20;
 // Debounce map for epoch-by-hash requests to prevent spam
-static RECENT_HASH_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_HASH_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const HASH_REQ_DEDUP_SECS: u64 = 20;
 // Debounce map for direct parent-by-height requests to avoid spamming the network
-static RECENT_DIRECT_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_DIRECT_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const DIRECT_REQ_DEDUP_SECS: u64 = 5;
 
 // Queue-level de-duplication and per-key backoff controls
-static RECENT_ENQUEUED_CMDS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static CMD_BACKOFF: Lazy<Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_ENQUEUED_CMDS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static CMD_BACKOFF: Lazy<Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const QUEUE_DEDUP_TTL_SECS: u64 = 30;
 const BACKOFF_BASE_MS: u64 = 2000;
 const BACKOFF_CAP_MS: u64 = 16000;
@@ -783,16 +932,22 @@ fn command_key(cmd: &NetworkCommand) -> Option<String> {
         NetworkCommand::RequestEpoch(n) => Some(format!("epoch:{}", n)),
         // For direct requests, bypass queue-level dedup/backoff entirely
         NetworkCommand::RequestEpochDirect(_n) => None,
-        NetworkCommand::RequestEpochHeadersRange(range) => Some(format!("hdr:{}:{}", range.start_height, range.count)),
+        NetworkCommand::RequestEpochHeadersRange(range) => {
+            Some(format!("hdr:{}:{}", range.start_height, range.count))
+        }
         // Parent-by-hash can be extremely spammy during forks; throttle by full hash
         NetworkCommand::RequestEpochByHash(h) => Some(format!("epoch_by_hash:{}", hex::encode(h))),
         NetworkCommand::RequestCoin(id) => Some(format!("coin:{}", hex::encode(&id[..8]))),
         NetworkCommand::RequestLatestEpoch => Some("latest".to_string()),
         NetworkCommand::RequestCoinProof(id) => Some(format!("proof:{}", hex::encode(&id[..8]))),
-        NetworkCommand::RequestEpochTxn(req) => Some(format!("txn:{}", hex::encode(&req.epoch_hash[..8]))),
+        NetworkCommand::RequestEpochTxn(req) => {
+            Some(format!("txn:{}", hex::encode(&req.epoch_hash[..8])))
+        }
         NetworkCommand::RequestEpochLeaves(n) => Some(format!("leaves:{}", n)),
         NetworkCommand::RequestEpochSelected(n) => Some(format!("selected:{}", n)),
-        NetworkCommand::RequestEpochCandidates(h) => Some(format!("cands:{}", hex::encode(&h[..8]))),
+        NetworkCommand::RequestEpochCandidates(h) => {
+            Some(format!("cands:{}", hex::encode(&h[..8])))
+        }
         // Handshake backoff/dedup keyed by short hash of payload
         NetworkCommand::GossipPqhs2Init(data) => {
             let key = blake3::hash(&data[..std::cmp::min(64, data.len())]);
@@ -808,11 +963,14 @@ fn command_key(cmd: &NetworkCommand) -> Option<String> {
 const HDR_CHUNK: u64 = 64; // Align range requests to 64-epoch chunks
 
 // Bootstrap redial deduplication by address string
-static RECENT_BOOTSTRAP_DIALS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static RECENT_BOOTSTRAP_DIALS: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const BOOTSTRAP_REDIAL_DEDUP_SECS: u64 = 30;
 
 // Per-peer orphan buffer contribution tracking
-static PEER_ORPHAN_CONTRIB: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static PEER_ORPHAN_CONTRIB: Lazy<
+    Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u32)>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 const MAX_ORPHANS_PER_PEER_PER_HOUR: u32 = 64;
 
 // Consensus limits for plausibility checks
@@ -839,32 +997,48 @@ fn allow_peer_orphan_contribution(peer_id: PeerId) -> bool {
 }
 
 // Request aligned header range with coalescing
-fn request_aligned_range(command_tx: &mpsc::UnboundedSender<NetworkCommand>, target_height: u64, window: u64) {
+fn request_aligned_range(
+    command_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    target_height: u64,
+    window: u64,
+) {
     let aligned_start = (target_height.saturating_sub(window) / HDR_CHUNK) * HDR_CHUNK;
     // Ensure we include the target height itself; avoid zero-count requests
     let diff = target_height.saturating_sub(aligned_start);
     let count = ((diff.saturating_add(1)).min(256)) as u32;
-    
+
     let now = std::time::Instant::now();
     let mut allow = true;
     if let Ok(mut m) = RECENT_RANGE_REQS.lock() {
-        m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(RANGE_REQ_DEDUP_SECS));
+        m.retain(|_, t| {
+            now.duration_since(*t) < std::time::Duration::from_secs(RANGE_REQ_DEDUP_SECS)
+        });
         allow = !m.contains_key(&aligned_start);
-        if allow { m.insert(aligned_start, now); }
+        if allow {
+            m.insert(aligned_start, now);
+        }
     }
-    if allow { 
-        let _ = command_tx.send(NetworkCommand::RequestEpochHeadersRange(EpochHeadersRange{ 
-            start_height: aligned_start, 
-            count 
-        })); 
+    if allow {
+        let _ = command_tx.send(NetworkCommand::RequestEpochHeadersRange(
+            EpochHeadersRange {
+                start_height: aligned_start,
+                count,
+            },
+        ));
     }
 }
 
 // Request an entire historical window ending at `end_height` by issuing a bounded series of
 // aligned range requests (coalesced via RECENT_RANGE_REQS). This ensures we actually cover
 // the trailing portion of the window needed for retarget validation (e.g., 22000..23999).
-fn request_window_chunks(command_tx: &mpsc::UnboundedSender<NetworkCommand>, end_height: u64, window: u64) {
-    if window == 0 { return; }
+fn request_window_chunks(
+    command_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    end_height: u64,
+    window: u64,
+) {
+    if window == 0 {
+        return;
+    }
     let mut remaining = window;
     let mut cur_end = end_height;
     // Issue at most ceil(window/256) requests, from the end backward
@@ -877,17 +1051,25 @@ fn request_window_chunks(command_tx: &mpsc::UnboundedSender<NetworkCommand>, end
         let now = std::time::Instant::now();
         let mut allow = true;
         if let Ok(mut m) = RECENT_RANGE_REQS.lock() {
-            m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(RANGE_REQ_DEDUP_SECS));
+            m.retain(|_, t| {
+                now.duration_since(*t) < std::time::Duration::from_secs(RANGE_REQ_DEDUP_SECS)
+            });
             allow = !m.contains_key(&aligned_start);
-            if allow { m.insert(aligned_start, now); }
+            if allow {
+                m.insert(aligned_start, now);
+            }
         }
         if allow {
-            let _ = command_tx.send(NetworkCommand::RequestEpochHeadersRange(EpochHeadersRange{
-                start_height: aligned_start,
-                count,
-            }));
+            let _ = command_tx.send(NetworkCommand::RequestEpochHeadersRange(
+                EpochHeadersRange {
+                    start_height: aligned_start,
+                    count,
+                },
+            ));
         }
-        if cur_end < chunk { break; }
+        if cur_end < chunk {
+            break;
+        }
         cur_end = cur_end.saturating_sub(chunk);
         remaining = remaining.saturating_sub(chunk);
     }
@@ -896,7 +1078,9 @@ fn request_window_chunks(command_tx: &mpsc::UnboundedSender<NetworkCommand>, end
 pub type NetHandle = Arc<Network>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoinProofRequest { pub coin_id: [u8; 32] }
+pub struct CoinProofRequest {
+    pub coin_id: [u8; 32],
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoinProofResponse {
@@ -937,19 +1121,19 @@ pub struct EpochHeadersRange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactEpoch {
     pub anchor: Anchor,
-    pub short_ids: Vec<[u8; 8]>,      // short ids of coins expected to be in mempool/view
-    pub prefilled: Vec<(u32, Coin)>,  // (index, full coin)
+    pub short_ids: Vec<[u8; 8]>, // short ids of coins expected to be in mempool/view
+    pub prefilled: Vec<(u32, Coin)>, // (index, full coin)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochGetTxn {
-    pub epoch_hash: [u8;32],
+    pub epoch_hash: [u8; 32],
     pub indexes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochTxn {
-    pub epoch_hash: [u8;32],
+    pub epoch_hash: [u8; 32],
     pub coins: Vec<Coin>,
 }
 
@@ -987,7 +1171,7 @@ pub fn testing_stub_handle() -> NetHandle {
     let (rate_limited_tx, _) = broadcast::channel(1);
     let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
     let (command_tx, _) = mpsc::unbounded_channel();
-    Arc::new(Network{
+    Arc::new(Network {
         anchor_tx,
         proof_tx,
         spend_tx,
@@ -1003,7 +1187,7 @@ pub fn testing_stub_handle() -> NetHandle {
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
-    
+
     GossipSpend(Spend),
     GossipCompactEpoch(CompactEpoch),
     GossipEpochSelectedResponse(SelectedIdsBundle),
@@ -1016,7 +1200,7 @@ enum NetworkCommand {
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
-    RequestSpend([u8;32]),
+    RequestSpend([u8; 32]),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
     RequestCoinProof([u8; 32]),
@@ -1027,7 +1211,7 @@ enum NetworkCommand {
     GossipEpochLeaves(EpochLeavesBundle),
     // removed commitment gossip
     RequestEpochCandidates([u8; 32]),
-    RequestEpochDirect(u64),  // Bypass deduplication
+    RequestEpochDirect(u64), // Bypass deduplication
     RedialBootstraps,
 }
 
@@ -1072,9 +1256,12 @@ pub async fn spawn(
     // Load Dilithium identity for PQHS v2 (Dilithium-authenticated handshake)
     let (dili_pk_net, dili_sk_net) = match load_or_create_dili_identity() {
         Ok(v) => v,
-        Err(e) => { eprintln!("failed to load Dilithium network identity: {}", e); return Err(e); }
+        Err(e) => {
+            eprintln!("failed to load Dilithium network identity: {}", e);
+            return Err(e);
+        }
     };
-    
+
     let transport = quic::tokio::Transport::new(quic::Config::new(&id_keys))
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
         .boxed();
@@ -1089,28 +1276,44 @@ pub async fn spawn(
         .flood_publish(true)
         .max_transmit_size(8 * 1024 * 1024) // 8 MiB cap
         .build()?;
-        
+
     let mut gs: Gossipsub<IdentityTransform, AllowAllSubscriptionFilter> = Gossipsub::new(
         MessageAuthenticity::Signed(id_keys.clone()),
         gossipsub_config,
-    ).map_err(|e| anyhow::anyhow!(e))?;
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     for t in [
-        TOP_ANCHOR, TOP_COIN, TOP_SPEND,
-        TOP_EPOCH_REQUEST, TOP_COIN_REQUEST, TOP_LATEST_REQUEST,
-        TOP_COIN_PROOF_REQUEST, TOP_COIN_PROOF_RESPONSE,
-        TOP_COIN_PROOF_REQUEST_URGENT, TOP_COIN_PROOF_RESPONSE_URGENT,
-        TOP_EPOCH_LEAVES, TOP_EPOCH_LEAVES_REQUEST,
-        TOP_EPOCH_SELECTED_REQUEST, TOP_EPOCH_SELECTED_RESPONSE,
-        TOP_SPEND_REQUEST, TOP_SPEND_RESPONSE,
+        TOP_ANCHOR,
+        TOP_COIN,
+        TOP_SPEND,
+        TOP_EPOCH_REQUEST,
+        TOP_COIN_REQUEST,
+        TOP_LATEST_REQUEST,
+        TOP_COIN_PROOF_REQUEST,
+        TOP_COIN_PROOF_RESPONSE,
+        TOP_COIN_PROOF_REQUEST_URGENT,
+        TOP_COIN_PROOF_RESPONSE_URGENT,
+        TOP_EPOCH_LEAVES,
+        TOP_EPOCH_LEAVES_REQUEST,
+        TOP_EPOCH_SELECTED_REQUEST,
+        TOP_EPOCH_SELECTED_RESPONSE,
+        TOP_SPEND_REQUEST,
+        TOP_SPEND_RESPONSE,
         TOP_PEER_ADDR,
         TOP_RATE_LIMITED,
-        TOP_EPOCH_HEADERS_REQUEST, TOP_EPOCH_HEADERS_RESPONSE,
-        TOP_EPOCH_BY_HASH_REQUEST, TOP_EPOCH_BY_HASH_RESPONSE,
-        TOP_EPOCH_COMPACT, TOP_EPOCH_GET_TXN, TOP_EPOCH_TXN,
-        TOP_EPOCH_CANDIDATES_REQUEST, TOP_EPOCH_CANDIDATES_RESPONSE,
+        TOP_EPOCH_HEADERS_REQUEST,
+        TOP_EPOCH_HEADERS_RESPONSE,
+        TOP_EPOCH_BY_HASH_REQUEST,
+        TOP_EPOCH_BY_HASH_RESPONSE,
+        TOP_EPOCH_COMPACT,
+        TOP_EPOCH_GET_TXN,
+        TOP_EPOCH_TXN,
+        TOP_EPOCH_CANDIDATES_REQUEST,
+        TOP_EPOCH_CANDIDATES_RESPONSE,
         TOP_OFFERS_V1,
         // PQ handshake v2 topics (Dilithium-authenticated)
-        TOP_PQHS2_INIT, TOP_PQHS2_RESP,
+        TOP_PQHS2_INIT,
+        TOP_PQHS2_RESP,
     ] {
         gs.subscribe(&IdentTopic::new(t))?;
     }
@@ -1120,15 +1323,17 @@ pub async fn spawn(
         gs,
         peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(std::time::Duration::from_secs(555))
+            .with_idle_connection_timeout(std::time::Duration::from_secs(555)),
     );
 
     // In-memory session keys per peer (pure PQ); used for future encryption layers
-    let session_keys: Arc<Mutex<HashMap<PeerId, ([u8;32], std::time::Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let pending_inits: Arc<Mutex<HashMap<PeerId, ([u8;8], std::time::Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let session_keys: Arc<Mutex<HashMap<PeerId, ([u8; 32], std::time::Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending_inits: Arc<Mutex<HashMap<PeerId, ([u8; 8], std::time::Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     const SESSION_TTL_SECS: u64 = 6 * 60 * 60; // 6 hours
     const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
-    
+
     let mut port = net_cfg.listen_port;
     loop {
         let listen_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port);
@@ -1140,9 +1345,10 @@ pub async fn spawn(
             Err(e) => return Err(e.into()),
         }
     }
-    
+
     if let Some(public_ip) = &net_cfg.public_ip {
-        let external_addr: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", public_ip, port).parse()?;
+        let external_addr: Multiaddr =
+            format!("/ip4/{}/udp/{}/quic-v1", public_ip, port).parse()?;
         swarm.add_external_address(external_addr.clone());
     }
 
@@ -1179,22 +1385,34 @@ pub async fn spawn(
         if let Some(cf) = meta {
             if let Ok(Some(v)) = db.db.get_cf(cf, key) {
                 if v.len() == 8 {
-                    let mut a = [0u8;8]; a.copy_from_slice(&v);
+                    let mut a = [0u8; 8];
+                    a.copy_from_slice(&v);
                     u64::from_le_bytes(a)
-                } else { 0 }
+                } else {
+                    0
+                }
             } else {
                 // Approximate: count up to max_entries + small slice
                 let mut c: u64 = 0;
                 if let Some(of) = db.db.cf_handle("offers") {
                     let it = db.db.iterator_cf(of, rocksdb::IteratorMode::Start);
-                    for item in it.take(200_000) { if item.is_ok() { c = c.saturating_add(1); } }
+                    for item in it.take(200_000) {
+                        if item.is_ok() {
+                            c = c.saturating_add(1);
+                        }
+                    }
                 }
-                if let Some(cf2) = meta { let _ = db.db.put_cf(cf2, key, &c.to_le_bytes()); }
+                if let Some(cf2) = meta {
+                    let _ = db.db.put_cf(cf2, key, &c.to_le_bytes());
+                }
                 c
             }
-        } else { 0 }
+        } else {
+            0
+        }
     };
-    let mut offers_per_peer: std::collections::HashMap<PeerId, std::collections::VecDeque<u64>> = std::collections::HashMap::new();
+    let mut offers_per_peer: std::collections::HashMap<PeerId, std::collections::VecDeque<u64>> =
+        std::collections::HashMap::new();
     let mut _last_offers_prune: std::time::Instant = std::time::Instant::now();
     // Offers pruning cursor and schedule (single timer)
 
@@ -1205,97 +1423,133 @@ pub async fn spawn(
     let (offers_tx, _) = broadcast::channel::<crate::wallet::OfferDocV1>(1024);
     // removed commitment channels
 
-
-
-    
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (headers_tx, _headers_rx) = broadcast::channel::<EpochHeadersBatch>(1024);
-    let net = Arc::new(Network{ anchor_tx: anchor_tx.clone(), proof_tx: proof_tx.clone(), spend_tx: spend_tx.clone(), rate_limited_tx: rate_limited_tx.clone(), headers_tx: headers_tx.clone(), offers_tx: offers_tx.clone(), command_tx: command_tx.clone(), connected_peers: connected_peers.clone() });
+    let net = Arc::new(Network {
+        anchor_tx: anchor_tx.clone(),
+        proof_tx: proof_tx.clone(),
+        spend_tx: spend_tx.clone(),
+        rate_limited_tx: rate_limited_tx.clone(),
+        headers_tx: headers_tx.clone(),
+        offers_tx: offers_tx.clone(),
+        command_tx: command_tx.clone(),
+        connected_peers: connected_peers.clone(),
+    });
 
     let mut peer_scores: HashMap<PeerId, PeerScore> = HashMap::new();
     let mut pending_commands: VecDeque<NetworkCommand> = VecDeque::new();
-    let mut orphan_buf: OrphanBuffer = OrphanBuffer::new(ORPHAN_TOTAL_CAP, MAX_ORPHANS_PER_HEIGHT, ORPHAN_TTL_SECS);
+    let mut orphan_buf: OrphanBuffer =
+        OrphanBuffer::new(ORPHAN_TOTAL_CAP, MAX_ORPHANS_PER_HEIGHT, ORPHAN_TTL_SECS);
     let mut needs_reorg_check: bool = false;
-    let mut last_reorg_attempt: std::time::Instant = std::time::Instant::now() - std::time::Duration::from_millis(REORG_MIN_GAP_MS);
+    let mut last_reorg_attempt: std::time::Instant =
+        std::time::Instant::now() - std::time::Duration::from_millis(REORG_MIN_GAP_MS);
     let mut last_orphan_snapshot: u64 = 0;
     // Buffer for out-of-order spends (by coin_id)
-    let mut pending_spends: HashMap<[u8;32], Vec<Spend>> = HashMap::new();
-    let mut pending_spend_deadline: HashMap<[u8;32], std::time::Instant> = HashMap::new();
+    let mut pending_spends: HashMap<[u8; 32], Vec<Spend>> = HashMap::new();
+    let mut pending_spend_deadline: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
     // Pending coin-proof requests we could not answer immediately (awaiting leaves/coins)
-    let mut pending_proof_requests: HashMap<[u8;32], std::time::Instant> = HashMap::new();
+    let mut pending_proof_requests: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
     // Per-topic quotas for the custom rate-limited topic
     let mut inbound_quota: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     let _outbound_quota: (std::time::Instant, u32) = (std::time::Instant::now(), 0);
 
     const ORPHAN_BUFFER_TIP_WINDOW: u64 = 10000; // Increased window for large sync gaps
-    static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_PROOF_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_SPEND_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate coin fetch requests when we receive spends for unknown coins
-    static RECENT_COIN_REQS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_COIN_REQS: Lazy<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Deduplicate epoch selected-id requests (helps reconstruct selection index on followers)
-    
-    static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    static RECENT_LEAVES_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static RECENT_EPOCH_REQS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Reduce deduplication time for better responsiveness
-    const EPOCH_REQ_DEDUP_SECS: u64 = 5;  // Reduced from 12 to 5 seconds
-    // Deduplicate and throttle responses to latest-epoch requests
-    static RECENT_LATEST_REQS: Lazy<Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> = Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
+    const EPOCH_REQ_DEDUP_SECS: u64 = 5; // Reduced from 12 to 5 seconds
+                                         // Deduplicate and throttle responses to latest-epoch requests
+    static RECENT_LATEST_REQS: Lazy<
+        Mutex<std::collections::HashMap<PeerId, (std::time::Instant, u64)>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_LATEST_ANNOUNCE: Lazy<Mutex<std::time::Instant>> =
+        Lazy::new(|| Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)));
     const LATEST_REQ_DEDUP_SECS: u64 = 8; // per-peer TTL for duplicate latest requests at same height
     const LATEST_GLOBAL_THROTTLE_MS: u64 = 1000; // minimum gap between our latest responses
     const PENDING_SPEND_TTL_SECS: u64 = 15;
     const PENDING_PROOF_TTL_SECS: u64 = 30;
-const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on hash mismatch
-const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget window when historical data is missing
-    // Global aggregation cadence for alt-fork summaries
+    const REORG_BACKFILL: u64 = 64; // proactively backfill up to 64 predecessors on hash mismatch
+    const RETARGET_BACKFILL: u64 = RETARGET_INTERVAL; // request a full retarget window when historical data is missing
+                                                      // Global aggregation cadence for alt-fork summaries
     const ALT_FORK_LOG_THROTTLE_SECS: u64 = 60;
     // Throttle proactive retarget prefetch logs (per retarget height)
-    static LAST_RETARGET_PREFETCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_RETARGET_PREFETCH_LOGS: Lazy<
+        Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const RETARGET_PREFETCH_LOG_THROTTLE_SECS: u64 = 30;
     // Throttle noisy reorg logs (per-height)
     const REORG_LOG_THROTTLE_SECS: u64 = 30;
-    static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_MISMATCH_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_MISSING_FORK_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Throttle noisy per-(height,parent) fork parent mismatch logs and per-height unknown-parent logs
-    static LAST_FORK_PARENT_LOGS: Lazy<Mutex<std::collections::HashMap<(u64, [u8;8]), std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    static LAST_UNKNOWN_PARENT_LOGS: Lazy<Mutex<std::collections::HashMap<u64, std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_FORK_PARENT_LOGS: Lazy<
+        Mutex<std::collections::HashMap<(u64, [u8; 8]), std::time::Instant>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static LAST_UNKNOWN_PARENT_LOGS: Lazy<
+        Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     // Short-window tracker for peers repeatedly sending divergent parents at the same height
-    static DIVERGENT_PARENT_EVENTS: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static DIVERGENT_PARENT_EVENTS: Lazy<
+        Mutex<std::collections::HashMap<(PeerId, u64), (std::time::Instant, u32)>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const DIVERGENT_WINDOW_SECS: u64 = 10;
     const DIVERGENT_THRESHOLD: u32 = 3; // aggressive threshold to penalize sooner
-    // Per-peer per-height throttle for consensus-mismatch logs
-    static CONS_MISMATCH_PEER_HEIGHT: Lazy<Mutex<std::collections::HashMap<(PeerId, u64), std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+                                        // Per-peer per-height throttle for consensus-mismatch logs
+    static CONS_MISMATCH_PEER_HEIGHT: Lazy<
+        Mutex<std::collections::HashMap<(PeerId, u64), std::time::Instant>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
     const CONS_MISMATCH_PEER_HEIGHT_TTL_SECS: u64 = 30;
     const DIVERGENT_SPAM_BAN_SECS: u64 = 60 * 60 * 4; // 4 hour ban for spam
 
     fn note_divergent_parent_event(peer_id: &PeerId, height: u64) -> u32 {
         let now = std::time::Instant::now();
         if let Ok(mut map) = DIVERGENT_PARENT_EVENTS.lock() {
-            map.retain(|_, (t, _)| now.duration_since(*t) < std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS));
+            map.retain(|_, (t, _)| {
+                now.duration_since(*t) < std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS)
+            });
             let key = (peer_id.clone(), height);
             let entry = map.entry(key).or_insert((now, 0));
-            if now.duration_since(entry.0) >= std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS) {
+            if now.duration_since(entry.0) >= std::time::Duration::from_secs(DIVERGENT_WINDOW_SECS)
+            {
                 *entry = (now, 0);
             }
             entry.1 = entry.1.saturating_add(1);
             entry.1
-        } else { 0 }
+        } else {
+            0
+        }
     }
     // Throttle fork/unknown-parent logs additionally by epoch hash to avoid repeated spam for same child
-    static LAST_FORK_CHILD_LOGS: Lazy<Mutex<std::collections::HashMap<[u8;32], std::time::Instant>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-    
+    static LAST_FORK_CHILD_LOGS: Lazy<
+        Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
     // Aggregate alternate-fork events per height and periodically emit a summary
     struct AltForkAgg {
-        first_seen: std::time::Instant,     
+        first_seen: std::time::Instant,
         last_emit: std::time::Instant,
         peers: std::collections::HashSet<String>,
-        hashes: std::collections::HashSet<[u8;32]>,
+        hashes: std::collections::HashSet<[u8; 32]>,
     }
-    static ALT_FORK_AGG: Lazy<Mutex<std::collections::HashMap<u64, AltForkAgg>>> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+    static ALT_FORK_AGG: Lazy<Mutex<std::collections::HashMap<u64, AltForkAgg>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
     // Attempt to reorg to a better chain using buffered anchors.
-fn attempt_reorg(
+    fn attempt_reorg(
         db: &Store,
         orphan_buf: &mut OrphanBuffer,
         anchor_tx: &broadcast::Sender<Anchor>,
@@ -1312,38 +1566,63 @@ fn attempt_reorg(
         let mut near_chain: Vec<Anchor> = Vec::new();
         loop {
             let children = orphan_buf.children_of(&near_parent.hash);
-            if children.is_empty() { break; }
+            if children.is_empty() {
+                break;
+            }
             // Choose the best child (highest cumulative_work)
             let mut best: Option<Anchor> = None;
             for ch in children {
-                if ch.num != near_parent.num.saturating_add(1) { continue; }
-                if best.as_ref().map(|b| ch.cumulative_work > b.cumulative_work).unwrap_or(true) {
+                if ch.num != near_parent.num.saturating_add(1) {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .map(|b| ch.cumulative_work > b.cumulative_work)
+                    .unwrap_or(true)
+                {
                     best = Some(ch);
                 }
             }
             if let Some(next) = best {
                 near_chain.push(next.clone());
                 near_parent = next;
-            } else { break; }
+            } else {
+                break;
+            }
         }
         if let Some(near_tip) = near_chain.last() {
             if near_tip.cumulative_work > current_latest.cumulative_work {
                 // Gate sequential catch-up adoption on consensus validation
-                if let Err(e) = validate_segment_consensus(&current_latest, &near_chain, db, &orphan_buf) {
+                if let Err(e) =
+                    validate_segment_consensus(&current_latest, &near_chain, db, &orphan_buf)
+                {
                     net_log!("⛔ Reorg blocked (near-tip): {}", e);
                     // If blocked due to incomplete retarget window, backfill the exact window range
                     if let Some(rest) = e.strip_prefix("Retarget window incomplete starting at ") {
                         if let Ok(missing_from) = rest.trim().parse::<u64>() {
-                            let window_end = missing_from.saturating_add(RETARGET_INTERVAL.saturating_sub(1));
+                            let window_end =
+                                missing_from.saturating_add(RETARGET_INTERVAL.saturating_sub(1));
                             request_window_chunks(&command_tx, window_end, RETARGET_INTERVAL);
                         }
                     }
                     // Also backfill near the fork point for context
                     let start = current_latest.num.saturating_sub(REORG_BACKFILL);
-                    for n in start..=current_latest.num { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+                    for n in start..=current_latest.num {
+                        let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                    }
                     return false;
                 }
-                let (Some(epoch_cf), Some(anchor_cf), Some(sel_cf), Some(leaves_cf), Some(coin_cf), Some(coin_epoch_cf), Some(spend_cf), Some(nullifier_cf), Some(commitment_used_cf)) = (
+                let (
+                    Some(epoch_cf),
+                    Some(anchor_cf),
+                    Some(sel_cf),
+                    Some(leaves_cf),
+                    Some(coin_cf),
+                    Some(coin_epoch_cf),
+                    Some(spend_cf),
+                    Some(nullifier_cf),
+                    Some(commitment_used_cf),
+                ) = (
                     db.db.cf_handle("epoch"),
                     db.db.cf_handle("anchor"),
                     db.db.cf_handle("epoch_selected"),
@@ -1353,12 +1632,18 @@ fn attempt_reorg(
                     db.db.cf_handle("spend"),
                     db.db.cf_handle("nullifier"),
                     db.db.cf_handle("commitment_used"),
-                ) else { return false; };
+                )
+                else {
+                    return false;
+                };
                 let mut batch = WriteBatch::default();
                 let mut parent = current_latest.clone();
                 for alt in &near_chain {
                     // 1) Overwrite anchor mappings for this epoch and advance latest
-                    let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return false };
+                    let ser = match bincode::serialize(alt) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
                     batch.put_cf(epoch_cf, alt.num.to_le_bytes(), &ser);
                     batch.put_cf(epoch_cf, b"latest", &ser);
                     batch.put_cf(anchor_cf, &alt.hash, &ser);
@@ -1374,7 +1659,14 @@ fn attempt_reorg(
                                 if sp.unlock_preimage.is_some() {
                                     if let Some(next_lock) = sp.next_lock_hash {
                                         if let Ok(chain_id) = db.get_chain_id() {
-                                            let cid = crate::crypto::commitment_id_v1(&sp.to.one_time_pk, &sp.to.kyber_ct, &next_lock, &sp.coin_id, sp.to.amount_le, &chain_id);
+                                            let cid = crate::crypto::commitment_id_v1(
+                                                &sp.to.one_time_pk,
+                                                &sp.to.kyber_ct,
+                                                &next_lock,
+                                                &sp.coin_id,
+                                                sp.to.amount_le,
+                                                &chain_id,
+                                            );
                                             batch.delete_cf(commitment_used_cf, &cid);
                                         }
                                     }
@@ -1385,7 +1677,10 @@ fn attempt_reorg(
 
                     // 3) Clear old per-epoch selected index keys and leaves
                     let prefix = alt.num.to_le_bytes();
-                    let iter = db.db.iterator_cf(sel_cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+                    let iter = db.db.iterator_cf(
+                        sel_cf,
+                        rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+                    );
                     for item in iter {
                         if let Ok((k, _)) = item {
                             if k.len() >= 8 && &k[0..8] == prefix {
@@ -1399,16 +1694,26 @@ fn attempt_reorg(
 
                     // 4) Attempt to reconstruct selected set using canonical selector
                     let cap = alt.coin_count as usize;
-                    let (candidates, _total_candidates) = crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
-                    let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
-                    let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                    let (candidates, _total_candidates) =
+                        crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
+                    let selected_ids: std::collections::HashSet<[u8; 32]> =
+                        candidates.iter().map(|c| c.id).collect();
+                    let mut leaves: Vec<[u8; 32]> = selected_ids
+                        .iter()
+                        .map(crate::coin::Coin::id_to_leaf_hash)
+                        .collect();
                     leaves.sort();
-                    let computed_root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
+                    let computed_root =
+                        crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
 
-                    if computed_root == alt.merkle_root && selected_ids.len() as u32 == alt.coin_count {
+                    if computed_root == alt.merkle_root
+                        && selected_ids.len() as u32 == alt.coin_count
+                    {
                         for cand in &candidates {
                             let coin = cand.clone().into_confirmed();
-                            if let Ok(bytes) = bincode::serialize(&coin) { batch.put_cf(coin_cf, &coin.id, &bytes); }
+                            if let Ok(bytes) = bincode::serialize(&coin) {
+                                batch.put_cf(coin_cf, &coin.id, &bytes);
+                            }
                             batch.put_cf(coin_epoch_cf, &coin.id, &alt.num.to_le_bytes());
                         }
                         for coin_id in &selected_ids {
@@ -1417,7 +1722,9 @@ fn attempt_reorg(
                             key.extend_from_slice(coin_id);
                             batch.put_cf(sel_cf, &key, &[]);
                         }
-                        if let Ok(bytes) = bincode::serialize(&leaves) { batch.put_cf(leaves_cf, &alt.num.to_le_bytes(), &bytes); }
+                        if let Ok(bytes) = bincode::serialize(&leaves) {
+                            batch.put_cf(leaves_cf, &alt.num.to_le_bytes(), &bytes);
+                        }
                     } else {
                         net_log!(
                             "⚠️ Reorg: unable to reconstruct selected set for epoch {} (merkle {} vs computed {}, count {} vs {})",
@@ -1431,29 +1738,54 @@ fn attempt_reorg(
                     }
                     parent = alt.clone();
                 }
-                if let Err(e) = db.db.write(batch) { eprintln!("🔥 Reorg write failed: {}", e); return false; }
-                for alt in &near_chain { let _ = anchor_tx.send(alt.clone()); }
-                if let Ok(mut st) = sync_state.lock() { st.highest_seen_epoch = near_tip.num; }
-                for alt in &near_chain { let _ = orphan_buf.remove_exact(alt.num, alt.hash); }
-                net_log!("🔁 Reorg adopted up to epoch {} (sequential catch-up)", near_tip.num);
+                if let Err(e) = db.db.write(batch) {
+                    eprintln!("🔥 Reorg write failed: {}", e);
+                    return false;
+                }
+                for alt in &near_chain {
+                    let _ = anchor_tx.send(alt.clone());
+                }
+                if let Ok(mut st) = sync_state.lock() {
+                    st.highest_seen_epoch = near_tip.num;
+                }
+                for alt in &near_chain {
+                    let _ = orphan_buf.remove_exact(alt.num, alt.hash);
+                }
+                net_log!(
+                    "🔁 Reorg adopted up to epoch {} (sequential catch-up)",
+                    near_tip.num
+                );
                 return true;
             }
         }
-        let Some(&max_buf_height) = orphan_buf.by_height.keys().max() else { return false };
-        if max_buf_height <= current_latest.num { return false; }
+        let Some(&max_buf_height) = orphan_buf.by_height.keys().max() else {
+            return false;
+        };
+        if max_buf_height <= current_latest.num {
+            return false;
+        }
 
         // Determine earliest contiguous height present in the orphan buffer
         let mut h = max_buf_height;
         while h > 0 {
             match orphan_buf.by_height.get(&h) {
-                Some(v) if !v.is_empty() => { h -= 1; }
+                Some(v) if !v.is_empty() => {
+                    h -= 1;
+                }
                 _ => break,
             }
         }
-        let first_height = if orphan_buf.by_height.get(&h).is_some() { h } else { h + 1 };
-        if first_height > max_buf_height { return false; }
+        let first_height = if orphan_buf.by_height.get(&h).is_some() {
+            h
+        } else {
+            h + 1
+        };
+        if first_height > max_buf_height {
+            return false;
+        }
         let fork_height = first_height.saturating_sub(1);
-        net_routine!("🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
+        net_routine!(
+            "🔎 Reorg: considering buffered segment {}..={} ({} epochs). Fork height candidate: {}",
             first_height,
             max_buf_height,
             (max_buf_height - first_height + 1),
@@ -1466,26 +1798,41 @@ fn attempt_reorg(
             parent_candidates.push(local_parent);
         }
         if let Some(alts_at_fork) = orphan_buf.by_height.get(&fork_height) {
-            for a in alts_at_fork { parent_candidates.push(a.clone()); }
+            for a in alts_at_fork {
+                parent_candidates.push(a.clone());
+            }
         }
         if parent_candidates.is_empty() {
             // Throttle log spam per-fork height
             let now = std::time::Instant::now();
             let mut allow_log = true;
             if let Ok(mut map) = LAST_MISSING_FORK_LOGS.lock() {
-                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                map.retain(|_, t| {
+                    now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS)
+                });
                 if let Some(last) = map.get(&fork_height) {
-                    if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                    if now.duration_since(*last)
+                        < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS)
+                    {
+                        allow_log = false;
+                    }
                 }
-                if allow_log { map.insert(fork_height, now); }
+                if allow_log {
+                    map.insert(fork_height, now);
+                }
             }
             if allow_log {
-                net_routine!("⛔ Reorg: missing fork anchor at height {} (local and alternates)", fork_height);
+                net_routine!(
+                    "⛔ Reorg: missing fork anchor at height {} (local and alternates)",
+                    fork_height
+                );
             }
             // Pre-deduplicate epoch requests before enqueuing
             let start = fork_height.saturating_sub(REORG_BACKFILL);
             if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
-                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS));
+                map.retain(|_, t| {
+                    now.duration_since(*t) < std::time::Duration::from_secs(EPOCH_REQ_DEDUP_SECS)
+                });
             }
             if let Ok(mut map) = RECENT_EPOCH_REQS.lock() {
                 for n in start..=fork_height {
@@ -1501,29 +1848,44 @@ fn attempt_reorg(
         // Try to assemble a valid alternate branch from first_height..=max_buf_height using BFS across candidates
         let chosen_chain: Vec<Anchor>;
         let mut resolved_parent: Option<Anchor> = None;
-        let parent_hashes: std::collections::HashSet<[u8; 32]> = parent_candidates.iter().map(|p| p.hash).collect();
-        let mut back: std::collections::HashMap<[u8; 32], [u8; 32]> = std::collections::HashMap::new(); // child.hash -> parent.hash
-        let mut node_by_hash: std::collections::HashMap<[u8; 32], Anchor> = std::collections::HashMap::new();
-        for p in &parent_candidates { node_by_hash.insert(p.hash, p.clone()); }
+        let parent_hashes: std::collections::HashSet<[u8; 32]> =
+            parent_candidates.iter().map(|p| p.hash).collect();
+        let mut back: std::collections::HashMap<[u8; 32], [u8; 32]> =
+            std::collections::HashMap::new(); // child.hash -> parent.hash
+        let mut node_by_hash: std::collections::HashMap<[u8; 32], Anchor> =
+            std::collections::HashMap::new();
+        for p in &parent_candidates {
+            node_by_hash.insert(p.hash, p.clone());
+        }
         let mut frontier: Vec<Anchor> = parent_candidates.clone();
         let mut last_frontier: Vec<Anchor> = Vec::new();
         let mut advanced = false;
         let mut steps: usize = 0;
         loop {
-            if steps >= MAX_REORG_STEPS { break; }
+            if steps >= MAX_REORG_STEPS {
+                break;
+            }
             let mut next_frontier: Vec<Anchor> = Vec::new();
             for p in &frontier {
                 let mut children = orphan_buf.children_of(&p.hash);
                 // Keep only direct children at H+1
                 children.retain(|c| c.num == p.num.saturating_add(1));
                 for ch in children {
-                    if !back.contains_key(&ch.hash) { back.insert(ch.hash, p.hash); }
+                    if !back.contains_key(&ch.hash) {
+                        back.insert(ch.hash, p.hash);
+                    }
                     next_frontier.push(ch.clone());
-                    if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
+                    if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT {
+                        break;
+                    }
                 }
-                if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT { break; }
+                if next_frontier.len() >= MAX_BFS_WIDTH_PER_HEIGHT {
+                    break;
+                }
             }
-            if next_frontier.is_empty() { break; }
+            if next_frontier.is_empty() {
+                break;
+            }
             // Deduplicate by hash to prevent frontier explosion
             let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
             let mut deduped: Vec<Anchor> = Vec::new();
@@ -1542,30 +1904,50 @@ fn attempt_reorg(
             let now = std::time::Instant::now();
             let mut allow_log = true;
             if let Ok(mut map) = LAST_MISMATCH_LOGS.lock() {
-                map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS));
+                map.retain(|_, t| {
+                    now.duration_since(*t) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS)
+                });
                 if let Some(last) = map.get(&first_height) {
-                    if now.duration_since(*last) < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS) { allow_log = false; }
+                    if now.duration_since(*last)
+                        < std::time::Duration::from_secs(REORG_LOG_THROTTLE_SECS)
+                    {
+                        allow_log = false;
+                    }
                 }
-                if allow_log { map.insert(first_height, now); }
+                if allow_log {
+                    map.insert(first_height, now);
+                }
             }
             if allow_log {
-                net_log!("⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)", first_height);
+                net_log!(
+                    "⛔ Reorg: anchor hash mismatch at {} (no candidate links to provided parents)",
+                    first_height
+                );
             }
             if first_height > 0 {
                 let start = fork_height.saturating_sub(REORG_BACKFILL);
                 let end = first_height - 1;
-                for n in start..=end { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+                for n in start..=end {
+                    let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+                }
             }
             let _ = command_tx.send(NetworkCommand::RequestEpoch(fork_height));
             return false;
         }
 
         // Choose the best reachable tip with deterministic tie-break like is_better_chain()
-        let Some(seg_tip) = last_frontier.iter().max_by(|x, y| {
-            x.cumulative_work.cmp(&y.cumulative_work)
-                .then_with(|| x.num.cmp(&y.num))
-                .then_with(|| x.hash.cmp(&y.hash))
-        }).cloned() else { return false };
+        let Some(seg_tip) = last_frontier
+            .iter()
+            .max_by(|x, y| {
+                x.cumulative_work
+                    .cmp(&y.cumulative_work)
+                    .then_with(|| x.num.cmp(&y.num))
+                    .then_with(|| x.hash.cmp(&y.hash))
+            })
+            .cloned()
+        else {
+            return false;
+        };
 
         // Reconstruct the chosen chain from seg_tip back to one of the parents
         let mut chain_rev: Vec<Anchor> = Vec::new();
@@ -1579,30 +1961,58 @@ fn attempt_reorg(
             if let Some(prev) = node_by_hash.get(prev_hash).cloned() {
                 chain_rev.push(prev.clone());
                 cur = prev;
-            } else { break; }
+            } else {
+                break;
+            }
         }
         chain_rev.reverse();
         chosen_chain = chain_rev;
-        if chosen_chain.is_empty() { return false; }
+        if chosen_chain.is_empty() {
+            return false;
+        }
 
-        let Some(seg_tip) = chosen_chain.last() else { return false; };
+        let Some(seg_tip) = chosen_chain.last() else {
+            return false;
+        };
         if seg_tip.cumulative_work <= current_latest.cumulative_work {
-            net_routine!("ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
-                seg_tip.num, seg_tip.cumulative_work, current_latest.num, current_latest.cumulative_work);
+            net_routine!(
+                "ℹ️  Reorg: candidate tip #{} cum_work {} not better than current #{} cum_work {}",
+                seg_tip.num,
+                seg_tip.cumulative_work,
+                current_latest.num,
+                current_latest.cumulative_work
+            );
             return false;
         }
 
         // Gate BFS adoption on consensus validation across the segment using resolved parent
-        if let Err(e) = validate_segment_consensus(resolved_parent.as_ref().unwrap_or(&current_latest), &chosen_chain, db, &orphan_buf) {
+        if let Err(e) = validate_segment_consensus(
+            resolved_parent.as_ref().unwrap_or(&current_latest),
+            &chosen_chain,
+            db,
+            &orphan_buf,
+        ) {
             net_log!("⛔ Reorg blocked (BFS): {}", e);
             // Backfill around fork height to complete windows for a future attempt
             let start = fork_height.saturating_sub(REORG_BACKFILL);
-            for n in start..=fork_height { let _ = command_tx.send(NetworkCommand::RequestEpoch(n)); }
+            for n in start..=fork_height {
+                let _ = command_tx.send(NetworkCommand::RequestEpoch(n));
+            }
             return false;
         }
 
         // Adopt: overwrite epochs and latest pointer; reconcile per-epoch selected/leaves/coins
-        let (Some(epoch_cf), Some(anchor_cf), Some(sel_cf), Some(leaves_cf), Some(coin_cf), Some(coin_epoch_cf), Some(spend_cf), Some(nullifier_cf), Some(commitment_used_cf)) = (
+        let (
+            Some(epoch_cf),
+            Some(anchor_cf),
+            Some(sel_cf),
+            Some(leaves_cf),
+            Some(coin_cf),
+            Some(coin_epoch_cf),
+            Some(spend_cf),
+            Some(nullifier_cf),
+            Some(commitment_used_cf),
+        ) = (
             db.db.cf_handle("epoch"),
             db.db.cf_handle("anchor"),
             db.db.cf_handle("epoch_selected"),
@@ -1612,13 +2022,22 @@ fn attempt_reorg(
             db.db.cf_handle("spend"),
             db.db.cf_handle("nullifier"),
             db.db.cf_handle("commitment_used"),
-        ) else { return false; };
+        )
+        else {
+            return false;
+        };
         let mut batch = WriteBatch::default();
 
-        let mut parent = match resolved_parent { Some(p) => p, None => return false };
+        let mut parent = match resolved_parent {
+            Some(p) => p,
+            None => return false,
+        };
         for alt in &chosen_chain {
             // 1) Overwrite anchor mappings for this epoch and advance latest
-            let ser = match bincode::serialize(alt) { Ok(v) => v, Err(_) => return false };
+            let ser = match bincode::serialize(alt) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
             batch.put_cf(epoch_cf, alt.num.to_le_bytes(), &ser);
             batch.put_cf(epoch_cf, b"latest", &ser);
             batch.put_cf(anchor_cf, &alt.hash, &ser);
@@ -1638,7 +2057,14 @@ fn attempt_reorg(
                         if sp.unlock_preimage.is_some() {
                             if let Some(next_lock) = sp.next_lock_hash {
                                 if let Ok(chain_id) = db.get_chain_id() {
-                                    let cid = crate::crypto::commitment_id_v1(&sp.to.one_time_pk, &sp.to.kyber_ct, &next_lock, &sp.coin_id, sp.to.amount_le, &chain_id);
+                                    let cid = crate::crypto::commitment_id_v1(
+                                        &sp.to.one_time_pk,
+                                        &sp.to.kyber_ct,
+                                        &next_lock,
+                                        &sp.coin_id,
+                                        sp.to.amount_le,
+                                        &chain_id,
+                                    );
                                     batch.delete_cf(commitment_used_cf, &cid);
                                 }
                             }
@@ -1649,7 +2075,10 @@ fn attempt_reorg(
 
             // 3) Clear old per-epoch selected index keys and leaves
             let prefix = alt.num.to_le_bytes();
-            let iter = db.db.iterator_cf(sel_cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+            let iter = db.db.iterator_cf(
+                sel_cf,
+                rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            );
             for item in iter {
                 if let Ok((k, _)) = item {
                     if k.len() >= 8 && &k[0..8] == prefix {
@@ -1663,12 +2092,19 @@ fn attempt_reorg(
 
             // 4) Attempt to reconstruct selected set using canonical selector
             let cap = alt.coin_count as usize;
-            let (candidates, _total_candidates) = crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
+            let (candidates, _total_candidates) =
+                crate::epoch::select_candidates_for_epoch(&db, &parent, cap, None);
 
-            let selected_ids: std::collections::HashSet<[u8;32]> = candidates.iter().map(|c| c.id).collect();
-            let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+            let selected_ids: std::collections::HashSet<[u8; 32]> =
+                candidates.iter().map(|c| c.id).collect();
+            let mut leaves: Vec<[u8; 32]> = selected_ids
+                .iter()
+                .map(crate::coin::Coin::id_to_leaf_hash)
+                .collect();
             leaves.sort();
-            let computed_root = if leaves.is_empty() { [0u8;32] } else {
+            let computed_root = if leaves.is_empty() {
+                [0u8; 32]
+            } else {
                 let mut tmp = leaves.clone();
                 while tmp.len() > 1 {
                     let mut next = Vec::new();
@@ -1722,16 +2158,23 @@ fn attempt_reorg(
             eprintln!("🔥 Reorg write failed: {}", e);
             return false;
         }
-        for alt in &chosen_chain { let _ = anchor_tx.send(alt.clone()); }
+        for alt in &chosen_chain {
+            let _ = anchor_tx.send(alt.clone());
+        }
         if let Ok(mut st) = sync_state.lock() {
             st.highest_seen_epoch = seg_tip.num;
         }
-        for alt in &chosen_chain { let _ = orphan_buf.remove_exact(alt.num, alt.hash); }
-        net_log!("🔁 Reorg adopted up to epoch {} (better cumulative work)", seg_tip.num);
+        for alt in &chosen_chain {
+            let _ = orphan_buf.remove_exact(alt.num, alt.hash);
+        }
+        net_log!(
+            "🔁 Reorg adopted up to epoch {} (better cumulative work)",
+            seg_tip.num
+        );
         true
     }
 
-    tokio::spawn(async move {       
+    tokio::spawn(async move {
         // Track peers being dialed to avoid duplicate concurrent dials
         let mut dialing_peers: HashSet<PeerId> = HashSet::new();
         // Track active connection counts per peer to deduplicate logs and state updates
@@ -1741,15 +2184,18 @@ fn attempt_reorg(
         // Rate-limit self address advertisement to avoid connect storms
         const PEER_ADDR_ADVERTISE_MIN_SECS: u64 = 60;
         const PEER_DIAL_DEDUP_SECS: u64 = 30;
-        let mut last_peer_addr_advertise: Instant = Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
+        let mut last_peer_addr_advertise: Instant =
+            Instant::now() - std::time::Duration::from_secs(PEER_ADDR_ADVERTISE_MIN_SECS);
         // Opportunistic dialing of stored peer addresses and periodic bootstrap nudges
         const KNOWN_ADDR_REFRESH_SECS: u64 = 60;
         const PER_TICK_DIAL_LIMIT: usize = 2;
         const BOOTSTRAP_REDIAL_INTERVAL_SECS: u64 = 45;
         let mut known_peer_addrs: Vec<String> = Vec::new();
         let mut next_known_addr_idx: usize = 0;
-        let mut last_known_addrs_refresh: Instant = Instant::now() - std::time::Duration::from_secs(KNOWN_ADDR_REFRESH_SECS);
-        let mut last_bootstrap_redial: Instant = Instant::now() - std::time::Duration::from_secs(BOOTSTRAP_REDIAL_INTERVAL_SECS);
+        let mut last_known_addrs_refresh: Instant =
+            Instant::now() - std::time::Duration::from_secs(KNOWN_ADDR_REFRESH_SECS);
+        let mut last_bootstrap_redial: Instant =
+            Instant::now() - std::time::Duration::from_secs(BOOTSTRAP_REDIAL_INTERVAL_SECS);
         // Periodic retry timer to flush pending publishes even without connection events
         let mut retry_timer = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
@@ -1989,7 +2435,7 @@ fn attempt_reorg(
                             let score = peer_scores.entry(peer_id).or_insert_with(|| PeerScore::new(&p2p_cfg));
                             let rate_limit_exempt = topic_str == TOP_ANCHOR || topic_str == TOP_RATE_LIMITED;
                             if score.is_banned() || (!rate_limit_exempt && !score.check_rate_limit()) { continue; }
-                            
+
                             match topic_str {
                                 TOP_PQHS2_INIT => {
                                     if let Ok(msg) = bincode::deserialize::<Pqhs2Init>(&message.data) {
@@ -2210,7 +2656,7 @@ fn attempt_reorg(
                                             let parent_hash = links_to_available_parent(&a, &orphan_buf, &db);
                                             if let Some(p_hash) = parent_hash {
                                                 if p_hash == latest.hash {
-                                                    net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, linked to expected parent)", 
+                                                    net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, linked to expected parent)",
                                                         a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
                                                 } else {
                                                     // Throttle this per-(height,parent) to avoid spam
@@ -2233,8 +2679,8 @@ fn attempt_reorg(
                                                             if allow_hash_log { map.insert(a.hash, now); }
                                                         }
                                                         if allow_hash_log {
-                                                            net_log!("🔀 Received fork epoch {} (hash: {}, cum_work: {}, diff: {}, linked to parent {} ≠ expected {})", 
-                                                                a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty, 
+                                                            net_log!("🔀 Received fork epoch {} (hash: {}, cum_work: {}, diff: {}, linked to parent {} ≠ expected {})",
+                                                                a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty,
                                                                 hex::encode(&p_hash[..8]), hex::encode(&latest.hash[..8]));
                                                         }
                                                     }
@@ -2287,7 +2733,7 @@ fn attempt_reorg(
                                                         if allow_hash_log { map.insert(a.hash, now); }
                                                     }
                                                     if allow_hash_log {
-                                                        net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)", 
+                                                        net_log!("📦 Received next epoch {} (hash: {}, cum_work: {}, diff: {}, parent unknown)",
                                                             a.num, hex::encode(&a.hash[..8]), a.cumulative_work, a.difficulty);
                                                     }
                                                 }
@@ -2453,7 +2899,7 @@ fn attempt_reorg(
                                                 net_routine!("⚠️ Peer {} exceeded orphan contribution limit, dropping anchor {}", peer_id, a.num);
                                                 continue;
                                             }
-                                            
+
                                             // Log details about missing previous anchor (throttled per height)
                                             if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                                                 let retarget_gap = parent_h.saturating_add(1) != a.num;
@@ -2497,12 +2943,12 @@ fn attempt_reorg(
                                                         if allow { m.insert(a.num, now); }
                                                     }
                                                     if allow {
-                                                        net_log!("⚠️  Epoch {} missing or divergent parent. Looking for parent at {}", 
+                                                        net_log!("⚠️  Epoch {} missing or divergent parent. Looking for parent at {}",
                                                             a.num, a.num.saturating_sub(1));
                                                         // Check if we have the previous epoch with a different hash
                                                         if let Ok(Some(stored_prev)) = db.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
                                                             net_log!("❌ Hash mismatch at epoch {}: stored hash {}, anchor observed child {}",
-                                                                a.num - 1, hex::encode(&stored_prev.hash[..8]), 
+                                                                a.num - 1, hex::encode(&stored_prev.hash[..8]),
                                                                 hex::encode(&a.hash[..8]));
                                                         }
                                                     }
@@ -2521,7 +2967,7 @@ fn attempt_reorg(
                                                         net_routine!("⏳ Buffered orphan anchor for epoch {} (buffer size: {})", a.num, orphan_buf.len());
                                                         // If buffer is getting full, trigger aggressive cleanup and reorg
                                                         if orphan_buf.len() > ORPHAN_TOTAL_CAP * 3 / 4 {
-                                                            net_log!("⚠️  Orphan buffer at {}% capacity, triggering cleanup", 
+                                                            net_log!("⚠️  Orphan buffer at {}% capacity, triggering cleanup",
                                                                 (orphan_buf.len() * 100) / ORPHAN_TOTAL_CAP);
                                                             orphan_buf.prune_expired(std::time::Instant::now());
                                                         }
@@ -2531,7 +2977,7 @@ fn attempt_reorg(
                                                     }
                                                 }
                                             }
-                                            
+
                                             // Do not treat MissingParent as confirmation of network tip; wait for Valid linkage
                                             if a.num > 0 {
                                                 let retarget_gap = parent_h.saturating_add(1) != a.num;
@@ -2587,10 +3033,10 @@ fn attempt_reorg(
                                                 net_routine!("⚠️ Peer {} exceeded orphan contribution limit, dropping anchor {}", peer_id, a.num);
                                                 continue;
                                             }
-                                            
+
                                             let parent_hash = links_to_available_parent(&a, &orphan_buf, &db);
-                                            if let Some(p_hash) = parent_hash { 
-                                                net_routine!("🔗 Fork epoch {} linked to parent {}", a.num, hex::encode(&p_hash[..8])); 
+                                            if let Some(p_hash) = parent_hash {
+                                                net_routine!("🔗 Fork epoch {} linked to parent {}", a.num, hex::encode(&p_hash[..8]));
                                                 // Check if this parent differs from our local tip and request it by hash
                                                 if let Ok(Some(lat)) = db.get::<Anchor>("epoch", b"latest") {
                                                     if p_hash != lat.hash {
@@ -2815,7 +3261,7 @@ fn attempt_reorg(
                                         if validate_anchor(&cmp_anchor, &db).is_ok() {
                                             if db.put("epoch", &cmp_anchor.num.to_le_bytes(), &cmp_anchor).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                             if db.put("anchor", &cmp_anchor.hash, &cmp_anchor).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                        	                let better = cmp_anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None));
+                                            let better = cmp_anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or(None));
                                             if better { if db.put("epoch", b"latest", &cmp_anchor).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); } }
                                             let _ = anchor_tx.send(cmp_anchor.clone());
                                             // After adoption, reconcile orphan buffer near tip
@@ -3831,13 +4277,13 @@ fn attempt_reorg(
                             // Only redial bootstraps if we are currently not connected to any peer
                             let have_any_peers = connected_peers.lock().map(|s| !s.is_empty()).unwrap_or(false);
                             if have_any_peers { continue; }
-                            
+
                             // Actively redial configured bootstraps with address-based deduplication
                             let now = Instant::now();
                             if let Ok(mut map) = RECENT_BOOTSTRAP_DIALS.lock() {
                                 map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(BOOTSTRAP_REDIAL_DEDUP_SECS));
                             }
-                            
+
                             for addr in &net_cfg.bootstrap {
                                 // Skip banned bootstraps
                                 if let Some(id_str) = addr.split("/p2p/").last() {
@@ -3849,14 +4295,14 @@ fn attempt_reorg(
                                     // Capacity and address-based dedup checks
                                     let under_cap = connected_peers.lock().map(|s| s.len()).unwrap_or(usize::MAX) < net_cfg.max_peers as usize;
                                     if !under_cap { continue; }
-                                    
+
                                     let mut allow = true;
                                     if let Ok(mut map) = RECENT_BOOTSTRAP_DIALS.lock() {
                                         allow = !map.contains_key(addr);
                                         if allow { map.insert(addr.clone(), now); }
                                     }
                                     if !allow { continue; }
-                                    
+
                                     match swarm.dial(m.clone()) {
                                         Ok(()) => net_routine!("📡 Redialing bootstrap {}", addr),
                                         Err(e) => eprintln!("❌ Failed to redial bootstrap {}: {}", addr, e),
@@ -3892,40 +4338,74 @@ fn attempt_reorg(
             if _last_offers_prune.elapsed() > std::time::Duration::from_secs(15) {
                 _last_offers_prune = std::time::Instant::now();
                 if let Some(cf) = db.db.cf_handle("offers") {
-                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u128;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0) as u128;
                     let ttl_ms = (offers_cfg.ttl_secs as u128) * 1000u128;
                     let cutoff = now_ms.saturating_sub(ttl_ms);
                     // Load cursor
                     let meta_cf = db.db.cf_handle("meta");
                     let cursor_key = b"offers_prune_cursor_ts";
                     let mut cursor_ts: u128 = 0;
-                    if let Some(meta) = meta_cf { if let Ok(Some(v)) = db.db.get_cf(meta, cursor_key) { if v.len() == 16 { let mut a=[0u8;16]; a.copy_from_slice(&v); cursor_ts = u128::from_le_bytes(a); } } }
-                    if cursor_ts == 0 { cursor_ts = cutoff.saturating_sub(1_000u128); }
+                    if let Some(meta) = meta_cf {
+                        if let Ok(Some(v)) = db.db.get_cf(meta, cursor_key) {
+                            if v.len() == 16 {
+                                let mut a = [0u8; 16];
+                                a.copy_from_slice(&v);
+                                cursor_ts = u128::from_le_bytes(a);
+                            }
+                        }
+                    }
+                    if cursor_ts == 0 {
+                        cursor_ts = cutoff.saturating_sub(1_000u128);
+                    }
 
                     // Iterate from cursor forward, bounded
                     let mut ro = rocksdb::ReadOptions::default();
                     ro.set_iterate_lower_bound(cursor_ts.to_le_bytes().to_vec());
-                    let it = db.db.iterator_cf_opt(cf, ro, rocksdb::IteratorMode::From(&cursor_ts.to_le_bytes(), rocksdb::Direction::Forward));
+                    let it = db.db.iterator_cf_opt(
+                        cf,
+                        ro,
+                        rocksdb::IteratorMode::From(
+                            &cursor_ts.to_le_bytes(),
+                            rocksdb::Direction::Forward,
+                        ),
+                    );
                     let mut pruned: u64 = 0;
                     let mut visited: u64 = 0;
                     let mut last_seen_ts: u128 = cursor_ts;
                     let mut batch = rocksdb::WriteBatch::default();
                     const MAX_VISIT: u64 = 10_000; // bounded work per tick
                     for item in it {
-                        if visited >= MAX_VISIT { break; }
+                        if visited >= MAX_VISIT {
+                            break;
+                        }
                         if let Ok((k, _v)) = item {
-                            if k.len() < 16 { continue; }
-                            let mut ts_le = [0u8;16]; ts_le.copy_from_slice(&k[0..16]);
+                            if k.len() < 16 {
+                                continue;
+                            }
+                            let mut ts_le = [0u8; 16];
+                            ts_le.copy_from_slice(&k[0..16]);
                             let ts = u128::from_le_bytes(ts_le);
                             last_seen_ts = ts;
                             visited = visited.saturating_add(1);
-                            if ts < cutoff { batch.delete_cf(&cf, &k); pruned = pruned.saturating_add(1); }
-                            else { break; }
+                            if ts < cutoff {
+                                batch.delete_cf(&cf, &k);
+                                pruned = pruned.saturating_add(1);
+                            } else {
+                                break;
+                            }
                         }
                     }
-                    if pruned > 0 { let _ = db.db.write(batch); crate::metrics::OFFERS_PRUNED.inc_by(pruned); }
+                    if pruned > 0 {
+                        let _ = db.db.write(batch);
+                        crate::metrics::OFFERS_PRUNED.inc_by(pruned);
+                    }
                     // Persist next cursor (advance even if no prunes, to avoid rescanning)
-                    if let Some(meta) = meta_cf { let _ = db.db.put_cf(meta, cursor_key, &last_seen_ts.to_le_bytes()); }
+                    if let Some(meta) = meta_cf {
+                        let _ = db.db.put_cf(meta, cursor_key, &last_seen_ts.to_le_bytes());
+                    }
 
                     // Enforce global cap approximately: if over cap, delete oldest beyond cap in small batches
                     // Use an approximate pass without full counting; remove up to CAP_SLICE oldest entries
@@ -3935,16 +4415,28 @@ fn attempt_reorg(
                         // Count up to max_entries + CAP_SLICE
                         let mut total_est: u64 = 0;
                         let iter_count = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-                        for item in iter_count.take((offers_cfg.max_entries + CAP_SLICE) as usize) { if item.is_ok() { total_est = total_est.saturating_add(1); } }
+                        for item in iter_count.take((offers_cfg.max_entries + CAP_SLICE) as usize) {
+                            if item.is_ok() {
+                                total_est = total_est.saturating_add(1);
+                            }
+                        }
                         if total_est > offers_cfg.max_entries {
                             let to_prune = (total_est - offers_cfg.max_entries).min(CAP_SLICE);
                             let mut batch2 = rocksdb::WriteBatch::default();
                             let iter2 = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
                             for item in iter2 {
-                                if count >= to_prune { break; }
-                                if let Ok((k, _)) = item { batch2.delete_cf(&cf, &k); count = count.saturating_add(1); }
+                                if count >= to_prune {
+                                    break;
+                                }
+                                if let Ok((k, _)) = item {
+                                    batch2.delete_cf(&cf, &k);
+                                    count = count.saturating_add(1);
+                                }
                             }
-                            if count > 0 { let _ = db.db.write(batch2); crate::metrics::OFFERS_PRUNED.inc_by(count); }
+                            if count > 0 {
+                                let _ = db.db.write(batch2);
+                                crate::metrics::OFFERS_PRUNED.inc_by(count);
+                            }
                         }
                     }
                 }
@@ -3955,62 +4447,138 @@ fn attempt_reorg(
 }
 
 impl Network {
-    pub async fn gossip_anchor(&self, a: &Anchor) { let _ = self.command_tx.send(NetworkCommand::GossipAnchor(a.clone())); }
+    pub async fn gossip_anchor(&self, a: &Anchor) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipAnchor(a.clone()));
+    }
     pub async fn gossip_coin(&self, c: &CoinCandidate) {
         // Gossip the new-format candidate only (V3-only)
         let _ = self.command_tx.send(NetworkCommand::GossipCoin(c.clone()));
     }
-    pub async fn gossip_spend(&self, sp: &Spend) { let _ = self.command_tx.send(NetworkCommand::GossipSpend(sp.clone())); }
-    pub async fn gossip_compact_epoch(&self, compact: CompactEpoch) { let _ = self.command_tx.send(NetworkCommand::GossipCompactEpoch(compact)); }
-    pub async fn gossip_rate_limited(&self, msg: RateLimitedMessage) { let _ = self.command_tx.send(NetworkCommand::GossipRateLimited(msg)); }
-    pub async fn request_spend(&self, id: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestSpend(id)); }
-    pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> { self.anchor_tx.subscribe() }
-    pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> { self.proof_tx.subscribe() }
-    pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> { self.spend_tx.subscribe() }
-    pub fn headers_subscribe(&self) -> broadcast::Receiver<EpochHeadersBatch> { self.headers_tx.subscribe() }
-    pub fn offers_subscribe(&self) -> broadcast::Receiver<crate::wallet::OfferDocV1> { self.offers_tx.subscribe() }
-    // Commitment subscription interfaces removed
-    pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> { self.rate_limited_tx.subscribe() }
-    pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> { self.anchor_tx.clone() }
-    pub async fn request_epoch(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n)); }
-    pub async fn request_epoch_direct(&self, n: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochDirect(n)); }
-    pub async fn request_epoch_headers_range(&self, start_height: u64, count: u32) {
-        let range = EpochHeadersRange { start_height, count };
-        let _ = self.command_tx.send(NetworkCommand::RequestEpochHeadersRange(range));
+    pub async fn gossip_spend(&self, sp: &Spend) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipSpend(sp.clone()));
     }
-    pub async fn request_epoch_by_hash(&self, hash: [u8; 32]) { 
+    pub async fn gossip_compact_epoch(&self, compact: CompactEpoch) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipCompactEpoch(compact));
+    }
+    pub async fn gossip_rate_limited(&self, msg: RateLimitedMessage) {
+        let _ = self.command_tx.send(NetworkCommand::GossipRateLimited(msg));
+    }
+    pub async fn request_spend(&self, id: [u8; 32]) {
+        let _ = self.command_tx.send(NetworkCommand::RequestSpend(id));
+    }
+    pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> {
+        self.anchor_tx.subscribe()
+    }
+    pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> {
+        self.proof_tx.subscribe()
+    }
+    pub fn spend_subscribe(&self) -> broadcast::Receiver<Spend> {
+        self.spend_tx.subscribe()
+    }
+    pub fn headers_subscribe(&self) -> broadcast::Receiver<EpochHeadersBatch> {
+        self.headers_tx.subscribe()
+    }
+    pub fn offers_subscribe(&self) -> broadcast::Receiver<crate::wallet::OfferDocV1> {
+        self.offers_tx.subscribe()
+    }
+    // Commitment subscription interfaces removed
+    pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> {
+        self.rate_limited_tx.subscribe()
+    }
+    pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> {
+        self.anchor_tx.clone()
+    }
+    pub async fn request_epoch(&self, n: u64) {
+        let _ = self.command_tx.send(NetworkCommand::RequestEpoch(n));
+    }
+    pub async fn request_epoch_direct(&self, n: u64) {
+        let _ = self.command_tx.send(NetworkCommand::RequestEpochDirect(n));
+    }
+    pub async fn request_epoch_headers_range(&self, start_height: u64, count: u32) {
+        let range = EpochHeadersRange {
+            start_height,
+            count,
+        };
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::RequestEpochHeadersRange(range));
+    }
+    pub async fn request_epoch_by_hash(&self, hash: [u8; 32]) {
         // Deduplicate requests to avoid spam
         let now = std::time::Instant::now();
         let mut allow = true;
         if let Ok(mut m) = RECENT_HASH_REQS.lock() {
-            m.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(HASH_REQ_DEDUP_SECS));
+            m.retain(|_, t| {
+                now.duration_since(*t) < std::time::Duration::from_secs(HASH_REQ_DEDUP_SECS)
+            });
             allow = !m.contains_key(&hash);
-            if allow { m.insert(hash, now); }
+            if allow {
+                m.insert(hash, now);
+            }
         }
         if allow {
-            let _ = self.command_tx.send(NetworkCommand::RequestEpochByHash(hash));
+            let _ = self
+                .command_tx
+                .send(NetworkCommand::RequestEpochByHash(hash));
         }
     }
-    pub async fn request_coin(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoin(id)); }
-    pub async fn request_latest_epoch(&self) { let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch); }
-    pub async fn request_coin_proof(&self, id: [u8; 32]) { let _ = self.command_tx.send(NetworkCommand::RequestCoinProof(id)); }
-    pub async fn request_epoch_selected(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochSelected(epoch_num)); }
-    pub async fn request_epoch_txn(&self, epoch_hash: [u8;32], indexes: Vec<u32>) {
-        let req = EpochGetTxn { epoch_hash, indexes };
+    pub async fn request_coin(&self, id: [u8; 32]) {
+        let _ = self.command_tx.send(NetworkCommand::RequestCoin(id));
+    }
+    pub async fn request_latest_epoch(&self) {
+        let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch);
+    }
+    pub async fn request_coin_proof(&self, id: [u8; 32]) {
+        let _ = self.command_tx.send(NetworkCommand::RequestCoinProof(id));
+    }
+    pub async fn request_epoch_selected(&self, epoch_num: u64) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::RequestEpochSelected(epoch_num));
+    }
+    pub async fn request_epoch_txn(&self, epoch_hash: [u8; 32], indexes: Vec<u32>) {
+        let req = EpochGetTxn {
+            epoch_hash,
+            indexes,
+        };
         let _ = self.command_tx.send(NetworkCommand::RequestEpochTxn(req));
     }
-    pub async fn request_epoch_candidates(&self, epoch_hash: [u8;32]) { let _ = self.command_tx.send(NetworkCommand::RequestEpochCandidates(epoch_hash)); }
-    pub async fn request_epoch_leaves(&self, epoch_num: u64) { let _ = self.command_tx.send(NetworkCommand::RequestEpochLeaves(epoch_num)); }
+    pub async fn request_epoch_candidates(&self, epoch_hash: [u8; 32]) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::RequestEpochCandidates(epoch_hash));
+    }
+    pub async fn request_epoch_leaves(&self, epoch_num: u64) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::RequestEpochLeaves(epoch_num));
+    }
     // Note: We do not keep an explicit command variant; selected requests are sent directly when needed.
-    pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) { let _ = self.command_tx.send(NetworkCommand::GossipEpochLeaves(bundle)); }
-    pub async fn gossip_offer(&self, offer: &crate::wallet::OfferDocV1) { let _ = self.command_tx.send(NetworkCommand::GossipOffer(offer.clone())); }
+    pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipEpochLeaves(bundle));
+    }
+    pub async fn gossip_offer(&self, offer: &crate::wallet::OfferDocV1) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipOffer(offer.clone()));
+    }
     // Commitment gossip removed
-    
+
     /// Gets the current number of connected peers
     pub fn peer_count(&self) -> usize {
         self.connected_peers.lock().map(|s| s.len()).unwrap_or(0)
     }
-    pub async fn redial_bootstraps(&self) { let _ = self.command_tx.send(NetworkCommand::RedialBootstraps); }
+    pub async fn redial_bootstraps(&self) {
+        let _ = self.command_tx.send(NetworkCommand::RedialBootstraps);
+    }
 }
 
 #[derive(Debug)]
@@ -4056,12 +4624,17 @@ impl OrphanBuffer {
         }
     }
 
-    fn len(&self) -> usize { self.count }
-    fn version(&self) -> u64 { self.version }
+    fn len(&self) -> usize {
+        self.count
+    }
+    fn version(&self) -> u64 {
+        self.version
+    }
 
     fn prune_expired(&mut self, now: std::time::Instant) {
         // Prune seen_recent
-        self.seen_recent.retain(|_, t| now.duration_since(*t) < self.ttl);
+        self.seen_recent
+            .retain(|_, t| now.duration_since(*t) < self.ttl);
         // Prune FIFO by TTL
         let mut rotated: usize = 0;
         let max_rotate = self.index_fifo.len();
@@ -4081,11 +4654,14 @@ impl OrphanBuffer {
                 } else {
                     break;
                 }
-            } else { break; }
+            } else {
+                break;
+            }
             rotated += 1;
         }
         // Prune cooled-down heights map
-        self.per_height_cooldown.retain(|_, t| now.duration_since(*t) < self.height_cooldown);
+        self.per_height_cooldown
+            .retain(|_, t| now.duration_since(*t) < self.height_cooldown);
     }
 
     fn remove_exact(&mut self, height: u64, hash: [u8; 32]) -> bool {
@@ -4103,19 +4679,25 @@ impl OrphanBuffer {
             if let Some(parent_hash) = self.parent_of.remove(&hash) {
                 if let Some(children) = self.by_parent.get_mut(&parent_hash) {
                     children.retain(|h| *h != hash);
-                    if children.is_empty() { self.by_parent.remove(&parent_hash); }
+                    if children.is_empty() {
+                        self.by_parent.remove(&parent_hash);
+                    }
                 }
             }
             if let Some(children) = self.by_parent.remove(&hash) {
                 for ch in children {
                     if let Some(p) = self.parent_of.get(&ch).copied() {
-                        if p == hash { self.parent_of.remove(&ch); }
+                        if p == hash {
+                            self.parent_of.remove(&ch);
+                        }
                     }
                 }
             }
             // now safe to clean maps and possibly remove empty vector
             if let Some(vec2) = self.by_height.get(&height) {
-                if vec2.is_empty() { self.by_height.remove(&height); }
+                if vec2.is_empty() {
+                    self.by_height.remove(&height);
+                }
             }
             {
                 self.count = self.count.saturating_sub(1);
@@ -4144,7 +4726,9 @@ impl OrphanBuffer {
                 } else {
                     self.index_fifo.push_back(h);
                 }
-            } else { break; }
+            } else {
+                break;
+            }
         }
         None
     }
@@ -4161,36 +4745,64 @@ impl OrphanBuffer {
             }
         }
         if removed > 0 {
-            eprintln!("Force pruned {} orphan anchors to prevent overflow", removed);
+            eprintln!(
+                "Force pruned {} orphan anchors to prevent overflow",
+                removed
+            );
         }
     }
 
-    fn insert(&mut self, anchor: Anchor, local_tip: Option<u64>, tip_window: u64, now: std::time::Instant, db: &Store) -> bool {
+    fn insert(
+        &mut self,
+        anchor: Anchor,
+        local_tip: Option<u64>,
+        tip_window: u64,
+        now: std::time::Instant,
+        db: &Store,
+    ) -> bool {
         // Only buffer within window of local tip
         if let Some(tip) = local_tip {
-            let dist = if anchor.num >= tip { anchor.num - tip } else { tip - anchor.num };
-            if dist > tip_window { return false; }
+            let dist = if anchor.num >= tip {
+                anchor.num - tip
+            } else {
+                tip - anchor.num
+            };
+            if dist > tip_window {
+                return false;
+            }
         }
         // TTL prune first
         self.prune_expired(now);
         // Dedup recent by hash
         if let Some(t) = self.seen_recent.get(&anchor.hash).copied() {
-            if now.duration_since(t) < self.ttl { return false; }
+            if now.duration_since(t) < self.ttl {
+                return false;
+            }
         }
         self.seen_recent.insert(anchor.hash, now);
         // Per-height cooldown
         if let Some(t) = self.per_height_cooldown.get(&anchor.num).copied() {
-            if now.duration_since(t) < self.height_cooldown { return false; }
+            if now.duration_since(t) < self.height_cooldown {
+                return false;
+            }
         }
         // Per-height cap enforcement
         // Use a scoped block to avoid overlapping borrows when we might mutate elsewhere
         let exists_or_full = {
             let vec = self.by_height.entry(anchor.num).or_default();
-            if vec.iter().any(|a| a.hash == anchor.hash) { return true; }
+            if vec.iter().any(|a| a.hash == anchor.hash) {
+                return true;
+            }
             vec.len() >= self.per_height_cap
         };
         if exists_or_full {
-            if self.by_height.get(&anchor.num).map(|v| v.len()).unwrap_or(0) >= self.per_height_cap {
+            if self
+                .by_height
+                .get(&anchor.num)
+                .map(|v| v.len())
+                .unwrap_or(0)
+                >= self.per_height_cap
+            {
                 self.remove_first_for_height(anchor.num);
                 self.per_height_cooldown.insert(anchor.num, now);
             } else {
@@ -4198,7 +4810,10 @@ impl OrphanBuffer {
                 return false;
             }
         }
-        self.by_height.entry(anchor.num).or_default().push(anchor.clone());
+        self.by_height
+            .entry(anchor.num)
+            .or_default()
+            .push(anchor.clone());
         self.index_fifo.push_back(anchor.hash);
         self.hash_to_height.insert(anchor.hash, anchor.num);
         self.inserted_at.insert(anchor.hash, now);
@@ -4211,7 +4826,9 @@ impl OrphanBuffer {
                 if let Some(h) = self.hash_to_height.get(&old_hash).copied() {
                     let _ = self.remove_exact(h, old_hash);
                 }
-            } else { break; }
+            } else {
+                break;
+            }
         }
         // Update adjacency/link cache once per insert
         self.update_adjacency_for(&anchor, db);
@@ -4219,7 +4836,7 @@ impl OrphanBuffer {
     }
 
     // Record parent->child linkage within buffer (assumes both exist in buffer)
-    fn record_parent_child(&mut self, parent_hash: [u8;32], child_hash: [u8;32]) {
+    fn record_parent_child(&mut self, parent_hash: [u8; 32], child_hash: [u8; 32]) {
         // Update parent_of
         self.parent_of.insert(child_hash, parent_hash);
         // Update by_parent list with de-dup
@@ -4230,23 +4847,35 @@ impl OrphanBuffer {
     }
 
     // Link a child (already in buffer) to available parents at H-1 (buffer-only); also cache DB parent if present
-    fn link_child_to_available_parents(&mut self, child_hash: [u8;32], db: &Store) {
-        let Some(child) = self.by_hash.get(&child_hash).cloned() else { return; };
-        if child.num == 0 { return; }
+    fn link_child_to_available_parents(&mut self, child_hash: [u8; 32], db: &Store) {
+        let Some(child) = self.by_hash.get(&child_hash).cloned() else {
+            return;
+        };
+        if child.num == 0 {
+            return;
+        }
         let parent_h = child.num.saturating_sub(1);
         let expected = Anchor::expected_work_for_difficulty(child.difficulty);
         // Try buffer parents
-        let mut selected_parent_hash: Option<[u8;32]> = None;
+        let mut selected_parent_hash: Option<[u8; 32]> = None;
         if let Some(cands) = self.by_height.get(&parent_h) {
             for p in cands {
-                if child.cumulative_work != p.cumulative_work.saturating_add(expected) { continue; }
+                if child.cumulative_work != p.cumulative_work.saturating_add(expected) {
+                    continue;
+                }
                 let mut h = blake3::Hasher::new();
                 h.update(&child.merkle_root);
                 h.update(&p.hash);
-                if *h.finalize().as_bytes() == child.hash { selected_parent_hash = Some(p.hash); break; }
+                if *h.finalize().as_bytes() == child.hash {
+                    selected_parent_hash = Some(p.hash);
+                    break;
+                }
             }
         }
-        if let Some(ph) = selected_parent_hash { self.record_parent_child(ph, child.hash); return; }
+        if let Some(ph) = selected_parent_hash {
+            self.record_parent_child(ph, child.hash);
+            return;
+        }
         // Cache DB parent hash if available (no by_parent linkage if parent not buffered)
         if let Ok(Some(local_parent)) = db.get::<Anchor>("epoch", &parent_h.to_le_bytes()) {
             if child.cumulative_work == local_parent.cumulative_work.saturating_add(expected) {
@@ -4256,31 +4885,44 @@ impl OrphanBuffer {
                 if *h.finalize().as_bytes() == child.hash {
                     self.parent_of.insert(child.hash, local_parent.hash);
                     // also record adjacency under DB parent for BFS traversal
-                    let entry = self.by_parent.entry(local_parent.hash).or_insert_with(Vec::new);
-                    if !entry.iter().any(|h| *h == child.hash) { entry.push(child.hash); }
+                    let entry = self
+                        .by_parent
+                        .entry(local_parent.hash)
+                        .or_insert_with(Vec::new);
+                    if !entry.iter().any(|h| *h == child.hash) {
+                        entry.push(child.hash);
+                    }
                 }
             }
         }
     }
 
     // Link a parent (already in buffer) to any available children at H+1 (buffer-only)
-    fn link_parent_to_available_children(&mut self, parent_hash: [u8;32]) {
-        let Some(parent) = self.by_hash.get(&parent_hash).cloned() else { return; };
+    fn link_parent_to_available_children(&mut self, parent_hash: [u8; 32]) {
+        let Some(parent) = self.by_hash.get(&parent_hash).cloned() else {
+            return;
+        };
         let child_h = parent.num.saturating_add(1);
-        let mut link_children: Vec<[u8;32]> = Vec::new();
+        let mut link_children: Vec<[u8; 32]> = Vec::new();
         if let Some(children) = self.by_height.get(&child_h) {
             for ch in children {
                 // Verify linkage
                 let expected = Anchor::expected_work_for_difficulty(ch.difficulty);
                 let expected_cum = parent.cumulative_work.saturating_add(expected);
-                if ch.cumulative_work != expected_cum { continue; }
+                if ch.cumulative_work != expected_cum {
+                    continue;
+                }
                 let mut h = blake3::Hasher::new();
                 h.update(&ch.merkle_root);
                 h.update(&parent.hash);
-                if *h.finalize().as_bytes() == ch.hash { link_children.push(ch.hash); }
+                if *h.finalize().as_bytes() == ch.hash {
+                    link_children.push(ch.hash);
+                }
             }
         }
-        for ch in link_children { self.record_parent_child(parent.hash, ch); }
+        for ch in link_children {
+            self.record_parent_child(parent.hash, ch);
+        }
     }
 
     // Update adjacency for a newly inserted anchor, both as child and as parent
@@ -4290,92 +4932,140 @@ impl OrphanBuffer {
     }
 
     // Get buffered children anchors for a parent hash
-    fn children_of(&self, parent_hash: &[u8;32]) -> Vec<Anchor> {
+    fn children_of(&self, parent_hash: &[u8; 32]) -> Vec<Anchor> {
         if let Some(child_hashes) = self.by_parent.get(parent_hash) {
-            child_hashes.iter().filter_map(|h| self.by_hash.get(h)).cloned().collect()
-        } else { Vec::new() }
+            child_hashes
+                .iter()
+                .filter_map(|h| self.by_hash.get(h))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use pqcrypto_kyber::kyber768;
-	use pqcrypto_dilithium::dilithium3;
+    use super::*;
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_kyber::kyber768;
 
-	fn kdf_roles(shared: &[u8], initiator_peer: &PeerId, responder_peer: &PeerId, init_nonce: &[u8;8], resp_nonce: &[u8;8], initiator_dpk: &DiliPk, responder_dpk: &DiliPk) -> [u8;32] {
-		kdf_b3("unchained.pqhs2.session.v1", &[
-			shared,
-			initiator_peer.to_bytes().as_slice(),
-			responder_peer.to_bytes().as_slice(),
-			init_nonce,
-			resp_nonce,
-			initiator_dpk.as_bytes(),
-			responder_dpk.as_bytes(),
-		])
-	}
+    fn kdf_roles(
+        shared: &[u8],
+        initiator_peer: &PeerId,
+        responder_peer: &PeerId,
+        init_nonce: &[u8; 8],
+        resp_nonce: &[u8; 8],
+        initiator_dpk: &DiliPk,
+        responder_dpk: &DiliPk,
+    ) -> [u8; 32] {
+        kdf_b3(
+            "unchained.pqhs2.session.v1",
+            &[
+                shared,
+                initiator_peer.to_bytes().as_slice(),
+                responder_peer.to_bytes().as_slice(),
+                init_nonce,
+                resp_nonce,
+                initiator_dpk.as_bytes(),
+                responder_dpk.as_bytes(),
+            ],
+        )
+    }
 
-	#[test]
-	fn pqhs2_session_keys_match_and_sig_verifies() {
-		// Generate identities
-		let id_i = identity::Keypair::generate_ed25519();
-		let id_r = identity::Keypair::generate_ed25519();
-		let peer_i = PeerId::from(id_i.public());
-		let peer_r = PeerId::from(id_r.public());
-		// Kyber keypairs
-		let (pk_i, sk_i) = kyber768::keypair();
-		let (pk_r, sk_r) = kyber768::keypair();
-		// Dilithium identities
-		let (dpk_i, dsk_i) = dilithium3::keypair();
-		let (dpk_r, dsk_r) = dilithium3::keypair();
+    #[test]
+    fn pqhs2_session_keys_match_and_sig_verifies() {
+        // Generate identities
+        let id_i = identity::Keypair::generate_ed25519();
+        let id_r = identity::Keypair::generate_ed25519();
+        let peer_i = PeerId::from(id_i.public());
+        let peer_r = PeerId::from(id_r.public());
+        // Kyber keypairs
+        let (pk_i, sk_i) = kyber768::keypair();
+        let (pk_r, sk_r) = kyber768::keypair();
+        // Dilithium identities
+        let (dpk_i, dsk_i) = dilithium3::keypair();
+        let (dpk_r, dsk_r) = dilithium3::keypair();
 
-		// Initiator builds init and signs
-		let mut nonce_i = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce_i);
-		let init_signable = pqhs2_init_signable(&peer_i, &peer_r, pk_i.as_bytes(), &nonce_i);
-		let sig_i = dili_detached_sign(&init_signable, &dsk_i);
-		assert!(dili_verify_detached(&DiliDetachedSignature::from_bytes(sig_i.as_bytes()).unwrap(), &init_signable, &dpk_i).is_ok());
+        // Initiator builds init and signs
+        let mut nonce_i = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_i);
+        let init_signable = pqhs2_init_signable(&peer_i, &peer_r, pk_i.as_bytes(), &nonce_i);
+        let sig_i = dili_detached_sign(&init_signable, &dsk_i);
+        assert!(dili_verify_detached(
+            &DiliDetachedSignature::from_bytes(sig_i.as_bytes()).unwrap(),
+            &init_signable,
+            &dpk_i
+        )
+        .is_ok());
 
-		// Responder encapsulates and signs response
-		let (shared_r, ct) = kyber768::encapsulate(&pk_i);
-		let mut nonce_r = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce_r);
-		let resp_signable = pqhs2_resp_signable(&peer_r, &peer_i, ct.as_bytes(), &nonce_i, &nonce_r);
-		let sig_r = dili_detached_sign(&resp_signable, &dsk_r);
-		assert!(dili_verify_detached(&DiliDetachedSignature::from_bytes(sig_r.as_bytes()).unwrap(), &resp_signable, &dpk_r).is_ok());
-		let sess_r = kdf_roles(shared_r.as_bytes(), &peer_i, &peer_r, &nonce_i, &nonce_r, &dpk_i, &dpk_r);
+        // Responder encapsulates and signs response
+        let (shared_r, ct) = kyber768::encapsulate(&pk_i);
+        let mut nonce_r = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_r);
+        let resp_signable =
+            pqhs2_resp_signable(&peer_r, &peer_i, ct.as_bytes(), &nonce_i, &nonce_r);
+        let sig_r = dili_detached_sign(&resp_signable, &dsk_r);
+        assert!(dili_verify_detached(
+            &DiliDetachedSignature::from_bytes(sig_r.as_bytes()).unwrap(),
+            &resp_signable,
+            &dpk_r
+        )
+        .is_ok());
+        let sess_r = kdf_roles(
+            shared_r.as_bytes(),
+            &peer_i,
+            &peer_r,
+            &nonce_i,
+            &nonce_r,
+            &dpk_i,
+            &dpk_r,
+        );
 
-		// Initiator decapsulates and derives session
-		let ct_parsed = kyber768::Ciphertext::from_bytes(ct.as_bytes()).unwrap();
-		let shared_i = kyber768::decapsulate(&ct_parsed, &sk_i);
-		let sess_i = kdf_roles(shared_i.as_bytes(), &peer_i, &peer_r, &nonce_i, &nonce_r, &dpk_i, &dpk_r);
-		assert_eq!(sess_i, sess_r);
-	}
+        // Initiator decapsulates and derives session
+        let ct_parsed = kyber768::Ciphertext::from_bytes(ct.as_bytes()).unwrap();
+        let shared_i = kyber768::decapsulate(&ct_parsed, &sk_i);
+        let sess_i = kdf_roles(
+            shared_i.as_bytes(),
+            &peer_i,
+            &peer_r,
+            &nonce_i,
+            &nonce_r,
+            &dpk_i,
+            &dpk_r,
+        );
+        assert_eq!(sess_i, sess_r);
+    }
 
-	#[test]
-	fn pqhs2_rejects_bad_signature() {
-		let id_i = identity::Keypair::generate_ed25519();
-		let id_r = identity::Keypair::generate_ed25519();
-		let peer_i = PeerId::from(id_i.public());
-		let peer_r = PeerId::from(id_r.public());
-		let (pk_i, sk_i) = kyber768::keypair();
-		let (pk_r, _sk_r) = kyber768::keypair();
-		let (dpk_i, _dsk_i) = dilithium3::keypair();
-		let (dpk_r, _dsk_r) = dilithium3::keypair();
+    #[test]
+    fn pqhs2_rejects_bad_signature() {
+        let id_i = identity::Keypair::generate_ed25519();
+        let id_r = identity::Keypair::generate_ed25519();
+        let peer_i = PeerId::from(id_i.public());
+        let peer_r = PeerId::from(id_r.public());
+        let (pk_i, sk_i) = kyber768::keypair();
+        let (pk_r, _sk_r) = kyber768::keypair();
+        let (dpk_i, _dsk_i) = dilithium3::keypair();
+        let (dpk_r, _dsk_r) = dilithium3::keypair();
 
-		let mut nonce = [0u8;8]; rand::rngs::OsRng.fill_bytes(&mut nonce);
-		let mut bogus_sig = vec![0u8; pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES];
-		rand::rngs::OsRng.fill_bytes(&mut bogus_sig);
-		let init = Pqhs2Init {
-			kyber_pk: pk_r.as_bytes().to_vec(),
-			nonce8: nonce,
-			to_peer: peer_r.to_string(),
-			dili_pk: dpk_i.as_bytes().to_vec(),
-			sig: bogus_sig,
-		};
-		// Verifier should fail
-		let signable = pqhs2_init_signable(&peer_i, &peer_r, &init.kyber_pk, &init.nonce8);
-		let parsed_pk = DiliPk::from_bytes(&init.dili_pk).unwrap();
-		assert!(DiliDetachedSignature::from_bytes(&init.sig).is_ok());
-		let sig = DiliDetachedSignature::from_bytes(&init.sig).unwrap();
-		assert!(dili_verify_detached(&sig, &signable, &parsed_pk).is_err());
-	}
+        let mut nonce = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut bogus_sig =
+            vec![0u8; pqcrypto_dilithium::ffi::PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut bogus_sig);
+        let init = Pqhs2Init {
+            kyber_pk: pk_r.as_bytes().to_vec(),
+            nonce8: nonce,
+            to_peer: peer_r.to_string(),
+            dili_pk: dpk_i.as_bytes().to_vec(),
+            sig: bogus_sig,
+        };
+        // Verifier should fail
+        let signable = pqhs2_init_signable(&peer_i, &peer_r, &init.kyber_pk, &init.nonce8);
+        let parsed_pk = DiliPk::from_bytes(&init.dili_pk).unwrap();
+        assert!(DiliDetachedSignature::from_bytes(&init.sig).is_ok());
+        let sig = DiliDetachedSignature::from_bytes(&init.sig).unwrap();
+        assert!(dili_verify_detached(&sig, &signable, &parsed_pk).is_err());
+    }
 }
