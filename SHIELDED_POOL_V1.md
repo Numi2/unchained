@@ -19,10 +19,12 @@ It is designed around four constraints:
 - `ArchivedNullifierEpoch`
 - `ArchiveShard`
 - `ArchiveProviderManifest`
+- `ArchiveReplicaAttestation`
 - `ArchiveDirectory`
 - `NullifierRootLedger`
 - `HistoricalUnspentCheckpoint`
 - `HistoricalUnspentServiceResponse`
+- `HistoricalUnspentSegment`
 - `HistoricalUnspentExtension`
 - `ShieldedSyncServer`
 
@@ -89,11 +91,12 @@ over the PQ mesh as batched checkpoint request/response messages rather than as
 a local-only helper.
 
 The live wallet no longer uses this in a one-note-at-a-time pattern. It builds
-batched checkpoint-extension requests across many owned notes, routes them
-through a rotating provider schedule, pads each provider/epoch bucket with
-cover requests up to a power-of-two bucket, and only then rerandomizes the
-provider response into the checkpoint extension that becomes durable local
-state.
+batched checkpoint-extension requests across many owned notes, splits each note
+history into shard-aligned segments, routes those segments through a rotating
+multi-provider schedule, pads each provider/shard bucket with cover requests up
+to a power-of-two bucket, rerandomizes every provider response segment, and
+only then aggregates the rerandomized segments into the checkpoint extension
+that becomes durable local state.
 
 `HistoricalUnspentCheckpoint::apply_extension()` verifies those records against
 the `NullifierRootLedger` and advances the checkpoint without requiring the
@@ -106,11 +109,13 @@ can be continued by another, as long as both agree on the same root ledger.
 
 Historical roots are also organized into content-addressed archive shards.
 
-`ArchiveDirectory::from_root_ledger_and_providers()` derives:
+`ArchiveDirectory::from_root_ledger_and_providers_and_replicas()` derives:
 
 - contiguous epoch-root shards
 - provider manifests learned from the PQ mesh
+- replica attestations and retention horizons per shard
 - a provider-selection schedule for checkpoint refresh
+- deterministic shard-custody assignments for replication repair
 
 The live runtime no longer treats archive operators as a purely local replica
 directory. Nodes now:
@@ -118,8 +123,11 @@ directory. Nodes now:
 - gossip node records over the PQ mesh
 - dial newly discovered operators directly
 - ingest provider-authored archive manifests into the local directory
+- ingest provider-authored replica attestations into the local directory
 - request missing archive shards from the serving provider over the PQ mesh
 - send remote checkpoint batch requests to the selected provider over the PQ mesh
+- rebalance shard custody toward the protocol replica target when they are a
+  deterministic assignee for an under-held shard
 
 That makes the archive layer a real multi-operator network while preserving the
 same provider-routing and rerandomization contract for checkpoint updates.
@@ -130,9 +138,19 @@ same provider-routing and rerandomization contract for checkpoint updates.
 checkpoint transcript root.
 
 `HistoricalUnspentServiceResponse::rerandomize()` is the stronger privacy step.
-It takes the deterministic provider response transcript and folds in client-only
-blinding, the provider manifest digest, and the historical root digest before
-the result is stored or used in the private spend witness.
+It takes a deterministic provider response segment and folds in client-only
+blinding, the provider manifest digest, and the segment historical root digest
+before that segment becomes durable state.
+
+`HistoricalUnspentExtension::aggregate()` is the next step. It takes many
+rerandomized provider segments and compresses them into one checkpoint
+extension with:
+
+- one note commitment
+- one prior checkpoint root
+- one aggregate historical-root digest
+- one segment-commitment root
+- one final aggregate rerandomization step
 
 The checkpoint layer is no longer a public transaction field. It is private
 witness material carried into the succinct spend proof, so validators consume
@@ -146,6 +164,8 @@ only the resulting public journal bindings rather than raw absence records.
 - `shielded_nullifier_epoch`
 - `shielded_root_ledger`
 - `shielded_checkpoint`
+- `shielded_archive_provider`
+- `shielded_archive_replica`
 
 These are persisted via canonical encodings in `src/canonical.rs`.
 
@@ -182,12 +202,17 @@ What remains public:
 The proving backend is CPU-first on Apple Silicon/macOS. Metal proving is not
 part of the correctness contract for this repository.
 
-## Next Frontier
+## Current Frontier
 
-The remaining frontier is no longer basic provider-oblivious sync. It is:
+The live runtime now already has:
 
-1. stronger long-horizon DA for historical epoch shards
-2. provider-oblivious retrieval beyond padded batching and rotating schedules
-3. batch amortization across many checkpoint-response segments
-4. accumulation schemes that compress many rerandomized response segments
-   without weakening PQ safety
+1. segmented multi-provider checkpoint retrieval
+2. rerandomized checkpoint-segment accumulation
+3. mesh-discovered archive providers and shard exchange
+4. replica attestations plus deterministic shard-custody rebalancing
+
+What remains is narrower:
+
+1. fixed-cadence background refresh so spending is even less query-shaped
+2. stronger long-horizon external operator incentives or accounting
+3. deeper proof-system compression across many rerandomized segment accumulators

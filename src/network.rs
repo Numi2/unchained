@@ -16,8 +16,9 @@ use crate::{
     coin::{Coin, CoinCandidate},
     config, crypto,
     shielded::{
-        local_archive_provider_manifest, route_checkpoint_requests, ArchiveDirectory,
-        ArchiveProviderManifest, ArchiveShardBundle, CheckpointBatchRequest,
+        local_archive_provider_manifest, local_archive_replica_attestations,
+        route_checkpoint_requests, ArchiveDirectory, ArchiveProviderManifest,
+        ArchiveReplicaAttestation, ArchiveShardBundle, CheckpointBatchRequest,
         CheckpointBatchResponse, CheckpointExtensionRequest, HistoricalUnspentExtension,
         ShieldedSyncServer,
     },
@@ -72,6 +73,7 @@ const REQUEST_FANOUT_HEADERS: usize = 3;
 const REQUEST_FANOUT_TIP: usize = 4;
 const REQUEST_FANOUT_RECOVERY: usize = 4;
 const ARCHIVE_MANIFEST_REFRESH_SECS: u64 = 15;
+const ARCHIVE_REBALANCE_INTERVAL_SECS: u64 = 15;
 
 static RECENT_HASH_REQS: Lazy<Mutex<HashMap<[u8; 32], Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -186,6 +188,7 @@ enum WireTopic {
     RequestEpochCandidates,
     NodeRecord,
     ArchiveManifest,
+    ArchiveReplica,
     RequestArchiveShard,
     ArchiveShard,
     RequestCheckpointBatch,
@@ -229,10 +232,11 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::RequestEpochCandidates => 21,
         WireTopic::NodeRecord => 22,
         WireTopic::ArchiveManifest => 23,
-        WireTopic::RequestArchiveShard => 24,
-        WireTopic::ArchiveShard => 25,
-        WireTopic::RequestCheckpointBatch => 26,
-        WireTopic::CheckpointBatch => 27,
+        WireTopic::ArchiveReplica => 24,
+        WireTopic::RequestArchiveShard => 25,
+        WireTopic::ArchiveShard => 26,
+        WireTopic::RequestCheckpointBatch => 27,
+        WireTopic::CheckpointBatch => 28,
     }
 }
 
@@ -261,10 +265,11 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         21 => WireTopic::RequestEpochCandidates,
         22 => WireTopic::NodeRecord,
         23 => WireTopic::ArchiveManifest,
-        24 => WireTopic::RequestArchiveShard,
-        25 => WireTopic::ArchiveShard,
-        26 => WireTopic::RequestCheckpointBatch,
-        27 => WireTopic::CheckpointBatch,
+        24 => WireTopic::ArchiveReplica,
+        25 => WireTopic::RequestArchiveShard,
+        26 => WireTopic::ArchiveShard,
+        27 => WireTopic::RequestCheckpointBatch,
+        28 => WireTopic::CheckpointBatch,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -425,6 +430,7 @@ struct RuntimeState {
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
+    archive_replicas: Arc<RwLock<HashMap<([u8; 32], u64), ArchiveReplicaAttestation>>>,
     peer_exchange: bool,
 }
 
@@ -445,6 +451,7 @@ pub struct Network {
     local_node_id: [u8; 32],
     known_records: Arc<RwLock<HashMap<[u8; 32], NodeRecordV2>>>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
+    archive_replicas: Arc<RwLock<HashMap<([u8; 32], u64), ArchiveReplicaAttestation>>>,
 }
 
 enum NetworkCommand {
@@ -502,6 +509,7 @@ pub fn testing_stub_handle() -> NetHandle {
         local_node_id: [0u8; 32],
         known_records: Arc::new(RwLock::new(HashMap::new())),
         archive_manifests: Arc::new(RwLock::new(HashMap::new())),
+        archive_replicas: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -619,6 +627,54 @@ impl RuntimeState {
         Ok(manifest)
     }
 
+    async fn local_archive_replicas(&self) -> Result<Vec<ArchiveReplicaAttestation>> {
+        let ledger = self.db.load_shielded_root_ledger()?.unwrap_or_default();
+        let mut providers = self
+            .archive_manifests
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_manifest = self.local_archive_manifest().await?;
+        if let Some(existing) = providers
+            .iter_mut()
+            .find(|existing| existing.provider_id == local_manifest.provider_id)
+        {
+            *existing = local_manifest.clone();
+        } else {
+            providers.push(local_manifest.clone());
+        }
+        let persisted_replicas = self
+            .archive_replicas
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            providers,
+            persisted_replicas,
+        )?;
+        local_archive_replica_attestations(
+            local_manifest.provider_id,
+            &directory,
+            PROTOCOL.archive_retention_horizon_epochs,
+        )
+    }
+
+    async fn refresh_local_archive_replicas(&self) -> Result<Vec<ArchiveReplicaAttestation>> {
+        let replicas = self.local_archive_replicas().await?;
+        let mut guard = self.archive_replicas.write().await;
+        for replica in &replicas {
+            self.db.store_shielded_archive_replica(replica)?;
+            guard.insert((replica.provider_id, replica.shard_id), replica.clone());
+        }
+        Ok(replicas)
+    }
+
     async fn local_archive_directory(&self) -> Result<ArchiveDirectory> {
         let ledger = self.db.load_shielded_root_ledger()?.unwrap_or_default();
         let mut providers = self
@@ -637,10 +693,19 @@ impl RuntimeState {
         } else {
             providers.push(local_manifest);
         }
-        ArchiveDirectory::from_root_ledger_and_providers(
+        let mut replicas = self
+            .archive_replicas
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        replicas.extend(self.local_archive_replicas().await?);
+        ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
             &ledger,
             PROTOCOL.archive_shard_epoch_span,
             providers,
+            replicas,
         )
     }
 
@@ -652,10 +717,11 @@ impl RuntimeState {
         if request.provider_id != manifest.provider_id {
             return Ok(None);
         }
-        let directory = ArchiveDirectory::from_root_ledger_and_providers(
+        let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
             &self.db.load_shielded_root_ledger()?.unwrap_or_default(),
             PROTOCOL.archive_shard_epoch_span,
             vec![manifest.clone()],
+            self.local_archive_replicas().await?,
         )?;
         request.validate_against_manifest(&manifest, &directory)?;
 
@@ -688,10 +754,11 @@ impl RuntimeState {
         if manifest.provider_id != record.node_id {
             bail!("archive manifest provider id does not match the envelope signer");
         }
-        let directory = ArchiveDirectory::from_root_ledger_and_providers(
+        let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
             &self.db.load_shielded_root_ledger()?.unwrap_or_default(),
             PROTOCOL.archive_shard_epoch_span,
             vec![manifest.clone()],
+            Vec::new(),
         )?;
         manifest.validate(&directory)?;
         self.db.store_shielded_archive_provider(&manifest)?;
@@ -699,6 +766,24 @@ impl RuntimeState {
             .write()
             .await
             .insert(manifest.provider_id, manifest);
+        Ok(())
+    }
+
+    async fn ingest_archive_replica(
+        &self,
+        record: &NodeRecordV2,
+        replica: ArchiveReplicaAttestation,
+    ) -> Result<()> {
+        if replica.provider_id != record.node_id {
+            bail!("archive replica provider id does not match the envelope signer");
+        }
+        let directory = self.local_archive_directory().await?;
+        replica.validate(&directory)?;
+        self.db.store_shielded_archive_replica(&replica)?;
+        self.archive_replicas
+            .write()
+            .await
+            .insert((replica.provider_id, replica.shard_id), replica);
         Ok(())
     }
 
@@ -739,6 +824,51 @@ impl RuntimeState {
                     None,
                 )
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn rebalance_archive_replication(&self) -> Result<()> {
+        let directory = self.local_archive_directory().await?;
+        if directory.shards.is_empty() {
+            return Ok(());
+        }
+
+        let local_node_id = self.local_node_id().await;
+        let local_manifest = self.local_archive_manifest().await?;
+        let mut candidates = {
+            let guard = self.known_records.read().await;
+            guard.keys().copied().collect::<Vec<_>>()
+        };
+        candidates.push(local_node_id);
+        let assignments = directory.custody_assignments(
+            &candidates,
+            PROTOCOL.archive_provider_replica_count as usize,
+        );
+        for assignment in assignments {
+            if !assignment.custodians.contains(&local_node_id) {
+                continue;
+            }
+            let Some(shard) = directory.shard(assignment.shard_id) else {
+                continue;
+            };
+            if local_manifest.serves_shard(shard.shard_id, &shard.root_digest) {
+                continue;
+            }
+            let missing_epochs = (shard.first_epoch..=shard.last_epoch)
+                .filter(|epoch| {
+                    self.db
+                        .load_shielded_nullifier_epoch(*epoch)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                })
+                .collect::<Vec<_>>();
+            if missing_epochs.is_empty() {
+                continue;
+            }
+            self.request_missing_archive_epochs(&missing_epochs).await?;
+            break;
         }
         Ok(())
     }
@@ -1578,6 +1708,10 @@ impl RuntimeState {
                     .collect::<Vec<_>>();
                 self.request_missing_archive_epochs(&wanted).await?;
             }
+            WireTopic::ArchiveReplica => {
+                let replica = canonical::decode_archive_replica_attestation(&frame.body)?;
+                self.ingest_archive_replica(&record, replica).await?;
+            }
             WireTopic::RequestArchiveShard => {
                 let request = decode_archive_shard_request(&frame.body)?;
                 if let Some(bundle) = self.build_local_archive_shard_bundle(&request).await? {
@@ -1603,6 +1737,7 @@ impl RuntimeState {
                     self.db.store_shielded_nullifier_epoch(&archived)?;
                 }
                 let _ = self.refresh_local_archive_manifest().await;
+                let _ = self.refresh_local_archive_replicas().await;
             }
         }
 
@@ -1978,6 +2113,7 @@ pub async fn spawn(
 
     let persisted_records = load_persisted_records(&db, &banned_node_ids)?;
     let persisted_archive_manifests = db.load_shielded_archive_providers()?;
+    let persisted_archive_replicas = db.load_shielded_archive_replicas()?;
     let (anchor_tx, _) = broadcast::channel(256);
     let (tx_tx, _) = broadcast::channel(256);
     let (rate_limited_tx, _) = broadcast::channel(64);
@@ -2018,6 +2154,12 @@ pub async fn spawn(
                 .map(|manifest| (manifest.provider_id, manifest))
                 .collect(),
         )),
+        archive_replicas: Arc::new(RwLock::new(
+            persisted_archive_replicas
+                .into_iter()
+                .map(|replica| ((replica.provider_id, replica.shard_id), replica))
+                .collect(),
+        )),
         peer_exchange: net_cfg.peer_exchange,
     };
 
@@ -2033,6 +2175,7 @@ pub async fn spawn(
         let _ = state.remember_record(record).await;
     }
     let _ = state.refresh_local_archive_manifest().await;
+    let _ = state.refresh_local_archive_replicas().await;
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let net = Arc::new(Network {
@@ -2051,6 +2194,7 @@ pub async fn spawn(
         local_node_id: local_record.node_id,
         known_records: state.known_records.clone(),
         archive_manifests: state.archive_manifests.clone(),
+        archive_replicas: state.archive_replicas.clone(),
     });
 
     {
@@ -2165,10 +2309,48 @@ pub async fn spawn(
                                         net_log!("⚠️  Failed to encode local archive manifest: {}", e);
                                     }
                                 }
+                                match state.refresh_local_archive_replicas().await {
+                                    Ok(replicas) => {
+                                        for replica in replicas {
+                                            match canonical::encode_archive_replica_attestation(&replica) {
+                                                Ok(bytes) => {
+                                                    let _ = state
+                                                        .sign_and_broadcast(WireTopic::ArchiveReplica, bytes)
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    net_log!("⚠️  Failed to encode local archive replica: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        net_log!("⚠️  Failed to refresh local archive replicas: {}", e);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 net_log!("⚠️  Failed to refresh local archive manifest: {}", e);
                             }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let tasks = state.tasks.clone();
+        tasks.spawn(async move {
+            let mut rebalance_tick =
+                tokio::time::interval(Duration::from_secs(ARCHIVE_REBALANCE_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
+                    _ = rebalance_tick.tick() => {
+                        if let Err(e) = state.rebalance_archive_replication().await {
+                            net_log!("⚠️  Failed to rebalance archive replication: {}", e);
                         }
                     }
                 }
@@ -2579,10 +2761,29 @@ impl Network {
         } else {
             providers.push(local_manifest);
         }
-        ArchiveDirectory::from_root_ledger_and_providers(
+        let mut replicas = self
+            .archive_replicas
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
             &ledger,
             PROTOCOL.archive_shard_epoch_span,
             providers,
+            replicas.clone(),
+        )?;
+        replicas.extend(local_archive_replica_attestations(
+            self.local_node_id,
+            &local_directory,
+            PROTOCOL.archive_retention_horizon_epochs,
+        )?);
+        ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            local_directory.providers,
+            replicas,
         )
     }
 
@@ -2674,12 +2875,7 @@ impl Network {
                 }
             })
             .collect::<Vec<_>>();
-        let mut routable_index_map = Vec::new();
-        for (request_index, request) in requests.iter().enumerate() {
-            if !request.queries.is_empty() {
-                routable_index_map.push(request_index);
-            }
-        }
+        let mut segment_results = vec![Vec::new(); requests.len()];
         let mut response_rx = self.checkpoint_subscribe();
         let deadline = Instant::now() + self.archive_sync_timeout;
 
@@ -2732,21 +2928,37 @@ impl Network {
 
             for (routed, response) in batch.requests.iter().zip(checkpoint_response.responses) {
                 response.verify_against_manifest(&manifest, &directory)?;
-                if let Some(routed_index) = routed.request_index {
-                    let request_index = *routable_index_map
-                        .get(routed_index)
-                        .ok_or_else(|| anyhow!("missing routed historical extension index"))?;
+                if let Some(request_index) = routed.request_index {
                     let mut blinding = [0u8; 32];
                     rand::rngs::OsRng.fill_bytes(&mut blinding);
-                    results[request_index] = Some(response.rerandomize(blinding));
+                    segment_results[request_index]
+                        .push((routed.segment_index, response.rerandomize(blinding)));
                 }
             }
+        }
+
+        for (request_index, request) in requests.iter().enumerate() {
+            if request.queries.is_empty() {
+                continue;
+            }
+            let mut segments = std::mem::take(&mut segment_results[request_index]);
+            if segments.is_empty() {
+                bail!("missing routed historical extension segments");
+            }
+            segments.sort_by_key(|(segment_index, _)| *segment_index);
+            let mut aggregate_blinding = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut aggregate_blinding);
+            results[request_index] = Some(HistoricalUnspentExtension::aggregate(
+                &request.checkpoint,
+                segments.into_iter().map(|(_, segment)| segment).collect(),
+                aggregate_blinding,
+            )?);
         }
 
         results
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| anyhow!("missing routed historical extension"))
+            .ok_or_else(|| anyhow!("missing aggregated historical extension"))
     }
 
     pub async fn shutdown(&self) {

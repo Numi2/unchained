@@ -5,9 +5,11 @@ use tempfile::TempDir;
 use unchained::{
     crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
     shielded::{
-        local_archive_provider_manifest, route_checkpoint_requests, ArchiveDirectory,
+        assigned_archive_custodians, local_archive_provider_manifest,
+        local_archive_replica_attestations, route_checkpoint_requests, ArchiveDirectory,
         ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
-        HistoricalUnspentCheckpoint, NoteCommitmentTree, ShieldedNote, ShieldedSyncServer,
+        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, NoteCommitmentTree, ShieldedNote,
+        ShieldedSyncServer,
     },
     Store,
 };
@@ -128,7 +130,11 @@ fn checkpoint_extensions_are_portable_across_providers() -> Result<()> {
         ],
     )?;
     response_a.verify_against_manifest(&manifest_a, &directory)?;
-    let extension_a = response_a.rerandomize([1u8; 32]);
+    let extension_a = HistoricalUnspentExtension::aggregate(
+        &checkpoint0,
+        vec![response_a.rerandomize([1u8; 32])],
+        [3u8; 32],
+    )?;
     let checkpoint1 = checkpoint0.apply_extension(&extension_a, provider_b.root_ledger())?;
     assert_eq!(checkpoint1.covered_through_epoch, 6);
 
@@ -141,7 +147,11 @@ fn checkpoint_extensions_are_portable_across_providers() -> Result<()> {
         }],
     )?;
     response_b.verify_against_manifest(&manifest_b, &directory)?;
-    let extension_b = response_b.rerandomize([2u8; 32]);
+    let extension_b = HistoricalUnspentExtension::aggregate(
+        &checkpoint1,
+        vec![response_b.rerandomize([2u8; 32])],
+        [4u8; 32],
+    )?;
     let checkpoint2 = checkpoint1.apply_extension(&extension_b, provider_a.root_ledger())?;
     assert_eq!(checkpoint2.covered_through_epoch, 7);
     assert_eq!(checkpoint2.verified_epoch_count, 3);
@@ -215,8 +225,16 @@ fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
     assert_eq!(batch[1].through_epoch, 7);
     assert_eq!(batch[0].records.len(), 3);
     assert_eq!(batch[1].records.len(), 2);
-    let rerandomized_a = batch[0].rerandomize([7u8; 32]);
-    let rerandomized_b = batch[1].rerandomize([8u8; 32]);
+    let rerandomized_a = HistoricalUnspentExtension::aggregate(
+        &checkpoint_a,
+        vec![batch[0].rerandomize([7u8; 32])],
+        [9u8; 32],
+    )?;
+    let rerandomized_b = HistoricalUnspentExtension::aggregate(
+        &checkpoint_b,
+        vec![batch[1].rerandomize([8u8; 32])],
+        [10u8; 32],
+    )?;
     assert_ne!(
         rerandomized_a.new_transcript_root,
         rerandomized_b.new_transcript_root
@@ -316,5 +334,95 @@ fn storage_roundtrip_persists_shielded_state() -> Result<()> {
     assert_eq!(loaded_checkpoint, checkpoint);
 
     db.close()?;
+    Ok(())
+}
+
+#[test]
+fn route_checkpoint_requests_stripes_one_note_across_multiple_providers() -> Result<()> {
+    let chain_id = [66u8; 32];
+    let note_key = [67u8; 32];
+    let note = fixed_note(5, note_key, [68u8; 32], [69u8; 32]);
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifests = (0u8..3)
+        .map(|seed| {
+            local_archive_provider_manifest(
+                [seed + 20; 32],
+                provider.root_ledger(),
+                2,
+                &available_epochs,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let directory =
+        ArchiveDirectory::from_root_ledger_and_providers(provider.root_ledger(), 2, manifests)?;
+    let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
+    let request = CheckpointExtensionRequest {
+        checkpoint,
+        queries: (5u64..=8)
+            .map(|epoch| {
+                Ok(EvolvingNullifierQuery {
+                    epoch,
+                    nullifier: note.derive_evolving_nullifier(&note_key, &chain_id, epoch)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let batches = route_checkpoint_requests(&directory, std::slice::from_ref(&request), 11, 2, 8)?;
+    let routed_providers = batches
+        .iter()
+        .flat_map(|batch| batch.requests.iter())
+        .filter_map(|request| request.request_index.map(|_| request.provider_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(routed_providers.len() > 1);
+    Ok(())
+}
+
+#[test]
+fn archive_replica_reports_and_custody_assignments_track_durability() -> Result<()> {
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([31u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([32u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(manifest_a.provider_id, &base_directory, 32)?;
+    replicas.extend(local_archive_replica_attestations(
+        manifest_b.provider_id,
+        &base_directory,
+        64,
+    )?);
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas,
+    )?;
+
+    let report = directory.replica_report(0)?;
+    assert_eq!(report.replica_count, 2);
+    assert!(report.retention_through_epoch >= 37);
+    assert!(!directory.under_replicated_shards(3).is_empty());
+
+    let custodians = assigned_archive_custodians(
+        0,
+        &directory.shard(0).expect("shard").root_digest,
+        &[[1u8; 32], [2u8; 32], [3u8; 32]],
+        2,
+    );
+    assert_eq!(custodians.len(), 2);
+    assert_ne!(custodians[0], custodians[1]);
     Ok(())
 }

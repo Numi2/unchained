@@ -143,6 +143,7 @@ impl Store {
             "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
             "shielded_spent_note", // note_commitment -> spent marker
             "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
+            "shielded_archive_replica", // provider_id||shard_id -> ArchiveReplicaAttestation
         ];
 
         // Configure column family options with sane production defaults
@@ -896,6 +897,40 @@ impl Store {
             manifests.push(crate::canonical::decode_archive_provider_manifest(&value)?);
         }
         Ok(manifests)
+    }
+
+    pub fn store_shielded_archive_replica(
+        &self,
+        replica: &crate::shielded::ArchiveReplicaAttestation,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_replica")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_replica' column family missing"))?;
+        let mut key = Vec::with_capacity(40);
+        key.extend_from_slice(&replica.provider_id);
+        key.extend_from_slice(&replica.shard_id.to_le_bytes());
+        let bytes = crate::canonical::encode_archive_replica_attestation(replica)?;
+        self.db.put_cf(cf, key, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_replicas(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveReplicaAttestation>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_replica")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_replica' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut replicas = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            replicas.push(crate::canonical::decode_archive_replica_attestation(
+                &value,
+            )?);
+        }
+        Ok(replicas)
     }
 
     pub fn store_shielded_output(

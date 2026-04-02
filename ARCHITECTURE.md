@@ -64,7 +64,7 @@ The proof-carrying contract is split deliberately:
 
 This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
 
-On the client side, checkpoint refresh is now routed through a mesh-learned archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests, request missing epoch shards from the chosen provider over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet rotates provider selection by sync round, batches across notes, pads provider/epoch buckets with cover traffic, and rerandomizes each provider response before it becomes durable checkpoint state. That means repeated refreshes do not have to hit the same archive provider for the same note history, and the stored checkpoint transcript root is not byte-identical to what any provider produced.
+On the client side, checkpoint refresh is now routed through a replica-aware mesh archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests plus replica attestations, request missing epoch shards over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet no longer treats a historical refresh as one provider, one proof. It splits each note history into shard-aligned checkpoint segments, routes those segments across multiple providers, pads provider/shard buckets with cover traffic, rerandomizes every provider segment reply, and only then aggregates the segments into one checkpoint extension. That means no single provider needs to see the full note history for a refresh, and the durable checkpoint transcript root is not byte-identical to what any provider produced.
 
 ## Service Boundary
 
@@ -89,14 +89,14 @@ The public CLI is intentionally phrased in product terms:
 - `message` is the mesh-native user command
 - `advanced` contains protocol and maintenance tooling
 
-## Privacy Frontier
+## Archive Layer
 
-The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, and rerandomizes provider responses before they enter the proof witness.
+The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, rerandomizes provider responses before they enter the proof witness, and rebalances deterministic shard custody toward the protocol replica target.
 
-The next research-grade frontier is now narrower:
+That leaves a narrower remaining frontier:
 
-- stronger DA economics and distribution for very long historical horizons
-- batch proof amortization across many notes and many checkpoint-response segments
-- provider-oblivious archive retrieval beyond padded batching and schedule rotation
+- fixed-cadence background refresh so spend timing is even less query-shaped
+- stronger external operator incentives or accounting for very long historical horizons
+- proof-system-level accumulation that compresses many rerandomized checkpoint segments further inside the private witness
 
-It should still not reintroduce an unbounded RocksDB nullifier column as canonical state.
+It still must not reintroduce an unbounded RocksDB nullifier column as canonical state.

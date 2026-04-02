@@ -4,6 +4,7 @@ use proof_core::{
     HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
     HistoricalUnspentCheckpoint as ProofHistoricalUnspentCheckpoint,
     HistoricalUnspentExtension as ProofHistoricalUnspentExtension,
+    HistoricalUnspentSegment as ProofHistoricalUnspentSegment,
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
     NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofShieldedInputWitness,
@@ -16,7 +17,8 @@ use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, 
 use crate::{
     shielded::{
         HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
-        NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof, ShieldedNote,
+        HistoricalUnspentSegment, NoteMembershipProof, NullifierMembershipWitness,
+        NullifierNonMembershipProof, ShieldedNote,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
@@ -162,17 +164,29 @@ fn checkpoint_to_proof(
 fn extension_to_proof(extension: &HistoricalUnspentExtension) -> ProofHistoricalUnspentExtension {
     ProofHistoricalUnspentExtension {
         version: extension.version,
-        provider_id: extension.provider_id,
-        provider_manifest_digest: extension.provider_manifest_digest,
         note_commitment: extension.note_commitment,
         from_epoch: extension.from_epoch,
         through_epoch: extension.through_epoch,
         prior_transcript_root: extension.prior_transcript_root,
-        service_transcript_root: extension.service_transcript_root,
         historical_root_digest: extension.historical_root_digest,
-        rerandomization_blinding: extension.rerandomization_blinding,
+        segment_commitment_root: extension.segment_commitment_root,
+        aggregate_rerandomization_blinding: extension.aggregate_rerandomization_blinding,
         new_transcript_root: extension.new_transcript_root,
-        records: extension
+        segments: extension.segments.iter().map(segment_to_proof).collect(),
+    }
+}
+
+fn segment_to_proof(segment: &HistoricalUnspentSegment) -> ProofHistoricalUnspentSegment {
+    ProofHistoricalUnspentSegment {
+        provider_id: segment.provider_id,
+        provider_manifest_digest: segment.provider_manifest_digest,
+        from_epoch: segment.from_epoch,
+        through_epoch: segment.through_epoch,
+        segment_service_root: segment.segment_service_root,
+        segment_historical_root_digest: segment.segment_historical_root_digest,
+        rerandomization_blinding: segment.rerandomization_blinding,
+        segment_transcript_root: segment.segment_transcript_root,
+        records: segment
             .records
             .iter()
             .map(absence_record_to_proof)

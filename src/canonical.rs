@@ -15,12 +15,13 @@ use crate::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
     },
     shielded::{
-        ArchiveProviderManifest, ArchiveShard, ArchiveShardBundle, ArchivedNullifierEpoch,
-        CheckpointBatchRequest, CheckpointBatchResponse, CheckpointExtensionRequest,
-        CheckpointPresentation, EvolvingNullifierQuery, HistoricalAbsenceRecord,
-        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, HistoricalUnspentServiceResponse,
-        NoteCommitmentTree, NoteMembershipProof, NullifierMembershipWitness,
-        NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
+        ArchiveProviderManifest, ArchiveReplicaAttestation, ArchiveShard, ArchiveShardBundle,
+        ArchivedNullifierEpoch, CheckpointBatchRequest, CheckpointBatchResponse,
+        CheckpointExtensionRequest, CheckpointPresentation, EvolvingNullifierQuery,
+        HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
+        HistoricalUnspentSegment, HistoricalUnspentServiceResponse, NoteCommitmentTree,
+        NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof,
+        NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
     wallet::KeyDocV2,
@@ -1072,6 +1073,35 @@ pub fn decode_archive_provider_manifest(bytes: &[u8]) -> Result<ArchiveProviderM
     Ok(manifest)
 }
 
+pub fn encode_archive_replica_attestation(
+    attestation: &ArchiveReplicaAttestation,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&attestation.provider_id);
+    writer.write_u64(attestation.shard_id);
+    writer.write_fixed(&attestation.shard_digest);
+    writer.write_u64(attestation.first_epoch);
+    writer.write_u64(attestation.last_epoch);
+    writer.write_u64(attestation.retention_through_epoch);
+    writer.write_fixed(&attestation.attestation_digest);
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_replica_attestation(bytes: &[u8]) -> Result<ArchiveReplicaAttestation> {
+    let mut reader = CanonicalReader::new(bytes);
+    let attestation = ArchiveReplicaAttestation {
+        provider_id: reader.read_fixed()?,
+        shard_id: reader.read_u64()?,
+        shard_digest: reader.read_fixed()?,
+        first_epoch: reader.read_u64()?,
+        last_epoch: reader.read_u64()?,
+        retention_through_epoch: reader.read_u64()?,
+        attestation_digest: reader.read_fixed()?,
+    };
+    reader.finish()?;
+    Ok(attestation)
+}
+
 pub fn encode_archive_shard_bundle(bundle: &ArchiveShardBundle) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_fixed(&bundle.provider_id);
@@ -1208,18 +1238,26 @@ pub fn encode_historical_unspent_extension(
 ) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(extension.version);
-    writer.write_fixed(&extension.provider_id);
-    writer.write_fixed(&extension.provider_manifest_digest);
     writer.write_fixed(&extension.note_commitment);
     writer.write_u64(extension.from_epoch);
     writer.write_u64(extension.through_epoch);
     writer.write_fixed(&extension.prior_transcript_root);
-    writer.write_fixed(&extension.service_transcript_root);
     writer.write_fixed(&extension.historical_root_digest);
-    writer.write_fixed(&extension.rerandomization_blinding);
+    writer.write_fixed(&extension.segment_commitment_root);
+    writer.write_fixed(&extension.aggregate_rerandomization_blinding);
     writer.write_fixed(&extension.new_transcript_root);
-    writer.write_vec(&extension.records, |writer, record| {
-        write_historical_absence_record(writer, record)
+    writer.write_vec(&extension.segments, |writer, segment| {
+        writer.write_fixed(&segment.provider_id);
+        writer.write_fixed(&segment.provider_manifest_digest);
+        writer.write_u64(segment.from_epoch);
+        writer.write_u64(segment.through_epoch);
+        writer.write_fixed(&segment.segment_service_root);
+        writer.write_fixed(&segment.segment_historical_root_digest);
+        writer.write_fixed(&segment.rerandomization_blinding);
+        writer.write_fixed(&segment.segment_transcript_root);
+        writer.write_vec(&segment.records, |writer, record| {
+            write_historical_absence_record(writer, record)
+        })
     })?;
     Ok(writer.into_vec())
 }
@@ -1228,17 +1266,27 @@ pub fn decode_historical_unspent_extension(bytes: &[u8]) -> Result<HistoricalUns
     let mut reader = CanonicalReader::new(bytes);
     let extension = HistoricalUnspentExtension {
         version: reader.read_u8()?,
-        provider_id: reader.read_fixed()?,
-        provider_manifest_digest: reader.read_fixed()?,
         note_commitment: reader.read_fixed()?,
         from_epoch: reader.read_u64()?,
         through_epoch: reader.read_u64()?,
         prior_transcript_root: reader.read_fixed()?,
-        service_transcript_root: reader.read_fixed()?,
         historical_root_digest: reader.read_fixed()?,
-        rerandomization_blinding: reader.read_fixed()?,
+        segment_commitment_root: reader.read_fixed()?,
+        aggregate_rerandomization_blinding: reader.read_fixed()?,
         new_transcript_root: reader.read_fixed()?,
-        records: reader.read_vec(read_historical_absence_record)?,
+        segments: reader.read_vec(|reader| {
+            Ok(HistoricalUnspentSegment {
+                provider_id: reader.read_fixed()?,
+                provider_manifest_digest: reader.read_fixed()?,
+                from_epoch: reader.read_u64()?,
+                through_epoch: reader.read_u64()?,
+                segment_service_root: reader.read_fixed()?,
+                segment_historical_root_digest: reader.read_fixed()?,
+                rerandomization_blinding: reader.read_fixed()?,
+                segment_transcript_root: reader.read_fixed()?,
+                records: reader.read_vec(read_historical_absence_record)?,
+            })
+        })?,
     };
     reader.finish()?;
     Ok(extension)
@@ -1254,9 +1302,8 @@ pub fn encode_historical_unspent_service_response(
     writer.write_fixed(&response.note_commitment);
     writer.write_u64(response.from_epoch);
     writer.write_u64(response.through_epoch);
-    writer.write_fixed(&response.prior_transcript_root);
-    writer.write_fixed(&response.service_transcript_root);
-    writer.write_fixed(&response.historical_root_digest);
+    writer.write_fixed(&response.segment_service_root);
+    writer.write_fixed(&response.segment_historical_root_digest);
     writer.write_vec(&response.records, |writer, record| {
         write_historical_absence_record(writer, record)
     })?;
@@ -1274,9 +1321,8 @@ pub fn decode_historical_unspent_service_response(
         note_commitment: reader.read_fixed()?,
         from_epoch: reader.read_u64()?,
         through_epoch: reader.read_u64()?,
-        prior_transcript_root: reader.read_fixed()?,
-        service_transcript_root: reader.read_fixed()?,
-        historical_root_digest: reader.read_fixed()?,
+        segment_service_root: reader.read_fixed()?,
+        segment_historical_root_digest: reader.read_fixed()?,
         records: reader.read_vec(read_historical_absence_record)?,
     };
     reader.finish()?;

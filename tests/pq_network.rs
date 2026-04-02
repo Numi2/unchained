@@ -17,9 +17,9 @@ use unchained::network::{self, NetHandle};
 use unchained::node_identity;
 use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::shielded::{
-    local_archive_provider_manifest, ArchiveDirectory, ArchivedNullifierEpoch,
-    CheckpointExtensionRequest, EvolvingNullifierQuery, HistoricalUnspentCheckpoint,
-    NullifierRootLedger,
+    local_archive_provider_manifest, local_archive_replica_attestations, route_checkpoint_requests,
+    ArchiveDirectory, ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
+    HistoricalUnspentCheckpoint, NullifierRootLedger,
 };
 use unchained::storage::Store;
 use unchained::sync::SyncState;
@@ -803,10 +803,23 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
     } else {
         providers.push(local_manifest.clone());
     }
-    let directory = ArchiveDirectory::from_root_ledger_and_providers(
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        &ledger,
+        PROTOCOL.archive_shard_epoch_span,
+        providers.clone(),
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(provider_record_a.node_id, &base_directory, 32)?;
+    replicas.extend(local_archive_replica_attestations(
+        local_manifest.provider_id,
+        &base_directory,
+        32,
+    )?);
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
         &ledger,
         PROTOCOL.archive_shard_epoch_span,
         providers,
+        replicas,
     )?;
 
     let rotation_round = 7u64;
@@ -814,11 +827,23 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
         .find_map(|counter| {
             let note_commitment = *blake3::hash(&counter.to_le_bytes()).as_bytes();
             let checkpoint = HistoricalUnspentCheckpoint::genesis(note_commitment, 1);
-            directory
-                .pick_provider(&checkpoint, 1, rotation_round)
-                .ok()
-                .filter(|provider| provider.provider_id == provider_record_a.node_id)
-                .map(|_| checkpoint)
+            route_checkpoint_requests(
+                &directory,
+                &[CheckpointExtensionRequest {
+                    checkpoint: checkpoint.clone(),
+                    queries: vec![EvolvingNullifierQuery {
+                        epoch: 1,
+                        nullifier: [44u8; 32],
+                    }],
+                }],
+                rotation_round,
+                PROTOCOL.oblivious_sync_min_batch as usize,
+                PROTOCOL.max_historical_nullifier_batch as usize,
+            )
+            .ok()
+            .and_then(|batches| batches.first().map(|batch| batch.provider_id))
+            .filter(|provider_id| *provider_id == provider_record_a.node_id)
+            .map(|_| checkpoint)
         })
         .ok_or_else(|| anyhow::anyhow!("could not route checkpoint request to remote provider"))?;
 
@@ -835,7 +860,12 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(extensions.len(), 1);
-    assert_eq!(extensions[0].provider_id, provider_record_a.node_id);
+    assert_eq!(extensions[0].segments.len(), 1);
+    let serving_provider = extensions[0].segments[0].provider_id;
+    assert!(serving_provider == provider_record_a.node_id || serving_provider == node_id_b);
+    if serving_provider == node_id_b {
+        assert!(db_b.load_shielded_nullifier_epoch(1)?.is_some());
+    }
 
     let updated = checkpoint.apply_extension(&extensions[0], &ledger)?;
     assert_eq!(updated.covered_through_epoch, 1);
