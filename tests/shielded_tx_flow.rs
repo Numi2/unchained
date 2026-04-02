@@ -10,7 +10,7 @@ use unchained::epoch::Anchor;
 use unchained::network;
 use unchained::node_identity;
 use unchained::protocol::CURRENT as PROTOCOL;
-use unchained::storage::Store;
+use unchained::storage::{Store, WalletStore};
 use unchained::sync::SyncState;
 use unchained::wallet::Wallet;
 
@@ -114,8 +114,19 @@ fn provision_runtime_identity(
     Ok(())
 }
 
+async fn spawn_sender_network(
+    sender_dir: &TempDir,
+    sender_db: Arc<Store>,
+    genesis: &Anchor,
+) -> anyhow::Result<unchained::network::NetHandle> {
+    let port = pick_udp_port();
+    provision_runtime_identity(sender_dir, genesis.hash, format!("127.0.0.1:{port}"))?;
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    network::spawn(build_net(port), build_p2p(), sender_db, sync_state).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shielded_wallet_send_and_receive_roundtrip() -> anyhow::Result<()> {
+async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
     std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
@@ -125,25 +136,96 @@ async fn shielded_wallet_send_and_receive_roundtrip() -> anyhow::Result<()> {
 
     let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
     let receiver_db = Arc::new(Store::open(&receiver_dir.path().to_string_lossy())?);
+    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
+    let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
 
     let genesis = seed_genesis(sender_db.as_ref())?;
     seed_genesis(receiver_db.as_ref())?;
 
-    let sender_wallet = Arc::new(Wallet::load_or_create(sender_db.clone())?);
-    let receiver_wallet = Arc::new(Wallet::load_or_create(receiver_db.clone())?);
+    let sender_wallet = Arc::new(Wallet::load_or_create(
+        sender_db.clone(),
+        sender_wallet_db,
+    )?);
+    let receiver_wallet = Arc::new(Wallet::load_or_create(
+        receiver_db.clone(),
+        receiver_wallet_db,
+    )?);
 
     let sender_coin = seed_sender_coin(sender_db.as_ref(), sender_wallet.as_ref(), &genesis)?;
     receiver_db.put("coin", &sender_coin.id, &sender_coin)?;
     receiver_db.put_coin_epoch(&sender_coin.id, genesis.num)?;
     receiver_db.put_coin_epoch_rev(genesis.num, &sender_coin.id)?;
 
-    let port = pick_udp_port();
-    provision_runtime_identity(&sender_dir, genesis.hash, format!("127.0.0.1:{port}"))?;
-
-    let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let net = network::spawn(build_net(port), build_p2p(), sender_db.clone(), sync_state).await?;
-
+    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let recipient_handle = receiver_wallet.export_address()?;
+
+    assert_eq!(sender_wallet.balance()?, 1);
+    assert_eq!(receiver_wallet.balance()?, 0);
+
+    let prepared_a = sender_wallet
+        .prepare_shielded_send(&recipient_handle, 1, &net)
+        .await?;
+    let prepared_b = sender_wallet
+        .prepare_shielded_send(&recipient_handle, 1, &net)
+        .await?;
+
+    assert_eq!(prepared_a.input_count(), 1);
+    assert_eq!(prepared_a.output_count(), 1);
+    assert_eq!(
+        bincode::serialize(prepared_a.witness())?,
+        bincode::serialize(prepared_b.witness())?
+    );
+
+    let journal = proof_core::validate_shielded_tx_witness(prepared_a.witness())?;
+    assert_eq!(journal.inputs.len(), 1);
+    assert_eq!(journal.outputs.len(), 1);
+
+    let tx = prepared_a.tx_with_proof(Vec::new());
+    receiver_wallet.scan_tx_for_me(&tx)?;
+
+    assert_eq!(sender_wallet.balance()?, 1);
+    assert_eq!(receiver_wallet.balance()?, 1);
+    assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
+
+    net.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "expensive zkVM proving soak"]
+async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+    std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
+
+    let sender_dir = TempDir::new()?;
+    let receiver_dir = TempDir::new()?;
+
+    let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
+    let receiver_db = Arc::new(Store::open(&receiver_dir.path().to_string_lossy())?);
+    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
+    let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
+
+    let genesis = seed_genesis(sender_db.as_ref())?;
+    seed_genesis(receiver_db.as_ref())?;
+
+    let sender_wallet = Arc::new(Wallet::load_or_create(
+        sender_db.clone(),
+        sender_wallet_db,
+    )?);
+    let receiver_wallet = Arc::new(Wallet::load_or_create(
+        receiver_db.clone(),
+        receiver_wallet_db,
+    )?);
+
+    let sender_coin = seed_sender_coin(sender_db.as_ref(), sender_wallet.as_ref(), &genesis)?;
+    receiver_db.put("coin", &sender_coin.id, &sender_coin)?;
+    receiver_db.put_coin_epoch(&sender_coin.id, genesis.num)?;
+    receiver_db.put_coin_epoch_rev(genesis.num, &sender_coin.id)?;
+
+    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
+    let recipient_handle = receiver_wallet.export_address()?;
+
     assert_eq!(sender_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.balance()?, 0);
 

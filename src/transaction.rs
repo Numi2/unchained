@@ -77,7 +77,7 @@ impl Tx {
         }
 
         let current_epoch = current_nullifier_epoch(db)?;
-        let chain_id = db.get_chain_id()?;
+        let chain_id = db.effective_chain_id();
         let tree = db.load_shielded_note_tree()?.unwrap_or_default();
         let tree_root = tree.root();
         let ledger = db.load_shielded_root_ledger()?.unwrap_or_default();
@@ -245,7 +245,7 @@ pub fn ensure_shielded_runtime_state(db: &Store) -> Result<()> {
 }
 
 pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
-    let chain_id = db.get_chain_id()?;
+    let chain_id = db.effective_chain_id();
     let mut tree = db
         .load_shielded_note_tree()?
         .unwrap_or_else(NoteCommitmentTree::new);

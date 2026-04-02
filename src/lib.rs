@@ -1,6 +1,7 @@
 // Library interface for unchained blockchain
 // This allows tests and external consumers to use the blockchain functionality
 
+pub mod app;
 pub mod canonical;
 pub mod coin;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod storage;
 pub mod sync;
 pub mod transaction;
 pub mod wallet;
+pub mod wallet_control;
 
 pub use coin::Coin;
 pub use crypto::{address_from_pk, argon2id_pow, blake3_hash, Address};

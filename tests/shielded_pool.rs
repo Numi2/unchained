@@ -318,24 +318,18 @@ fn storage_roundtrip_persists_shielded_state() -> Result<()> {
     let epoch = ArchivedNullifierEpoch::new(8, vec![[41u8; 32], [42u8; 32]]);
     let mut provider = ShieldedSyncServer::new();
     provider.archive_epoch(epoch.epoch, epoch.nullifiers.clone())?;
-    let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
 
     db.store_shielded_note_tree(&tree)?;
     db.store_shielded_nullifier_epoch(&epoch)?;
     db.store_shielded_root_ledger(provider.root_ledger())?;
-    db.store_shielded_checkpoint(&checkpoint)?;
 
     let loaded_tree = db.load_shielded_note_tree()?.expect("tree");
     let loaded_epoch = db.load_shielded_nullifier_epoch(8)?.expect("epoch");
     let loaded_ledger = db.load_shielded_root_ledger()?.expect("ledger");
-    let loaded_checkpoint = db
-        .load_shielded_checkpoint(&note.commitment)?
-        .expect("checkpoint");
 
     assert_eq!(loaded_tree, tree);
     assert_eq!(loaded_epoch, epoch);
     assert_eq!(loaded_ledger, provider.root_ledger().clone());
-    assert_eq!(loaded_checkpoint, checkpoint);
 
     db.close()?;
     Ok(())

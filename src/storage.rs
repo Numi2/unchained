@@ -12,6 +12,11 @@ use std::sync::Arc;
 // Using zstd for a better compression ratio and speed than lz4.
 // These are significant performance and storage efficiency improvements.
 
+pub struct WalletStore {
+    pub db: DB,
+    path: String,
+}
+
 pub struct Store {
     pub db: DB,
     path: String,
@@ -46,6 +51,199 @@ impl RetargetCacheMem {
             }
         }
         self.windows_by_height.insert(height, window);
+    }
+}
+
+fn build_cf_options() -> Options {
+    let mut cf_opts = Options::default();
+    {
+        let mut block = rocksdb::BlockBasedOptions::default();
+        block.set_bloom_filter(10.0, false);
+        block.set_cache_index_and_filter_blocks(true);
+        block.set_partition_filters(true);
+        block.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        cf_opts.set_block_based_table_factory(&block);
+    }
+    cf_opts.set_write_buffer_size(64 * 1024 * 1024);
+    cf_opts.set_max_write_buffer_number(2);
+    cf_opts.set_target_file_size_base(64 * 1024 * 1024);
+    cf_opts
+}
+
+fn build_db_options(db_path: &str) -> Options {
+    let mut db_opts = Options::default();
+    db_opts.create_if_missing(true);
+    db_opts.create_missing_column_families(true);
+
+    let wal_dir = format!("{db_path}/logs");
+    let backup_dir = format!("{db_path}/backups");
+    std::fs::create_dir_all(db_path).ok();
+    std::fs::create_dir_all(&wal_dir).ok();
+    std::fs::create_dir_all(&backup_dir).ok();
+
+    db_opts.set_wal_dir(&wal_dir);
+    db_opts.set_use_fsync(false);
+    db_opts.set_bytes_per_sync(8 * 1024 * 1024);
+    db_opts.set_wal_bytes_per_sync(8 * 1024 * 1024);
+    db_opts.set_db_write_buffer_size(256 * 1024 * 1024);
+    db_opts.set_max_background_jobs(8);
+    db_opts.set_level_zero_slowdown_writes_trigger(20);
+    db_opts.set_level_zero_stop_writes_trigger(36);
+    db_opts.set_max_open_files(512);
+    db_opts.set_recycle_log_file_num(4);
+    db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
+    db_opts.set_manual_wal_flush(false);
+    db_opts.set_wal_size_limit_mb(64);
+    db_opts.set_max_total_wal_size(512 * 1024 * 1024);
+    db_opts.set_keep_log_file_num(10);
+    db_opts.set_wal_ttl_seconds(24 * 60 * 60);
+    db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
+    db_opts.set_max_subcompactions(4);
+    db_opts
+}
+
+fn open_db_with_families(db_path: &str, cf_names: &[&str]) -> Result<DB> {
+    let cf_opts = build_cf_options();
+    let db_opts = build_db_options(db_path);
+
+    let existing_cfs: Vec<String> = match DB::list_cf(&db_opts, db_path) {
+        Ok(names) => names,
+        Err(_) => Vec::new(),
+    };
+
+    let mut cf_name_set: HashSet<String> = existing_cfs.into_iter().collect();
+    for name in cf_names {
+        cf_name_set.insert((*name).to_string());
+    }
+    cf_name_set.insert("default".to_string());
+
+    let mut final_cf_names: Vec<String> = cf_name_set.into_iter().collect();
+    final_cf_names.sort();
+    if let Some(pos) = final_cf_names.iter().position(|n| n == "default") {
+        let default = final_cf_names.remove(pos);
+        final_cf_names.insert(0, default);
+    }
+    let cf_descriptors: Vec<ColumnFamilyDescriptor> = final_cf_names
+        .iter()
+        .map(|name| {
+            let mut opts = cf_opts.clone();
+            if name == "coin_candidate" {
+                opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
+                opts.set_optimize_filters_for_hits(true);
+            } else if name == "epoch_selected" || name == "coin_epoch_by_epoch" {
+                opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+                opts.set_optimize_filters_for_hits(true);
+            }
+            ColumnFamilyDescriptor::new(name.clone(), opts)
+        })
+        .collect();
+
+    DB::open_cf_descriptors(&db_opts, db_path, cf_descriptors)
+        .with_context(|| format!("Failed to open database at '{db_path}'"))
+}
+
+pub fn wallet_store_path(base_path: &str) -> String {
+    std::path::Path::new(base_path)
+        .join("wallet_private")
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl WalletStore {
+    pub fn base_path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn health_check(&self) -> Result<()> {
+        let test_key = b"wallet_health_check";
+        self.db
+            .put(test_key, b"ok")
+            .with_context(|| "Wallet database write test failed")?;
+        let value = self
+            .db
+            .get(test_key)
+            .with_context(|| "Wallet database read test failed")?;
+        if value.as_deref() != Some(b"ok") {
+            anyhow::bail!("Wallet database read/write consistency check failed");
+        }
+        self.db
+            .delete(test_key)
+            .with_context(|| "Wallet database delete test failed")?;
+        Ok(())
+    }
+
+    pub fn open(base_path: &str) -> Result<Self> {
+        let db_path = wallet_store_path(base_path);
+        let db = open_db_with_families(
+            &db_path,
+            &[
+                "default",
+                "wallet",
+                "meta",
+                "shielded_checkpoint",
+                "shielded_owned_note",
+            ],
+        )?;
+        let store = Self { db, path: db_path };
+        store
+            .health_check()
+            .with_context(|| "Wallet database health check failed during initialization")?;
+        Ok(store)
+    }
+
+    pub fn put<T: Serialize>(&self, cf: &str, key: &[u8], value: &T) -> Result<()> {
+        let data_to_store = bincode::serialize(value).with_context(|| {
+            format!("Failed to serialize wallet value for key '{key:?}' in CF '{cf}'")
+        })?;
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
+        self.db
+            .put_cf(handle, key, &data_to_store)
+            .with_context(|| format!("Failed to PUT to wallet database for key '{key:?}' in CF '{cf}'"))
+    }
+
+    pub fn get<T: DeserializeOwned + 'static>(&self, cf: &str, key: &[u8]) -> Result<Option<T>> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
+        match self.db.get_cf(handle, key)? {
+            Some(value) => match bincode::deserialize(&value[..]) {
+                Ok(deser) => Ok(Some(deser)),
+                Err(_) => Err(anyhow::anyhow!(
+                    "Failed to deserialize wallet value for key '{:?}' in CF '{}'",
+                    key,
+                    cf
+                )),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_raw_bytes(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
+        Ok(self.db.get_cf(handle, key)?.map(|v| v.to_vec()))
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        self.db
+            .flush()
+            .with_context(|| "Failed to flush wallet database")?;
+        if let Err(err) = self.db.flush_wal(true) {
+            eprintln!("Warning: Wallet WAL flush failed (non-critical): {err}");
+        }
+        Ok(())
+    }
+
+    pub fn close(&self) -> Result<()> {
+        self.flush()?;
+        self.db.cancel_all_background_work(true);
+        Ok(())
     }
 }
 
@@ -84,8 +282,19 @@ impl Store {
         std::fs::create_dir_all(&backup_dir)
             .with_context(|| "Failed to create backup directory")?;
 
-        // Backup critical column families
-        for cf_name in ["epoch", "wallet"] {
+        // Backup critical chain-state column families.
+        for cf_name in [
+            "epoch",
+            "anchor",
+            "tx",
+            "meta",
+            "shielded_note_tree",
+            "shielded_nullifier_epoch",
+            "shielded_root_ledger",
+            "shielded_output",
+            "shielded_active_nullifier",
+            "shielded_spent_note",
+        ] {
             if let Some(cf_handle) = self.db.cf_handle(cf_name) {
                 let iter = self.db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start);
                 let cf_backup_dir = format!("{backup_dir}/{cf_name}");
@@ -128,7 +337,6 @@ impl Store {
             "coin_epoch_by_epoch", // epoch_num||coin_id -> 1 (reverse index for range scans)
             "retarget_cache", // retarget_height -> Vec<Anchor> window
             "head",
-            "wallet",
             "anchor",
             "tx",
             "peers",
@@ -137,9 +345,7 @@ impl Store {
             "shielded_note_tree", // singleton canonical note commitment tree
             "shielded_nullifier_epoch", // epoch -> ArchivedNullifierEpoch
             "shielded_root_ledger", // singleton historical nullifier root ledger
-            "shielded_checkpoint", // note_commitment -> HistoricalUnspentCheckpoint
             "shielded_output",    // tx_id||output_index -> ShieldedOutput
-            "shielded_owned_note", // note_commitment -> wallet-owned note plaintext
             "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
             "shielded_spent_note", // note_commitment -> spent marker
             "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
@@ -150,110 +356,14 @@ impl Store {
             "shielded_archive_receipt", // receipt_digest -> ArchiveRetrievalReceipt
         ];
 
-        // Configure column family options with sane production defaults
-        let mut cf_opts = Options::default();
-        // Enable Bloom filters and prefix extractor for better prefix seeks (coin_candidate: 32-byte epoch_hash)
-        {
-            let mut block = rocksdb::BlockBasedOptions::default();
-            // Bloom filter ~10 bits/key; enable index/filter caching
-            block.set_bloom_filter(10.0, false);
-            block.set_cache_index_and_filter_blocks(true);
-            // Partitioned bloom filters improve prefix-iteration performance
-            block.set_partition_filters(true);
-            // Keep L0 index/filter pinned in cache to reduce thrash during bursts
-            block.set_pin_l0_filter_and_index_blocks_in_cache(true);
-            cf_opts.set_block_based_table_factory(&block);
+        let mut db = open_db_with_families(&db_path, &cf_names)?;
+        for obsolete_cf in ["wallet", "shielded_checkpoint", "shielded_owned_note"] {
+            if db.cf_handle(obsolete_cf).is_some() {
+                db.drop_cf(obsolete_cf).with_context(|| {
+                    format!("Failed to drop obsolete chain column family '{obsolete_cf}'")
+                })?;
+            }
         }
-        // Larger memtable for throughput; multiple write buffers
-        cf_opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
-        cf_opts.set_max_write_buffer_number(2);
-        // Target file size for compaction levels
-        cf_opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SSTs
-                                                             // Let RocksDB manage compaction triggers; avoid over-aggressive small thresholds
-
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-
-        // Organize files into meaningful subdirectories under the chosen db_path
-        let wal_dir = format!("{db_path}/logs");
-        let backup_dir = format!("{db_path}/backups");
-        std::fs::create_dir_all(&db_path).ok();
-        std::fs::create_dir_all(&wal_dir).ok();
-        std::fs::create_dir_all(&backup_dir).ok();
-
-        // Custom file organization
-        db_opts.set_wal_dir(&wal_dir); // Put WAL files in /logs subdirectory
-
-        // Production-leaning durability settings: rely on WAL + periodic fsync
-        db_opts.set_use_fsync(false);
-        db_opts.set_bytes_per_sync(8 * 1024 * 1024);
-        db_opts.set_wal_bytes_per_sync(8 * 1024 * 1024);
-        db_opts.set_db_write_buffer_size(256 * 1024 * 1024);
-        db_opts.set_max_background_jobs(8);
-
-        // More forgiving compaction thresholds
-        db_opts.set_level_zero_slowdown_writes_trigger(20);
-        db_opts.set_level_zero_stop_writes_trigger(36);
-        db_opts.set_max_open_files(512);
-
-        // Additional file management settings
-        db_opts.set_recycle_log_file_num(4);
-
-        // WAL and cleanup tuned for throughput
-        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
-        db_opts.set_manual_wal_flush(false);
-        db_opts.set_wal_size_limit_mb(64);
-        db_opts.set_max_total_wal_size(512 * 1024 * 1024);
-        db_opts.set_keep_log_file_num(10);
-        db_opts.set_wal_ttl_seconds(24 * 60 * 60);
-        db_opts.set_delete_obsolete_files_period_micros(10 * 1_000_000);
-        db_opts.set_max_subcompactions(4);
-
-        // Discover any existing column families so we can open previously initialized databases.
-        let existing_cfs: Vec<String> = match DB::list_cf(&db_opts, &db_path) {
-            Ok(names) => names,
-            Err(_)
-                // New database paths may not have any CF metadata yet; default to an empty list
-                => Vec::new(),
-        };
-
-        // Union of existing CFs and required CFs
-        let mut cf_name_set: HashSet<String> = existing_cfs.into_iter().collect();
-        for name in cf_names.iter() {
-            cf_name_set.insert((*name).to_string());
-        }
-        // Ensure 'default' is always present
-        cf_name_set.insert("default".to_string());
-
-        // Build descriptors from the unified list. Keep a stable order: 'default' first, then others sorted.
-        let mut final_cf_names: Vec<String> = cf_name_set.into_iter().collect();
-        final_cf_names.sort();
-        if let Some(pos) = final_cf_names.iter().position(|n| n == "default") {
-            let default = final_cf_names.remove(pos);
-            final_cf_names.insert(0, default);
-        }
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = final_cf_names
-            .iter()
-            .map(|name| {
-                let mut opts = cf_opts.clone();
-                // Apply a fixed-length 32-byte prefix extractor on coin_candidate CF to optimize per-epoch scans
-                if name == "coin_candidate" {
-                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
-                    opts.set_optimize_filters_for_hits(true);
-                } else if name == "epoch_selected" {
-                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
-                    opts.set_optimize_filters_for_hits(true);
-                } else if name == "coin_epoch_by_epoch" {
-                    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
-                    opts.set_optimize_filters_for_hits(true);
-                }
-                ColumnFamilyDescriptor::new(name.clone(), opts)
-            })
-            .collect();
-
-        let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descriptors)
-            .with_context(|| format!("Failed to open database at '{db_path}'"))?;
 
         // Create coins directory for individual coin files
         let coins_dir = format!("{db_path}/coins");
@@ -713,6 +823,11 @@ impl Store {
         }
     }
 
+    /// Return the canonical chain id even before the genesis anchor is materialized locally.
+    pub fn effective_chain_id(&self) -> [u8; 32] {
+        self.get_chain_id().unwrap_or_else(|_| protocol_chain_id())
+    }
+
     // (moved to module scope below)
 
     /// Persist a signed node record into the peers CF keyed by node_id.
@@ -845,35 +960,6 @@ impl Store {
             Some(bytes) => Ok(Some(crate::canonical::decode_nullifier_root_ledger(
                 &bytes,
             )?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn store_shielded_checkpoint(
-        &self,
-        checkpoint: &crate::shielded::HistoricalUnspentCheckpoint,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_checkpoint")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_checkpoint' column family missing"))?;
-        let bytes = crate::canonical::encode_historical_unspent_checkpoint(checkpoint)?;
-        self.db.put_cf(cf, &checkpoint.note_commitment, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_checkpoint(
-        &self,
-        note_commitment: &[u8; 32],
-    ) -> Result<Option<crate::shielded::HistoricalUnspentCheckpoint>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_checkpoint")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_checkpoint' column family missing"))?;
-        match self.db.get_cf(cf, note_commitment)? {
-            Some(bytes) => Ok(Some(
-                crate::canonical::decode_historical_unspent_checkpoint(&bytes)?,
-            )),
             None => Ok(None),
         }
     }
@@ -1132,35 +1218,6 @@ impl Store {
             outputs.push((tx_id, u32::from_le_bytes(index_bytes), output));
         }
         Ok(outputs)
-    }
-
-    pub fn store_shielded_owned_note<T: Serialize>(
-        &self,
-        note_commitment: &[u8; 32],
-        record: &T,
-    ) -> Result<()> {
-        self.put("shielded_owned_note", note_commitment, record)
-    }
-
-    pub fn load_shielded_owned_note<T: DeserializeOwned + 'static>(
-        &self,
-        note_commitment: &[u8; 32],
-    ) -> Result<Option<T>> {
-        self.get("shielded_owned_note", note_commitment)
-    }
-
-    pub fn iterate_shielded_owned_notes<T: DeserializeOwned + 'static>(&self) -> Result<Vec<T>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_owned_note")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_owned_note' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut out = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            out.push(bincode::deserialize::<T>(&value)?);
-        }
-        Ok(out)
     }
 
     pub fn store_shielded_active_nullifier_epoch(
@@ -1583,6 +1640,12 @@ impl Store {
         }
         Ok(())
     }
+}
+
+pub fn protocol_chain_id() -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[0u8; 32]);
+    *hasher.finalize().as_bytes()
 }
 
 fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]) -> Result<()> {

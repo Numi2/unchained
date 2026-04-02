@@ -568,7 +568,7 @@ pub fn peer_id_string() -> Result<String> {
 
 impl RuntimeState {
     fn local_chain_id(&self) -> Option<[u8; 32]> {
-        self.db.get_chain_id().ok()
+        Some(self.db.effective_chain_id())
     }
 
     async fn local_node_id(&self) -> [u8; 32] {
@@ -2408,7 +2408,7 @@ pub async fn spawn(
     let identity = NodeIdentity::load_runtime_in_dir(
         db.base_path(),
         PROTOCOL.version,
-        db.get_chain_id().ok(),
+        Some(db.effective_chain_id()),
         published_addresses.clone(),
     )?;
     let local_record = identity.record().clone();
@@ -3602,10 +3602,10 @@ fn should_relay_topic(topic: WireTopic) -> bool {
 }
 
 fn chain_compatible(local_chain_id: Option<[u8; 32]>, remote_chain_id: Option<[u8; 32]>) -> bool {
-    match local_chain_id {
-        Some(local_chain_id) => remote_chain_id == Some(local_chain_id),
-        None => true,
-    }
+    matches!(
+        (local_chain_id, remote_chain_id),
+        (Some(local_chain_id), Some(remote_chain_id)) if local_chain_id == remote_chain_id
+    )
 }
 
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {

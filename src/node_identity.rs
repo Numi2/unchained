@@ -739,14 +739,14 @@ impl NodeIdentity {
         let auth_path = dir.join(NODE_AUTH_KEY_PATH);
         if !auth_path.exists() {
             bail!(
-                "missing runtime auth key at {}. run `unchained node auth-prepare` first",
+                "missing runtime auth key at {}. run `unchained_node auth-prepare` first",
                 auth_path.display()
             );
         }
         let record_path = dir.join(NODE_RECORD_PATH);
         if !record_path.exists() {
             bail!(
-                "missing signed node record at {}. run `unchained node auth-install` after offline signing",
+                "missing signed node record at {}. run `unchained_node auth-install` after offline signing",
                 record_path.display()
             );
         }
@@ -894,7 +894,7 @@ pub fn load_local_node_id_in_dir(dir: impl AsRef<Path>) -> Result<String> {
             .map_err(|_| anyhow!("failed to DER-encode node root public key"))?;
         return Ok(hex::encode(derive_node_id(root_spki.as_ref())));
     }
-    bail!("no node identity present; run `unchained node init-root` and the auth ceremony first")
+    bail!("no node identity present; run `unchained_node init-root` and the auth ceremony first")
 }
 
 pub fn init_root_in_dir(dir: impl AsRef<Path>) -> Result<(String, String)> {
@@ -1005,7 +1005,7 @@ pub fn install_node_record_in_dir(
     let record = load_node_record_item(record_source)?;
     record.validate(now_unix_ms())?;
     let auth = load_key(&dir.join(NODE_AUTH_KEY_PATH)).map_err(|_| {
-        anyhow!("missing runtime auth key; run `unchained node auth-prepare` first")
+        anyhow!("missing runtime auth key; run `unchained_node auth-prepare` first")
     })?;
     let auth_spki = auth_spki_from_key(&auth)?;
     if auth_spki != record.auth_spki {
@@ -1035,7 +1035,7 @@ pub fn create_trust_update_replace(
 pub fn approve_trust_update_in_dir(dir: impl AsRef<Path>, update_source: &str) -> Result<String> {
     let dir = identity_dir(dir.as_ref());
     let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))
-        .map_err(|_| anyhow!("missing node root key; run `unchained node init-root` first"))?;
+        .map_err(|_| anyhow!("missing node root key; run `unchained_node init-root` first"))?;
     let root_info = root_info_from_key(&root)?;
     let mut update = load_trust_update(update_source)?;
     let signable = trust_update_signable_bytes(&TrustUpdateSignableV1::from(update.clone()))?;

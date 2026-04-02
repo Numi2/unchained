@@ -18,8 +18,10 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 - Wire objects and signed documents use an explicit canonical byte codec rather
   than relying on Serde or `bincode` layout for protocol compatibility
   (`src/canonical.rs`, `src/node_identity.rs`).
-- Persistence uses RocksDB, including dedicated column families for anchors,
-  transactions, shielded state, and archive metadata (`src/storage.rs`).
+- Persistence uses RocksDB with separate chain and wallet-private stores. Chain
+  state lives in the main node database, while wallet secrets, owned notes,
+  checkpoints, and wallet-local metadata live under a dedicated private store
+  rooted at `wallet_private/` (`src/storage.rs`, `src/wallet.rs`).
 - Wallet recipient handles are signed KeyDoc JSON documents that bind a chain ID
   to ML-DSA and ML-KEM public keys (`src/wallet.rs`).
 - Shielded outputs are ML-KEM-768 encrypted and carry opaque ciphertext plus a
@@ -46,8 +48,9 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 
 ## Wallet Refresh And Archive Layer
 
-- `node start` spawns a fixed-cadence oblivious refresh loop for wallet
-  checkpoints (`src/main.rs`, `src/wallet.rs`).
+- `unchained_wallet send` and `unchained_miner` use the wallet-private store for
+  owned note state and advance checkpoint refresh from that role boundary
+  (`src/app.rs`, `src/wallet.rs`, `src/storage.rs`).
 - Each refresh can issue real checkpoint requests for owned notes and synthetic
   cover requests even when no spend is pending (`src/wallet.rs`).
 - Checkpoint queries are segmented by archive shard, routed across providers,
@@ -63,15 +66,21 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 
 ## Service Boundary
 
-- The product runs as a single PQ mesh node. Remote interaction happens through
-  signed envelopes on the node-to-node transport
-  (`src/network.rs`, `src/node_identity.rs`).
+- The checked-in runtime is split into three binaries: `unchained_node`,
+  `unchained_wallet`, and `unchained_miner` (`src/app.rs`,
+  `src/bin/unchained_node.rs`, `src/bin/unchained_wallet.rs`,
+  `src/bin/unchained_miner.rs`).
+- `unchained_wallet serve` owns the wallet-private store and exposes a local
+  Unix-domain control socket for mining identity and lock derivation
+  (`src/app.rs`, `src/wallet_control.rs`).
+- Remote interaction happens through signed envelopes on the node-to-node
+  transport (`src/network.rs`, `src/node_identity.rs`).
 - The only HTTP surface in the checked-in runtime is the local metrics/log
   stream, and the code enforces a loopback bind for it (`src/metrics.rs`).
 - Node identity supports an offline-root ceremony through
-  `unchained node init-root`, `unchained node auth-prepare`,
-  `unchained node auth-sign`, and `unchained node auth-install`
-  (`src/main.rs`, `src/node_identity.rs`).
+  `unchained_node init-root`, `unchained_node auth-prepare`,
+  `unchained_node auth-sign`, and `unchained_node auth-install`
+  (`src/app.rs`, `src/node_identity.rs`).
 - Runtime operation only needs the installed auth key and signed node record;
   the offline root is not required by `NodeIdentity::load_runtime_in_dir`
   (`src/node_identity.rs`).
@@ -105,52 +114,45 @@ cargo fmt
 cargo check
 cargo test
 cargo test --test shielded_tx_flow -- --nocapture
-cargo run --release --bin unchained -- node start
-cargo run --release --bin unchained -- wallet receive
+cargo run --release --bin unchained_wallet -- serve
+cargo run --release --bin unchained_node -- start
+cargo run --release --bin unchained_wallet -- receive
+cargo run --release --bin unchained_miner
 ```
 
 The default test suite includes:
 
-- `tests/shielded_tx_flow.rs`: end-to-end succinct-proof wallet send/receive
-  roundtrip
+- `tests/shielded_tx_flow.rs`: deterministic prepared-send CI coverage plus an
+  ignored live-proving soak roundtrip
 - `tests/shielded_pool.rs`: shielded note, checkpoint, archive, and
   rerandomization coverage
 - `tests/pq_network.rs`: PQ bootstrap, anchor recovery, and network
   archive/proof flows
+- `tests/wallet_control.rs`: local wallet control socket coverage for miner-facing
+  identity and lock derivation
 
-`shielded_tx_flow` is materially slower than the rest of the suite on CPU-only
-proving hosts.
+Run `cargo test --test shielded_tx_flow -- --ignored --nocapture` when you want
+the full zkVM proving soak on CPU-only proving hosts.
 
 ## CLI
 
-Primary commands in the current binary:
+Primary binaries:
 
-- `node start`
-- `node init-root`
-- `node auth-prepare`
-- `node auth-sign`
-- `node auth-install`
-- `node trust-revoke`
-- `node trust-replace`
-- `node trust-approve`
-- `node peer-id`
-- `wallet receive`
-- `wallet send`
-- `wallet balance`
-- `wallet history`
-- `message send`
-- `message listen`
-- `advanced replay-transactions`
-- `advanced rescan-wallet`
-- `advanced export-anchors --out <FILE>`
-- `advanced import-anchors --input <FILE>`
+- `unchained_node`: node runtime, identity ceremony, message topic, anchor import/export, replay
+- `unchained_wallet`: wallet control service, receive, send, balance, history, rescan
+- `unchained_miner`: dedicated mining runtime that consumes the wallet control socket
 
-`wallet receive` exports a signed KeyDoc JSON recipient document, and
-`wallet send` validates that document before constructing a proof-backed
+`unchained_wallet receive` exports a signed KeyDoc JSON recipient document, and
+`unchained_wallet send` validates that document before constructing a proof-backed
 shielded transaction (`src/wallet.rs`).
 
-`message send` and `message listen` operate on a shared text topic rather than a
-direct wallet-to-wallet transport (`src/main.rs`, `src/network.rs`).
+Run `unchained_wallet serve` before `unchained_miner`; the miner no longer opens
+the wallet-private database or loads wallet secrets directly (`src/wallet_control.rs`,
+`src/miner.rs`).
+
+`unchained_node message send` and `unchained_node message listen` operate on a
+shared text topic rather than a direct wallet-to-wallet transport
+(`src/app.rs`, `src/network.rs`).
 
 ## Docs
 

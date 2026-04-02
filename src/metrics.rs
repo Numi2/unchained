@@ -642,10 +642,6 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
                         hyper::header::CONNECTION,
                         hyper::header::HeaderValue::from_static("keep-alive"),
                     );
-                    headers.insert(
-                        hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                        hyper::header::HeaderValue::from_static("*"),
-                    );
                     Ok::<_, std::convert::Infallible>(resp)
                 } else {
                     Ok::<_, std::convert::Infallible>(

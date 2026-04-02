@@ -1,11 +1,12 @@
 use crate::{
     coin::{Coin, CoinCandidate},
-    crypto,
+    crypto::{self, Address, TaggedSigningPublicKey},
     epoch::Anchor,
     network::NetHandle,
     storage::Store,
-    wallet::Wallet,
+    wallet_control::{MiningIdentity, WalletControlClient},
 };
+use anyhow::Result as AnyResult;
 use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -27,15 +28,59 @@ pub fn spawn(
     cfg: crate::config::Mining,
     db: Arc<Store>,
     net: NetHandle,
-    wallet: Arc<Wallet>, // The miner needs a persistent identity
+    wallet_control: WalletControlClient,
+    mining_identity: MiningIdentity,
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     shutdown_rx: Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>, // new
 ) {
     task::spawn(async move {
-        let mut miner = Miner::new(cfg, db, net, wallet, coin_tx, shutdown_rx, sync_state);
+        let mut miner = Miner::new(
+            cfg,
+            db,
+            net,
+            MinerWalletAuthority::new(wallet_control, mining_identity),
+            coin_tx,
+            shutdown_rx,
+            sync_state,
+        );
         miner.run().await;
     });
+}
+
+#[derive(Clone)]
+struct MinerWalletAuthority {
+    control: WalletControlClient,
+    address: Address,
+    signing_pk: TaggedSigningPublicKey,
+}
+
+impl MinerWalletAuthority {
+    fn new(control: WalletControlClient, identity: MiningIdentity) -> Self {
+        Self {
+            control,
+            address: identity.address,
+            signing_pk: identity.signing_pk,
+        }
+    }
+
+    fn address(&self) -> Address {
+        self.address
+    }
+
+    fn public_key(&self) -> &TaggedSigningPublicKey {
+        &self.signing_pk
+    }
+
+    async fn derive_genesis_lock_secret(
+        &self,
+        coin_id: [u8; 32],
+        chain_id: [u8; 32],
+    ) -> AnyResult<[u8; 32]> {
+        self.control
+            .derive_genesis_lock_secret(coin_id, chain_id)
+            .await
+    }
 }
 
 struct Miner {
@@ -43,7 +88,7 @@ struct Miner {
     cfg: crate::config::Mining,
     db: Arc<Store>,
     net: NetHandle,
-    wallet: Arc<Wallet>,
+    wallet: MinerWalletAuthority,
     coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     shutdown_rx: Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>, // new
@@ -62,7 +107,7 @@ impl Miner {
         cfg: crate::config::Mining,
         db: Arc<Store>,
         net: NetHandle,
-        wallet: Arc<Wallet>,
+        wallet: MinerWalletAuthority,
         coin_tx: mpsc::UnboundedSender<[u8; 32]>,
         shutdown_rx: Receiver<()>,
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
@@ -297,15 +342,9 @@ impl Miner {
                                      miner_routine!("⤴️  Ignoring out-of-order anchor #{} (< current #{})", anchor.num, curr);
                                      continue;
                                  }
-                             }
+                            }
 
                             miner_routine!("⛏️  New epoch #{}: difficulty={}, mem_kib={}. Mining...", anchor.num, anchor.difficulty, anchor.mem_kib);
-
-                            // Always show wallet balance and address on new epoch
-                            if let Ok(balance) = self.wallet.balance() {
-                                println!("💰 Wallet balance: {} coins", balance);
-                            }
-                            println!("📍 Address: {}", hex::encode(self.wallet.address()));
 
                             self.current_epoch = Some(anchor.num);
                             self.mine_epoch(anchor).await?;
@@ -559,10 +598,11 @@ impl Miner {
                 let creator_pk = self.wallet.public_key().clone();
                 let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_addr);
                 // Compute genesis lock for this coin deterministically from the wallet lock seed.
-                let chain_id = self.db.get_chain_id()?;
+                let chain_id = self.db.effective_chain_id();
                 let s0 = self
                     .wallet
-                    .compute_genesis_lock_secret(&candidate_id, &chain_id);
+                    .derive_genesis_lock_secret(candidate_id, chain_id)
+                    .await?;
                 let lock_hash =
                     crate::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &s0);
                 let candidate = CoinCandidate::new(

@@ -75,8 +75,16 @@ zeroize = "1.8.1"
 default = []
 
 [[bin]]
-name = "unchained"
-path = "src/main.rs"
+name = "unchained_node"
+path = "src/bin/unchained_node.rs"
+
+[[bin]]
+name = "unchained_wallet"
+path = "src/bin/unchained_wallet.rs"
+
+[[bin]]
+name = "unchained_miner"
+path = "src/bin/unchained_miner.rs"
 
 [[bin]]
 name = "inspect_db"
