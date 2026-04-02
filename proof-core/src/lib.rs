@@ -20,6 +20,9 @@ const CHECKPOINT_SEGMENT_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-se
 const CHECKPOINT_PACKET_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-packet-commit-v1";
 const CHECKPOINT_PACKET_ACCUMULATE_DOMAIN: &str =
     "unchained-shielded-checkpoint-packet-accumulate-v1";
+const CHECKPOINT_STRATUM_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-stratum-commit-v1";
+const CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN: &str =
+    "unchained-shielded-checkpoint-stratum-accumulate-v1";
 const CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN: &str = "unchained-shielded-checkpoint-accumulate-v1";
 const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
@@ -87,10 +90,10 @@ pub struct HistoricalUnspentExtension {
     pub through_epoch: u64,
     pub prior_transcript_root: [u8; 32],
     pub historical_root_digest: [u8; 32],
-    pub packet_commitment_root: [u8; 32],
+    pub stratum_commitment_root: [u8; 32],
     pub aggregate_rerandomization_blinding: [u8; 32],
     pub new_transcript_root: [u8; 32],
-    pub packets: Vec<HistoricalUnspentPacket>,
+    pub strata: Vec<HistoricalUnspentStratum>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +118,17 @@ pub struct HistoricalUnspentPacket {
     pub packet_rerandomization_blinding: [u8; 32],
     pub packet_transcript_root: [u8; 32],
     pub segments: Vec<HistoricalUnspentSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalUnspentStratum {
+    pub from_epoch: u64,
+    pub through_epoch: u64,
+    pub stratum_historical_root_digest: [u8; 32],
+    pub packet_commitment_root: [u8; 32],
+    pub stratum_rerandomization_blinding: [u8; 32],
+    pub stratum_transcript_root: [u8; 32],
+    pub packets: Vec<HistoricalUnspentPacket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,7 +238,7 @@ pub fn validate_shielded_tx_witness(
             .historical_checkpoint
             .apply_extension(&input.historical_extension)?;
         if witness.current_epoch == 0 {
-            if !input.historical_extension.packets.is_empty() {
+            if !input.historical_extension.strata.is_empty() {
                 bail!("epoch-zero spends must not include historical records");
             }
         } else if updated_checkpoint.covered_through_epoch != witness.current_epoch - 1 {
@@ -434,7 +448,7 @@ impl HistoricalUnspentCheckpoint {
         }
 
         let expected_from = self.covered_through_epoch.saturating_add(1);
-        if extension.packets.is_empty() {
+        if extension.strata.is_empty() {
             if extension.from_epoch != expected_from {
                 bail!("empty extension starts at the wrong epoch");
             }
@@ -444,8 +458,8 @@ impl HistoricalUnspentCheckpoint {
             if extension.new_transcript_root != self.transcript_root {
                 bail!("empty extension must preserve the transcript root");
             }
-            if extension.packet_commitment_root != [0u8; 32] {
-                bail!("empty extension must use the zero packet commitment root");
+            if extension.stratum_commitment_root != [0u8; 32] {
+                bail!("empty extension must use the zero stratum commitment root");
             }
             return Ok(self.clone());
         }
@@ -456,41 +470,43 @@ impl HistoricalUnspentCheckpoint {
 
         let mut expected_epoch = extension.from_epoch;
         let mut historical_pairs = Vec::new();
-        let mut packet_digests = Vec::with_capacity(extension.packets.len());
-        for packet in &extension.packets {
-            if packet.from_epoch != expected_epoch {
-                bail!("extension packets must be contiguous");
+        let mut stratum_digests = Vec::with_capacity(extension.strata.len());
+        for stratum in &extension.strata {
+            if stratum.from_epoch != expected_epoch {
+                bail!("extension strata must be contiguous");
             }
-            packet.verify_against_note(&self.note_commitment)?;
-            let mut packet_pairs = Vec::new();
-            for segment in &packet.segments {
-                if segment.from_epoch != expected_epoch {
-                    bail!("extension segments must be contiguous inside packets");
+            stratum.verify_against_note(&self.note_commitment)?;
+            let mut stratum_pairs = Vec::new();
+            for packet in &stratum.packets {
+                for segment in &packet.segments {
+                    if segment.from_epoch != expected_epoch {
+                        bail!("extension segments must be contiguous inside strata");
+                    }
+                    for record in &segment.records {
+                        if record.epoch != expected_epoch {
+                            bail!("extension epochs must be contiguous");
+                        }
+                        if record.nullifier != record.proof.queried_nullifier {
+                            bail!("record nullifier does not match its proof");
+                        }
+                        if record.proof.epoch != record.epoch {
+                            bail!("record epoch does not match its proof");
+                        }
+                        if record.proof.root == [0u8; 32] && record.proof.set_size != 0 {
+                            bail!("non-empty nullifier proof cannot use the zero root");
+                        }
+                        record.proof.verify()?;
+                        historical_pairs.push((record.epoch, record.proof.root));
+                        stratum_pairs.push((record.epoch, record.proof.root));
+                        expected_epoch = expected_epoch.saturating_add(1);
+                    }
                 }
-                for record in &segment.records {
-                    if record.epoch != expected_epoch {
-                        bail!("extension epochs must be contiguous");
-                    }
-                    if record.nullifier != record.proof.queried_nullifier {
-                        bail!("record nullifier does not match its proof");
-                    }
-                    if record.proof.epoch != record.epoch {
-                        bail!("record epoch does not match its proof");
-                    }
-                    if record.proof.root == [0u8; 32] && record.proof.set_size != 0 {
-                        bail!("non-empty nullifier proof cannot use the zero root");
-                    }
-                    record.proof.verify()?;
-                    historical_pairs.push((record.epoch, record.proof.root));
-                    packet_pairs.push((record.epoch, record.proof.root));
-                    expected_epoch = expected_epoch.saturating_add(1);
-                }
             }
-            let expected_packet_digest = historical_root_digest_from_pairs(&packet_pairs);
-            if packet.packet_historical_root_digest != expected_packet_digest {
-                bail!("packet historical root digest mismatch");
+            let expected_stratum_digest = historical_root_digest_from_pairs(&stratum_pairs);
+            if stratum.stratum_historical_root_digest != expected_stratum_digest {
+                bail!("stratum historical root digest mismatch");
             }
-            packet_digests.push(packet.commitment_digest());
+            stratum_digests.push(stratum.commitment_digest());
         }
 
         if extension.through_epoch != expected_epoch.saturating_sub(1) {
@@ -500,9 +516,9 @@ impl HistoricalUnspentCheckpoint {
         if extension.historical_root_digest != expected_historical_root_digest {
             bail!("extension historical root digest mismatch");
         }
-        let expected_packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
-        if extension.packet_commitment_root != expected_packet_commitment_root {
-            bail!("extension packet commitment root mismatch");
+        let expected_stratum_commitment_root = checkpoint_stratum_commitment_root(&stratum_digests);
+        if extension.stratum_commitment_root != expected_stratum_commitment_root {
+            bail!("extension stratum commitment root mismatch");
         }
         let rerandomized_root = accumulated_checkpoint_root(
             &self.transcript_root,
@@ -510,7 +526,7 @@ impl HistoricalUnspentCheckpoint {
             extension.from_epoch,
             extension.through_epoch,
             &extension.historical_root_digest,
-            &extension.packet_commitment_root,
+            &extension.stratum_commitment_root,
             &extension.aggregate_rerandomization_blinding,
         );
         if extension.new_transcript_root != rerandomized_root {
@@ -623,6 +639,67 @@ impl HistoricalUnspentPacket {
             &self.segment_commitment_root,
             &self.packet_transcript_root,
             self.segments.len() as u32,
+        )
+    }
+}
+
+impl HistoricalUnspentStratum {
+    pub fn verify_against_note(&self, note_commitment: &[u8; 32]) -> Result<()> {
+        if self.packets.is_empty() {
+            bail!("historical stratum cannot be empty");
+        }
+        let mut expected_epoch = self.from_epoch;
+        let mut historical_pairs = Vec::new();
+        let mut packet_digests = Vec::with_capacity(self.packets.len());
+        for packet in &self.packets {
+            if packet.from_epoch != expected_epoch {
+                bail!("historical stratum packets must stay contiguous");
+            }
+            packet.verify_against_note(note_commitment)?;
+            for segment in &packet.segments {
+                for record in &segment.records {
+                    if record.epoch != expected_epoch {
+                        bail!("historical stratum records must remain contiguous");
+                    }
+                    historical_pairs.push((record.epoch, record.proof.root));
+                    expected_epoch = expected_epoch.saturating_add(1);
+                }
+            }
+            packet_digests.push(packet.commitment_digest());
+        }
+        if self.through_epoch != expected_epoch.saturating_sub(1) {
+            bail!("historical stratum through_epoch does not match the final record");
+        }
+        let expected_historical_root_digest = historical_root_digest_from_pairs(&historical_pairs);
+        if self.stratum_historical_root_digest != expected_historical_root_digest {
+            bail!("historical stratum root digest mismatch");
+        }
+        let expected_packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
+        if self.packet_commitment_root != expected_packet_commitment_root {
+            bail!("historical stratum packet commitment root mismatch");
+        }
+        let expected_stratum_root = accumulated_stratum_root(
+            note_commitment,
+            self.from_epoch,
+            self.through_epoch,
+            &self.stratum_historical_root_digest,
+            &self.packet_commitment_root,
+            &self.stratum_rerandomization_blinding,
+        );
+        if self.stratum_transcript_root != expected_stratum_root {
+            bail!("historical stratum transcript root mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn commitment_digest(&self) -> [u8; 32] {
+        checkpoint_stratum_commitment_digest(
+            self.from_epoch,
+            self.through_epoch,
+            &self.stratum_historical_root_digest,
+            &self.packet_commitment_root,
+            &self.stratum_transcript_root,
+            self.packets.len() as u32,
         )
     }
 }
@@ -880,13 +957,58 @@ fn accumulated_packet_root(
     *hasher.finalize().as_bytes()
 }
 
+fn checkpoint_stratum_commitment_digest(
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    packet_commitment_root: &[u8; 32],
+    stratum_transcript_root: &[u8; 32],
+    packet_count: u32,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(packet_commitment_root);
+    hasher.update(stratum_transcript_root);
+    hasher.update(&packet_count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn checkpoint_stratum_commitment_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
+    hasher.update(&(stratum_digests.len() as u32).to_le_bytes());
+    for digest in stratum_digests {
+        hasher.update(digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn accumulated_stratum_root(
+    note_commitment: &[u8; 32],
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    packet_commitment_root: &[u8; 32],
+    blinding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN);
+    hasher.update(note_commitment);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(packet_commitment_root);
+    hasher.update(blinding);
+    *hasher.finalize().as_bytes()
+}
+
 fn accumulated_checkpoint_root(
     prior_transcript_root: &[u8; 32],
     note_commitment: &[u8; 32],
     from_epoch: u64,
     through_epoch: u64,
     historical_root_digest: &[u8; 32],
-    packet_commitment_root: &[u8; 32],
+    stratum_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN);
@@ -895,7 +1017,7 @@ fn accumulated_checkpoint_root(
     hasher.update(&from_epoch.to_le_bytes());
     hasher.update(&through_epoch.to_le_bytes());
     hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
+    hasher.update(stratum_commitment_root);
     hasher.update(blinding);
     *hasher.finalize().as_bytes()
 }
@@ -987,10 +1109,10 @@ mod tests {
                 through_epoch: checkpoint.covered_through_epoch,
                 prior_transcript_root: checkpoint.transcript_root,
                 historical_root_digest: historical_root_digest_from_pairs(&[]),
-                packet_commitment_root: [0u8; 32],
+                stratum_commitment_root: [0u8; 32],
                 aggregate_rerandomization_blinding: [0u8; 32],
                 new_transcript_root: checkpoint.transcript_root,
-                packets: Vec::new(),
+                strata: Vec::new(),
             };
         }
 
@@ -1056,8 +1178,26 @@ mod tests {
             ),
             segments: vec![segment],
         };
-        let packet_commitment_root =
-            checkpoint_packet_commitment_root(&[packet.commitment_digest()]);
+        let stratum = HistoricalUnspentStratum {
+            from_epoch,
+            through_epoch,
+            stratum_historical_root_digest: historical_root_digest,
+            packet_commitment_root: checkpoint_packet_commitment_root(
+                &[packet.commitment_digest()],
+            ),
+            stratum_rerandomization_blinding: [6u8; 32],
+            stratum_transcript_root: accumulated_stratum_root(
+                &checkpoint.note_commitment,
+                from_epoch,
+                through_epoch,
+                &historical_root_digest,
+                &checkpoint_packet_commitment_root(&[packet.commitment_digest()]),
+                &[6u8; 32],
+            ),
+            packets: vec![packet],
+        };
+        let stratum_commitment_root =
+            checkpoint_stratum_commitment_root(&[stratum.commitment_digest()]);
         let aggregate_rerandomization_blinding = [4u8; 32];
         HistoricalUnspentExtension {
             version: SHIELDED_EXTENSION_VERSION,
@@ -1066,7 +1206,7 @@ mod tests {
             through_epoch,
             prior_transcript_root: checkpoint.transcript_root,
             historical_root_digest,
-            packet_commitment_root,
+            stratum_commitment_root,
             aggregate_rerandomization_blinding,
             new_transcript_root: accumulated_checkpoint_root(
                 &checkpoint.transcript_root,
@@ -1074,10 +1214,10 @@ mod tests {
                 from_epoch,
                 through_epoch,
                 &historical_root_digest,
-                &packet_commitment_root,
+                &stratum_commitment_root,
                 &aggregate_rerandomization_blinding,
             ),
-            packets: vec![packet],
+            strata: vec![stratum],
         }
     }
 

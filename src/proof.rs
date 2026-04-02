@@ -6,6 +6,7 @@ use proof_core::{
     HistoricalUnspentExtension as ProofHistoricalUnspentExtension,
     HistoricalUnspentPacket as ProofHistoricalUnspentPacket,
     HistoricalUnspentSegment as ProofHistoricalUnspentSegment,
+    HistoricalUnspentStratum as ProofHistoricalUnspentStratum,
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
     NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofShieldedInputWitness,
@@ -18,8 +19,8 @@ use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, 
 use crate::{
     shielded::{
         HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
-        HistoricalUnspentPacket, HistoricalUnspentSegment, NoteMembershipProof,
-        NullifierMembershipWitness, NullifierNonMembershipProof, ShieldedNote,
+        HistoricalUnspentPacket, HistoricalUnspentSegment, HistoricalUnspentStratum,
+        NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof, ShieldedNote,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
@@ -170,10 +171,22 @@ fn extension_to_proof(extension: &HistoricalUnspentExtension) -> ProofHistorical
         through_epoch: extension.through_epoch,
         prior_transcript_root: extension.prior_transcript_root,
         historical_root_digest: extension.historical_root_digest,
-        packet_commitment_root: extension.packet_commitment_root,
+        stratum_commitment_root: extension.stratum_commitment_root,
         aggregate_rerandomization_blinding: extension.aggregate_rerandomization_blinding,
         new_transcript_root: extension.new_transcript_root,
-        packets: extension.packets.iter().map(packet_to_proof).collect(),
+        strata: extension.strata.iter().map(stratum_to_proof).collect(),
+    }
+}
+
+fn stratum_to_proof(stratum: &HistoricalUnspentStratum) -> ProofHistoricalUnspentStratum {
+    ProofHistoricalUnspentStratum {
+        from_epoch: stratum.from_epoch,
+        through_epoch: stratum.through_epoch,
+        stratum_historical_root_digest: stratum.stratum_historical_root_digest,
+        packet_commitment_root: stratum.packet_commitment_root,
+        stratum_rerandomization_blinding: stratum.stratum_rerandomization_blinding,
+        stratum_transcript_root: stratum.stratum_transcript_root,
+        packets: stratum.packets.iter().map(packet_to_proof).collect(),
     }
 }
 

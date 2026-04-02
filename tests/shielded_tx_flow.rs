@@ -115,7 +115,6 @@ fn provision_runtime_identity(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expensive succinct STARK proof-generation integration"]
 async fn shielded_wallet_send_and_receive_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);

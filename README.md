@@ -22,8 +22,8 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 - Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
 - Canonical transactions carry a succinct STARK receipt over a private witness, while validators only see the current nullifiers, encrypted outputs, and the proof journal bindings required to update state.
 - Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
-- Wallet checkpoint refresh now runs on a fixed cadence, not only at spend time. Each cycle stripes note history across shard-aligned checkpoint segments, routes those segments across multiple archive providers discovered on the PQ mesh, pads provider buckets with cover traffic, rerandomizes each provider reply, packetizes the resulting segment transcript, and only then aggregates it into one durable checkpoint extension.
-- Archived nullifier history is organized into content-addressed epoch shards with provider manifests, replica attestations, and deterministic operator scorecards advertised or derived over the PQ mesh. Nodes deterministically rebalance shard custody so the archive layer converges toward the protocol replica target without pulling historical nullifier bulk back into validator state.
+- Wallet checkpoint refresh now runs on a fixed cadence, not only at spend time, and it still emits cover traffic even when there is no immediate spend-shaped refresh to perform. Each cycle stripes note history across shard-aligned checkpoint segments, routes those segments across multiple archive providers discovered on the PQ mesh, pads provider buckets with cover traffic, rerandomizes every provider reply, compresses segment replies into packets, compresses packets into strata, and only then aggregates the strata into one durable checkpoint extension.
+- Archived nullifier history is organized into content-addressed epoch shards with provider manifests, replica attestations, service ledgers, derived availability certificates, and deterministic operator scorecards over the PQ mesh. Nodes deterministically rebalance shard custody so the archive layer converges toward the protocol replica target without pulling historical nullifier bulk back into validator state, and routing now prefers providers that both retain shards deeply and actually serve checkpoint/archive traffic reliably.
 
 ## Architecture
 
@@ -67,12 +67,12 @@ Useful commands:
 cargo fmt
 cargo check
 cargo test
-cargo test --test shielded_tx_flow -- --ignored --nocapture
+cargo test --test shielded_tx_flow -- --nocapture
 cargo run --release --bin unchained -- node start
 cargo run --release --bin unchained -- wallet receive
 ```
 
-`cargo test` is the fast default suite. The ignored `shielded_tx_flow` integration runs the full end-to-end succinct-proof wallet roundtrip.
+`cargo test` now exercises the full end-to-end succinct-proof wallet roundtrip by default. On CPU-only proving hosts, `shielded_tx_flow` is materially slower than the rest of the suite.
 
 ## CLI
 

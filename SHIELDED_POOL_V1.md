@@ -91,14 +91,15 @@ over the PQ mesh as batched checkpoint request/response messages rather than as
 a local-only helper.
 
 The live wallet no longer uses this in a one-note-at-a-time pattern. It runs a
-fixed-cadence background refresh loop, builds batched checkpoint-extension
+fixed-cadence background refresh loop, still emits cover-only refresh traffic
+even when no note is about to spend, builds batched checkpoint-extension
 requests across many owned notes, splits each note history into shard-aligned
 segments, routes those segments through a rotating multi-provider schedule,
 pads each provider/shard bucket with cover requests up to a power-of-two
 bucket, rerandomizes every provider response segment, packetizes those
-rerandomized segments into a deeper checkpoint compression layer, and only then
-aggregates the packets into the checkpoint extension that becomes durable local
-state.
+rerandomized segments, compresses packets into stratum-level checkpoint
+accumulators, and only then aggregates the strata into the checkpoint
+extension that becomes durable local state.
 
 `HistoricalUnspentCheckpoint::apply_extension()` verifies those records against
 the `NullifierRootLedger` and advances the checkpoint without requiring the
@@ -116,7 +117,9 @@ Historical roots are also organized into content-addressed archive shards.
 - contiguous epoch-root shards
 - provider manifests learned from the PQ mesh
 - replica attestations and retention horizons per shard
-- deterministic operator scorecards from public custody and retention data
+- service ledgers from observed checkpoint and archive-shard serving
+- availability certificates derived from retention plus service evidence
+- deterministic operator scorecards from custody, retention, and service data
 - a provider-selection schedule for checkpoint refresh
 - deterministic shard-custody assignments for replication repair
 
@@ -147,12 +150,13 @@ before that segment becomes durable state.
 
 `HistoricalUnspentExtension::aggregate()` is the next step. It takes many
 rerandomized provider segments, compresses them into packet-level accumulators,
-and then compresses those packets into one checkpoint extension with:
+compresses those packets into stratum-level accumulators, and then compresses
+those strata into one checkpoint extension with:
 
 - one note commitment
 - one prior checkpoint root
 - one aggregate historical-root digest
-- one packet-commitment root
+- one stratum-commitment root
 - one final aggregate rerandomization step
 
 The checkpoint layer is no longer a public transaction field. It is private
@@ -212,12 +216,13 @@ The live runtime now already has:
 1. segmented multi-provider checkpoint retrieval
 2. rerandomized checkpoint-segment accumulation
 3. fixed-cadence background checkpoint refresh with cover traffic
-4. packet-level checkpoint compression above raw segments
+4. packet-level and stratum-level checkpoint compression above raw segments
 5. mesh-discovered archive providers and shard exchange
-6. replica attestations, deterministic operator scorecards, and shard-custody rebalancing
+6. replica attestations, service ledgers, derived availability certificates,
+   deterministic operator scorecards, and shard-custody rebalancing
 
 What remains is narrower:
 
 1. stronger operator economics beyond deterministic scorecards and routing bias
 2. archive-DA durability for very long historical horizons
-3. deeper recursive compression across packet-level checkpoint accumulators
+3. deeper recursive compression across stratum-level checkpoint accumulators

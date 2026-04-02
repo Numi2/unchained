@@ -5,11 +5,12 @@ use tempfile::TempDir;
 use unchained::{
     crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
     shielded::{
-        assigned_archive_custodians, local_archive_provider_manifest,
-        local_archive_replica_attestations, route_checkpoint_requests, ArchiveDirectory,
-        ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
-        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, NoteCommitmentTree, ShieldedNote,
-        ShieldedSyncServer,
+        assigned_archive_custodians, local_archive_custody_commitments,
+        local_archive_provider_manifest, local_archive_replica_attestations,
+        route_checkpoint_requests, ArchiveDirectory, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
+        ArchiveServiceLedger, ArchivedNullifierEpoch, CheckpointExtensionRequest,
+        EvolvingNullifierQuery, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
+        NoteCommitmentTree, ShieldedNote, ShieldedSyncServer,
     },
     Store,
 };
@@ -463,11 +464,12 @@ fn checkpoint_extensions_packetize_large_segment_sets() -> Result<()> {
     }
 
     let extension = HistoricalUnspentExtension::aggregate(&checkpoint, segments, [91u8; 32])?;
-    assert!(extension.packets.len() > 1);
+    assert!(extension.strata.len() >= 1);
     assert_eq!(
         extension
-            .packets
+            .strata
             .iter()
+            .flat_map(|stratum| stratum.packets.iter())
             .map(|packet| packet.segments.len())
             .sum::<usize>(),
         6
@@ -506,6 +508,23 @@ fn archive_operator_scorecards_reward_long_retention() -> Result<()> {
         vec![manifest_a.clone(), manifest_b.clone()],
         replicas,
     )?;
+    let mut commitments =
+        local_archive_custody_commitments(manifest_a.provider_id, &directory, 2, 32)?;
+    commitments.extend(local_archive_custody_commitments(
+        manifest_b.provider_id,
+        &directory,
+        2,
+        32,
+    )?);
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas_and_evidence(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        directory.replicas.clone(),
+        Vec::new(),
+        commitments,
+        Vec::new(),
+    )?;
 
     let mut scorecards = directory.operator_scorecards(2, 32);
     scorecards.sort_by_key(|scorecard| scorecard.provider_id);
@@ -513,6 +532,216 @@ fn archive_operator_scorecards_reward_long_retention() -> Result<()> {
     let score_a = &scorecards[0];
     let score_b = &scorecards[1];
     assert!(score_b.retention_surplus_epochs > score_a.retention_surplus_epochs);
+    assert!(score_b.reward_weight > score_a.reward_weight);
+    Ok(())
+}
+
+#[test]
+fn archive_service_ledgers_feed_availability_certificates() -> Result<()> {
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([61u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([62u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(manifest_a.provider_id, &base_directory, 512)?;
+    replicas.extend(local_archive_replica_attestations(
+        manifest_b.provider_id,
+        &base_directory,
+        512,
+    )?);
+    let mut ledger_a =
+        ArchiveServiceLedger::new(manifest_a.provider_id, manifest_a.manifest_digest);
+    ledger_a.record_checkpoint_failure();
+    let mut ledger_b =
+        ArchiveServiceLedger::new(manifest_b.provider_id, manifest_b.manifest_digest);
+    ledger_b.record_checkpoint_success(4, 12, 1_000);
+    ledger_b.record_archive_shard_success(2, 1_001);
+    let replica_directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas,
+    )?;
+    let commitments_b =
+        local_archive_custody_commitments(manifest_b.provider_id, &replica_directory, 2, 32)?;
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas_and_evidence(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replica_directory.replicas.clone(),
+        vec![ledger_a, ledger_b],
+        commitments_b,
+        Vec::new(),
+    )?;
+
+    let shard_id = directory.shards.first().expect("shard").shard_id;
+    let cert = directory
+        .availability_certificate(shard_id)
+        .expect("availability cert");
+    assert!(cert.certified_providers.contains(&manifest_b.provider_id));
+    assert!(!cert.certified_providers.contains(&manifest_a.provider_id));
+    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
+    assert!(score_b.service_success_bps > score_a.service_success_bps);
+    assert!(score_b.reward_weight > score_a.reward_weight);
+    Ok(())
+}
+
+#[test]
+fn archive_custody_commitments_gate_certification_and_rewards() -> Result<()> {
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([71u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([72u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(manifest_a.provider_id, &base_directory, 512)?;
+    replicas.extend(local_archive_replica_attestations(
+        manifest_b.provider_id,
+        &base_directory,
+        512,
+    )?);
+    let replica_directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas.clone(),
+    )?;
+    let commitments_b =
+        local_archive_custody_commitments(manifest_b.provider_id, &replica_directory, 2, 32)?;
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas_and_evidence(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas,
+        Vec::new(),
+        commitments_b,
+        Vec::new(),
+    )?;
+
+    let shard_id = directory.shards.first().expect("shard").shard_id;
+    let cert = directory
+        .availability_certificate(shard_id)
+        .expect("availability cert");
+    assert!(cert.certified_providers.contains(&manifest_b.provider_id));
+    assert!(!cert.certified_providers.contains(&manifest_a.provider_id));
+
+    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
+    assert_eq!(score_a.committed_custody_count, 0);
+    assert!(score_b.committed_custody_count > 0);
+    assert!(score_b.availability_bps > score_a.availability_bps);
+    assert!(score_b.reward_weight > score_a.reward_weight);
+    Ok(())
+}
+
+#[test]
+fn archive_retrieval_receipts_override_local_service_bias() -> Result<()> {
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([81u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([82u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(manifest_a.provider_id, &base_directory, 512)?;
+    replicas.extend(local_archive_replica_attestations(
+        manifest_b.provider_id,
+        &base_directory,
+        512,
+    )?);
+    let replica_directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas.clone(),
+    )?;
+    let mut commitments =
+        local_archive_custody_commitments(manifest_a.provider_id, &replica_directory, 2, 32)?;
+    commitments.extend(local_archive_custody_commitments(
+        manifest_b.provider_id,
+        &replica_directory,
+        2,
+        32,
+    )?);
+    let mut optimistic_ledger_a =
+        ArchiveServiceLedger::new(manifest_a.provider_id, manifest_a.manifest_digest);
+    optimistic_ledger_a.record_checkpoint_success(4, 12, 1_000);
+    let receipt_a = ArchiveRetrievalReceipt::new(
+        [9u8; 32],
+        manifest_a.provider_id,
+        manifest_a.manifest_digest,
+        ArchiveRetrievalKind::CheckpointBatch,
+        [1u8; 32],
+        None,
+        5,
+        8,
+        None,
+        0,
+        false,
+        21,
+        1_111,
+    );
+    let receipt_b = ArchiveRetrievalReceipt::new(
+        [9u8; 32],
+        manifest_b.provider_id,
+        manifest_b.manifest_digest,
+        ArchiveRetrievalKind::CheckpointBatch,
+        [2u8; 32],
+        Some([3u8; 32]),
+        5,
+        8,
+        None,
+        4,
+        true,
+        11,
+        1_112,
+    );
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas_and_evidence(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas,
+        vec![optimistic_ledger_a],
+        commitments,
+        vec![receipt_a, receipt_b],
+    )?;
+
+    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
+    assert_eq!(score_a.successful_retrieval_receipts, 0);
+    assert_eq!(score_a.failed_retrieval_receipts, 1);
+    assert_eq!(score_a.service_success_bps, 0);
+    assert_eq!(score_b.successful_retrieval_receipts, 1);
+    assert_eq!(score_b.failed_retrieval_receipts, 0);
+    assert_eq!(score_b.service_success_bps, 10_000);
     assert!(score_b.reward_weight > score_a.reward_weight);
     Ok(())
 }

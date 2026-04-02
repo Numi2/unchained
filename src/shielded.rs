@@ -27,6 +27,9 @@ const CHECKPOINT_SEGMENT_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-se
 const CHECKPOINT_PACKET_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-packet-commit-v1";
 const CHECKPOINT_PACKET_ACCUMULATE_DOMAIN: &str =
     "unchained-shielded-checkpoint-packet-accumulate-v1";
+const CHECKPOINT_STRATUM_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-stratum-commit-v1";
+const CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN: &str =
+    "unchained-shielded-checkpoint-stratum-accumulate-v1";
 const CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN: &str = "unchained-shielded-checkpoint-accumulate-v1";
 const PRESENTATION_DOMAIN: &str = "unchained-shielded-presentation-v1";
 const ARCHIVE_SHARD_DOMAIN: &str = "unchained-shielded-archive-shard-v1";
@@ -35,6 +38,10 @@ const ARCHIVE_PROVIDER_SELECT_DOMAIN: &str = "unchained-shielded-archive-select-
 const ARCHIVE_BATCH_ORDER_DOMAIN: &str = "unchained-shielded-archive-batch-order-v1";
 const ARCHIVE_REPLICA_ATTEST_DOMAIN: &str = "unchained-shielded-archive-replica-v1";
 const ARCHIVE_CUSTODY_ASSIGN_DOMAIN: &str = "unchained-shielded-archive-custody-v1";
+const ARCHIVE_CUSTODY_COMMITMENT_DOMAIN: &str = "unchained-shielded-archive-custody-commit-v1";
+const ARCHIVE_SERVICE_LEDGER_DOMAIN: &str = "unchained-shielded-archive-service-ledger-v1";
+const ARCHIVE_AVAILABILITY_CERT_DOMAIN: &str = "unchained-shielded-archive-availability-v1";
+const ARCHIVE_RETRIEVAL_RECEIPT_DOMAIN: &str = "unchained-shielded-archive-retrieval-receipt-v1";
 const GENESIS_NOTE_KEY_DOMAIN: &str = "unchained-shielded-genesis-note-key-v1";
 const GENESIS_NOTE_RHO_DOMAIN: &str = "unchained-shielded-genesis-note-rho-v1";
 const GENESIS_NOTE_RANDOMIZER_DOMAIN: &str = "unchained-shielded-genesis-note-randomizer-v1";
@@ -158,6 +165,17 @@ pub struct HistoricalUnspentPacket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalUnspentStratum {
+    pub from_epoch: u64,
+    pub through_epoch: u64,
+    pub stratum_historical_root_digest: [u8; 32],
+    pub packet_commitment_root: [u8; 32],
+    pub stratum_rerandomization_blinding: [u8; 32],
+    pub stratum_transcript_root: [u8; 32],
+    pub packets: Vec<HistoricalUnspentPacket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoricalUnspentExtension {
     pub version: u8,
     pub note_commitment: [u8; 32],
@@ -165,10 +183,10 @@ pub struct HistoricalUnspentExtension {
     pub through_epoch: u64,
     pub prior_transcript_root: [u8; 32],
     pub historical_root_digest: [u8; 32],
-    pub packet_commitment_root: [u8; 32],
+    pub stratum_commitment_root: [u8; 32],
     pub aggregate_rerandomization_blinding: [u8; 32],
     pub new_transcript_root: [u8; 32],
-    pub packets: Vec<HistoricalUnspentPacket>,
+    pub strata: Vec<HistoricalUnspentStratum>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,9 +222,78 @@ pub struct ArchiveOperatorScorecard {
     pub advertised_shard_count: u32,
     pub assigned_shard_count: u32,
     pub fulfilled_custody_count: u32,
+    pub committed_custody_count: u32,
+    pub missing_custody_commitment_count: u32,
     pub retention_surplus_epochs: u64,
     pub availability_bps: u16,
+    pub service_success_bps: u16,
+    pub successful_retrieval_receipts: u64,
+    pub failed_retrieval_receipts: u64,
+    pub served_checkpoint_batches: u64,
+    pub served_checkpoint_segments: u64,
+    pub served_archive_shards: u64,
+    pub mean_checkpoint_latency_ms: u32,
     pub reward_weight: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveServiceLedger {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub served_checkpoint_batches: u64,
+    pub served_checkpoint_segments: u64,
+    pub served_archive_shards: u64,
+    pub failed_checkpoint_batches: u64,
+    pub failed_archive_shards: u64,
+    pub total_checkpoint_latency_ms: u64,
+    pub last_success_unix_ms: u64,
+    pub ledger_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveAvailabilityCertificate {
+    pub shard_id: u64,
+    pub shard_digest: [u8; 32],
+    pub certified_providers: Vec<[u8; 32]>,
+    pub certified_replica_count: u32,
+    pub quorum_target: u32,
+    pub quorum_met: bool,
+    pub retention_through_epoch: u64,
+    pub certificate_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArchiveRetrievalKind {
+    CheckpointBatch,
+    ArchiveShard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveCustodyCommitment {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub shard_id: u64,
+    pub shard_digest: [u8; 32],
+    pub retention_through_epoch: u64,
+    pub commitment_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveRetrievalReceipt {
+    pub requester_id: [u8; 32],
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub retrieval_kind: ArchiveRetrievalKind,
+    pub request_message_id: [u8; 32],
+    pub response_message_id: Option<[u8; 32]>,
+    pub from_epoch: u64,
+    pub through_epoch: u64,
+    pub shard_id: Option<u64>,
+    pub served_units: u32,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub observed_unix_ms: u64,
+    pub receipt_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,6 +336,10 @@ pub struct ArchiveDirectory {
     pub shards: Vec<ArchiveShard>,
     pub providers: Vec<ArchiveProviderManifest>,
     pub replicas: Vec<ArchiveReplicaAttestation>,
+    pub accounting: Vec<ArchiveServiceLedger>,
+    pub custody_commitments: Vec<ArchiveCustodyCommitment>,
+    pub retrieval_receipts: Vec<ArchiveRetrievalReceipt>,
+    pub availability_certificates: Vec<ArchiveAvailabilityCertificate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -694,10 +785,10 @@ impl HistoricalUnspentCheckpoint {
             through_epoch: self.covered_through_epoch,
             prior_transcript_root: self.transcript_root,
             historical_root_digest: proof_core::historical_root_digest_from_pairs(&[]),
-            packet_commitment_root: [0u8; 32],
+            stratum_commitment_root: [0u8; 32],
             aggregate_rerandomization_blinding: [0u8; 32],
             new_transcript_root: self.transcript_root,
-            packets: Vec::new(),
+            strata: Vec::new(),
         }
     }
 
@@ -720,7 +811,7 @@ impl HistoricalUnspentCheckpoint {
         }
 
         let expected_from = self.covered_through_epoch.saturating_add(1);
-        if extension.packets.is_empty() {
+        if extension.strata.is_empty() {
             if extension.from_epoch != expected_from {
                 bail!("empty extension starts at the wrong epoch");
             }
@@ -730,8 +821,8 @@ impl HistoricalUnspentCheckpoint {
             if extension.new_transcript_root != self.transcript_root {
                 bail!("empty extension must preserve the transcript root");
             }
-            if extension.packet_commitment_root != [0u8; 32] {
-                bail!("empty extension must use the zero packet commitment root");
+            if extension.stratum_commitment_root != [0u8; 32] {
+                bail!("empty extension must use the zero stratum commitment root");
             }
             return Ok(self.clone());
         }
@@ -742,43 +833,47 @@ impl HistoricalUnspentCheckpoint {
 
         let mut expected_epoch = extension.from_epoch;
         let mut historical_roots = Vec::new();
-        let mut packet_digests = Vec::with_capacity(extension.packets.len());
-        for packet in &extension.packets {
-            packet.verify_against_note(&self.note_commitment)?;
-            if packet.segments.is_empty() {
-                bail!("historical extension packets cannot be empty");
+        let mut stratum_digests = Vec::with_capacity(extension.strata.len());
+        for stratum in &extension.strata {
+            stratum.verify_against_note(&self.note_commitment)?;
+            if stratum.packets.is_empty() {
+                bail!("historical extension strata cannot be empty");
             }
-            if packet.from_epoch != expected_epoch {
-                bail!("historical extension packets must be contiguous");
+            if stratum.from_epoch != expected_epoch {
+                bail!("historical extension strata must be contiguous");
             }
-            let mut packet_pairs = Vec::new();
-            for segment in &packet.segments {
-                if segment.from_epoch != expected_epoch {
-                    bail!("historical extension segments must stay contiguous inside packets");
+            let mut stratum_pairs = Vec::new();
+            for packet in &stratum.packets {
+                for segment in &packet.segments {
+                    if segment.from_epoch != expected_epoch {
+                        bail!("historical extension segments must stay contiguous inside strata");
+                    }
+                    for record in &segment.records {
+                        if record.epoch != expected_epoch {
+                            bail!(
+                                "extension epochs must stay contiguous across segment boundaries"
+                            );
+                        }
+                        if record.nullifier != record.proof.queried_nullifier {
+                            bail!("extension record nullifier does not match the proof");
+                        }
+                        let root = ledger.root_for_epoch(record.epoch)?;
+                        if root != record.proof.root {
+                            bail!("extension proof root does not match the historical root ledger");
+                        }
+                        record.proof.verify()?;
+                        stratum_pairs.push((record.epoch, root));
+                        historical_roots.push((record.epoch, root));
+                        expected_epoch = expected_epoch.saturating_add(1);
+                    }
                 }
-                for record in &segment.records {
-                    if record.epoch != expected_epoch {
-                        bail!("extension epochs must stay contiguous across segment boundaries");
-                    }
-                    if record.nullifier != record.proof.queried_nullifier {
-                        bail!("extension record nullifier does not match the proof");
-                    }
-                    let root = ledger.root_for_epoch(record.epoch)?;
-                    if root != record.proof.root {
-                        bail!("extension proof root does not match the historical root ledger");
-                    }
-                    record.proof.verify()?;
-                    packet_pairs.push((record.epoch, root));
-                    historical_roots.push((record.epoch, root));
-                    expected_epoch = expected_epoch.saturating_add(1);
-                }
             }
-            let expected_segment_digest =
-                proof_core::historical_root_digest_from_pairs(&packet_pairs);
-            if packet.packet_historical_root_digest != expected_segment_digest {
-                bail!("packet historical root digest mismatch");
+            let expected_stratum_digest =
+                proof_core::historical_root_digest_from_pairs(&stratum_pairs);
+            if stratum.stratum_historical_root_digest != expected_stratum_digest {
+                bail!("stratum historical root digest mismatch");
             }
-            packet_digests.push(packet.commitment_digest());
+            stratum_digests.push(stratum.commitment_digest());
         }
 
         if extension.through_epoch != expected_epoch.saturating_sub(1) {
@@ -789,9 +884,9 @@ impl HistoricalUnspentCheckpoint {
         if extension.historical_root_digest != expected_historical_root_digest {
             bail!("extension historical root digest mismatch");
         }
-        let expected_packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
-        if extension.packet_commitment_root != expected_packet_commitment_root {
-            bail!("extension packet commitment root mismatch");
+        let expected_stratum_commitment_root = checkpoint_stratum_commitment_root(&stratum_digests);
+        if extension.stratum_commitment_root != expected_stratum_commitment_root {
+            bail!("extension stratum commitment root mismatch");
         }
         let rerandomized_root = accumulated_checkpoint_root(
             &self.transcript_root,
@@ -799,7 +894,7 @@ impl HistoricalUnspentCheckpoint {
             extension.from_epoch,
             extension.through_epoch,
             &extension.historical_root_digest,
-            &extension.packet_commitment_root,
+            &extension.stratum_commitment_root,
             &extension.aggregate_rerandomization_blinding,
         );
         if extension.new_transcript_root != rerandomized_root {
@@ -1029,6 +1124,120 @@ impl HistoricalUnspentPacket {
     }
 }
 
+impl HistoricalUnspentStratum {
+    pub fn aggregate(
+        note_commitment: &[u8; 32],
+        mut packets: Vec<HistoricalUnspentPacket>,
+        blinding: [u8; 32],
+    ) -> Result<Self> {
+        if packets.is_empty() {
+            bail!("historical strata cannot be empty");
+        }
+        packets.sort_by_key(|packet| (packet.from_epoch, packet.through_epoch));
+        let from_epoch = packets[0].from_epoch;
+        let mut expected_epoch = from_epoch;
+        let mut historical_pairs = Vec::new();
+        let mut packet_digests = Vec::with_capacity(packets.len());
+        for packet in &packets {
+            if packet.from_epoch != expected_epoch {
+                bail!("historical stratum packets must stay contiguous");
+            }
+            packet.verify_against_note(note_commitment)?;
+            for segment in &packet.segments {
+                for record in &segment.records {
+                    if record.epoch != expected_epoch {
+                        bail!("historical stratum records must remain contiguous");
+                    }
+                    historical_pairs.push((record.epoch, record.proof.root));
+                    expected_epoch = expected_epoch.saturating_add(1);
+                }
+            }
+            packet_digests.push(packet.commitment_digest());
+        }
+        let through_epoch = expected_epoch.saturating_sub(1);
+        let stratum_historical_root_digest =
+            proof_core::historical_root_digest_from_pairs(&historical_pairs);
+        let packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
+        let stratum_transcript_root = accumulated_stratum_root(
+            note_commitment,
+            from_epoch,
+            through_epoch,
+            &stratum_historical_root_digest,
+            &packet_commitment_root,
+            &blinding,
+        );
+        Ok(Self {
+            from_epoch,
+            through_epoch,
+            stratum_historical_root_digest,
+            packet_commitment_root,
+            stratum_rerandomization_blinding: blinding,
+            stratum_transcript_root,
+            packets,
+        })
+    }
+
+    pub fn verify_against_note(&self, note_commitment: &[u8; 32]) -> Result<()> {
+        if self.packets.is_empty() {
+            bail!("historical stratum cannot be empty");
+        }
+        let mut expected_epoch = self.from_epoch;
+        let mut historical_pairs = Vec::new();
+        let mut packet_digests = Vec::with_capacity(self.packets.len());
+        for packet in &self.packets {
+            if packet.from_epoch != expected_epoch {
+                bail!("historical stratum packets must stay contiguous");
+            }
+            packet.verify_against_note(note_commitment)?;
+            for segment in &packet.segments {
+                for record in &segment.records {
+                    if record.epoch != expected_epoch {
+                        bail!("historical stratum records must remain contiguous");
+                    }
+                    historical_pairs.push((record.epoch, record.proof.root));
+                    expected_epoch = expected_epoch.saturating_add(1);
+                }
+            }
+            packet_digests.push(packet.commitment_digest());
+        }
+        if self.through_epoch != expected_epoch.saturating_sub(1) {
+            bail!("historical stratum through_epoch does not match the final record");
+        }
+        let expected_historical_root_digest =
+            proof_core::historical_root_digest_from_pairs(&historical_pairs);
+        if self.stratum_historical_root_digest != expected_historical_root_digest {
+            bail!("historical stratum root digest mismatch");
+        }
+        let expected_packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
+        if self.packet_commitment_root != expected_packet_commitment_root {
+            bail!("historical stratum packet commitment root mismatch");
+        }
+        let expected_stratum_root = accumulated_stratum_root(
+            note_commitment,
+            self.from_epoch,
+            self.through_epoch,
+            &self.stratum_historical_root_digest,
+            &self.packet_commitment_root,
+            &self.stratum_rerandomization_blinding,
+        );
+        if self.stratum_transcript_root != expected_stratum_root {
+            bail!("historical stratum transcript root mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn commitment_digest(&self) -> [u8; 32] {
+        checkpoint_stratum_commitment_digest(
+            self.from_epoch,
+            self.through_epoch,
+            &self.stratum_historical_root_digest,
+            &self.packet_commitment_root,
+            &self.stratum_transcript_root,
+            self.packets.len() as u32,
+        )
+    }
+}
+
 impl HistoricalUnspentExtension {
     pub fn aggregate(
         checkpoint: &HistoricalUnspentCheckpoint,
@@ -1082,10 +1291,26 @@ impl HistoricalUnspentExtension {
             )?);
             packet_start = packet_end;
         }
-        let packet_commitment_root = checkpoint_packet_commitment_root(
-            &packets
+        let stratum_target = crate::protocol::CURRENT
+            .archive_checkpoint_stratum_packets
+            .max(1) as usize;
+        let mut strata = Vec::new();
+        let mut stratum_start = 0usize;
+        while stratum_start < packets.len() {
+            let stratum_end = (stratum_start + stratum_target).min(packets.len());
+            let mut stratum_blinding = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut stratum_blinding);
+            strata.push(HistoricalUnspentStratum::aggregate(
+                &checkpoint.note_commitment,
+                packets[stratum_start..stratum_end].to_vec(),
+                stratum_blinding,
+            )?);
+            stratum_start = stratum_end;
+        }
+        let stratum_commitment_root = checkpoint_stratum_commitment_root(
+            &strata
                 .iter()
-                .map(HistoricalUnspentPacket::commitment_digest)
+                .map(HistoricalUnspentStratum::commitment_digest)
                 .collect::<Vec<_>>(),
         );
         let new_transcript_root = accumulated_checkpoint_root(
@@ -1094,7 +1319,7 @@ impl HistoricalUnspentExtension {
             from_epoch,
             through_epoch,
             &historical_root_digest,
-            &packet_commitment_root,
+            &stratum_commitment_root,
             &aggregate_blinding,
         );
         Ok(Self {
@@ -1104,10 +1329,10 @@ impl HistoricalUnspentExtension {
             through_epoch,
             prior_transcript_root: checkpoint.transcript_root,
             historical_root_digest,
-            packet_commitment_root,
+            stratum_commitment_root,
             aggregate_rerandomization_blinding: aggregate_blinding,
             new_transcript_root,
-            packets,
+            strata,
         })
     }
 }
@@ -1343,7 +1568,13 @@ impl ArchiveDirectory {
         shard_span: u64,
         providers: Vec<ArchiveProviderManifest>,
     ) -> Result<Self> {
-        Self::from_root_ledger_and_providers_and_replicas(ledger, shard_span, providers, Vec::new())
+        Self::from_root_ledger_and_providers_and_replicas_and_accounting(
+            ledger,
+            shard_span,
+            providers,
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     pub fn from_root_ledger_and_providers_and_replicas(
@@ -1352,12 +1583,52 @@ impl ArchiveDirectory {
         providers: Vec<ArchiveProviderManifest>,
         replicas: Vec<ArchiveReplicaAttestation>,
     ) -> Result<Self> {
+        Self::from_root_ledger_and_providers_and_replicas_and_accounting(
+            ledger,
+            shard_span,
+            providers,
+            replicas,
+            Vec::new(),
+        )
+    }
+
+    pub fn from_root_ledger_and_providers_and_replicas_and_accounting(
+        ledger: &NullifierRootLedger,
+        shard_span: u64,
+        providers: Vec<ArchiveProviderManifest>,
+        replicas: Vec<ArchiveReplicaAttestation>,
+        accounting: Vec<ArchiveServiceLedger>,
+    ) -> Result<Self> {
+        Self::from_root_ledger_and_providers_and_replicas_and_evidence(
+            ledger,
+            shard_span,
+            providers,
+            replicas,
+            accounting,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn from_root_ledger_and_providers_and_replicas_and_evidence(
+        ledger: &NullifierRootLedger,
+        shard_span: u64,
+        providers: Vec<ArchiveProviderManifest>,
+        replicas: Vec<ArchiveReplicaAttestation>,
+        accounting: Vec<ArchiveServiceLedger>,
+        custody_commitments: Vec<ArchiveCustodyCommitment>,
+        retrieval_receipts: Vec<ArchiveRetrievalReceipt>,
+    ) -> Result<Self> {
         let shards = Self::shards_from_root_ledger(ledger, shard_span)?;
         let validation_directory = Self {
             shard_span,
             shards: shards.clone(),
             providers: Vec::new(),
             replicas: Vec::new(),
+            accounting: Vec::new(),
+            custody_commitments: Vec::new(),
+            retrieval_receipts: Vec::new(),
+            availability_certificates: Vec::new(),
         };
         let providers: Vec<ArchiveProviderManifest> = providers
             .into_iter()
@@ -1368,17 +1639,71 @@ impl ArchiveDirectory {
             shards: shards.clone(),
             providers: providers.clone(),
             replicas: Vec::new(),
+            accounting: Vec::new(),
+            custody_commitments: Vec::new(),
+            retrieval_receipts: Vec::new(),
+            availability_certificates: Vec::new(),
         };
-        let replicas = replicas
+        let replicas: Vec<ArchiveReplicaAttestation> = replicas
             .into_iter()
             .filter(|replica| replica.validate(&replica_validation_directory).is_ok())
             .collect();
-        Ok(Self {
+        let accounting = accounting
+            .into_iter()
+            .filter(|ledger| {
+                providers.iter().any(|provider| {
+                    provider.provider_id == ledger.provider_id
+                        && provider.manifest_digest == ledger.provider_manifest_digest
+                }) && ledger.validate().is_ok()
+            })
+            .collect::<Vec<_>>();
+        let commitment_validation_directory = Self {
+            shard_span,
+            shards: shards.clone(),
+            providers: providers.clone(),
+            replicas: replicas.clone(),
+            accounting: accounting.clone(),
+            custody_commitments: Vec::new(),
+            retrieval_receipts: Vec::new(),
+            availability_certificates: Vec::new(),
+        };
+        let custody_commitments = custody_commitments
+            .into_iter()
+            .filter(|commitment| {
+                commitment
+                    .validate(&commitment_validation_directory)
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
+        let receipt_validation_directory = Self {
+            shard_span,
+            shards: shards.clone(),
+            providers: providers.clone(),
+            replicas: replicas.clone(),
+            accounting: accounting.clone(),
+            custody_commitments: custody_commitments.clone(),
+            retrieval_receipts: Vec::new(),
+            availability_certificates: Vec::new(),
+        };
+        let retrieval_receipts = retrieval_receipts
+            .into_iter()
+            .filter(|receipt| receipt.validate(&receipt_validation_directory).is_ok())
+            .collect::<Vec<_>>();
+        let mut directory = Self {
             shard_span,
             shards,
             providers,
             replicas,
-        })
+            accounting,
+            custody_commitments,
+            retrieval_receipts,
+            availability_certificates: Vec::new(),
+        };
+        directory.availability_certificates = directory.derive_availability_certificates(
+            crate::protocol::CURRENT.archive_provider_replica_count as usize,
+            crate::protocol::CURRENT.archive_retention_horizon_epochs,
+        );
+        Ok(directory)
     }
 
     pub fn provider(&self, provider_id: &[u8; 32]) -> Result<&ArchiveProviderManifest> {
@@ -1432,6 +1757,52 @@ impl ArchiveDirectory {
         })
     }
 
+    pub fn accounting_for_provider(&self, provider_id: &[u8; 32]) -> Option<&ArchiveServiceLedger> {
+        self.accounting
+            .iter()
+            .find(|ledger| &ledger.provider_id == provider_id)
+    }
+
+    pub fn custody_commitment(
+        &self,
+        provider_id: &[u8; 32],
+        shard_id: u64,
+    ) -> Option<&ArchiveCustodyCommitment> {
+        self.custody_commitments.iter().find(|commitment| {
+            &commitment.provider_id == provider_id && commitment.shard_id == shard_id
+        })
+    }
+
+    pub fn has_custody_commitment(
+        &self,
+        provider_id: &[u8; 32],
+        shard_id: u64,
+        required_retention: u64,
+    ) -> bool {
+        self.custody_commitment(provider_id, shard_id)
+            .map(|commitment| commitment.retention_through_epoch >= required_retention)
+            .unwrap_or(false)
+    }
+
+    pub fn retrieval_receipts_for_provider(
+        &self,
+        provider_id: &[u8; 32],
+    ) -> Vec<&ArchiveRetrievalReceipt> {
+        self.retrieval_receipts
+            .iter()
+            .filter(|receipt| &receipt.provider_id == provider_id)
+            .collect()
+    }
+
+    pub fn availability_certificate(
+        &self,
+        shard_id: u64,
+    ) -> Option<&ArchiveAvailabilityCertificate> {
+        self.availability_certificates
+            .iter()
+            .find(|certificate| certificate.shard_id == shard_id)
+    }
+
     pub fn providers_covering_range(
         &self,
         from_epoch: u64,
@@ -1470,14 +1841,50 @@ impl ArchiveDirectory {
         if eligible.is_empty() {
             bail!("no archive provider covers the requested epoch range");
         }
+        let range_shards = self
+            .shards
+            .iter()
+            .filter(|shard| !(through_epoch < shard.first_epoch || from_epoch > shard.last_epoch))
+            .collect::<Vec<_>>();
         eligible.sort_by_key(|provider| {
-            provider_selection_score(
-                &provider.provider_id,
-                &provider.schedule_seed,
-                &checkpoint.note_commitment,
-                from_epoch,
-                through_epoch,
-                rotation_round,
+            let commitment_penalty = range_shards.iter().any(|shard| {
+                let required_retention = shard
+                    .last_epoch
+                    .saturating_add(crate::protocol::CURRENT.archive_retention_horizon_epochs);
+                !self.has_custody_commitment(
+                    &provider.provider_id,
+                    shard.shard_id,
+                    required_retention,
+                )
+            }) as u8;
+            let certificate_penalty = range_shards
+                .iter()
+                .filter_map(|shard| self.availability_certificate(shard.shard_id))
+                .filter(|certificate| certificate.quorum_met)
+                .any(|certificate| {
+                    !certificate
+                        .certified_providers
+                        .contains(&provider.provider_id)
+                }) as u8;
+            let scorecard = self
+                .operator_scorecard(
+                    &provider.provider_id,
+                    crate::protocol::CURRENT.archive_provider_replica_count as usize,
+                    crate::protocol::CURRENT.archive_retention_horizon_epochs,
+                )
+                .ok();
+            (
+                commitment_penalty,
+                certificate_penalty,
+                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
+                provider_selection_score(
+                    &provider.provider_id,
+                    &provider.schedule_seed,
+                    &checkpoint.note_commitment,
+                    from_epoch,
+                    through_epoch,
+                    rotation_round,
+                ),
             )
         });
         Ok(eligible[0])
@@ -1516,6 +1923,7 @@ impl ArchiveDirectory {
                     .collect::<Vec<_>>();
                 let assigned_shard_count = assigned.len() as u32;
                 let mut fulfilled_custody_count = 0u32;
+                let mut committed_custody_count = 0u32;
                 let mut retention_surplus_epochs = 0u64;
                 for shard_id in &provider.shard_ids {
                     let retention =
@@ -1540,25 +1948,131 @@ impl ArchiveDirectory {
                     {
                         fulfilled_custody_count = fulfilled_custody_count.saturating_add(1);
                     }
+                    if self.has_custody_commitment(
+                        &provider.provider_id,
+                        assignment.shard_id,
+                        required_retention,
+                    ) {
+                        committed_custody_count = committed_custody_count.saturating_add(1);
+                    }
                 }
+                let missing_custody_commitment_count =
+                    assigned_shard_count.saturating_sub(committed_custody_count);
+                let effective_custody_count = fulfilled_custody_count.min(committed_custody_count);
                 let availability_bps = if assigned_shard_count == 0 {
                     10_000
                 } else {
-                    ((fulfilled_custody_count as u64 * 10_000) / assigned_shard_count as u64)
+                    ((effective_custody_count as u64 * 10_000) / assigned_shard_count as u64)
                         .min(10_000) as u16
                 };
+                let accounting = self.accounting_for_provider(&provider.provider_id);
+                let receipts = self.retrieval_receipts_for_provider(&provider.provider_id);
+                let successful_retrieval_receipts =
+                    receipts.iter().filter(|receipt| receipt.success).count() as u64;
+                let failed_retrieval_receipts =
+                    receipts.iter().filter(|receipt| !receipt.success).count() as u64;
+                let total_receipts =
+                    successful_retrieval_receipts.saturating_add(failed_retrieval_receipts);
+                let service_success_bps = if total_receipts == 0 {
+                    accounting
+                        .map(ArchiveServiceLedger::success_bps)
+                        .unwrap_or(10_000)
+                } else {
+                    ((successful_retrieval_receipts.saturating_mul(10_000)) / total_receipts)
+                        .min(10_000) as u16
+                };
+                let receipt_checkpoint_batches = receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.success
+                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
+                    })
+                    .count() as u64;
+                let receipt_checkpoint_segments = receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.success
+                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
+                    })
+                    .map(|receipt| receipt.served_units as u64)
+                    .sum::<u64>();
+                let receipt_archive_shards = receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.success
+                            && receipt.retrieval_kind == ArchiveRetrievalKind::ArchiveShard
+                    })
+                    .map(|receipt| receipt.served_units as u64)
+                    .sum::<u64>();
+                let receipt_checkpoint_latency_ms = receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.success
+                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
+                    })
+                    .map(|receipt| receipt.latency_ms)
+                    .sum::<u64>();
+                let served_checkpoint_batches = if total_receipts == 0 {
+                    accounting
+                        .map(|ledger| ledger.served_checkpoint_batches)
+                        .unwrap_or(0)
+                } else {
+                    receipt_checkpoint_batches
+                };
+                let served_checkpoint_segments = if total_receipts == 0 {
+                    accounting
+                        .map(|ledger| ledger.served_checkpoint_segments)
+                        .unwrap_or(0)
+                } else {
+                    receipt_checkpoint_segments
+                };
+                let served_archive_shards = if total_receipts == 0 {
+                    accounting
+                        .map(|ledger| ledger.served_archive_shards)
+                        .unwrap_or(0)
+                } else {
+                    receipt_archive_shards
+                };
+                let mean_checkpoint_latency_ms = if total_receipts == 0 {
+                    accounting
+                        .map(ArchiveServiceLedger::mean_checkpoint_latency_ms)
+                        .unwrap_or(0)
+                } else if served_checkpoint_batches == 0 {
+                    0
+                } else {
+                    (receipt_checkpoint_latency_ms / served_checkpoint_batches).min(u32::MAX as u64)
+                        as u32
+                };
                 let reward_weight = 1u64
-                    .saturating_add((fulfilled_custody_count as u64).saturating_mul(1_000_000))
+                    .saturating_add((effective_custody_count as u64).saturating_mul(1_000_000))
+                    .saturating_add((committed_custody_count as u64).saturating_mul(500_000))
                     .saturating_add((retention_surplus_epochs.min(u32::MAX as u64)) * 1_000)
-                    .saturating_add(advertised_shard_count as u64);
+                    .saturating_add((service_success_bps as u64).saturating_mul(100))
+                    .saturating_add(successful_retrieval_receipts.saturating_mul(100))
+                    .saturating_add(served_checkpoint_segments)
+                    .saturating_add(served_archive_shards.saturating_mul(10))
+                    .saturating_add(advertised_shard_count as u64)
+                    .saturating_sub(
+                        (missing_custody_commitment_count as u64).saturating_mul(750_000),
+                    )
+                    .saturating_sub(failed_retrieval_receipts.saturating_mul(500));
                 ArchiveOperatorScorecard {
                     provider_id: provider.provider_id,
                     provider_manifest_digest: provider.manifest_digest,
                     advertised_shard_count,
                     assigned_shard_count,
                     fulfilled_custody_count,
+                    committed_custody_count,
+                    missing_custody_commitment_count,
                     retention_surplus_epochs,
                     availability_bps,
+                    service_success_bps,
+                    successful_retrieval_receipts,
+                    failed_retrieval_receipts,
+                    served_checkpoint_batches,
+                    served_checkpoint_segments,
+                    served_archive_shards,
+                    mean_checkpoint_latency_ms,
                     reward_weight,
                 }
             })
@@ -1575,6 +2089,64 @@ impl ArchiveDirectory {
             .into_iter()
             .find(|scorecard| &scorecard.provider_id == provider_id)
             .ok_or_else(|| anyhow!("missing archive operator scorecard"))
+    }
+
+    fn derive_availability_certificates(
+        &self,
+        replica_count: usize,
+        retention_horizon_epochs: u64,
+    ) -> Vec<ArchiveAvailabilityCertificate> {
+        let scorecards = self
+            .operator_scorecards(replica_count, retention_horizon_epochs)
+            .into_iter()
+            .map(|scorecard| (scorecard.provider_id, scorecard))
+            .collect::<BTreeMap<_, _>>();
+        self.shards
+            .iter()
+            .map(|shard| {
+                let mut certified_providers = self
+                    .providers
+                    .iter()
+                    .filter(|provider| provider.serves_shard(shard.shard_id, &shard.root_digest))
+                    .filter(|provider| {
+                        let retention = self
+                            .provider_retention_for_shard(&provider.provider_id, shard.shard_id);
+                        let Some(scorecard) = scorecards.get(&provider.provider_id) else {
+                            return false;
+                        };
+                        let required_retention =
+                            shard.last_epoch.saturating_add(retention_horizon_epochs);
+                        retention >= shard.last_epoch.saturating_add(retention_horizon_epochs)
+                            && self.has_custody_commitment(
+                                &provider.provider_id,
+                                shard.shard_id,
+                                required_retention,
+                            )
+                            && scorecard.availability_bps >= 9_000
+                            && scorecard.service_success_bps >= 9_000
+                    })
+                    .map(|provider| provider.provider_id)
+                    .collect::<Vec<_>>();
+                certified_providers.sort();
+                let certified_replica_count = certified_providers.len() as u32;
+                let retention_through_epoch = certified_providers
+                    .iter()
+                    .map(|provider_id| {
+                        self.provider_retention_for_shard(provider_id, shard.shard_id)
+                    })
+                    .max()
+                    .unwrap_or(shard.last_epoch);
+                let quorum_target = replica_count as u32;
+                ArchiveAvailabilityCertificate::new(
+                    shard.shard_id,
+                    shard.root_digest,
+                    certified_providers,
+                    certified_replica_count,
+                    quorum_target,
+                    retention_through_epoch,
+                )
+            })
+            .collect()
     }
 
     pub fn pick_provider_for_segment(
@@ -1619,9 +2191,30 @@ impl ArchiveDirectory {
                 })
                 .min()
                 .unwrap_or(through_epoch);
+            let commitment_penalty = range_shards.iter().any(|shard| {
+                let required_retention = shard
+                    .last_epoch
+                    .saturating_add(crate::protocol::CURRENT.archive_retention_horizon_epochs);
+                !self.has_custody_commitment(
+                    &provider.provider_id,
+                    shard.shard_id,
+                    required_retention,
+                )
+            }) as u8;
+            let certificate_penalty = range_shards
+                .iter()
+                .filter_map(|shard| self.availability_certificate(shard.shard_id))
+                .filter(|certificate| certificate.quorum_met)
+                .any(|certificate| {
+                    !certificate
+                        .certified_providers
+                        .contains(&provider.provider_id)
+                }) as u8;
             (
                 used_penalty,
                 provider_load,
+                commitment_penalty,
+                certificate_penalty,
                 u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
                 u64::MAX.saturating_sub(min_retention),
                 u32::MAX.saturating_sub(min_replica_count),
@@ -1689,7 +2282,24 @@ impl ArchiveDirectory {
                     crate::protocol::CURRENT.archive_retention_horizon_epochs,
                 )
                 .ok();
+            let required_retention = shard
+                .last_epoch
+                .saturating_add(crate::protocol::CURRENT.archive_retention_horizon_epochs);
+            let commitment_penalty =
+                !self.has_custody_commitment(&provider.provider_id, shard_id, required_retention)
+                    as u8;
+            let certificate_penalty = self
+                .availability_certificate(shard_id)
+                .map(|certificate| {
+                    (certificate.quorum_met
+                        && !certificate
+                            .certified_providers
+                            .contains(&provider.provider_id)) as u8
+                })
+                .unwrap_or(0);
             (
+                commitment_penalty,
+                certificate_penalty,
                 u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
                 u64::MAX.saturating_sub(retention),
                 provider_selection_score(
@@ -1709,8 +2319,13 @@ impl ArchiveDirectory {
         self.shards
             .iter()
             .filter(|shard| {
-                self.replica_report(shard.shard_id)
-                    .map(|report| report.replica_count < target_replica_count)
+                self.availability_certificate(shard.shard_id)
+                    .map(|certificate| certificate.certified_replica_count < target_replica_count)
+                    .or_else(|| {
+                        self.replica_report(shard.shard_id)
+                            .map(|report| report.replica_count < target_replica_count)
+                            .ok()
+                    })
                     .unwrap_or(false)
             })
             .cloned()
@@ -1772,6 +2387,41 @@ pub fn local_archive_provider_manifest(
         })
         .collect::<Vec<_>>();
     Ok(ArchiveProviderManifest::new(provider_id, &shards))
+}
+
+pub fn local_archive_custody_commitments(
+    provider_id: [u8; 32],
+    directory: &ArchiveDirectory,
+    replica_count: usize,
+    retention_horizon_epochs: u64,
+) -> Result<Vec<ArchiveCustodyCommitment>> {
+    let provider = directory.provider(&provider_id)?;
+    let candidate_nodes = directory
+        .providers
+        .iter()
+        .map(|provider| provider.provider_id)
+        .collect::<Vec<_>>();
+    let assignments = directory.custody_assignments(&candidate_nodes, replica_count);
+    Ok(assignments
+        .into_iter()
+        .filter(|assignment| assignment.custodians.contains(&provider_id))
+        .filter_map(|assignment| {
+            let shard = directory.shard(assignment.shard_id)?;
+            let retention =
+                directory.provider_retention_for_shard(&provider_id, assignment.shard_id);
+            let required_retention = shard.last_epoch.saturating_add(retention_horizon_epochs);
+            if retention < required_retention {
+                return None;
+            }
+            Some(ArchiveCustodyCommitment::new(
+                provider.provider_id,
+                provider.manifest_digest,
+                shard.shard_id,
+                shard.root_digest,
+                retention,
+            ))
+        })
+        .collect())
 }
 
 pub fn local_archive_replica_attestations(
@@ -2364,13 +3014,58 @@ fn accumulated_packet_root(
     *hasher.finalize().as_bytes()
 }
 
+fn checkpoint_stratum_commitment_digest(
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    packet_commitment_root: &[u8; 32],
+    stratum_transcript_root: &[u8; 32],
+    packet_count: u32,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(packet_commitment_root);
+    hasher.update(stratum_transcript_root);
+    hasher.update(&packet_count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn checkpoint_stratum_commitment_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
+    hasher.update(&(stratum_digests.len() as u32).to_le_bytes());
+    for digest in stratum_digests {
+        hasher.update(digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn accumulated_stratum_root(
+    note_commitment: &[u8; 32],
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    packet_commitment_root: &[u8; 32],
+    blinding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN);
+    hasher.update(note_commitment);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(packet_commitment_root);
+    hasher.update(blinding);
+    *hasher.finalize().as_bytes()
+}
+
 fn accumulated_checkpoint_root(
     prior_transcript_root: &[u8; 32],
     note_commitment: &[u8; 32],
     from_epoch: u64,
     through_epoch: u64,
     historical_root_digest: &[u8; 32],
-    packet_commitment_root: &[u8; 32],
+    stratum_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN);
@@ -2379,7 +3074,7 @@ fn accumulated_checkpoint_root(
     hasher.update(&from_epoch.to_le_bytes());
     hasher.update(&through_epoch.to_le_bytes());
     hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
+    hasher.update(stratum_commitment_root);
     hasher.update(blinding);
     *hasher.finalize().as_bytes()
 }
@@ -2410,6 +3105,120 @@ fn archive_replica_attestation_digest(
     hasher.update(&first_epoch.to_le_bytes());
     hasher.update(&last_epoch.to_le_bytes());
     hasher.update(&retention_through_epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_service_ledger_digest(
+    provider_id: &[u8; 32],
+    provider_manifest_digest: &[u8; 32],
+    served_checkpoint_batches: u64,
+    served_checkpoint_segments: u64,
+    served_archive_shards: u64,
+    failed_checkpoint_batches: u64,
+    failed_archive_shards: u64,
+    total_checkpoint_latency_ms: u64,
+    last_success_unix_ms: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_SERVICE_LEDGER_DOMAIN);
+    hasher.update(provider_id);
+    hasher.update(provider_manifest_digest);
+    hasher.update(&served_checkpoint_batches.to_le_bytes());
+    hasher.update(&served_checkpoint_segments.to_le_bytes());
+    hasher.update(&served_archive_shards.to_le_bytes());
+    hasher.update(&failed_checkpoint_batches.to_le_bytes());
+    hasher.update(&failed_archive_shards.to_le_bytes());
+    hasher.update(&total_checkpoint_latency_ms.to_le_bytes());
+    hasher.update(&last_success_unix_ms.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_custody_commitment_digest(
+    provider_id: &[u8; 32],
+    provider_manifest_digest: &[u8; 32],
+    shard_id: u64,
+    shard_digest: &[u8; 32],
+    retention_through_epoch: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_CUSTODY_COMMITMENT_DOMAIN);
+    hasher.update(provider_id);
+    hasher.update(provider_manifest_digest);
+    hasher.update(&shard_id.to_le_bytes());
+    hasher.update(shard_digest);
+    hasher.update(&retention_through_epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_availability_certificate_digest(
+    shard_id: u64,
+    shard_digest: &[u8; 32],
+    certified_providers: &[[u8; 32]],
+    certified_replica_count: u32,
+    quorum_target: u32,
+    quorum_met: bool,
+    retention_through_epoch: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_AVAILABILITY_CERT_DOMAIN);
+    hasher.update(&shard_id.to_le_bytes());
+    hasher.update(shard_digest);
+    hasher.update(&(certified_providers.len() as u32).to_le_bytes());
+    for provider_id in certified_providers {
+        hasher.update(provider_id);
+    }
+    hasher.update(&certified_replica_count.to_le_bytes());
+    hasher.update(&quorum_target.to_le_bytes());
+    hasher.update(&[quorum_met as u8]);
+    hasher.update(&retention_through_epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_retrieval_receipt_digest(
+    requester_id: &[u8; 32],
+    provider_id: &[u8; 32],
+    provider_manifest_digest: &[u8; 32],
+    retrieval_kind: ArchiveRetrievalKind,
+    request_message_id: &[u8; 32],
+    response_message_id: &Option<[u8; 32]>,
+    from_epoch: u64,
+    through_epoch: u64,
+    shard_id: &Option<u64>,
+    served_units: u32,
+    success: bool,
+    latency_ms: u64,
+    observed_unix_ms: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_RETRIEVAL_RECEIPT_DOMAIN);
+    hasher.update(requester_id);
+    hasher.update(provider_id);
+    hasher.update(provider_manifest_digest);
+    hasher.update(&[match retrieval_kind {
+        ArchiveRetrievalKind::CheckpointBatch => 1,
+        ArchiveRetrievalKind::ArchiveShard => 2,
+    }]);
+    hasher.update(request_message_id);
+    match response_message_id {
+        Some(message_id) => {
+            hasher.update(&[1]);
+            hasher.update(message_id);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    match shard_id {
+        Some(shard_id) => {
+            hasher.update(&[1]);
+            hasher.update(&shard_id.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&served_units.to_le_bytes());
+    hasher.update(&[success as u8]);
+    hasher.update(&latency_ms.to_le_bytes());
+    hasher.update(&observed_unix_ms.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -2591,6 +3400,319 @@ impl ArchiveReplicaAttestation {
             bail!("archive replica attestation digest mismatch");
         }
         Ok(())
+    }
+}
+
+impl ArchiveServiceLedger {
+    pub fn new(provider_id: [u8; 32], provider_manifest_digest: [u8; 32]) -> Self {
+        let mut ledger = Self {
+            provider_id,
+            provider_manifest_digest,
+            served_checkpoint_batches: 0,
+            served_checkpoint_segments: 0,
+            served_archive_shards: 0,
+            failed_checkpoint_batches: 0,
+            failed_archive_shards: 0,
+            total_checkpoint_latency_ms: 0,
+            last_success_unix_ms: 0,
+            ledger_digest: [0u8; 32],
+        };
+        ledger.refresh_digest();
+        ledger
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.ledger_digest
+            != archive_service_ledger_digest(
+                &self.provider_id,
+                &self.provider_manifest_digest,
+                self.served_checkpoint_batches,
+                self.served_checkpoint_segments,
+                self.served_archive_shards,
+                self.failed_checkpoint_batches,
+                self.failed_archive_shards,
+                self.total_checkpoint_latency_ms,
+                self.last_success_unix_ms,
+            )
+        {
+            bail!("archive service ledger digest mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn record_checkpoint_success(
+        &mut self,
+        segment_count: u64,
+        latency_ms: u64,
+        observed_unix_ms: u64,
+    ) {
+        self.served_checkpoint_batches = self.served_checkpoint_batches.saturating_add(1);
+        self.served_checkpoint_segments = self
+            .served_checkpoint_segments
+            .saturating_add(segment_count);
+        self.total_checkpoint_latency_ms =
+            self.total_checkpoint_latency_ms.saturating_add(latency_ms);
+        self.last_success_unix_ms = observed_unix_ms.max(self.last_success_unix_ms);
+        self.refresh_digest();
+    }
+
+    pub fn record_checkpoint_failure(&mut self) {
+        self.failed_checkpoint_batches = self.failed_checkpoint_batches.saturating_add(1);
+        self.refresh_digest();
+    }
+
+    pub fn record_archive_shard_success(&mut self, shard_count: u64, observed_unix_ms: u64) {
+        self.served_archive_shards = self.served_archive_shards.saturating_add(shard_count);
+        self.last_success_unix_ms = observed_unix_ms.max(self.last_success_unix_ms);
+        self.refresh_digest();
+    }
+
+    pub fn record_archive_shard_failure(&mut self) {
+        self.failed_archive_shards = self.failed_archive_shards.saturating_add(1);
+        self.refresh_digest();
+    }
+
+    pub fn success_bps(&self) -> u16 {
+        let successes = self
+            .served_checkpoint_batches
+            .saturating_add(self.served_archive_shards);
+        let failures = self
+            .failed_checkpoint_batches
+            .saturating_add(self.failed_archive_shards);
+        let total = successes.saturating_add(failures);
+        if total == 0 {
+            10_000
+        } else {
+            ((successes.saturating_mul(10_000)) / total).min(10_000) as u16
+        }
+    }
+
+    pub fn mean_checkpoint_latency_ms(&self) -> u32 {
+        if self.served_checkpoint_batches == 0 {
+            0
+        } else {
+            (self.total_checkpoint_latency_ms / self.served_checkpoint_batches).min(u32::MAX as u64)
+                as u32
+        }
+    }
+
+    fn refresh_digest(&mut self) {
+        self.ledger_digest = archive_service_ledger_digest(
+            &self.provider_id,
+            &self.provider_manifest_digest,
+            self.served_checkpoint_batches,
+            self.served_checkpoint_segments,
+            self.served_archive_shards,
+            self.failed_checkpoint_batches,
+            self.failed_archive_shards,
+            self.total_checkpoint_latency_ms,
+            self.last_success_unix_ms,
+        );
+    }
+}
+
+impl ArchiveCustodyCommitment {
+    pub fn new(
+        provider_id: [u8; 32],
+        provider_manifest_digest: [u8; 32],
+        shard_id: u64,
+        shard_digest: [u8; 32],
+        retention_through_epoch: u64,
+    ) -> Self {
+        Self {
+            provider_id,
+            provider_manifest_digest,
+            shard_id,
+            shard_digest,
+            retention_through_epoch,
+            commitment_digest: archive_custody_commitment_digest(
+                &provider_id,
+                &provider_manifest_digest,
+                shard_id,
+                &shard_digest,
+                retention_through_epoch,
+            ),
+        }
+    }
+
+    pub fn validate(&self, directory: &ArchiveDirectory) -> Result<()> {
+        let provider = directory.provider(&self.provider_id)?;
+        if provider.manifest_digest != self.provider_manifest_digest {
+            bail!("archive custody commitment manifest digest mismatch");
+        }
+        let shard = directory
+            .shard(self.shard_id)
+            .ok_or_else(|| anyhow!("unknown archive shard {}", self.shard_id))?;
+        if shard.root_digest != self.shard_digest {
+            bail!("archive custody commitment shard digest mismatch");
+        }
+        if !provider.serves_shard(self.shard_id, &self.shard_digest) {
+            bail!("archive custody commitment references an unserved shard");
+        }
+        if directory.provider_retention_for_shard(&self.provider_id, self.shard_id)
+            < self.retention_through_epoch
+        {
+            bail!("archive custody commitment exceeds replica retention");
+        }
+        if self.commitment_digest
+            != archive_custody_commitment_digest(
+                &self.provider_id,
+                &self.provider_manifest_digest,
+                self.shard_id,
+                &self.shard_digest,
+                self.retention_through_epoch,
+            )
+        {
+            bail!("archive custody commitment digest mismatch");
+        }
+        Ok(())
+    }
+}
+
+impl ArchiveRetrievalReceipt {
+    pub fn new(
+        requester_id: [u8; 32],
+        provider_id: [u8; 32],
+        provider_manifest_digest: [u8; 32],
+        retrieval_kind: ArchiveRetrievalKind,
+        request_message_id: [u8; 32],
+        response_message_id: Option<[u8; 32]>,
+        from_epoch: u64,
+        through_epoch: u64,
+        shard_id: Option<u64>,
+        served_units: u32,
+        success: bool,
+        latency_ms: u64,
+        observed_unix_ms: u64,
+    ) -> Self {
+        Self {
+            requester_id,
+            provider_id,
+            provider_manifest_digest,
+            retrieval_kind,
+            request_message_id,
+            response_message_id,
+            from_epoch,
+            through_epoch,
+            shard_id,
+            served_units,
+            success,
+            latency_ms,
+            observed_unix_ms,
+            receipt_digest: archive_retrieval_receipt_digest(
+                &requester_id,
+                &provider_id,
+                &provider_manifest_digest,
+                retrieval_kind,
+                &request_message_id,
+                &response_message_id,
+                from_epoch,
+                through_epoch,
+                &shard_id,
+                served_units,
+                success,
+                latency_ms,
+                observed_unix_ms,
+            ),
+        }
+    }
+
+    pub fn validate(&self, directory: &ArchiveDirectory) -> Result<()> {
+        let provider = directory.provider(&self.provider_id)?;
+        if provider.manifest_digest != self.provider_manifest_digest {
+            bail!("archive retrieval receipt manifest digest mismatch");
+        }
+        if self.from_epoch > self.through_epoch {
+            bail!("archive retrieval receipt range is inverted");
+        }
+        if self.success {
+            if self.served_units == 0 {
+                bail!("successful archive retrieval receipt must serve at least one unit");
+            }
+            if self.response_message_id.is_none() {
+                bail!("successful archive retrieval receipt must bind a response message");
+            }
+        } else if self.response_message_id.is_some() {
+            bail!("failed archive retrieval receipt cannot bind a response message");
+        }
+        match self.retrieval_kind {
+            ArchiveRetrievalKind::CheckpointBatch => {
+                if self.shard_id.is_some() {
+                    bail!("checkpoint retrieval receipt must not name a shard");
+                }
+                if !provider.covers_range(directory, self.from_epoch, self.through_epoch)? {
+                    bail!("checkpoint retrieval receipt references an uncovered range");
+                }
+            }
+            ArchiveRetrievalKind::ArchiveShard => {
+                let shard_id = self
+                    .shard_id
+                    .ok_or_else(|| anyhow!("archive-shard receipt is missing the shard id"))?;
+                let shard = directory
+                    .shard(shard_id)
+                    .ok_or_else(|| anyhow!("unknown archive shard {}", shard_id))?;
+                if shard.first_epoch != self.from_epoch || shard.last_epoch != self.through_epoch {
+                    bail!("archive-shard receipt range does not match the shard");
+                }
+                if !provider.serves_shard(shard_id, &shard.root_digest) {
+                    bail!("archive-shard receipt references an unserved shard");
+                }
+            }
+        }
+        if self.receipt_digest
+            != archive_retrieval_receipt_digest(
+                &self.requester_id,
+                &self.provider_id,
+                &self.provider_manifest_digest,
+                self.retrieval_kind,
+                &self.request_message_id,
+                &self.response_message_id,
+                self.from_epoch,
+                self.through_epoch,
+                &self.shard_id,
+                self.served_units,
+                self.success,
+                self.latency_ms,
+                self.observed_unix_ms,
+            )
+        {
+            bail!("archive retrieval receipt digest mismatch");
+        }
+        Ok(())
+    }
+}
+
+impl ArchiveAvailabilityCertificate {
+    pub fn new(
+        shard_id: u64,
+        shard_digest: [u8; 32],
+        mut certified_providers: Vec<[u8; 32]>,
+        certified_replica_count: u32,
+        quorum_target: u32,
+        retention_through_epoch: u64,
+    ) -> Self {
+        certified_providers.sort();
+        certified_providers.dedup();
+        let quorum_met = certified_replica_count >= quorum_target.max(1);
+        let certificate_digest = archive_availability_certificate_digest(
+            shard_id,
+            &shard_digest,
+            &certified_providers,
+            certified_replica_count,
+            quorum_target,
+            quorum_met,
+            retention_through_epoch,
+        );
+        Self {
+            shard_id,
+            shard_digest,
+            certified_providers,
+            certified_replica_count,
+            quorum_target,
+            quorum_met,
+            retention_through_epoch,
+            certificate_digest,
+        }
     }
 }
 

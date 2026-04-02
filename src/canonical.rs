@@ -15,14 +15,15 @@ use crate::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
     },
     shielded::{
-        ArchiveOperatorScorecard, ArchiveProviderManifest, ArchiveReplicaAttestation, ArchiveShard,
-        ArchiveShardBundle, ArchivedNullifierEpoch, CheckpointBatchRequest,
-        CheckpointBatchResponse, CheckpointExtensionRequest, CheckpointPresentation,
-        EvolvingNullifierQuery, HistoricalAbsenceRecord, HistoricalUnspentCheckpoint,
-        HistoricalUnspentExtension, HistoricalUnspentPacket, HistoricalUnspentSegment,
-        HistoricalUnspentServiceResponse, NoteCommitmentTree, NoteMembershipProof,
-        NullifierMembershipWitness, NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote,
-        ShieldedSpendContext,
+        ArchiveCustodyCommitment, ArchiveOperatorScorecard, ArchiveProviderManifest,
+        ArchiveReplicaAttestation, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
+        ArchiveServiceLedger, ArchiveShard, ArchiveShardBundle, ArchivedNullifierEpoch,
+        CheckpointBatchRequest, CheckpointBatchResponse, CheckpointExtensionRequest,
+        CheckpointPresentation, EvolvingNullifierQuery, HistoricalAbsenceRecord,
+        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, HistoricalUnspentPacket,
+        HistoricalUnspentSegment, HistoricalUnspentServiceResponse, HistoricalUnspentStratum,
+        NoteCommitmentTree, NoteMembershipProof, NullifierMembershipWitness,
+        NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
     wallet::KeyDocV2,
@@ -1103,6 +1104,31 @@ pub fn decode_archive_replica_attestation(bytes: &[u8]) -> Result<ArchiveReplica
     Ok(attestation)
 }
 
+pub fn encode_archive_custody_commitment(commitment: &ArchiveCustodyCommitment) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&commitment.provider_id);
+    writer.write_fixed(&commitment.provider_manifest_digest);
+    writer.write_u64(commitment.shard_id);
+    writer.write_fixed(&commitment.shard_digest);
+    writer.write_u64(commitment.retention_through_epoch);
+    writer.write_fixed(&commitment.commitment_digest);
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_custody_commitment(bytes: &[u8]) -> Result<ArchiveCustodyCommitment> {
+    let mut reader = CanonicalReader::new(bytes);
+    let commitment = ArchiveCustodyCommitment {
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        shard_id: reader.read_u64()?,
+        shard_digest: reader.read_fixed()?,
+        retention_through_epoch: reader.read_u64()?,
+        commitment_digest: reader.read_fixed()?,
+    };
+    reader.finish()?;
+    Ok(commitment)
+}
+
 pub fn encode_archive_operator_scorecard(scorecard: &ArchiveOperatorScorecard) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_fixed(&scorecard.provider_id);
@@ -1110,28 +1136,165 @@ pub fn encode_archive_operator_scorecard(scorecard: &ArchiveOperatorScorecard) -
     writer.write_u32(scorecard.advertised_shard_count);
     writer.write_u32(scorecard.assigned_shard_count);
     writer.write_u32(scorecard.fulfilled_custody_count);
+    writer.write_u32(scorecard.committed_custody_count);
+    writer.write_u32(scorecard.missing_custody_commitment_count);
     writer.write_u64(scorecard.retention_surplus_epochs);
     writer.write_u32(scorecard.availability_bps as u32);
+    writer.write_u32(scorecard.service_success_bps as u32);
+    writer.write_u64(scorecard.successful_retrieval_receipts);
+    writer.write_u64(scorecard.failed_retrieval_receipts);
+    writer.write_u64(scorecard.served_checkpoint_batches);
+    writer.write_u64(scorecard.served_checkpoint_segments);
+    writer.write_u64(scorecard.served_archive_shards);
+    writer.write_u32(scorecard.mean_checkpoint_latency_ms);
     writer.write_u64(scorecard.reward_weight);
     Ok(writer.into_vec())
 }
 
 pub fn decode_archive_operator_scorecard(bytes: &[u8]) -> Result<ArchiveOperatorScorecard> {
     let mut reader = CanonicalReader::new(bytes);
+    let provider_id = reader.read_fixed()?;
+    let provider_manifest_digest = reader.read_fixed()?;
+    let advertised_shard_count = reader.read_u32()?;
+    let assigned_shard_count = reader.read_u32()?;
+    let fulfilled_custody_count = reader.read_u32()?;
+    let committed_custody_count = reader.read_u32()?;
+    let missing_custody_commitment_count = reader.read_u32()?;
+    let retention_surplus_epochs = reader.read_u64()?;
     let availability_bps = reader.read_u32()?;
+    let service_success_bps = reader.read_u32()?;
+    let successful_retrieval_receipts = reader.read_u64()?;
+    let failed_retrieval_receipts = reader.read_u64()?;
+    let served_checkpoint_batches = reader.read_u64()?;
+    let served_checkpoint_segments = reader.read_u64()?;
+    let served_archive_shards = reader.read_u64()?;
+    let mean_checkpoint_latency_ms = reader.read_u32()?;
+    let reward_weight = reader.read_u64()?;
     let scorecard = ArchiveOperatorScorecard {
-        provider_id: reader.read_fixed()?,
-        provider_manifest_digest: reader.read_fixed()?,
-        advertised_shard_count: reader.read_u32()?,
-        assigned_shard_count: reader.read_u32()?,
-        fulfilled_custody_count: reader.read_u32()?,
-        retention_surplus_epochs: reader.read_u64()?,
+        provider_id,
+        provider_manifest_digest,
+        advertised_shard_count,
+        assigned_shard_count,
+        fulfilled_custody_count,
+        committed_custody_count,
+        missing_custody_commitment_count,
+        retention_surplus_epochs,
         availability_bps: u16::try_from(availability_bps)
             .map_err(|_| anyhow!("archive operator availability does not fit in u16"))?,
-        reward_weight: reader.read_u64()?,
+        service_success_bps: u16::try_from(service_success_bps)
+            .map_err(|_| anyhow!("archive operator service availability does not fit in u16"))?,
+        successful_retrieval_receipts,
+        failed_retrieval_receipts,
+        served_checkpoint_batches,
+        served_checkpoint_segments,
+        served_archive_shards,
+        mean_checkpoint_latency_ms,
+        reward_weight,
     };
     reader.finish()?;
     Ok(scorecard)
+}
+
+pub fn encode_archive_service_ledger(ledger: &ArchiveServiceLedger) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&ledger.provider_id);
+    writer.write_fixed(&ledger.provider_manifest_digest);
+    writer.write_u64(ledger.served_checkpoint_batches);
+    writer.write_u64(ledger.served_checkpoint_segments);
+    writer.write_u64(ledger.served_archive_shards);
+    writer.write_u64(ledger.failed_checkpoint_batches);
+    writer.write_u64(ledger.failed_archive_shards);
+    writer.write_u64(ledger.total_checkpoint_latency_ms);
+    writer.write_u64(ledger.last_success_unix_ms);
+    writer.write_fixed(&ledger.ledger_digest);
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_service_ledger(bytes: &[u8]) -> Result<ArchiveServiceLedger> {
+    let mut reader = CanonicalReader::new(bytes);
+    let ledger = ArchiveServiceLedger {
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        served_checkpoint_batches: reader.read_u64()?,
+        served_checkpoint_segments: reader.read_u64()?,
+        served_archive_shards: reader.read_u64()?,
+        failed_checkpoint_batches: reader.read_u64()?,
+        failed_archive_shards: reader.read_u64()?,
+        total_checkpoint_latency_ms: reader.read_u64()?,
+        last_success_unix_ms: reader.read_u64()?,
+        ledger_digest: reader.read_fixed()?,
+    };
+    reader.finish()?;
+    Ok(ledger)
+}
+
+pub fn encode_archive_retrieval_receipt(receipt: &ArchiveRetrievalReceipt) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&receipt.requester_id);
+    writer.write_fixed(&receipt.provider_id);
+    writer.write_fixed(&receipt.provider_manifest_digest);
+    writer.write_u8(match receipt.retrieval_kind {
+        ArchiveRetrievalKind::CheckpointBatch => 1,
+        ArchiveRetrievalKind::ArchiveShard => 2,
+    });
+    writer.write_fixed(&receipt.request_message_id);
+    write_option_fixed32(&mut writer, &receipt.response_message_id);
+    writer.write_u64(receipt.from_epoch);
+    writer.write_u64(receipt.through_epoch);
+    writer.write_bool(receipt.shard_id.is_some());
+    if let Some(shard_id) = receipt.shard_id {
+        writer.write_u64(shard_id);
+    }
+    writer.write_u32(receipt.served_units);
+    writer.write_bool(receipt.success);
+    writer.write_u64(receipt.latency_ms);
+    writer.write_u64(receipt.observed_unix_ms);
+    writer.write_fixed(&receipt.receipt_digest);
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_retrieval_receipt(bytes: &[u8]) -> Result<ArchiveRetrievalReceipt> {
+    let mut reader = CanonicalReader::new(bytes);
+    let requester_id = reader.read_fixed()?;
+    let provider_id = reader.read_fixed()?;
+    let provider_manifest_digest = reader.read_fixed()?;
+    let retrieval_kind = match reader.read_u8()? {
+        1 => ArchiveRetrievalKind::CheckpointBatch,
+        2 => ArchiveRetrievalKind::ArchiveShard,
+        other => bail!("unsupported archive retrieval kind {}", other),
+    };
+    let request_message_id = reader.read_fixed()?;
+    let response_message_id = read_option_fixed32(&mut reader)?;
+    let from_epoch = reader.read_u64()?;
+    let through_epoch = reader.read_u64()?;
+    let shard_id = if reader.read_bool()? {
+        Some(reader.read_u64()?)
+    } else {
+        None
+    };
+    let served_units = reader.read_u32()?;
+    let success = reader.read_bool()?;
+    let latency_ms = reader.read_u64()?;
+    let observed_unix_ms = reader.read_u64()?;
+    let receipt_digest = reader.read_fixed()?;
+    let receipt = ArchiveRetrievalReceipt {
+        requester_id,
+        provider_id,
+        provider_manifest_digest,
+        retrieval_kind,
+        request_message_id,
+        response_message_id,
+        from_epoch,
+        through_epoch,
+        shard_id,
+        served_units,
+        success,
+        latency_ms,
+        observed_unix_ms,
+        receipt_digest,
+    };
+    reader.finish()?;
+    Ok(receipt)
 }
 
 pub fn encode_archive_shard_bundle(bundle: &ArchiveShardBundle) -> Result<Vec<u8>> {
@@ -1317,6 +1480,34 @@ fn read_historical_unspent_packet(
     })
 }
 
+fn write_historical_unspent_stratum(
+    writer: &mut CanonicalWriter,
+    stratum: &HistoricalUnspentStratum,
+) -> Result<()> {
+    writer.write_u64(stratum.from_epoch);
+    writer.write_u64(stratum.through_epoch);
+    writer.write_fixed(&stratum.stratum_historical_root_digest);
+    writer.write_fixed(&stratum.packet_commitment_root);
+    writer.write_fixed(&stratum.stratum_rerandomization_blinding);
+    writer.write_fixed(&stratum.stratum_transcript_root);
+    writer.write_vec(&stratum.packets, write_historical_unspent_packet)?;
+    Ok(())
+}
+
+fn read_historical_unspent_stratum(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<HistoricalUnspentStratum> {
+    Ok(HistoricalUnspentStratum {
+        from_epoch: reader.read_u64()?,
+        through_epoch: reader.read_u64()?,
+        stratum_historical_root_digest: reader.read_fixed()?,
+        packet_commitment_root: reader.read_fixed()?,
+        stratum_rerandomization_blinding: reader.read_fixed()?,
+        stratum_transcript_root: reader.read_fixed()?,
+        packets: reader.read_vec(read_historical_unspent_packet)?,
+    })
+}
+
 pub fn encode_historical_unspent_extension(
     extension: &HistoricalUnspentExtension,
 ) -> Result<Vec<u8>> {
@@ -1327,10 +1518,10 @@ pub fn encode_historical_unspent_extension(
     writer.write_u64(extension.through_epoch);
     writer.write_fixed(&extension.prior_transcript_root);
     writer.write_fixed(&extension.historical_root_digest);
-    writer.write_fixed(&extension.packet_commitment_root);
+    writer.write_fixed(&extension.stratum_commitment_root);
     writer.write_fixed(&extension.aggregate_rerandomization_blinding);
     writer.write_fixed(&extension.new_transcript_root);
-    writer.write_vec(&extension.packets, write_historical_unspent_packet)?;
+    writer.write_vec(&extension.strata, write_historical_unspent_stratum)?;
     Ok(writer.into_vec())
 }
 
@@ -1343,10 +1534,10 @@ pub fn decode_historical_unspent_extension(bytes: &[u8]) -> Result<HistoricalUns
         through_epoch: reader.read_u64()?,
         prior_transcript_root: reader.read_fixed()?,
         historical_root_digest: reader.read_fixed()?,
-        packet_commitment_root: reader.read_fixed()?,
+        stratum_commitment_root: reader.read_fixed()?,
         aggregate_rerandomization_blinding: reader.read_fixed()?,
         new_transcript_root: reader.read_fixed()?,
-        packets: reader.read_vec(read_historical_unspent_packet)?,
+        strata: reader.read_vec(read_historical_unspent_stratum)?,
     };
     reader.finish()?;
     Ok(extension)

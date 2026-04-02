@@ -860,9 +860,10 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(extensions.len(), 1);
-    assert_eq!(extensions[0].packets.len(), 1);
-    assert_eq!(extensions[0].packets[0].segments.len(), 1);
-    let serving_provider = extensions[0].packets[0].segments[0].provider_id;
+    assert_eq!(extensions[0].strata.len(), 1);
+    assert_eq!(extensions[0].strata[0].packets.len(), 1);
+    assert_eq!(extensions[0].strata[0].packets[0].segments.len(), 1);
+    let serving_provider = extensions[0].strata[0].packets[0].segments[0].provider_id;
     assert!(serving_provider == provider_record_a.node_id || serving_provider == node_id_b);
     if serving_provider == node_id_b {
         assert!(db_b.load_shielded_nullifier_epoch(1)?.is_some());

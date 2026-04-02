@@ -145,6 +145,9 @@ impl Store {
             "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
             "shielded_archive_replica", // provider_id||shard_id -> ArchiveReplicaAttestation
             "shielded_archive_operator", // provider_id -> ArchiveOperatorScorecard
+            "shielded_archive_accounting", // provider_id -> ArchiveServiceLedger
+            "shielded_archive_custody", // provider_id||shard_id -> ArchiveCustodyCommitment
+            "shielded_archive_receipt", // receipt_digest -> ArchiveRetrievalReceipt
         ];
 
         // Configure column family options with sane production defaults
@@ -961,6 +964,118 @@ impl Store {
             scorecards.push(crate::canonical::decode_archive_operator_scorecard(&value)?);
         }
         Ok(scorecards)
+    }
+
+    pub fn store_shielded_archive_service_ledger(
+        &self,
+        ledger: &crate::shielded::ArchiveServiceLedger,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_accounting")
+            .ok_or_else(|| {
+                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
+            })?;
+        let bytes = crate::canonical::encode_archive_service_ledger(ledger)?;
+        self.db.put_cf(cf, &ledger.provider_id, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_service_ledger(
+        &self,
+        provider_id: &[u8; 32],
+    ) -> Result<Option<crate::shielded::ArchiveServiceLedger>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_accounting")
+            .ok_or_else(|| {
+                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
+            })?;
+        match self.db.get_cf(cf, provider_id)? {
+            Some(bytes) => Ok(Some(crate::canonical::decode_archive_service_ledger(
+                &bytes,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_shielded_archive_service_ledgers(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveServiceLedger>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_accounting")
+            .ok_or_else(|| {
+                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
+            })?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut ledgers = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            ledgers.push(crate::canonical::decode_archive_service_ledger(&value)?);
+        }
+        Ok(ledgers)
+    }
+
+    pub fn store_shielded_archive_custody_commitment(
+        &self,
+        commitment: &crate::shielded::ArchiveCustodyCommitment,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_custody")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_custody' column family missing"))?;
+        let mut key = Vec::with_capacity(40);
+        key.extend_from_slice(&commitment.provider_id);
+        key.extend_from_slice(&commitment.shard_id.to_le_bytes());
+        let bytes = crate::canonical::encode_archive_custody_commitment(commitment)?;
+        self.db.put_cf(cf, key, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_custody_commitments(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveCustodyCommitment>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_custody")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_custody' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut commitments = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            commitments.push(crate::canonical::decode_archive_custody_commitment(&value)?);
+        }
+        Ok(commitments)
+    }
+
+    pub fn store_shielded_archive_retrieval_receipt(
+        &self,
+        receipt: &crate::shielded::ArchiveRetrievalReceipt,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_receipt")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
+        let bytes = crate::canonical::encode_archive_retrieval_receipt(receipt)?;
+        self.db.put_cf(cf, &receipt.receipt_digest, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_retrieval_receipts(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveRetrievalReceipt>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_receipt")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut receipts = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            receipts.push(crate::canonical::decode_archive_retrieval_receipt(&value)?);
+        }
+        Ok(receipts)
     }
 
     pub fn store_shielded_output(

@@ -645,13 +645,12 @@ impl Wallet {
         transaction::ensure_shielded_runtime_state(store.as_ref())?;
         self.sync_owned_shielded_notes()?;
         let mut notes = self.load_owned_shielded_notes(false, true)?;
-        if notes.is_empty() {
-            return Ok(());
-        }
         let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
         let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
-        self.refresh_owned_shielded_checkpoints_with_round(&mut notes, network, rotation_round)
-            .await?;
+        if !notes.is_empty() {
+            self.refresh_owned_shielded_checkpoints_with_round(&mut notes, network, rotation_round)
+                .await?;
+        }
         let cover_requests = self.build_cover_checkpoint_requests(
             current_epoch,
             rotation_round,
