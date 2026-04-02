@@ -5,7 +5,6 @@ use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 // use std::process; // removed unused
 
@@ -49,9 +48,6 @@ impl RetargetCacheMem {
         self.windows_by_height.insert(height, window);
     }
 }
-
-// Global counter to ensure unique database paths
-static DB_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Store {
     pub fn base_path(&self) -> &str {
@@ -115,9 +111,6 @@ impl Store {
     }
 
     pub fn open(base_path: &str) -> Result<Self> {
-        // Increment counter for tracking (helps with debugging)
-        let _instance_id = DB_INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-
         // Use base path directly for production, but ensure clean state
         let db_path = base_path.to_string();
 
@@ -149,6 +142,7 @@ impl Store {
             "shielded_owned_note", // note_commitment -> wallet-owned note plaintext
             "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
             "shielded_spent_note", // note_commitment -> spent marker
+            "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
         ];
 
         // Configure column family options with sane production defaults
@@ -296,8 +290,6 @@ impl Store {
         store
             .health_check()
             .with_context(|| "Database health check failed during initialization")?;
-
-        println!("✅ Database opened successfully ");
         Ok(store)
     }
 
@@ -859,6 +851,51 @@ impl Store {
             )),
             None => Ok(None),
         }
+    }
+
+    pub fn store_shielded_archive_provider(
+        &self,
+        manifest: &crate::shielded::ArchiveProviderManifest,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_provider")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
+        let bytes = crate::canonical::encode_archive_provider_manifest(manifest)?;
+        self.db.put_cf(cf, &manifest.provider_id, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_provider(
+        &self,
+        provider_id: &[u8; 32],
+    ) -> Result<Option<crate::shielded::ArchiveProviderManifest>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_provider")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
+        match self.db.get_cf(cf, provider_id)? {
+            Some(bytes) => Ok(Some(crate::canonical::decode_archive_provider_manifest(
+                &bytes,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_shielded_archive_providers(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveProviderManifest>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_provider")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut manifests = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            manifests.push(crate::canonical::decode_archive_provider_manifest(&value)?);
+        }
+        Ok(manifests)
     }
 
     pub fn store_shielded_output(

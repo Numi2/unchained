@@ -19,8 +19,13 @@ const NOTE_LEAF_DOMAIN: &str = "unchained-shielded-note-leaf-v1";
 const NULLIFIER_DOMAIN: &str = "unchained-shielded-evolving-nullifier-v1";
 const NULLIFIER_LEAF_DOMAIN: &str = "unchained-shielded-nullifier-leaf-v1";
 const CHECKPOINT_BASE_DOMAIN: &str = "unchained-shielded-checkpoint-base-v1";
-const CHECKPOINT_STEP_DOMAIN: &str = "unchained-shielded-checkpoint-step-v1";
+const CHECKPOINT_SERVICE_DOMAIN: &str = "unchained-shielded-checkpoint-service-v1";
+const CHECKPOINT_RERANDOMIZE_DOMAIN: &str = "unchained-shielded-checkpoint-rerandomize-v1";
 const PRESENTATION_DOMAIN: &str = "unchained-shielded-presentation-v1";
+const ARCHIVE_SHARD_DOMAIN: &str = "unchained-shielded-archive-shard-v1";
+const ARCHIVE_PROVIDER_MANIFEST_DOMAIN: &str = "unchained-shielded-archive-provider-v1";
+const ARCHIVE_PROVIDER_SELECT_DOMAIN: &str = "unchained-shielded-archive-select-v1";
+const ARCHIVE_BATCH_ORDER_DOMAIN: &str = "unchained-shielded-archive-batch-order-v1";
 const GENESIS_NOTE_KEY_DOMAIN: &str = "unchained-shielded-genesis-note-key-v1";
 const GENESIS_NOTE_RHO_DOMAIN: &str = "unchained-shielded-genesis-note-rho-v1";
 const GENESIS_NOTE_RANDOMIZER_DOMAIN: &str = "unchained-shielded-genesis-note-randomizer-v1";
@@ -107,12 +112,31 @@ pub struct HistoricalUnspentCheckpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HistoricalUnspentExtension {
+pub struct HistoricalUnspentServiceResponse {
     pub version: u8,
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
     pub note_commitment: [u8; 32],
     pub from_epoch: u64,
     pub through_epoch: u64,
     pub prior_transcript_root: [u8; 32],
+    pub service_transcript_root: [u8; 32],
+    pub historical_root_digest: [u8; 32],
+    pub records: Vec<HistoricalAbsenceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalUnspentExtension {
+    pub version: u8,
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub note_commitment: [u8; 32],
+    pub from_epoch: u64,
+    pub through_epoch: u64,
+    pub prior_transcript_root: [u8; 32],
+    pub service_transcript_root: [u8; 32],
+    pub historical_root_digest: [u8; 32],
+    pub rerandomization_blinding: [u8; 32],
     pub new_transcript_root: [u8; 32],
     pub records: Vec<HistoricalAbsenceRecord>,
 }
@@ -129,6 +153,41 @@ pub struct ActiveNullifierEpoch {
     pub version: u8,
     pub epoch: u64,
     pub nullifiers: BTreeSet<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveShard {
+    pub shard_id: u64,
+    pub first_epoch: u64,
+    pub last_epoch: u64,
+    pub root_digest: [u8; 32],
+    pub epoch_roots: Vec<(u64, [u8; 32])>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveProviderManifest {
+    pub provider_id: [u8; 32],
+    pub schedule_seed: [u8; 32],
+    pub coverage_first_epoch: u64,
+    pub coverage_last_epoch: u64,
+    pub shard_ids: Vec<u64>,
+    pub shard_digests: Vec<[u8; 32]>,
+    pub manifest_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ArchiveDirectory {
+    pub shard_span: u64,
+    pub shards: Vec<ArchiveShard>,
+    pub providers: Vec<ArchiveProviderManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveShardBundle {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub shard: ArchiveShard,
+    pub epochs: Vec<ArchivedNullifierEpoch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +208,33 @@ pub struct ShieldedSyncServer {
 pub struct CheckpointExtensionRequest {
     pub checkpoint: HistoricalUnspentCheckpoint,
     pub queries: Vec<EvolvingNullifierQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointBatchRequest {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub requests: Vec<CheckpointExtensionRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointBatchResponse {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub responses: Vec<HistoricalUnspentServiceResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedCheckpointRequest {
+    pub provider_id: [u8; 32],
+    pub request_index: Option<usize>,
+    pub request: CheckpointExtensionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoutedCheckpointBatch {
+    pub provider_id: [u8; 32],
+    pub requests: Vec<RoutedCheckpointRequest>,
 }
 
 impl ShieldedNote {
@@ -381,6 +467,16 @@ impl ArchivedNullifierEpoch {
         self.nullifiers.binary_search(queried_nullifier).is_ok()
     }
 
+    pub fn validate(&self) -> Result<()> {
+        Self::from_parts(
+            self.epoch,
+            self.nullifiers.clone(),
+            self.levels.clone(),
+            self.root,
+        )?;
+        Ok(())
+    }
+
     pub fn prove_absence(
         &self,
         queried_nullifier: [u8; 32],
@@ -519,6 +615,23 @@ impl HistoricalUnspentCheckpoint {
         }
     }
 
+    pub fn empty_extension(&self) -> HistoricalUnspentExtension {
+        HistoricalUnspentExtension {
+            version: SHIELDED_EXTENSION_VERSION,
+            provider_id: [0u8; 32],
+            provider_manifest_digest: [0u8; 32],
+            note_commitment: self.note_commitment,
+            from_epoch: self.covered_through_epoch.saturating_add(1),
+            through_epoch: self.covered_through_epoch,
+            prior_transcript_root: self.transcript_root,
+            service_transcript_root: self.transcript_root,
+            historical_root_digest: proof_core::historical_root_digest_from_pairs(&[]),
+            rerandomization_blinding: [0u8; 32],
+            new_transcript_root: self.transcript_root,
+            records: Vec::new(),
+        }
+    }
+
     pub fn apply_extension(
         &self,
         extension: &HistoricalUnspentExtension,
@@ -545,6 +658,9 @@ impl HistoricalUnspentCheckpoint {
             if extension.through_epoch != self.covered_through_epoch {
                 bail!("empty extension cannot advance the checkpoint range");
             }
+            if extension.service_transcript_root != self.transcript_root {
+                bail!("empty extension must preserve the service transcript root");
+            }
             if extension.new_transcript_root != self.transcript_root {
                 bail!("empty extension must preserve the transcript root");
             }
@@ -555,8 +671,9 @@ impl HistoricalUnspentCheckpoint {
             bail!("extension does not continue from the prior checkpoint");
         }
 
-        let mut transcript_root = self.transcript_root;
+        let mut service_transcript_root = self.transcript_root;
         let mut expected_epoch = extension.from_epoch;
+        let mut historical_roots = Vec::with_capacity(extension.records.len());
         for record in &extension.records {
             if record.epoch != expected_epoch {
                 bail!("extension epochs must be contiguous");
@@ -564,12 +681,14 @@ impl HistoricalUnspentCheckpoint {
             if record.nullifier != record.proof.queried_nullifier {
                 bail!("extension record nullifier does not match the proof");
             }
-            if ledger.root_for_epoch(record.epoch)? != record.proof.root {
+            let root = ledger.root_for_epoch(record.epoch)?;
+            if root != record.proof.root {
                 bail!("extension proof root does not match the historical root ledger");
             }
             record.proof.verify()?;
-            transcript_root = checkpoint_step_root(
-                &transcript_root,
+            historical_roots.push((record.epoch, root));
+            service_transcript_root = checkpoint_service_root(
+                &service_transcript_root,
                 record.epoch,
                 &record.nullifier,
                 &record.proof.digest(),
@@ -580,7 +699,22 @@ impl HistoricalUnspentCheckpoint {
         if extension.through_epoch != expected_epoch.saturating_sub(1) {
             bail!("extension through_epoch does not match the proof payload");
         }
-        if extension.new_transcript_root != transcript_root {
+        let expected_historical_root_digest =
+            proof_core::historical_root_digest_from_pairs(&historical_roots);
+        if extension.historical_root_digest != expected_historical_root_digest {
+            bail!("extension historical root digest mismatch");
+        }
+        if extension.service_transcript_root != service_transcript_root {
+            bail!("extension service transcript root mismatch");
+        }
+        let rerandomized_root = rerandomized_checkpoint_root(
+            &extension.service_transcript_root,
+            &extension.provider_id,
+            &extension.provider_manifest_digest,
+            &extension.historical_root_digest,
+            &extension.rerandomization_blinding,
+        );
+        if extension.new_transcript_root != rerandomized_root {
             bail!("extension transcript root mismatch");
         }
 
@@ -591,9 +725,117 @@ impl HistoricalUnspentCheckpoint {
             note_commitment: self.note_commitment,
             birth_epoch: self.birth_epoch,
             covered_through_epoch: extension.through_epoch,
-            transcript_root,
+            transcript_root: rerandomized_root,
             verified_epoch_count: self.verified_epoch_count.saturating_add(additional),
         })
+    }
+}
+
+impl HistoricalUnspentServiceResponse {
+    pub fn rerandomize(&self, blinding: [u8; 32]) -> HistoricalUnspentExtension {
+        HistoricalUnspentExtension {
+            version: self.version,
+            provider_id: self.provider_id,
+            provider_manifest_digest: self.provider_manifest_digest,
+            note_commitment: self.note_commitment,
+            from_epoch: self.from_epoch,
+            through_epoch: self.through_epoch,
+            prior_transcript_root: self.prior_transcript_root,
+            service_transcript_root: self.service_transcript_root,
+            historical_root_digest: self.historical_root_digest,
+            rerandomization_blinding: blinding,
+            new_transcript_root: rerandomized_checkpoint_root(
+                &self.service_transcript_root,
+                &self.provider_id,
+                &self.provider_manifest_digest,
+                &self.historical_root_digest,
+                &blinding,
+            ),
+            records: self.records.clone(),
+        }
+    }
+
+    pub fn verify_against_manifest(
+        &self,
+        manifest: &ArchiveProviderManifest,
+        directory: &ArchiveDirectory,
+    ) -> Result<()> {
+        if self.provider_id != manifest.provider_id {
+            bail!("service response provider id mismatch");
+        }
+        if self.provider_manifest_digest != manifest.manifest_digest {
+            bail!("service response manifest digest mismatch");
+        }
+        if self.provider_manifest_digest != manifest.digest() {
+            bail!("archive provider manifest digest mismatch");
+        }
+        if !manifest.covers_range(directory, self.from_epoch, self.through_epoch)? {
+            bail!("archive provider manifest does not cover the requested epoch range");
+        }
+        let expected_historical_root_digest =
+            directory.historical_root_digest_for_range(self.from_epoch, self.through_epoch)?;
+        if self.historical_root_digest != expected_historical_root_digest {
+            bail!("service response historical root digest mismatch");
+        }
+        Ok(())
+    }
+}
+
+impl CheckpointBatchRequest {
+    pub fn validate_against_manifest(
+        &self,
+        manifest: &ArchiveProviderManifest,
+        directory: &ArchiveDirectory,
+    ) -> Result<()> {
+        if self.provider_id != manifest.provider_id {
+            bail!("checkpoint batch request provider id mismatch");
+        }
+        if self.provider_manifest_digest != manifest.manifest_digest {
+            bail!("checkpoint batch request manifest digest mismatch");
+        }
+        if self.provider_manifest_digest != manifest.digest() {
+            bail!("archive provider manifest digest mismatch");
+        }
+        for request in &self.requests {
+            if request.queries.is_empty() {
+                continue;
+            }
+            let expected_from = request.checkpoint.covered_through_epoch.saturating_add(1);
+            let through_epoch = request
+                .queries
+                .last()
+                .map(|query| query.epoch)
+                .ok_or_else(|| anyhow!("checkpoint batch request missing terminal epoch"))?;
+            if request.queries.first().map(|query| query.epoch) != Some(expected_from) {
+                bail!("checkpoint batch request does not continue from the prior checkpoint");
+            }
+            if !manifest.covers_range(directory, expected_from, through_epoch)? {
+                bail!("archive provider manifest does not cover the requested checkpoint range");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CheckpointBatchResponse {
+    pub fn verify_against_manifest(
+        &self,
+        manifest: &ArchiveProviderManifest,
+        directory: &ArchiveDirectory,
+    ) -> Result<()> {
+        if self.provider_id != manifest.provider_id {
+            bail!("checkpoint batch response provider id mismatch");
+        }
+        if self.provider_manifest_digest != manifest.manifest_digest {
+            bail!("checkpoint batch response manifest digest mismatch");
+        }
+        if self.provider_manifest_digest != manifest.digest() {
+            bail!("archive provider manifest digest mismatch");
+        }
+        for response in &self.responses {
+            response.verify_against_manifest(manifest, directory)?;
+        }
+        Ok(())
     }
 }
 
@@ -604,6 +846,453 @@ impl CheckpointPresentation {
         hasher.update(&self.blinding);
         *hasher.finalize().as_bytes() == self.presentation_digest
     }
+}
+
+impl ArchiveShard {
+    pub fn new(shard_id: u64, epoch_roots: Vec<(u64, [u8; 32])>) -> Result<Self> {
+        if epoch_roots.is_empty() {
+            bail!("archive shard cannot be empty");
+        }
+        for pair in epoch_roots.windows(2) {
+            if pair[1].0 != pair[0].0.saturating_add(1) {
+                bail!("archive shard epochs must be contiguous");
+            }
+        }
+        let first_epoch = epoch_roots.first().map(|(epoch, _)| *epoch).unwrap_or(0);
+        let last_epoch = epoch_roots.last().map(|(epoch, _)| *epoch).unwrap_or(0);
+        let root_digest = archive_shard_digest(shard_id, &epoch_roots);
+        Ok(Self {
+            shard_id,
+            first_epoch,
+            last_epoch,
+            root_digest,
+            epoch_roots,
+        })
+    }
+
+    pub fn covers_range(&self, from_epoch: u64, through_epoch: u64) -> bool {
+        if from_epoch > through_epoch {
+            return true;
+        }
+        self.first_epoch <= from_epoch && self.last_epoch >= through_epoch
+    }
+
+    pub fn epoch_root(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.epoch_roots
+            .iter()
+            .find(|(candidate_epoch, _)| *candidate_epoch == epoch)
+            .map(|(_, root)| *root)
+    }
+}
+
+impl ArchiveProviderManifest {
+    pub fn new(provider_id: [u8; 32], shards: &[ArchiveShard]) -> Self {
+        let coverage_first_epoch = shards.first().map(|shard| shard.first_epoch).unwrap_or(0);
+        let coverage_last_epoch = shards.last().map(|shard| shard.last_epoch).unwrap_or(0);
+        let shard_ids = shards
+            .iter()
+            .map(|shard| shard.shard_id)
+            .collect::<Vec<_>>();
+        let shard_digests = shards
+            .iter()
+            .map(|shard| shard.root_digest)
+            .collect::<Vec<_>>();
+        let schedule_seed =
+            archive_provider_schedule_seed(&provider_id, &shard_ids, &shard_digests);
+        let manifest_digest = archive_provider_manifest_digest(
+            &provider_id,
+            &schedule_seed,
+            coverage_first_epoch,
+            coverage_last_epoch,
+            &shard_ids,
+            &shard_digests,
+        );
+        Self {
+            provider_id,
+            schedule_seed,
+            coverage_first_epoch,
+            coverage_last_epoch,
+            shard_ids,
+            shard_digests,
+            manifest_digest,
+        }
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        archive_provider_manifest_digest(
+            &self.provider_id,
+            &self.schedule_seed,
+            self.coverage_first_epoch,
+            self.coverage_last_epoch,
+            &self.shard_ids,
+            &self.shard_digests,
+        )
+    }
+
+    pub fn validate(&self, directory: &ArchiveDirectory) -> Result<()> {
+        if self.schedule_seed
+            != archive_provider_schedule_seed(
+                &self.provider_id,
+                &self.shard_ids,
+                &self.shard_digests,
+            )
+        {
+            bail!("archive provider manifest schedule seed mismatch");
+        }
+        if self.manifest_digest != self.digest() {
+            bail!("archive provider manifest digest mismatch");
+        }
+        for (shard_id, shard_digest) in self.shard_ids.iter().zip(&self.shard_digests) {
+            let shard = directory
+                .shard(*shard_id)
+                .ok_or_else(|| anyhow!("archive provider references unknown shard {}", shard_id))?;
+            if shard.root_digest != *shard_digest {
+                bail!("archive provider shard digest mismatch");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn serves_shard(&self, shard_id: u64, shard_digest: &[u8; 32]) -> bool {
+        self.shard_ids
+            .iter()
+            .zip(&self.shard_digests)
+            .any(|(candidate_id, candidate_digest)| {
+                *candidate_id == shard_id && candidate_digest == shard_digest
+            })
+    }
+
+    pub fn covers_range(
+        &self,
+        directory: &ArchiveDirectory,
+        from_epoch: u64,
+        through_epoch: u64,
+    ) -> Result<bool> {
+        if from_epoch > through_epoch {
+            return Ok(true);
+        }
+        if from_epoch < self.coverage_first_epoch || through_epoch > self.coverage_last_epoch {
+            return Ok(false);
+        }
+        Ok(directory
+            .shards
+            .iter()
+            .filter(|shard| !(through_epoch < shard.first_epoch || from_epoch > shard.last_epoch))
+            .all(|shard| {
+                self.shard_ids
+                    .iter()
+                    .zip(&self.shard_digests)
+                    .any(|(shard_id, shard_digest)| {
+                        *shard_id == shard.shard_id && *shard_digest == shard.root_digest
+                    })
+            }))
+    }
+}
+
+impl ArchiveDirectory {
+    pub fn shards_from_root_ledger(
+        ledger: &NullifierRootLedger,
+        shard_span: u64,
+    ) -> Result<Vec<ArchiveShard>> {
+        let shard_span = shard_span.max(1);
+        let entries = ledger
+            .roots
+            .iter()
+            .map(|(epoch, root)| (*epoch, *root))
+            .collect::<Vec<_>>();
+        let mut shards = Vec::new();
+        for (shard_index, chunk) in entries.chunks(shard_span as usize).enumerate() {
+            shards.push(ArchiveShard::new(shard_index as u64, chunk.to_vec())?);
+        }
+        Ok(shards)
+    }
+
+    pub fn from_root_ledger_and_providers(
+        ledger: &NullifierRootLedger,
+        shard_span: u64,
+        providers: Vec<ArchiveProviderManifest>,
+    ) -> Result<Self> {
+        let shards = Self::shards_from_root_ledger(ledger, shard_span)?;
+        let validation_directory = Self {
+            shard_span,
+            shards: shards.clone(),
+            providers: Vec::new(),
+        };
+        let providers = providers
+            .into_iter()
+            .filter(|provider| provider.validate(&validation_directory).is_ok())
+            .collect();
+        Ok(Self {
+            shard_span,
+            shards,
+            providers,
+        })
+    }
+
+    pub fn provider(&self, provider_id: &[u8; 32]) -> Result<&ArchiveProviderManifest> {
+        self.providers
+            .iter()
+            .find(|provider| &provider.provider_id == provider_id)
+            .ok_or_else(|| anyhow!("unknown archive provider"))
+    }
+
+    pub fn shard(&self, shard_id: u64) -> Option<&ArchiveShard> {
+        self.shards.iter().find(|shard| shard.shard_id == shard_id)
+    }
+
+    pub fn pick_provider(
+        &self,
+        checkpoint: &HistoricalUnspentCheckpoint,
+        through_epoch: u64,
+        rotation_round: u64,
+    ) -> Result<&ArchiveProviderManifest> {
+        let from_epoch = checkpoint.covered_through_epoch.saturating_add(1);
+        let mut eligible = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .covers_range(self, from_epoch, through_epoch)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            bail!("no archive provider covers the requested epoch range");
+        }
+        eligible.sort_by_key(|provider| {
+            provider_selection_score(
+                &provider.provider_id,
+                &provider.schedule_seed,
+                &checkpoint.note_commitment,
+                from_epoch,
+                through_epoch,
+                rotation_round,
+            )
+        });
+        Ok(eligible[0])
+    }
+
+    pub fn historical_root_digest_for_range(
+        &self,
+        from_epoch: u64,
+        through_epoch: u64,
+    ) -> Result<[u8; 32]> {
+        if from_epoch > through_epoch {
+            return Ok(proof_core::historical_root_digest_from_pairs(&[]));
+        }
+        let mut pairs = Vec::new();
+        for epoch in from_epoch..=through_epoch {
+            let root = self
+                .shards
+                .iter()
+                .find_map(|shard| {
+                    shard
+                        .epoch_roots
+                        .iter()
+                        .find(|(candidate_epoch, _)| *candidate_epoch == epoch)
+                        .map(|(_, root)| *root)
+                })
+                .ok_or_else(|| anyhow!("missing archive shard root for epoch {}", epoch))?;
+            pairs.push((epoch, root));
+        }
+        Ok(proof_core::historical_root_digest_from_pairs(&pairs))
+    }
+
+    pub fn provider_for_shard(
+        &self,
+        shard_id: u64,
+        rotation_round: u64,
+    ) -> Result<&ArchiveProviderManifest> {
+        let shard = self
+            .shard(shard_id)
+            .ok_or_else(|| anyhow!("unknown archive shard {}", shard_id))?;
+        let mut eligible = self
+            .providers
+            .iter()
+            .filter(|provider| provider.serves_shard(shard_id, &shard.root_digest))
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            bail!("no archive provider serves shard {}", shard_id);
+        }
+        eligible.sort_by_key(|provider| {
+            provider_selection_score(
+                &provider.provider_id,
+                &provider.schedule_seed,
+                &shard.root_digest,
+                shard.first_epoch,
+                shard.last_epoch,
+                rotation_round,
+            )
+        });
+        Ok(eligible[0])
+    }
+
+    pub fn shard_ids_covering_epochs(
+        &self,
+        epochs: &BTreeSet<u64>,
+        available_epochs: &BTreeSet<u64>,
+    ) -> Vec<u64> {
+        let mut shard_ids = BTreeSet::new();
+        for epoch in epochs {
+            if available_epochs.contains(epoch) {
+                continue;
+            }
+            if let Some(shard) = self
+                .shards
+                .iter()
+                .find(|shard| *epoch >= shard.first_epoch && *epoch <= shard.last_epoch)
+            {
+                shard_ids.insert(shard.shard_id);
+            }
+        }
+        shard_ids.into_iter().collect()
+    }
+}
+
+pub fn local_archive_provider_manifest(
+    provider_id: [u8; 32],
+    ledger: &NullifierRootLedger,
+    shard_span: u64,
+    available_epochs: &BTreeSet<u64>,
+) -> Result<ArchiveProviderManifest> {
+    let shards = ArchiveDirectory::shards_from_root_ledger(ledger, shard_span)?
+        .into_iter()
+        .filter(|shard| {
+            (shard.first_epoch..=shard.last_epoch).all(|epoch| available_epochs.contains(&epoch))
+        })
+        .collect::<Vec<_>>();
+    Ok(ArchiveProviderManifest::new(provider_id, &shards))
+}
+
+impl ArchiveShardBundle {
+    pub fn validate(
+        &self,
+        manifest: &ArchiveProviderManifest,
+        directory: &ArchiveDirectory,
+    ) -> Result<()> {
+        manifest.validate(directory)?;
+        if self.provider_id != manifest.provider_id {
+            bail!("archive shard bundle provider id mismatch");
+        }
+        if self.provider_manifest_digest != manifest.manifest_digest {
+            bail!("archive shard bundle manifest digest mismatch");
+        }
+        if !manifest.serves_shard(self.shard.shard_id, &self.shard.root_digest) {
+            bail!("archive shard bundle references an unserved shard");
+        }
+        let canonical_shard = directory
+            .shard(self.shard.shard_id)
+            .ok_or_else(|| anyhow!("archive shard bundle references unknown shard"))?;
+        if canonical_shard != &self.shard {
+            bail!("archive shard bundle shard descriptor mismatch");
+        }
+        if self.epochs.len() != canonical_shard.epoch_roots.len() {
+            bail!("archive shard bundle epoch count mismatch");
+        }
+        for (archived, (epoch, root)) in self.epochs.iter().zip(&canonical_shard.epoch_roots) {
+            if archived.epoch != *epoch {
+                bail!("archive shard bundle epoch ordering mismatch");
+            }
+            if archived.root != *root {
+                bail!("archive shard bundle epoch root mismatch");
+            }
+            archived.validate()?;
+        }
+        Ok(())
+    }
+}
+
+pub fn route_checkpoint_requests(
+    directory: &ArchiveDirectory,
+    requests: &[CheckpointExtensionRequest],
+    rotation_round: u64,
+    min_batch_size: usize,
+    max_batch_size: usize,
+) -> Result<Vec<RoutedCheckpointBatch>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_batch_size = max_batch_size.max(1);
+    let min_batch_size = min_batch_size.max(1).min(max_batch_size);
+    let mut routed = Vec::new();
+    let mut counts_by_provider_epoch = BTreeMap::<([u8; 32], u64), usize>::new();
+
+    for (request_index, request) in requests.iter().enumerate() {
+        if request.queries.is_empty() {
+            continue;
+        }
+        let through_epoch = request
+            .queries
+            .last()
+            .map(|query| query.epoch)
+            .ok_or_else(|| anyhow!("checkpoint request is missing a terminal epoch"))?;
+        let provider =
+            directory.pick_provider(&request.checkpoint, through_epoch, rotation_round)?;
+        for query in &request.queries {
+            *counts_by_provider_epoch
+                .entry((provider.provider_id, query.epoch))
+                .or_default() += 1;
+        }
+        routed.push(RoutedCheckpointRequest {
+            provider_id: provider.provider_id,
+            request_index: Some(request_index),
+            request: request.clone(),
+        });
+    }
+
+    for ((provider_id, epoch), real_count) in counts_by_provider_epoch {
+        let mut target_count = real_count.max(min_batch_size).next_power_of_two();
+        target_count = target_count.min(max_batch_size.max(real_count));
+        for cover_index in real_count..target_count {
+            let fake_commitment = synthetic_cover_digest(
+                b"commitment",
+                &provider_id,
+                rotation_round,
+                epoch,
+                cover_index as u64,
+            );
+            let fake_nullifier = synthetic_cover_digest(
+                b"nullifier",
+                &provider_id,
+                rotation_round,
+                epoch,
+                cover_index as u64,
+            );
+            routed.push(RoutedCheckpointRequest {
+                provider_id,
+                request_index: None,
+                request: CheckpointExtensionRequest {
+                    checkpoint: HistoricalUnspentCheckpoint::genesis(fake_commitment, epoch),
+                    queries: vec![EvolvingNullifierQuery {
+                        epoch,
+                        nullifier: fake_nullifier,
+                    }],
+                },
+            });
+        }
+    }
+
+    let mut batches_by_provider = BTreeMap::<[u8; 32], Vec<RoutedCheckpointRequest>>::new();
+    for routed_request in routed {
+        batches_by_provider
+            .entry(routed_request.provider_id)
+            .or_default()
+            .push(routed_request);
+    }
+
+    Ok(batches_by_provider
+        .into_iter()
+        .map(|(provider_id, mut requests)| {
+            requests.sort_by_key(|request| {
+                checkpoint_batch_order_key(&provider_id, rotation_round, request)
+            });
+            RoutedCheckpointBatch {
+                provider_id,
+                requests,
+            }
+        })
+        .collect())
 }
 
 impl ShieldedSyncServer {
@@ -641,34 +1330,40 @@ impl ShieldedSyncServer {
         self.epochs.get(&epoch)
     }
 
-    pub fn extend_checkpoint(
+    pub fn serve_checkpoint(
         &self,
+        manifest: &ArchiveProviderManifest,
         checkpoint: &HistoricalUnspentCheckpoint,
         queries: &[EvolvingNullifierQuery],
-    ) -> Result<HistoricalUnspentExtension> {
-        let mut extensions = self.extend_checkpoints_batch(&[CheckpointExtensionRequest {
-            checkpoint: checkpoint.clone(),
-            queries: queries.to_vec(),
-        }])?;
-        extensions
+    ) -> Result<HistoricalUnspentServiceResponse> {
+        let mut responses = self.serve_checkpoints_batch(
+            manifest,
+            &[CheckpointExtensionRequest {
+                checkpoint: checkpoint.clone(),
+                queries: queries.to_vec(),
+            }],
+        )?;
+        responses
             .pop()
-            .ok_or_else(|| anyhow!("missing checkpoint extension result"))
+            .ok_or_else(|| anyhow!("missing checkpoint service response"))
     }
 
-    pub fn extend_checkpoints_batch(
+    pub fn serve_checkpoints_batch(
         &self,
+        manifest: &ArchiveProviderManifest,
         requests: &[CheckpointExtensionRequest],
-    ) -> Result<Vec<HistoricalUnspentExtension>> {
+    ) -> Result<Vec<HistoricalUnspentServiceResponse>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
 
-        struct PendingExtension {
+        struct PendingResponse {
             note_commitment: [u8; 32],
             from_epoch: u64,
             through_epoch: u64,
             prior_transcript_root: [u8; 32],
-            transcript_root: [u8; 32],
+            service_transcript_root: [u8; 32],
+            historical_roots: Vec<(u64, [u8; 32])>,
             records: Vec<HistoricalAbsenceRecord>,
         }
 
@@ -688,12 +1383,13 @@ impl ShieldedSyncServer {
                     .push((request_index, query.nullifier));
                 expected_epoch = expected_epoch.saturating_add(1);
             }
-            pending.push(PendingExtension {
+            pending.push(PendingResponse {
                 note_commitment: request.checkpoint.note_commitment,
                 from_epoch: expected_from,
                 through_epoch: request.checkpoint.covered_through_epoch,
                 prior_transcript_root: request.checkpoint.transcript_root,
-                transcript_root: request.checkpoint.transcript_root,
+                service_transcript_root: request.checkpoint.transcript_root,
+                historical_roots: Vec::with_capacity(request.queries.len()),
                 records: Vec::with_capacity(request.queries.len()),
             });
         }
@@ -707,32 +1403,38 @@ impl ShieldedSyncServer {
             ordered_entries.sort_by_key(|(_, nullifier)| *nullifier);
             for (request_index, nullifier) in ordered_entries {
                 let proof = archived.prove_absence(nullifier)?;
-                let pending_extension = &mut pending[request_index];
-                pending_extension.transcript_root = checkpoint_step_root(
-                    &pending_extension.transcript_root,
+                let pending_response = &mut pending[request_index];
+                pending_response.service_transcript_root = checkpoint_service_root(
+                    &pending_response.service_transcript_root,
                     epoch,
                     &nullifier,
                     &proof.digest(),
                 );
-                pending_extension.records.push(HistoricalAbsenceRecord {
+                pending_response.historical_roots.push((epoch, proof.root));
+                pending_response.records.push(HistoricalAbsenceRecord {
                     epoch,
                     nullifier,
                     proof,
                 });
-                pending_extension.through_epoch = epoch;
+                pending_response.through_epoch = epoch;
             }
         }
 
         Ok(pending
             .into_iter()
-            .map(|pending_extension| HistoricalUnspentExtension {
+            .map(|pending_response| HistoricalUnspentServiceResponse {
                 version: SHIELDED_EXTENSION_VERSION,
-                note_commitment: pending_extension.note_commitment,
-                from_epoch: pending_extension.from_epoch,
-                through_epoch: pending_extension.through_epoch,
-                prior_transcript_root: pending_extension.prior_transcript_root,
-                new_transcript_root: pending_extension.transcript_root,
-                records: pending_extension.records,
+                provider_id: manifest.provider_id,
+                provider_manifest_digest: manifest.manifest_digest,
+                note_commitment: pending_response.note_commitment,
+                from_epoch: pending_response.from_epoch,
+                through_epoch: pending_response.through_epoch,
+                prior_transcript_root: pending_response.prior_transcript_root,
+                service_transcript_root: pending_response.service_transcript_root,
+                historical_root_digest: proof_core::historical_root_digest_from_pairs(
+                    &pending_response.historical_roots,
+                ),
+                records: pending_response.records,
             })
             .collect())
     }
@@ -842,17 +1544,145 @@ fn checkpoint_base_root(note_commitment: &[u8; 32], birth_epoch: u64) -> [u8; 32
     *hasher.finalize().as_bytes()
 }
 
-fn checkpoint_step_root(
+fn checkpoint_service_root(
     prior_root: &[u8; 32],
     epoch: u64,
     nullifier: &[u8; 32],
     proof_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STEP_DOMAIN);
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SERVICE_DOMAIN);
     hasher.update(prior_root);
     hasher.update(&epoch.to_le_bytes());
     hasher.update(nullifier);
     hasher.update(proof_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn rerandomized_checkpoint_root(
+    service_root: &[u8; 32],
+    provider_id: &[u8; 32],
+    provider_manifest_digest: &[u8; 32],
+    historical_root_digest: &[u8; 32],
+    blinding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_RERANDOMIZE_DOMAIN);
+    hasher.update(service_root);
+    hasher.update(provider_id);
+    hasher.update(provider_manifest_digest);
+    hasher.update(historical_root_digest);
+    hasher.update(blinding);
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_shard_digest(shard_id: u64, epoch_roots: &[(u64, [u8; 32])]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_SHARD_DOMAIN);
+    hasher.update(&shard_id.to_le_bytes());
+    hasher.update(&(epoch_roots.len() as u32).to_le_bytes());
+    for (epoch, root) in epoch_roots {
+        hasher.update(&epoch.to_le_bytes());
+        hasher.update(root);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_provider_manifest_digest(
+    provider_id: &[u8; 32],
+    schedule_seed: &[u8; 32],
+    coverage_first_epoch: u64,
+    coverage_last_epoch: u64,
+    shard_ids: &[u64],
+    shard_digests: &[[u8; 32]],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_PROVIDER_MANIFEST_DOMAIN);
+    hasher.update(provider_id);
+    hasher.update(schedule_seed);
+    hasher.update(&coverage_first_epoch.to_le_bytes());
+    hasher.update(&coverage_last_epoch.to_le_bytes());
+    hasher.update(&(shard_ids.len() as u32).to_le_bytes());
+    for (shard_id, shard_digest) in shard_ids.iter().zip(shard_digests) {
+        hasher.update(&shard_id.to_le_bytes());
+        hasher.update(shard_digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn checkpoint_batch_order_key(
+    provider_id: &[u8; 32],
+    rotation_round: u64,
+    request: &RoutedCheckpointRequest,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_BATCH_ORDER_DOMAIN);
+    hasher.update(provider_id);
+    hasher.update(&rotation_round.to_le_bytes());
+    match request.request_index {
+        Some(index) => {
+            hasher.update(&[1]);
+            hasher.update(&(index as u64).to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&request.request.checkpoint.note_commitment);
+    hasher.update(&request.request.checkpoint.transcript_root);
+    if let Some(first) = request.request.queries.first() {
+        hasher.update(&first.epoch.to_le_bytes());
+        hasher.update(&first.nullifier);
+    }
+    if let Some(last) = request.request.queries.last() {
+        hasher.update(&last.epoch.to_le_bytes());
+        hasher.update(&last.nullifier);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn archive_provider_schedule_seed(
+    provider_id: &[u8; 32],
+    shard_ids: &[u64],
+    shard_digests: &[[u8; 32]],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_PROVIDER_MANIFEST_DOMAIN);
+    hasher.update(b"provider-seed");
+    hasher.update(provider_id);
+    hasher.update(&(shard_ids.len() as u32).to_le_bytes());
+    for (shard_id, shard_digest) in shard_ids.iter().zip(shard_digests) {
+        hasher.update(&shard_id.to_le_bytes());
+        hasher.update(shard_digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn provider_selection_score(
+    provider_id: &[u8; 32],
+    schedule_seed: &[u8; 32],
+    note_commitment: &[u8; 32],
+    from_epoch: u64,
+    through_epoch: u64,
+    rotation_round: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_PROVIDER_SELECT_DOMAIN);
+    hasher.update(provider_id);
+    hasher.update(schedule_seed);
+    hasher.update(note_commitment);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(&rotation_round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn synthetic_cover_digest(
+    label: &[u8],
+    provider_id: &[u8; 32],
+    rotation_round: u64,
+    epoch: u64,
+    slot: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_PROVIDER_SELECT_DOMAIN);
+    hasher.update(label);
+    hasher.update(provider_id);
+    hasher.update(&rotation_round.to_le_bytes());
+    hasher.update(&epoch.to_le_bytes());
+    hasher.update(&slot.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 

@@ -162,10 +162,15 @@ fn checkpoint_to_proof(
 fn extension_to_proof(extension: &HistoricalUnspentExtension) -> ProofHistoricalUnspentExtension {
     ProofHistoricalUnspentExtension {
         version: extension.version,
+        provider_id: extension.provider_id,
+        provider_manifest_digest: extension.provider_manifest_digest,
         note_commitment: extension.note_commitment,
         from_epoch: extension.from_epoch,
         through_epoch: extension.through_epoch,
         prior_transcript_root: extension.prior_transcript_root,
+        service_transcript_root: extension.service_transcript_root,
+        historical_root_digest: extension.historical_root_digest,
+        rerandomization_blinding: extension.rerandomization_blinding,
         new_transcript_root: extension.new_transcript_root,
         records: extension
             .records

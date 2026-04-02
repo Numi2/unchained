@@ -15,10 +15,12 @@ use crate::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
     },
     shielded::{
-        ArchivedNullifierEpoch, CheckpointPresentation, HistoricalAbsenceRecord,
-        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, NoteCommitmentTree,
-        NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof,
-        NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
+        ArchiveProviderManifest, ArchiveShard, ArchiveShardBundle, ArchivedNullifierEpoch,
+        CheckpointBatchRequest, CheckpointBatchResponse, CheckpointExtensionRequest,
+        CheckpointPresentation, EvolvingNullifierQuery, HistoricalAbsenceRecord,
+        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, HistoricalUnspentServiceResponse,
+        NoteCommitmentTree, NoteMembershipProof, NullifierMembershipWitness,
+        NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
     wallet::KeyDocV2,
@@ -1001,6 +1003,99 @@ pub fn decode_archived_nullifier_epoch(bytes: &[u8]) -> Result<ArchivedNullifier
     ArchivedNullifierEpoch::from_parts(epoch_num, nullifiers, levels, root)
 }
 
+pub fn encode_archive_shard(shard: &ArchiveShard) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u64(shard.shard_id);
+    writer.write_u64(shard.first_epoch);
+    writer.write_u64(shard.last_epoch);
+    writer.write_fixed(&shard.root_digest);
+    writer.write_vec(&shard.epoch_roots, |writer, (epoch, root)| {
+        writer.write_u64(*epoch);
+        writer.write_fixed(root);
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_shard(bytes: &[u8]) -> Result<ArchiveShard> {
+    let mut reader = CanonicalReader::new(bytes);
+    let shard_id = reader.read_u64()?;
+    let first_epoch = reader.read_u64()?;
+    let last_epoch = reader.read_u64()?;
+    let root_digest = reader.read_fixed()?;
+    let epoch_roots = reader.read_vec(|reader| {
+        let epoch = reader.read_u64()?;
+        let root = reader.read_fixed()?;
+        Ok((epoch, root))
+    })?;
+    reader.finish()?;
+    let shard = ArchiveShard::new(shard_id, epoch_roots)?;
+    if shard.first_epoch != first_epoch
+        || shard.last_epoch != last_epoch
+        || shard.root_digest != root_digest
+    {
+        bail!("archive shard canonical fields mismatch");
+    }
+    Ok(shard)
+}
+
+pub fn encode_archive_provider_manifest(manifest: &ArchiveProviderManifest) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&manifest.provider_id);
+    writer.write_fixed(&manifest.schedule_seed);
+    writer.write_u64(manifest.coverage_first_epoch);
+    writer.write_u64(manifest.coverage_last_epoch);
+    writer.write_vec(&manifest.shard_ids, |writer, shard_id| {
+        writer.write_u64(*shard_id);
+        Ok(())
+    })?;
+    writer.write_vec(&manifest.shard_digests, |writer, digest| {
+        writer.write_fixed(digest);
+        Ok(())
+    })?;
+    writer.write_fixed(&manifest.manifest_digest);
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_provider_manifest(bytes: &[u8]) -> Result<ArchiveProviderManifest> {
+    let mut reader = CanonicalReader::new(bytes);
+    let manifest = ArchiveProviderManifest {
+        provider_id: reader.read_fixed()?,
+        schedule_seed: reader.read_fixed()?,
+        coverage_first_epoch: reader.read_u64()?,
+        coverage_last_epoch: reader.read_u64()?,
+        shard_ids: reader.read_vec(|reader| reader.read_u64())?,
+        shard_digests: reader.read_vec(|reader| reader.read_fixed())?,
+        manifest_digest: reader.read_fixed()?,
+    };
+    reader.finish()?;
+    Ok(manifest)
+}
+
+pub fn encode_archive_shard_bundle(bundle: &ArchiveShardBundle) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&bundle.provider_id);
+    writer.write_fixed(&bundle.provider_manifest_digest);
+    writer.write_bytes(&encode_archive_shard(&bundle.shard)?)?;
+    writer.write_vec(&bundle.epochs, |writer, epoch| {
+        writer.write_bytes(&encode_archived_nullifier_epoch(epoch)?)?;
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_archive_shard_bundle(bytes: &[u8]) -> Result<ArchiveShardBundle> {
+    let mut reader = CanonicalReader::new(bytes);
+    let bundle = ArchiveShardBundle {
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        shard: decode_archive_shard(&reader.read_bytes()?)?,
+        epochs: reader.read_vec(|reader| decode_archived_nullifier_epoch(&reader.read_bytes()?))?,
+    };
+    reader.finish()?;
+    Ok(bundle)
+}
+
 pub fn encode_nullifier_root_ledger(ledger: &NullifierRootLedger) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     let entries = ledger.roots.iter().collect::<Vec<_>>();
@@ -1052,6 +1147,42 @@ pub fn decode_historical_unspent_checkpoint(bytes: &[u8]) -> Result<HistoricalUn
     Ok(checkpoint)
 }
 
+fn write_evolving_nullifier_query(writer: &mut CanonicalWriter, query: &EvolvingNullifierQuery) {
+    writer.write_u64(query.epoch);
+    writer.write_fixed(&query.nullifier);
+}
+
+fn read_evolving_nullifier_query(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<EvolvingNullifierQuery> {
+    Ok(EvolvingNullifierQuery {
+        epoch: reader.read_u64()?,
+        nullifier: reader.read_fixed()?,
+    })
+}
+
+pub fn encode_checkpoint_extension_request(
+    request: &CheckpointExtensionRequest,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(&encode_historical_unspent_checkpoint(&request.checkpoint)?)?;
+    writer.write_vec(&request.queries, |writer, query| {
+        write_evolving_nullifier_query(writer, query);
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_checkpoint_extension_request(bytes: &[u8]) -> Result<CheckpointExtensionRequest> {
+    let mut reader = CanonicalReader::new(bytes);
+    let request = CheckpointExtensionRequest {
+        checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
+        queries: reader.read_vec(read_evolving_nullifier_query)?,
+    };
+    reader.finish()?;
+    Ok(request)
+}
+
 fn write_historical_absence_record(
     writer: &mut CanonicalWriter,
     record: &HistoricalAbsenceRecord,
@@ -1077,10 +1208,15 @@ pub fn encode_historical_unspent_extension(
 ) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(extension.version);
+    writer.write_fixed(&extension.provider_id);
+    writer.write_fixed(&extension.provider_manifest_digest);
     writer.write_fixed(&extension.note_commitment);
     writer.write_u64(extension.from_epoch);
     writer.write_u64(extension.through_epoch);
     writer.write_fixed(&extension.prior_transcript_root);
+    writer.write_fixed(&extension.service_transcript_root);
+    writer.write_fixed(&extension.historical_root_digest);
+    writer.write_fixed(&extension.rerandomization_blinding);
     writer.write_fixed(&extension.new_transcript_root);
     writer.write_vec(&extension.records, |writer, record| {
         write_historical_absence_record(writer, record)
@@ -1092,15 +1228,105 @@ pub fn decode_historical_unspent_extension(bytes: &[u8]) -> Result<HistoricalUns
     let mut reader = CanonicalReader::new(bytes);
     let extension = HistoricalUnspentExtension {
         version: reader.read_u8()?,
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
         note_commitment: reader.read_fixed()?,
         from_epoch: reader.read_u64()?,
         through_epoch: reader.read_u64()?,
         prior_transcript_root: reader.read_fixed()?,
+        service_transcript_root: reader.read_fixed()?,
+        historical_root_digest: reader.read_fixed()?,
+        rerandomization_blinding: reader.read_fixed()?,
         new_transcript_root: reader.read_fixed()?,
         records: reader.read_vec(read_historical_absence_record)?,
     };
     reader.finish()?;
     Ok(extension)
+}
+
+pub fn encode_historical_unspent_service_response(
+    response: &HistoricalUnspentServiceResponse,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(response.version);
+    writer.write_fixed(&response.provider_id);
+    writer.write_fixed(&response.provider_manifest_digest);
+    writer.write_fixed(&response.note_commitment);
+    writer.write_u64(response.from_epoch);
+    writer.write_u64(response.through_epoch);
+    writer.write_fixed(&response.prior_transcript_root);
+    writer.write_fixed(&response.service_transcript_root);
+    writer.write_fixed(&response.historical_root_digest);
+    writer.write_vec(&response.records, |writer, record| {
+        write_historical_absence_record(writer, record)
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_historical_unspent_service_response(
+    bytes: &[u8],
+) -> Result<HistoricalUnspentServiceResponse> {
+    let mut reader = CanonicalReader::new(bytes);
+    let response = HistoricalUnspentServiceResponse {
+        version: reader.read_u8()?,
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        note_commitment: reader.read_fixed()?,
+        from_epoch: reader.read_u64()?,
+        through_epoch: reader.read_u64()?,
+        prior_transcript_root: reader.read_fixed()?,
+        service_transcript_root: reader.read_fixed()?,
+        historical_root_digest: reader.read_fixed()?,
+        records: reader.read_vec(read_historical_absence_record)?,
+    };
+    reader.finish()?;
+    Ok(response)
+}
+
+pub fn encode_checkpoint_batch_request(request: &CheckpointBatchRequest) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&request.provider_id);
+    writer.write_fixed(&request.provider_manifest_digest);
+    writer.write_vec(&request.requests, |writer, request| {
+        writer.write_bytes(&encode_checkpoint_extension_request(request)?)?;
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_checkpoint_batch_request(bytes: &[u8]) -> Result<CheckpointBatchRequest> {
+    let mut reader = CanonicalReader::new(bytes);
+    let request = CheckpointBatchRequest {
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        requests: reader
+            .read_vec(|reader| decode_checkpoint_extension_request(&reader.read_bytes()?))?,
+    };
+    reader.finish()?;
+    Ok(request)
+}
+
+pub fn encode_checkpoint_batch_response(response: &CheckpointBatchResponse) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&response.provider_id);
+    writer.write_fixed(&response.provider_manifest_digest);
+    writer.write_vec(&response.responses, |writer, response| {
+        writer.write_bytes(&encode_historical_unspent_service_response(response)?)?;
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_checkpoint_batch_response(bytes: &[u8]) -> Result<CheckpointBatchResponse> {
+    let mut reader = CanonicalReader::new(bytes);
+    let response = CheckpointBatchResponse {
+        provider_id: reader.read_fixed()?,
+        provider_manifest_digest: reader.read_fixed()?,
+        responses: reader
+            .read_vec(|reader| decode_historical_unspent_service_response(&reader.read_bytes()?))?,
+    };
+    reader.finish()?;
+    Ok(response)
 }
 
 pub fn encode_checkpoint_presentation(presentation: &CheckpointPresentation) -> Result<Vec<u8>> {

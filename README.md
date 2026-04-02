@@ -22,7 +22,8 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 - Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
 - Canonical transactions carry a succinct STARK receipt over a private witness, while validators only see the current nullifiers, encrypted outputs, and the proof journal bindings required to update state.
 - Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
-- Wallet checkpoint refresh now batches note queries by epoch and pads them with cover requests, so archive sync is less one-note-at-a-time and less directly spend-shaped.
+- Wallet checkpoint refresh now sends batched checkpoint requests to archive providers discovered on the PQ mesh, pads provider/epoch buckets with cover traffic, and rerandomizes provider responses before they become checkpoint state.
+- Archived nullifier history is organized into content-addressed epoch shards with provider manifests advertised over the PQ mesh, and shard backfill happens through direct provider requests rather than a single opaque sync server.
 
 ## Architecture
 

@@ -26,7 +26,6 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     Key, XChaCha20Poly1305, XNonce,
 };
-use std::collections::BTreeMap;
 use std::sync::Arc;
 // no AEAD usage in deterministic OTP flow
 use atty;
@@ -44,7 +43,7 @@ const SENT_TX_PREFIX: &[u8] = b"shielded_sent_tx/";
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
-const OBLIVIOUS_SYNC_MIN_EPOCH_BATCH: usize = 4;
+const SHIELDED_SYNC_ROUND_KEY: &[u8] = b"shielded_sync_round";
 
 #[derive(Serialize, Deserialize)]
 struct WalletSecretsV3 {
@@ -438,9 +437,7 @@ impl Wallet {
     }
 
     pub fn sync_shielded_notes(&self) -> Result<()> {
-        self.sync_owned_shielded_notes()?;
-        let mut notes = self.load_owned_shielded_notes(false, true)?;
-        self.refresh_owned_shielded_checkpoints(&mut notes)
+        self.sync_owned_shielded_notes()
     }
 
     pub fn list_owned_shielded_notes(&self) -> Result<Vec<OwnedShieldedNote>> {
@@ -477,7 +474,11 @@ impl Wallet {
         Ok(notes)
     }
 
-    fn refresh_owned_shielded_checkpoints(&self, notes: &mut [OwnedShieldedNote]) -> Result<()> {
+    async fn refresh_owned_shielded_checkpoints(
+        &self,
+        notes: &mut [OwnedShieldedNote],
+        network: &crate::network::NetHandle,
+    ) -> Result<()> {
         let store = self
             ._db
             .upgrade()
@@ -491,7 +492,6 @@ impl Wallet {
 
         let mut requests = Vec::new();
         let mut request_note_indexes = Vec::new();
-        let mut query_counts_by_epoch = BTreeMap::<u64, usize>::new();
         for (note_index, owned) in notes.iter().enumerate() {
             let from_epoch = owned.checkpoint.covered_through_epoch.saturating_add(1);
             if through_epoch < from_epoch {
@@ -504,7 +504,6 @@ impl Wallet {
                         .note
                         .derive_evolving_nullifier(&owned.note_key, &chain_id, epoch)?;
                 queries.push(shielded::EvolvingNullifierQuery { epoch, nullifier });
-                *query_counts_by_epoch.entry(epoch).or_default() += 1;
             }
             request_note_indexes.push(note_index);
             requests.push(shielded::CheckpointExtensionRequest {
@@ -517,8 +516,10 @@ impl Wallet {
             return Ok(());
         }
 
-        requests.extend(self.build_oblivious_cover_requests(&query_counts_by_epoch)?);
-        let extensions = transaction::build_local_historical_extensions(store.as_ref(), &requests)?;
+        let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
+        let extensions = network
+            .request_historical_extensions(&requests, rotation_round)
+            .await?;
         let ledger = store
             .load_shielded_root_ledger()?
             .ok_or_else(|| anyhow!("missing shielded root ledger"))?;
@@ -537,34 +538,12 @@ impl Wallet {
         Ok(())
     }
 
-    fn build_oblivious_cover_requests(
-        &self,
-        query_counts_by_epoch: &BTreeMap<u64, usize>,
-    ) -> Result<Vec<shielded::CheckpointExtensionRequest>> {
-        let mut cover_requests = Vec::new();
-        for (&epoch, &real_count) in query_counts_by_epoch {
-            let target_count = real_count
-                .max(OBLIVIOUS_SYNC_MIN_EPOCH_BATCH)
-                .next_power_of_two()
-                .min(crate::protocol::CURRENT.max_historical_nullifier_batch as usize);
-            for _ in real_count..target_count {
-                let mut fake_commitment = [0u8; 32];
-                let mut fake_nullifier = [0u8; 32];
-                OsRng.fill_bytes(&mut fake_commitment);
-                OsRng.fill_bytes(&mut fake_nullifier);
-                cover_requests.push(shielded::CheckpointExtensionRequest {
-                    checkpoint: shielded::HistoricalUnspentCheckpoint::genesis(
-                        fake_commitment,
-                        epoch,
-                    ),
-                    queries: vec![shielded::EvolvingNullifierQuery {
-                        epoch,
-                        nullifier: fake_nullifier,
-                    }],
-                });
-            }
-        }
-        Ok(cover_requests)
+    fn next_shielded_sync_round(&self, store: &Store) -> Result<u64> {
+        let round = store
+            .get::<u64>("meta", SHIELDED_SYNC_ROUND_KEY)?
+            .unwrap_or(0);
+        store.put("meta", SHIELDED_SYNC_ROUND_KEY, &round.saturating_add(1))?;
+        Ok(round)
     }
 
     fn build_shielded_output(
@@ -715,7 +694,8 @@ impl Wallet {
         transaction::ensure_shielded_runtime_state(store.as_ref())?;
         self.sync_owned_shielded_notes()?;
         let mut available_notes = self.load_owned_shielded_notes(false, true)?;
-        self.refresh_owned_shielded_checkpoints(&mut available_notes)?;
+        self.refresh_owned_shielded_checkpoints(&mut available_notes, network)
+            .await?;
         let selected_notes = {
             let mut selected = Vec::new();
             let mut total = 0u64;
@@ -765,15 +745,7 @@ impl Wallet {
                 &owned.note_key,
                 &membership_proof,
                 &owned.checkpoint,
-                &shielded::HistoricalUnspentExtension {
-                    version: shielded::SHIELDED_EXTENSION_VERSION,
-                    note_commitment: owned.checkpoint.note_commitment,
-                    from_epoch: owned.checkpoint.covered_through_epoch.saturating_add(1),
-                    through_epoch: owned.checkpoint.covered_through_epoch,
-                    prior_transcript_root: owned.checkpoint.transcript_root,
-                    new_transcript_root: owned.checkpoint.transcript_root,
-                    records: Vec::new(),
-                },
+                &owned.checkpoint.empty_extension(),
                 &current_nullifier,
             ));
         }

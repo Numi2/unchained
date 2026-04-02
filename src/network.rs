@@ -15,20 +15,27 @@ use crate::sync::SyncState;
 use crate::{
     coin::{Coin, CoinCandidate},
     config, crypto,
+    shielded::{
+        local_archive_provider_manifest, route_checkpoint_requests, ArchiveDirectory,
+        ArchiveProviderManifest, ArchiveShardBundle, CheckpointBatchRequest,
+        CheckpointBatchResponse, CheckpointExtensionRequest, HistoricalUnspentExtension,
+        ShieldedSyncServer,
+    },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint};
+use rand::RngCore;
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -64,6 +71,7 @@ const REQUEST_FANOUT_DEFAULT: usize = 2;
 const REQUEST_FANOUT_HEADERS: usize = 3;
 const REQUEST_FANOUT_TIP: usize = 4;
 const REQUEST_FANOUT_RECOVERY: usize = 4;
+const ARCHIVE_MANIFEST_REFRESH_SECS: u64 = 15;
 
 static RECENT_HASH_REQS: Lazy<Mutex<HashMap<[u8; 32], Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -134,6 +142,19 @@ pub struct EpochByHash {
     pub hash: [u8; 32],
 }
 
+#[derive(Debug, Clone)]
+struct CheckpointBatchEvent {
+    response_to_message_id: [u8; 32],
+    provider_id: [u8; 32],
+    response: CheckpointBatchResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveShardRequest {
+    pub provider_id: [u8; 32],
+    pub shard_id: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HelloMessage {
     record: NodeRecordV2,
@@ -163,6 +184,12 @@ enum WireTopic {
     RequestEpochSelected,
     RequestEpochLeaves,
     RequestEpochCandidates,
+    NodeRecord,
+    ArchiveManifest,
+    RequestArchiveShard,
+    ArchiveShard,
+    RequestCheckpointBatch,
+    CheckpointBatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +227,12 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::RequestEpochSelected => 19,
         WireTopic::RequestEpochLeaves => 20,
         WireTopic::RequestEpochCandidates => 21,
+        WireTopic::NodeRecord => 22,
+        WireTopic::ArchiveManifest => 23,
+        WireTopic::RequestArchiveShard => 24,
+        WireTopic::ArchiveShard => 25,
+        WireTopic::RequestCheckpointBatch => 26,
+        WireTopic::CheckpointBatch => 27,
     }
 }
 
@@ -226,6 +259,12 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         19 => WireTopic::RequestEpochSelected,
         20 => WireTopic::RequestEpochLeaves,
         21 => WireTopic::RequestEpochCandidates,
+        22 => WireTopic::NodeRecord,
+        23 => WireTopic::ArchiveManifest,
+        24 => WireTopic::RequestArchiveShard,
+        25 => WireTopic::ArchiveShard,
+        26 => WireTopic::RequestCheckpointBatch,
+        27 => WireTopic::CheckpointBatch,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -266,6 +305,23 @@ fn decode_empty_body(bytes: &[u8]) -> Result<()> {
     } else {
         bail!("expected empty wire body")
     }
+}
+
+fn encode_archive_shard_request(request: &ArchiveShardRequest) -> Vec<u8> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&request.provider_id);
+    writer.write_u64(request.shard_id);
+    writer.into_vec()
+}
+
+fn decode_archive_shard_request(bytes: &[u8]) -> Result<ArchiveShardRequest> {
+    let mut reader = CanonicalReader::new(bytes);
+    let request = ArchiveShardRequest {
+        provider_id: reader.read_fixed()?,
+        shard_id: reader.read_u64()?,
+    };
+    reader.finish()?;
+    Ok(request)
 }
 
 fn encode_topic_frame(topic: WireTopic, body: Vec<u8>) -> Result<Vec<u8>> {
@@ -367,6 +423,9 @@ struct RuntimeState {
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
     rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
+    checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
+    archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
+    peer_exchange: bool,
 }
 
 #[derive(Clone)]
@@ -375,14 +434,19 @@ pub struct Network {
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
     rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
+    checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<[u8; 32]>>>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
     endpoint: Arc<AsyncMutex<Option<Endpoint>>>,
+    db: Arc<Store>,
+    archive_sync_timeout: Duration,
+    local_node_id: [u8; 32],
+    known_records: Arc<RwLock<HashMap<[u8; 32], NodeRecordV2>>>,
+    archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
 }
 
-#[derive(Debug, Clone)]
 enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
@@ -400,26 +464,44 @@ enum NetworkCommand {
     GossipEpochLeaves(EpochLeavesBundle),
     RequestEpochCandidates([u8; 32]),
     RequestEpochDirect(u64),
+    EnsureArchiveEpochs(Vec<u64>),
+    RequestCheckpointBatch {
+        record: NodeRecordV2,
+        request: CheckpointBatchRequest,
+        reply: oneshot::Sender<Result<[u8; 32]>>,
+    },
     RedialBootstraps,
 }
 
 #[cfg(test)]
 pub fn testing_stub_handle() -> NetHandle {
+    let tempdir = tempfile::tempdir().expect("create tempdir for network stub");
+    let db = Arc::new(
+        Store::open(&tempdir.path().to_string_lossy()).expect("open temp store for network stub"),
+    );
+    std::mem::forget(tempdir);
     let (tx_tx, _) = broadcast::channel(1);
     let (anchor_tx, _) = broadcast::channel(1);
     let (rate_limited_tx, _) = broadcast::channel(1);
     let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
+    let (checkpoint_tx, _) = broadcast::channel::<CheckpointBatchEvent>(1);
     let (command_tx, _) = mpsc::unbounded_channel();
     Arc::new(Network {
         anchor_tx,
         tx_tx,
         rate_limited_tx,
         headers_tx,
+        checkpoint_tx,
         command_tx,
         connected_peers: Arc::new(Mutex::new(HashSet::new())),
         shutdown: CancellationToken::new(),
         tasks: TaskTracker::new(),
         endpoint: Arc::new(AsyncMutex::new(None)),
+        db,
+        archive_sync_timeout: Duration::from_secs(1),
+        local_node_id: [0u8; 32],
+        known_records: Arc::new(RwLock::new(HashMap::new())),
+        archive_manifests: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -511,6 +593,190 @@ impl RuntimeState {
         }
     }
 
+    async fn local_archive_manifest(&self) -> Result<ArchiveProviderManifest> {
+        let ledger = self.db.load_shielded_root_ledger()?.unwrap_or_default();
+        let mut available_epochs = BTreeSet::new();
+        for epoch in ledger.roots.keys() {
+            if self.db.load_shielded_nullifier_epoch(*epoch)?.is_some() {
+                available_epochs.insert(*epoch);
+            }
+        }
+        local_archive_provider_manifest(
+            self.local_node_id().await,
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            &available_epochs,
+        )
+    }
+
+    async fn refresh_local_archive_manifest(&self) -> Result<ArchiveProviderManifest> {
+        let manifest = self.local_archive_manifest().await?;
+        self.db.store_shielded_archive_provider(&manifest)?;
+        self.archive_manifests
+            .write()
+            .await
+            .insert(manifest.provider_id, manifest.clone());
+        Ok(manifest)
+    }
+
+    async fn local_archive_directory(&self) -> Result<ArchiveDirectory> {
+        let ledger = self.db.load_shielded_root_ledger()?.unwrap_or_default();
+        let mut providers = self
+            .archive_manifests
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_manifest = self.local_archive_manifest().await?;
+        if let Some(existing) = providers
+            .iter_mut()
+            .find(|existing| existing.provider_id == local_manifest.provider_id)
+        {
+            *existing = local_manifest;
+        } else {
+            providers.push(local_manifest);
+        }
+        ArchiveDirectory::from_root_ledger_and_providers(
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            providers,
+        )
+    }
+
+    async fn build_local_checkpoint_batch_response(
+        &self,
+        request: &CheckpointBatchRequest,
+    ) -> Result<Option<CheckpointBatchResponse>> {
+        let manifest = self.local_archive_manifest().await?;
+        if request.provider_id != manifest.provider_id {
+            return Ok(None);
+        }
+        let directory = ArchiveDirectory::from_root_ledger_and_providers(
+            &self.db.load_shielded_root_ledger()?.unwrap_or_default(),
+            PROTOCOL.archive_shard_epoch_span,
+            vec![manifest.clone()],
+        )?;
+        request.validate_against_manifest(&manifest, &directory)?;
+
+        let mut server = ShieldedSyncServer::new();
+        let mut needed_epochs = BTreeSet::new();
+        for checkpoint_request in &request.requests {
+            for query in &checkpoint_request.queries {
+                needed_epochs.insert(query.epoch);
+            }
+        }
+        for epoch in needed_epochs {
+            let archived = self
+                .db
+                .load_shielded_nullifier_epoch(epoch)?
+                .ok_or_else(|| anyhow!("missing nullifier archive for epoch {}", epoch))?;
+            server.insert_archived_epoch(archived)?;
+        }
+        Ok(Some(CheckpointBatchResponse {
+            provider_id: manifest.provider_id,
+            provider_manifest_digest: manifest.manifest_digest,
+            responses: server.serve_checkpoints_batch(&manifest, &request.requests)?,
+        }))
+    }
+
+    async fn ingest_archive_manifest(
+        &self,
+        record: &NodeRecordV2,
+        manifest: ArchiveProviderManifest,
+    ) -> Result<()> {
+        if manifest.provider_id != record.node_id {
+            bail!("archive manifest provider id does not match the envelope signer");
+        }
+        let directory = ArchiveDirectory::from_root_ledger_and_providers(
+            &self.db.load_shielded_root_ledger()?.unwrap_or_default(),
+            PROTOCOL.archive_shard_epoch_span,
+            vec![manifest.clone()],
+        )?;
+        manifest.validate(&directory)?;
+        self.db.store_shielded_archive_provider(&manifest)?;
+        self.archive_manifests
+            .write()
+            .await
+            .insert(manifest.provider_id, manifest);
+        Ok(())
+    }
+
+    async fn request_missing_archive_epochs(&self, epochs: &[u64]) -> Result<()> {
+        if epochs.is_empty() {
+            return Ok(());
+        }
+        let wanted = epochs.iter().copied().collect::<BTreeSet<_>>();
+        let directory = self.local_archive_directory().await?;
+        let mut available_epochs = BTreeSet::new();
+        for epoch in &wanted {
+            if self.db.load_shielded_nullifier_epoch(*epoch)?.is_some() {
+                available_epochs.insert(*epoch);
+            }
+        }
+        let missing_shards = directory.shard_ids_covering_epochs(&wanted, &available_epochs);
+        let rotation_round = unix_ms();
+        for shard_id in missing_shards {
+            let provider = match directory.provider_for_shard(shard_id, rotation_round) {
+                Ok(provider) => provider.clone(),
+                Err(_) => continue,
+            };
+            let record = {
+                let guard = self.known_records.read().await;
+                guard.get(&provider.provider_id).cloned()
+            };
+            let Some(record) = record else {
+                continue;
+            };
+            let _ = self
+                .sign_and_send_to_record_related(
+                    record,
+                    WireTopic::RequestArchiveShard,
+                    encode_archive_shard_request(&ArchiveShardRequest {
+                        provider_id: provider.provider_id,
+                        shard_id,
+                    }),
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn build_local_archive_shard_bundle(
+        &self,
+        request: &ArchiveShardRequest,
+    ) -> Result<Option<ArchiveShardBundle>> {
+        if request.provider_id != self.local_node_id().await {
+            return Ok(None);
+        }
+        let manifest = self.local_archive_manifest().await?;
+        let directory = ArchiveDirectory::from_root_ledger_and_providers(
+            &self.db.load_shielded_root_ledger()?.unwrap_or_default(),
+            PROTOCOL.archive_shard_epoch_span,
+            vec![manifest.clone()],
+        )?;
+        let Some(shard) = directory.shard(request.shard_id).cloned() else {
+            return Ok(None);
+        };
+        if !manifest.serves_shard(shard.shard_id, &shard.root_digest) {
+            return Ok(None);
+        }
+        let mut epochs = Vec::with_capacity(shard.epoch_roots.len());
+        for (epoch, _) in &shard.epoch_roots {
+            let Some(archived) = self.db.load_shielded_nullifier_epoch(*epoch)? else {
+                return Ok(None);
+            };
+            epochs.push(archived);
+        }
+        Ok(Some(ArchiveShardBundle {
+            provider_id: manifest.provider_id,
+            provider_manifest_digest: manifest.manifest_digest,
+            shard,
+            epochs,
+        }))
+    }
+
     async fn register_connection(
         &self,
         record: NodeRecordV2,
@@ -527,7 +793,56 @@ impl RuntimeState {
             peers.insert(record.node_id);
             metrics::PEERS.set(peers.len() as i64);
         }
-        self.remember_record(record).await?;
+        let discovered = self.remember_record(record.clone()).await?;
+        if discovered && self.peer_exchange {
+            let _ = self
+                .sign_and_broadcast(
+                    WireTopic::NodeRecord,
+                    canonical::encode_node_record(&record)?,
+                )
+                .await;
+        }
+        if let Ok(manifest) = self.refresh_local_archive_manifest().await {
+            match canonical::encode_archive_provider_manifest(&manifest) {
+                Ok(body) => match self
+                    .sign_topic_envelope(WireTopic::ArchiveManifest, body)
+                    .await
+                {
+                    Ok(envelope) => match encode_wire_message(&WireMessage::Envelope(envelope)) {
+                        Ok(bytes) => {
+                            if let Err(e) = self.maybe_send_bytes(&connection, &bytes).await {
+                                net_log!(
+                                    "⚠️  Failed to publish archive manifest to {}: {}",
+                                    hex::encode(record.node_id),
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            net_log!(
+                                "⚠️  Failed to encode archive manifest for {}: {}",
+                                hex::encode(record.node_id),
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        net_log!(
+                            "⚠️  Failed to sign archive manifest for {}: {}",
+                            hex::encode(record.node_id),
+                            e
+                        );
+                    }
+                },
+                Err(e) => {
+                    net_log!(
+                        "⚠️  Failed to serialize archive manifest for {}: {}",
+                        hex::encode(record.node_id),
+                        e
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -657,6 +972,36 @@ impl RuntimeState {
         Ok(sent)
     }
 
+    async fn sign_and_send_to_record_related(
+        &self,
+        record: NodeRecordV2,
+        topic: WireTopic,
+        body: Vec<u8>,
+        response_to_message_id: Option<[u8; 32]>,
+    ) -> Result<bool> {
+        let bytes = encode_wire_message(&WireMessage::Envelope(
+            self.sign_topic_envelope_related(topic, body, response_to_message_id)
+                .await?,
+        ))?;
+        self.send_bytes_to_target(record, bytes).await
+    }
+
+    async fn sign_and_send_to_record_related_with_id(
+        &self,
+        record: NodeRecordV2,
+        topic: WireTopic,
+        body: Vec<u8>,
+        response_to_message_id: Option<[u8; 32]>,
+    ) -> Result<[u8; 32]> {
+        let envelope = self
+            .sign_topic_envelope_related(topic, body, response_to_message_id)
+            .await?;
+        let message_id = envelope.message_id;
+        let bytes = encode_wire_message(&WireMessage::Envelope(envelope))?;
+        let _ = self.send_bytes_to_target(record, bytes).await?;
+        Ok(message_id)
+    }
+
     async fn send_bytes_to_target(&self, record: NodeRecordV2, bytes: Vec<u8>) -> Result<bool> {
         if self.send_bytes_to_peer(record.node_id, &bytes).await? {
             return Ok(true);
@@ -679,6 +1024,19 @@ impl RuntimeState {
             if let Err(e) = state.send_bytes_to_peer(record.node_id, &bytes).await {
                 net_log!(
                     "⚠️  Failed to send queued request to {}: {}",
+                    hex::encode(record.node_id),
+                    e
+                );
+            }
+        });
+    }
+
+    fn schedule_dial(&self, record: NodeRecordV2) {
+        let state = self.clone();
+        self.tasks.spawn(async move {
+            if let Err(e) = state.dial_record(record.clone()).await {
+                net_log!(
+                    "⚠️  Failed to dial discovered peer {}: {}",
                     hex::encode(record.node_id),
                     e
                 );
@@ -894,21 +1252,51 @@ impl RuntimeState {
         self.unregister_connection(record.node_id).await;
     }
 
-    async fn handle_envelope(&self, record: NodeRecordV2, envelope: SignedEnvelope) -> Result<()> {
-        envelope.verify(&record, unix_ms())?;
+    async fn handle_envelope(
+        &self,
+        connection_record: NodeRecordV2,
+        envelope: SignedEnvelope,
+    ) -> Result<()> {
+        let connection_node_id = connection_record.node_id;
+        let response_to_message_id = envelope.response_to_message_id;
+        let author_record = if envelope.node_id == connection_record.node_id {
+            connection_record
+        } else {
+            let discovered = {
+                let guard = self.known_records.read().await;
+                guard.get(&envelope.node_id).cloned()
+            };
+            let Some(discovered) = discovered else {
+                net_log!(
+                    "⚠️  Dropping relayed envelope from unknown author {} via {}",
+                    hex::encode(envelope.node_id),
+                    hex::encode(connection_record.node_id)
+                );
+                return Ok(());
+            };
+            discovered
+        };
+        envelope.verify(&author_record, unix_ms())?;
         let first_time = self.mark_message_seen(envelope.message_id).await;
         let frame: TopicFrame = decode_topic_frame(&envelope.payload)?;
         if first_time && should_relay_topic(frame.topic) {
-            self.broadcast_envelope(envelope.clone(), Some(record.node_id))
+            self.broadcast_envelope(envelope.clone(), Some(connection_node_id))
                 .await?;
         }
-        self.handle_topic(record, envelope.message_id, frame).await
+        self.handle_topic(
+            author_record,
+            envelope.message_id,
+            response_to_message_id,
+            frame,
+        )
+        .await
     }
 
     async fn handle_topic(
         &self,
         record: NodeRecordV2,
-        request_message_id: [u8; 32],
+        message_id: [u8; 32],
+        response_to_message_id: Option<[u8; 32]>,
         frame: TopicFrame,
     ) -> Result<()> {
         match frame.topic {
@@ -951,6 +1339,21 @@ impl RuntimeState {
                 let msg = canonical::decode_rate_limited_message(&frame.body)?;
                 let _ = self.rate_limited_tx.send(msg);
             }
+            WireTopic::NodeRecord => {
+                let discovered = canonical::decode_node_record(&frame.body)?;
+                let is_new = self.remember_record(discovered.clone()).await?;
+                if is_new {
+                    if self.peer_exchange {
+                        let _ = self
+                            .sign_and_broadcast(
+                                WireTopic::NodeRecord,
+                                canonical::encode_node_record(&discovered)?,
+                            )
+                            .await;
+                    }
+                    self.schedule_dial(discovered);
+                }
+            }
             WireTopic::EpochLeaves => {
                 let bundle = canonical::decode_epoch_leaves_bundle(&frame.body)?;
                 let epoch_num = bundle.epoch_num;
@@ -989,7 +1392,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::Anchor,
                             canonical::encode_anchor(&anchor)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1014,7 +1417,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::EpochHeadersResponse,
                             canonical::encode_epoch_headers_batch(&batch)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1027,7 +1430,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::EpochByHashResponse,
                             canonical::encode_anchor(&anchor)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1040,7 +1443,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::Coin,
                             canonical::encode_coin(&coin)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1053,7 +1456,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::Anchor,
                             canonical::encode_anchor(&anchor)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1067,7 +1470,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::EpochTxn,
                             canonical::encode_epoch_txn(&txn)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1097,7 +1500,7 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::EpochSelectedResponse,
                             canonical::encode_selected_ids_bundle(&bundle)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
@@ -1116,7 +1519,7 @@ impl RuntimeState {
                                 record.node_id,
                                 WireTopic::EpochLeaves,
                                 canonical::encode_epoch_leaves_bundle(&bundle)?,
-                                Some(request_message_id),
+                                Some(message_id),
                             )
                             .await?;
                     }
@@ -1135,10 +1538,71 @@ impl RuntimeState {
                             record.node_id,
                             WireTopic::EpochCandidatesResponse,
                             canonical::encode_epoch_candidates_response(&response)?,
-                            Some(request_message_id),
+                            Some(message_id),
                         )
                         .await?;
                 }
+            }
+            WireTopic::RequestCheckpointBatch => {
+                let request = canonical::decode_checkpoint_batch_request(&frame.body)?;
+                if let Some(response) = self.build_local_checkpoint_batch_response(&request).await?
+                {
+                    let _ = self
+                        .sign_and_send_to_peer_related(
+                            record.node_id,
+                            WireTopic::CheckpointBatch,
+                            canonical::encode_checkpoint_batch_response(&response)?,
+                            Some(message_id),
+                        )
+                        .await?;
+                }
+            }
+            WireTopic::CheckpointBatch => {
+                let response = canonical::decode_checkpoint_batch_response(&frame.body)?;
+                if response.provider_id != record.node_id {
+                    bail!("checkpoint batch response provider does not match the envelope signer");
+                }
+                let response_to_message_id = response_to_message_id
+                    .ok_or_else(|| anyhow!("checkpoint batch response is missing correlation"))?;
+                let _ = self.checkpoint_tx.send(CheckpointBatchEvent {
+                    response_to_message_id,
+                    provider_id: response.provider_id,
+                    response,
+                });
+            }
+            WireTopic::ArchiveManifest => {
+                let manifest = canonical::decode_archive_provider_manifest(&frame.body)?;
+                self.ingest_archive_manifest(&record, manifest.clone())
+                    .await?;
+                let wanted = (manifest.coverage_first_epoch..=manifest.coverage_last_epoch)
+                    .collect::<Vec<_>>();
+                self.request_missing_archive_epochs(&wanted).await?;
+            }
+            WireTopic::RequestArchiveShard => {
+                let request = decode_archive_shard_request(&frame.body)?;
+                if let Some(bundle) = self.build_local_archive_shard_bundle(&request).await? {
+                    let _ = self
+                        .sign_and_send_to_peer_related(
+                            record.node_id,
+                            WireTopic::ArchiveShard,
+                            canonical::encode_archive_shard_bundle(&bundle)?,
+                            Some(message_id),
+                        )
+                        .await?;
+                }
+            }
+            WireTopic::ArchiveShard => {
+                let bundle = canonical::decode_archive_shard_bundle(&frame.body)?;
+                if bundle.provider_id != record.node_id {
+                    bail!("archive shard bundle provider does not match the envelope signer");
+                }
+                let directory = self.local_archive_directory().await?;
+                let manifest = directory.provider(&bundle.provider_id)?.clone();
+                bundle.validate(&manifest, &directory)?;
+                for archived in bundle.epochs {
+                    self.db.store_shielded_nullifier_epoch(&archived)?;
+                }
+                let _ = self.refresh_local_archive_manifest().await;
             }
         }
 
@@ -1513,10 +1977,12 @@ pub async fn spawn(
         .collect::<HashSet<_>>();
 
     let persisted_records = load_persisted_records(&db, &banned_node_ids)?;
+    let persisted_archive_manifests = db.load_shielded_archive_providers()?;
     let (anchor_tx, _) = broadcast::channel(256);
     let (tx_tx, _) = broadcast::channel(256);
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (headers_tx, _) = broadcast::channel(256);
+    let (checkpoint_tx, _) = broadcast::channel(256);
     let connected_peers = Arc::new(Mutex::new(HashSet::new()));
     let shutdown = CancellationToken::new();
     let tasks = TaskTracker::new();
@@ -1545,6 +2011,14 @@ pub async fn spawn(
         tx_tx: tx_tx.clone(),
         rate_limited_tx: rate_limited_tx.clone(),
         headers_tx: headers_tx.clone(),
+        checkpoint_tx: checkpoint_tx.clone(),
+        archive_manifests: Arc::new(RwLock::new(
+            persisted_archive_manifests
+                .into_iter()
+                .map(|manifest| (manifest.provider_id, manifest))
+                .collect(),
+        )),
+        peer_exchange: net_cfg.peer_exchange,
     };
 
     {
@@ -1558,6 +2032,7 @@ pub async fn spawn(
     {
         let _ = state.remember_record(record).await;
     }
+    let _ = state.refresh_local_archive_manifest().await;
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let net = Arc::new(Network {
@@ -1565,11 +2040,17 @@ pub async fn spawn(
         tx_tx,
         rate_limited_tx,
         headers_tx,
+        checkpoint_tx,
         command_tx: command_tx.clone(),
         connected_peers,
         shutdown,
         tasks,
         endpoint: Arc::new(AsyncMutex::new(Some(endpoint.clone()))),
+        db: state.db.clone(),
+        archive_sync_timeout: Duration::from_secs(net_cfg.sync_timeout_secs.max(1)),
+        local_node_id: local_record.node_id,
+        known_records: state.known_records.clone(),
+        archive_manifests: state.archive_manifests.clone(),
     });
 
     {
@@ -1666,6 +2147,39 @@ pub async fn spawn(
         let state = state.clone();
         let tasks = state.tasks.clone();
         tasks.spawn(async move {
+            let mut manifest_tick =
+                tokio::time::interval(Duration::from_secs(ARCHIVE_MANIFEST_REFRESH_SECS));
+            loop {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
+                    _ = manifest_tick.tick() => {
+                        match state.refresh_local_archive_manifest().await {
+                            Ok(manifest) => {
+                                match canonical::encode_archive_provider_manifest(&manifest) {
+                                    Ok(bytes) => {
+                                        let _ = state
+                                            .sign_and_broadcast(WireTopic::ArchiveManifest, bytes)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        net_log!("⚠️  Failed to encode local archive manifest: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                net_log!("⚠️  Failed to refresh local archive manifest: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let tasks = state.tasks.clone();
+        tasks.spawn(async move {
             let mut repair_tick =
                 tokio::time::interval(Duration::from_secs(EPOCH_REPAIR_INTERVAL_SECS));
             loop {
@@ -1674,6 +2188,16 @@ pub async fn spawn(
                     _ = repair_tick.tick() => {
                         if let Err(e) = state.repair_recent_epochs().await {
                             net_log!("⚠️  Failed to repair recent epoch state: {}", e);
+                        }
+                        let wanted = state
+                            .db
+                            .load_shielded_root_ledger()
+                            .ok()
+                            .flatten()
+                            .map(|ledger| ledger.roots.keys().copied().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        if let Err(e) = state.request_missing_archive_epochs(&wanted).await {
+                            net_log!("⚠️  Failed to repair archive state: {}", e);
                         }
                     }
                 }
@@ -1818,6 +2342,27 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
+        NetworkCommand::EnsureArchiveEpochs(epochs) => {
+            state.request_missing_archive_epochs(&epochs).await?;
+        }
+        NetworkCommand::RequestCheckpointBatch {
+            record,
+            request,
+            reply,
+        } => {
+            let result = async {
+                state
+                    .sign_and_send_to_record_related_with_id(
+                        record,
+                        WireTopic::RequestCheckpointBatch,
+                        canonical::encode_checkpoint_batch_request(&request)?,
+                        None,
+                    )
+                    .await
+            }
+            .await;
+            let _ = reply.send(result);
+        }
         NetworkCommand::RedialBootstraps => {
             for record in state.bootstrap_records.clone() {
                 let _ = state.dial_record(record).await;
@@ -1869,6 +2414,10 @@ impl Network {
 
     pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> {
         self.rate_limited_tx.subscribe()
+    }
+
+    fn checkpoint_subscribe(&self) -> broadcast::Receiver<CheckpointBatchEvent> {
+        self.checkpoint_tx.subscribe()
     }
 
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> {
@@ -1975,6 +2524,229 @@ impl Network {
 
     pub async fn redial_bootstraps(&self) {
         let _ = self.command_tx.send(NetworkCommand::RedialBootstraps);
+    }
+
+    pub async fn ensure_archive_epochs(&self, epochs: &[u64]) -> Result<()> {
+        if epochs.is_empty() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.archive_sync_timeout;
+        loop {
+            let missing = epochs
+                .iter()
+                .copied()
+                .filter(|epoch| {
+                    self.db
+                        .load_shielded_nullifier_epoch(*epoch)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                })
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            let _ = self
+                .command_tx
+                .send(NetworkCommand::EnsureArchiveEpochs(missing));
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for archive epochs to synchronize");
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn local_archive_directory(&self) -> Result<ArchiveDirectory> {
+        let ledger = self.db.load_shielded_root_ledger()?.unwrap_or_default();
+        let mut providers = self
+            .archive_manifests
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_manifest = local_archive_provider_manifest(
+            self.local_node_id,
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            &crate::transaction::local_available_archive_epochs(self.db.as_ref(), &ledger)?,
+        )?;
+        if let Some(existing) = providers
+            .iter_mut()
+            .find(|existing| existing.provider_id == local_manifest.provider_id)
+        {
+            *existing = local_manifest;
+        } else {
+            providers.push(local_manifest);
+        }
+        ArchiveDirectory::from_root_ledger_and_providers(
+            &ledger,
+            PROTOCOL.archive_shard_epoch_span,
+            providers,
+        )
+    }
+
+    async fn local_checkpoint_batch_response(
+        &self,
+        request: &CheckpointBatchRequest,
+    ) -> Result<Option<CheckpointBatchResponse>> {
+        let directory = self.local_archive_directory().await?;
+        let manifest = directory.provider(&self.local_node_id)?.clone();
+        if request.provider_id != manifest.provider_id {
+            return Ok(None);
+        }
+        request.validate_against_manifest(&manifest, &directory)?;
+        let mut server = ShieldedSyncServer::new();
+        let mut needed_epochs = BTreeSet::new();
+        for checkpoint_request in &request.requests {
+            for query in &checkpoint_request.queries {
+                needed_epochs.insert(query.epoch);
+            }
+        }
+        for epoch in needed_epochs {
+            let archived = self
+                .db
+                .load_shielded_nullifier_epoch(epoch)?
+                .ok_or_else(|| anyhow!("missing nullifier archive for epoch {}", epoch))?;
+            server.insert_archived_epoch(archived)?;
+        }
+        Ok(Some(CheckpointBatchResponse {
+            provider_id: manifest.provider_id,
+            provider_manifest_digest: manifest.manifest_digest,
+            responses: server.serve_checkpoints_batch(&manifest, &request.requests)?,
+        }))
+    }
+
+    async fn await_checkpoint_batch_response(
+        &self,
+        receiver: &mut broadcast::Receiver<CheckpointBatchEvent>,
+        request_message_id: [u8; 32],
+        provider_id: [u8; 32],
+        deadline: Instant,
+    ) -> Result<CheckpointBatchResponse> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for checkpoint batch response");
+            }
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Ok(event))
+                    if event.response_to_message_id == request_message_id
+                        && event.provider_id == provider_id =>
+                {
+                    return Ok(event.response);
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    bail!("checkpoint response channel closed")
+                }
+                Err(_) => bail!("timed out waiting for checkpoint batch response"),
+            }
+        }
+    }
+
+    pub async fn request_historical_extensions(
+        &self,
+        requests: &[CheckpointExtensionRequest],
+        rotation_round: u64,
+    ) -> Result<Vec<HistoricalUnspentExtension>> {
+        crate::transaction::ensure_shielded_runtime_state(self.db.as_ref())?;
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let directory = self.local_archive_directory().await?;
+        let routed_batches = route_checkpoint_requests(
+            &directory,
+            requests,
+            rotation_round,
+            PROTOCOL.oblivious_sync_min_batch as usize,
+            PROTOCOL.max_historical_nullifier_batch as usize,
+        )?;
+        let mut results = requests
+            .iter()
+            .map(|request| {
+                if request.queries.is_empty() {
+                    Some(request.checkpoint.empty_extension())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut routable_index_map = Vec::new();
+        for (request_index, request) in requests.iter().enumerate() {
+            if !request.queries.is_empty() {
+                routable_index_map.push(request_index);
+            }
+        }
+        let mut response_rx = self.checkpoint_subscribe();
+        let deadline = Instant::now() + self.archive_sync_timeout;
+
+        for batch in routed_batches {
+            let manifest = directory.provider(&batch.provider_id)?.clone();
+            let checkpoint_request = CheckpointBatchRequest {
+                provider_id: manifest.provider_id,
+                provider_manifest_digest: manifest.manifest_digest,
+                requests: batch
+                    .requests
+                    .iter()
+                    .map(|routed| routed.request.clone())
+                    .collect(),
+            };
+
+            let checkpoint_response = if manifest.provider_id == self.local_node_id {
+                self.local_checkpoint_batch_response(&checkpoint_request)
+                    .await?
+                    .ok_or_else(|| anyhow!("local archive provider refused checkpoint batch"))?
+            } else {
+                let record = {
+                    let guard = self.known_records.read().await;
+                    guard.get(&manifest.provider_id).cloned()
+                }
+                .ok_or_else(|| anyhow!("missing node record for archive provider"))?;
+                let (reply_tx, reply_rx) = oneshot::channel();
+                self.command_tx
+                    .send(NetworkCommand::RequestCheckpointBatch {
+                        record,
+                        request: checkpoint_request.clone(),
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| anyhow!("checkpoint request channel closed"))?;
+                let request_message_id = reply_rx
+                    .await
+                    .map_err(|_| anyhow!("checkpoint request sender dropped"))??;
+                self.await_checkpoint_batch_response(
+                    &mut response_rx,
+                    request_message_id,
+                    manifest.provider_id,
+                    deadline,
+                )
+                .await?
+            };
+
+            checkpoint_response.verify_against_manifest(&manifest, &directory)?;
+            if checkpoint_response.responses.len() != batch.requests.len() {
+                bail!("checkpoint batch response length mismatch");
+            }
+
+            for (routed, response) in batch.requests.iter().zip(checkpoint_response.responses) {
+                response.verify_against_manifest(&manifest, &directory)?;
+                if let Some(routed_index) = routed.request_index {
+                    let request_index = *routable_index_map
+                        .get(routed_index)
+                        .ok_or_else(|| anyhow!("missing routed historical extension index"))?;
+                    let mut blinding = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut blinding);
+                    results[request_index] = Some(response.rerandomize(blinding));
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("missing routed historical extension"))
     }
 
     pub async fn shutdown(&self) {
@@ -2109,6 +2881,7 @@ fn should_relay_topic(topic: WireTopic) -> bool {
             | WireTopic::Tx
             | WireTopic::CompactEpoch
             | WireTopic::RateLimited
+            | WireTopic::NodeRecord
     )
 }
 

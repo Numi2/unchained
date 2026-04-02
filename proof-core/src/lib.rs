@@ -13,7 +13,8 @@ const NOTE_LEAF_DOMAIN: &str = "unchained-shielded-note-leaf-v1";
 const NULLIFIER_DOMAIN: &str = "unchained-shielded-evolving-nullifier-v1";
 const NULLIFIER_LEAF_DOMAIN: &str = "unchained-shielded-nullifier-leaf-v1";
 const CHECKPOINT_BASE_DOMAIN: &str = "unchained-shielded-checkpoint-base-v1";
-const CHECKPOINT_STEP_DOMAIN: &str = "unchained-shielded-checkpoint-step-v1";
+const CHECKPOINT_SERVICE_DOMAIN: &str = "unchained-shielded-checkpoint-service-v1";
+const CHECKPOINT_RERANDOMIZE_DOMAIN: &str = "unchained-shielded-checkpoint-rerandomize-v1";
 const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
 
@@ -75,10 +76,15 @@ pub struct HistoricalUnspentCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoricalUnspentExtension {
     pub version: u8,
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
     pub note_commitment: [u8; 32],
     pub from_epoch: u64,
     pub through_epoch: u64,
     pub prior_transcript_root: [u8; 32],
+    pub service_transcript_root: [u8; 32],
+    pub historical_root_digest: [u8; 32],
+    pub rerandomization_blinding: [u8; 32],
     pub new_transcript_root: [u8; 32],
     pub records: Vec<HistoricalAbsenceRecord>,
 }
@@ -209,7 +215,7 @@ pub fn validate_shielded_tx_witness(
             current_nullifier: input.current_nullifier,
             historical_from_epoch: input.historical_extension.from_epoch,
             historical_through_epoch: input.historical_extension.through_epoch,
-            historical_root_digest: historical_root_digest(&input.historical_extension.records),
+            historical_root_digest: input.historical_extension.historical_root_digest,
         });
     }
 
@@ -407,6 +413,9 @@ impl HistoricalUnspentCheckpoint {
             if extension.through_epoch != self.covered_through_epoch {
                 bail!("empty extension cannot advance the checkpoint");
             }
+            if extension.service_transcript_root != self.transcript_root {
+                bail!("empty extension must preserve the service transcript root");
+            }
             if extension.new_transcript_root != self.transcript_root {
                 bail!("empty extension must preserve the transcript root");
             }
@@ -417,8 +426,9 @@ impl HistoricalUnspentCheckpoint {
             bail!("extension does not continue from the prior checkpoint");
         }
 
-        let mut transcript_root = self.transcript_root;
+        let mut service_transcript_root = self.transcript_root;
         let mut expected_epoch = extension.from_epoch;
+        let mut historical_pairs = Vec::with_capacity(extension.records.len());
         for record in &extension.records {
             if record.epoch != expected_epoch {
                 bail!("extension epochs must be contiguous");
@@ -433,8 +443,9 @@ impl HistoricalUnspentCheckpoint {
                 bail!("non-empty nullifier proof cannot use the zero root");
             }
             record.proof.verify()?;
-            transcript_root = checkpoint_step_root(
-                &transcript_root,
+            historical_pairs.push((record.epoch, record.proof.root));
+            service_transcript_root = checkpoint_service_root(
+                &service_transcript_root,
                 record.epoch,
                 &record.nullifier,
                 &record.proof.digest(),
@@ -445,7 +456,21 @@ impl HistoricalUnspentCheckpoint {
         if extension.through_epoch != expected_epoch.saturating_sub(1) {
             bail!("extension through_epoch does not match the payload");
         }
-        if extension.new_transcript_root != transcript_root {
+        let expected_historical_root_digest = historical_root_digest_from_pairs(&historical_pairs);
+        if extension.historical_root_digest != expected_historical_root_digest {
+            bail!("extension historical root digest mismatch");
+        }
+        if extension.service_transcript_root != service_transcript_root {
+            bail!("extension service transcript root mismatch");
+        }
+        let rerandomized_root = rerandomized_checkpoint_root(
+            &extension.service_transcript_root,
+            &extension.provider_id,
+            &extension.provider_manifest_digest,
+            &extension.historical_root_digest,
+            &extension.rerandomization_blinding,
+        );
+        if extension.new_transcript_root != rerandomized_root {
             bail!("extension transcript root mismatch");
         }
 
@@ -455,7 +480,7 @@ impl HistoricalUnspentCheckpoint {
             note_commitment: self.note_commitment,
             birth_epoch: self.birth_epoch,
             covered_through_epoch: extension.through_epoch,
-            transcript_root,
+            transcript_root: rerandomized_root,
             verified_epoch_count: self.verified_epoch_count.saturating_add(additional),
         })
     }
@@ -581,17 +606,33 @@ fn checkpoint_base_root(note_commitment: &[u8; 32], birth_epoch: u64) -> [u8; 32
     *hasher.finalize().as_bytes()
 }
 
-fn checkpoint_step_root(
+fn checkpoint_service_root(
     prior_root: &[u8; 32],
     epoch: u64,
     nullifier: &[u8; 32],
     proof_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STEP_DOMAIN);
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SERVICE_DOMAIN);
     hasher.update(prior_root);
     hasher.update(&epoch.to_le_bytes());
     hasher.update(nullifier);
     hasher.update(proof_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn rerandomized_checkpoint_root(
+    service_root: &[u8; 32],
+    provider_id: &[u8; 32],
+    provider_manifest_digest: &[u8; 32],
+    historical_root_digest: &[u8; 32],
+    blinding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_RERANDOMIZE_DOMAIN);
+    hasher.update(service_root);
+    hasher.update(provider_id);
+    hasher.update(provider_manifest_digest);
+    hasher.update(historical_root_digest);
+    hasher.update(blinding);
     *hasher.finalize().as_bytes()
 }
 
@@ -671,21 +712,29 @@ mod tests {
         checkpoint: &HistoricalUnspentCheckpoint,
         through_epoch: u64,
     ) -> HistoricalUnspentExtension {
+        let provider_id = [1u8; 32];
+        let provider_manifest_digest = [2u8; 32];
         let from_epoch = checkpoint.covered_through_epoch.saturating_add(1);
         if through_epoch < from_epoch {
             return HistoricalUnspentExtension {
                 version: SHIELDED_EXTENSION_VERSION,
+                provider_id: [0u8; 32],
+                provider_manifest_digest: [0u8; 32],
                 note_commitment: checkpoint.note_commitment,
                 from_epoch,
                 through_epoch: checkpoint.covered_through_epoch,
                 prior_transcript_root: checkpoint.transcript_root,
+                service_transcript_root: checkpoint.transcript_root,
+                historical_root_digest: historical_root_digest_from_pairs(&[]),
+                rerandomization_blinding: [0u8; 32],
                 new_transcript_root: checkpoint.transcript_root,
                 records: Vec::new(),
             };
         }
 
-        let mut transcript_root = checkpoint.transcript_root;
+        let mut service_transcript_root = checkpoint.transcript_root;
         let mut records = Vec::new();
+        let mut historical_pairs = Vec::new();
         for epoch in from_epoch..=through_epoch {
             let nullifier = note
                 .derive_evolving_nullifier(note_key, chain_id, epoch)
@@ -698,8 +747,13 @@ mod tests {
                 predecessor: None,
                 successor: None,
             };
-            transcript_root =
-                checkpoint_step_root(&transcript_root, epoch, &nullifier, &proof.digest());
+            service_transcript_root = checkpoint_service_root(
+                &service_transcript_root,
+                epoch,
+                &nullifier,
+                &proof.digest(),
+            );
+            historical_pairs.push((epoch, proof.root));
             records.push(HistoricalAbsenceRecord {
                 epoch,
                 nullifier,
@@ -707,13 +761,26 @@ mod tests {
             });
         }
 
+        let historical_root_digest = historical_root_digest_from_pairs(&historical_pairs);
+        let rerandomization_blinding = [3u8; 32];
         HistoricalUnspentExtension {
             version: SHIELDED_EXTENSION_VERSION,
+            provider_id,
+            provider_manifest_digest,
             note_commitment: checkpoint.note_commitment,
             from_epoch,
             through_epoch,
             prior_transcript_root: checkpoint.transcript_root,
-            new_transcript_root: transcript_root,
+            service_transcript_root,
+            historical_root_digest,
+            rerandomization_blinding,
+            new_transcript_root: rerandomized_checkpoint_root(
+                &service_transcript_root,
+                &provider_id,
+                &provider_manifest_digest,
+                &historical_root_digest,
+                &rerandomization_blinding,
+            ),
             records,
         }
     }
@@ -795,7 +862,7 @@ mod tests {
         );
         assert_eq!(
             journal.inputs[0].historical_root_digest,
-            historical_root_digest(&extension.records)
+            extension.historical_root_digest
         );
         assert_eq!(
             journal.outputs[0].note_commitment,

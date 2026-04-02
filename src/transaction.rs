@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::{
     canonical,
@@ -10,9 +10,8 @@ use crate::{
     proof,
     protocol::CURRENT as PROTOCOL,
     shielded::{
-        deterministic_genesis_note, ActiveNullifierEpoch, ArchivedNullifierEpoch,
-        CheckpointExtensionRequest, EvolvingNullifierQuery, HistoricalUnspentCheckpoint,
-        HistoricalUnspentExtension, NoteCommitmentTree, NullifierRootLedger, ShieldedNote,
+        deterministic_genesis_note, ActiveNullifierEpoch, HistoricalUnspentCheckpoint,
+        NoteCommitmentTree, NullifierRootLedger, ShieldedNote,
     },
     storage::Store,
 };
@@ -234,51 +233,6 @@ pub fn ensure_shielded_runtime_state(db: &Store) -> Result<()> {
     rollover_active_nullifier_epoch(db)
 }
 
-pub fn build_local_historical_extension(
-    db: &Store,
-    note: &ShieldedNote,
-    note_key: &[u8; 32],
-    checkpoint: &HistoricalUnspentCheckpoint,
-    through_epoch: Option<u64>,
-) -> Result<HistoricalUnspentExtension> {
-    let requests = vec![build_local_extension_request(
-        db,
-        note,
-        note_key,
-        checkpoint,
-        through_epoch,
-    )?];
-    let mut extensions = build_local_historical_extensions(db, &requests)?;
-    extensions
-        .pop()
-        .ok_or_else(|| anyhow!("missing local historical extension"))
-}
-
-pub fn build_local_historical_extensions(
-    db: &Store,
-    requests: &[CheckpointExtensionRequest],
-) -> Result<Vec<HistoricalUnspentExtension>> {
-    ensure_shielded_runtime_state(db)?;
-    if requests.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut server = crate::shielded::ShieldedSyncServer::new();
-    let mut needed_epochs = std::collections::BTreeSet::new();
-    for request in requests {
-        for query in &request.queries {
-            needed_epochs.insert(query.epoch);
-        }
-    }
-    for epoch in needed_epochs {
-        let archived = db
-            .load_shielded_nullifier_epoch(epoch)?
-            .unwrap_or_else(|| ArchivedNullifierEpoch::new(epoch, std::iter::empty()));
-        server.insert_archived_epoch(archived)?;
-    }
-    server.extend_checkpoints_batch(requests)
-}
-
 pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
     let chain_id = db.get_chain_id()?;
     let mut coins = db
@@ -307,41 +261,6 @@ pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
         db.store_shielded_note_tree(&tree)?;
     }
     Ok(())
-}
-
-fn build_local_extension_request(
-    db: &Store,
-    note: &ShieldedNote,
-    note_key: &[u8; 32],
-    checkpoint: &HistoricalUnspentCheckpoint,
-    through_epoch: Option<u64>,
-) -> Result<CheckpointExtensionRequest> {
-    let expected_from = checkpoint.covered_through_epoch.saturating_add(1);
-    let Some(through_epoch) = through_epoch else {
-        return Ok(CheckpointExtensionRequest {
-            checkpoint: checkpoint.clone(),
-            queries: Vec::new(),
-        });
-    };
-    if through_epoch < expected_from {
-        return Ok(CheckpointExtensionRequest {
-            checkpoint: checkpoint.clone(),
-            queries: Vec::new(),
-        });
-    }
-
-    let chain_id = db.get_chain_id()?;
-    let mut queries = Vec::new();
-    for epoch in expected_from..=through_epoch {
-        queries.push(EvolvingNullifierQuery {
-            epoch,
-            nullifier: note.derive_evolving_nullifier(note_key, &chain_id, epoch)?,
-        });
-    }
-    Ok(CheckpointExtensionRequest {
-        checkpoint: checkpoint.clone(),
-        queries,
-    })
 }
 
 fn rollover_active_nullifier_epoch(db: &Store) -> Result<()> {
@@ -388,4 +307,17 @@ fn historical_root_digest_for_range(
         pairs.push((epoch, ledger.root_for_epoch(epoch)?));
     }
     Ok(proof_core::historical_root_digest_from_pairs(&pairs))
+}
+
+pub fn local_available_archive_epochs(
+    db: &Store,
+    ledger: &NullifierRootLedger,
+) -> Result<BTreeSet<u64>> {
+    let mut epochs = BTreeSet::new();
+    for epoch in ledger.roots.keys() {
+        if db.load_shielded_nullifier_epoch(*epoch)?.is_some() {
+            epochs.insert(*epoch);
+        }
+    }
+    Ok(epochs)
 }

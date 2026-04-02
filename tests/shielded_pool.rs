@@ -5,8 +5,9 @@ use tempfile::TempDir;
 use unchained::{
     crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
     shielded::{
-        ArchivedNullifierEpoch, HistoricalUnspentCheckpoint, NoteCommitmentTree, ShieldedNote,
-        ShieldedSyncServer,
+        local_archive_provider_manifest, route_checkpoint_requests, ArchiveDirectory,
+        ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
+        HistoricalUnspentCheckpoint, NoteCommitmentTree, ShieldedNote, ShieldedSyncServer,
     },
     Store,
 };
@@ -96,35 +97,51 @@ fn checkpoint_extensions_are_portable_across_providers() -> Result<()> {
         provider_a.archive_epoch(epoch, set.clone())?;
         provider_b.archive_epoch(epoch, set)?;
     }
+    let available_epochs = provider_a.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([1u8; 32], provider_a.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([2u8; 32], provider_b.root_ledger(), 2, &available_epochs)?;
+    let directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider_a.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
 
     let checkpoint0 = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
     let query5 = note.derive_evolving_nullifier(&note_key, &chain_id, 5)?;
     let query6 = note.derive_evolving_nullifier(&note_key, &chain_id, 6)?;
     let query7 = note.derive_evolving_nullifier(&note_key, &chain_id, 7)?;
 
-    let extension_a = provider_a.extend_checkpoint(
+    let response_a = provider_a.serve_checkpoint(
+        &manifest_a,
         &checkpoint0,
         &[
-            unchained::shielded::EvolvingNullifierQuery {
+            EvolvingNullifierQuery {
                 epoch: 5,
                 nullifier: query5,
             },
-            unchained::shielded::EvolvingNullifierQuery {
+            EvolvingNullifierQuery {
                 epoch: 6,
                 nullifier: query6,
             },
         ],
     )?;
+    response_a.verify_against_manifest(&manifest_a, &directory)?;
+    let extension_a = response_a.rerandomize([1u8; 32]);
     let checkpoint1 = checkpoint0.apply_extension(&extension_a, provider_b.root_ledger())?;
     assert_eq!(checkpoint1.covered_through_epoch, 6);
 
-    let extension_b = provider_b.extend_checkpoint(
+    let response_b = provider_b.serve_checkpoint(
+        &manifest_b,
         &checkpoint1,
-        &[unchained::shielded::EvolvingNullifierQuery {
+        &[EvolvingNullifierQuery {
             epoch: 7,
             nullifier: query7,
         }],
     )?;
+    response_b.verify_against_manifest(&manifest_b, &directory)?;
+    let extension_b = response_b.rerandomize([2u8; 32]);
     let checkpoint2 = checkpoint1.apply_extension(&extension_b, provider_a.root_ledger())?;
     assert_eq!(checkpoint2.covered_through_epoch, 7);
     assert_eq!(checkpoint2.verified_epoch_count, 3);
@@ -147,46 +164,63 @@ fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
     ] {
         provider.archive_epoch(epoch, set)?;
     }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest =
+        local_archive_provider_manifest([3u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let _directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest.clone()],
+    )?;
 
     let checkpoint_a = HistoricalUnspentCheckpoint::genesis(note_a.commitment, note_a.birth_epoch);
     let checkpoint_b = HistoricalUnspentCheckpoint::genesis(note_b.commitment, note_b.birth_epoch);
-    let batch = provider.extend_checkpoints_batch(&[
-        unchained::shielded::CheckpointExtensionRequest {
-            checkpoint: checkpoint_a.clone(),
-            queries: vec![
-                unchained::shielded::EvolvingNullifierQuery {
-                    epoch: 5,
-                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 5)?,
-                },
-                unchained::shielded::EvolvingNullifierQuery {
-                    epoch: 6,
-                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 6)?,
-                },
-                unchained::shielded::EvolvingNullifierQuery {
-                    epoch: 7,
-                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 7)?,
-                },
-            ],
-        },
-        unchained::shielded::CheckpointExtensionRequest {
-            checkpoint: checkpoint_b.clone(),
-            queries: vec![
-                unchained::shielded::EvolvingNullifierQuery {
-                    epoch: 6,
-                    nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 6)?,
-                },
-                unchained::shielded::EvolvingNullifierQuery {
-                    epoch: 7,
-                    nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 7)?,
-                },
-            ],
-        },
-    ])?;
+    let batch = provider.serve_checkpoints_batch(
+        &manifest,
+        &[
+            CheckpointExtensionRequest {
+                checkpoint: checkpoint_a.clone(),
+                queries: vec![
+                    EvolvingNullifierQuery {
+                        epoch: 5,
+                        nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 5)?,
+                    },
+                    EvolvingNullifierQuery {
+                        epoch: 6,
+                        nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 6)?,
+                    },
+                    EvolvingNullifierQuery {
+                        epoch: 7,
+                        nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 7)?,
+                    },
+                ],
+            },
+            CheckpointExtensionRequest {
+                checkpoint: checkpoint_b.clone(),
+                queries: vec![
+                    EvolvingNullifierQuery {
+                        epoch: 6,
+                        nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 6)?,
+                    },
+                    EvolvingNullifierQuery {
+                        epoch: 7,
+                        nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 7)?,
+                    },
+                ],
+            },
+        ],
+    )?;
     assert_eq!(batch.len(), 2);
     assert_eq!(batch[0].through_epoch, 7);
     assert_eq!(batch[1].through_epoch, 7);
     assert_eq!(batch[0].records.len(), 3);
     assert_eq!(batch[1].records.len(), 2);
+    let rerandomized_a = batch[0].rerandomize([7u8; 32]);
+    let rerandomized_b = batch[1].rerandomize([8u8; 32]);
+    assert_ne!(
+        rerandomized_a.new_transcript_root,
+        rerandomized_b.new_transcript_root
+    );
     Ok(())
 }
 
@@ -203,6 +237,51 @@ fn checkpoint_presentations_are_blinded() -> Result<()> {
         presentation_a.presentation_digest,
         presentation_b.presentation_digest
     );
+    Ok(())
+}
+
+#[test]
+fn provider_rotation_changes_query_assignment_across_rounds() -> Result<()> {
+    let chain_id = [55u8; 32];
+    let note_key = [56u8; 32];
+    let note = fixed_note(5, note_key, [57u8; 32], [58u8; 32]);
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifests = (0u8..4)
+        .map(|seed| {
+            local_archive_provider_manifest(
+                [seed + 10; 32],
+                provider.root_ledger(),
+                2,
+                &available_epochs,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let directory =
+        ArchiveDirectory::from_root_ledger_and_providers(provider.root_ledger(), 2, manifests)?;
+    let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
+    let request = CheckpointExtensionRequest {
+        checkpoint: checkpoint.clone(),
+        queries: (5u64..=8)
+            .map(|epoch| {
+                Ok(EvolvingNullifierQuery {
+                    epoch,
+                    nullifier: note.derive_evolving_nullifier(&note_key, &chain_id, epoch)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let mut providers = std::collections::BTreeSet::new();
+    for round in 0u64..8 {
+        let batches =
+            route_checkpoint_requests(&directory, std::slice::from_ref(&request), round, 4, 16)?;
+        assert!(!batches.is_empty());
+        providers.insert(batches[0].provider_id);
+    }
+    assert!(providers.len() > 1);
     Ok(())
 }
 

@@ -17,8 +17,12 @@ It is designed around four constraints:
 - `ShieldedNote`
 - `NoteCommitmentTree`
 - `ArchivedNullifierEpoch`
+- `ArchiveShard`
+- `ArchiveProviderManifest`
+- `ArchiveDirectory`
 - `NullifierRootLedger`
 - `HistoricalUnspentCheckpoint`
+- `HistoricalUnspentServiceResponse`
 - `HistoricalUnspentExtension`
 - `ShieldedSyncServer`
 
@@ -79,14 +83,17 @@ validator hot path without weakening safety.
 - which historical epochs are already covered
 - a transcript root over all previously verified historical-absence steps
 
-`ShieldedSyncServer::extend_checkpoint()` extends that checkpoint over a
-contiguous range of epochs by producing authenticated absence records.
+`ShieldedSyncServer::serve_checkpoint()` defines the provider-side service logic
+for a contiguous checkpoint range. In the live runtime, that service is exposed
+over the PQ mesh as batched checkpoint request/response messages rather than as
+a local-only helper.
 
 The live wallet no longer uses this in a one-note-at-a-time pattern. It builds
-batched checkpoint-extension requests across many owned notes, groups them by
-epoch, and pads each epoch batch with cover requests up to a power-of-two
-bucket. That improves both scale and query-shape privacy without changing
-consensus semantics.
+batched checkpoint-extension requests across many owned notes, routes them
+through a rotating provider schedule, pads each provider/epoch bucket with
+cover requests up to a power-of-two bucket, and only then rerandomizes the
+provider response into the checkpoint extension that becomes durable local
+state.
 
 `HistoricalUnspentCheckpoint::apply_extension()` verifies those records against
 the `NullifierRootLedger` and advances the checkpoint without requiring the
@@ -95,10 +102,37 @@ client to download the full historical nullifier database.
 This makes provider switching possible. A checkpoint extended by one provider
 can be continued by another, as long as both agree on the same root ledger.
 
+## Archive Directory
+
+Historical roots are also organized into content-addressed archive shards.
+
+`ArchiveDirectory::from_root_ledger_and_providers()` derives:
+
+- contiguous epoch-root shards
+- provider manifests learned from the PQ mesh
+- a provider-selection schedule for checkpoint refresh
+
+The live runtime no longer treats archive operators as a purely local replica
+directory. Nodes now:
+
+- gossip node records over the PQ mesh
+- dial newly discovered operators directly
+- ingest provider-authored archive manifests into the local directory
+- request missing archive shards from the serving provider over the PQ mesh
+- send remote checkpoint batch requests to the selected provider over the PQ mesh
+
+That makes the archive layer a real multi-operator network while preserving the
+same provider-routing and rerandomization contract for checkpoint updates.
+
 ## Presentation Binding
 
 `CheckpointPresentation` is a client-side blinded presentation handle over a
 checkpoint transcript root.
+
+`HistoricalUnspentServiceResponse::rerandomize()` is the stronger privacy step.
+It takes the deterministic provider response transcript and folds in client-only
+blinding, the provider manifest digest, and the historical root digest before
+the result is stored or used in the private spend witness.
 
 The checkpoint layer is no longer a public transaction field. It is private
 witness material carried into the succinct spend proof, so validators consume
@@ -150,11 +184,10 @@ part of the correctness contract for this repository.
 
 ## Next Frontier
 
-The remaining frontier is sync/privacy efficiency, not shielded spend
-correctness:
+The remaining frontier is no longer basic provider-oblivious sync. It is:
 
-1. batched checkpoint extension across many notes
-2. stronger provider-oblivious synchronization beyond padded batching
-3. content-addressed archival distribution for historical nullifier epochs
-4. proof-system-level rerandomization and accumulation schemes where they
-   improve privacy or amortized proving cost without weakening PQ safety
+1. stronger long-horizon DA for historical epoch shards
+2. provider-oblivious retrieval beyond padded batching and rotating schedules
+3. batch amortization across many checkpoint-response segments
+4. accumulation schemes that compress many rerandomized response segments
+   without weakening PQ safety

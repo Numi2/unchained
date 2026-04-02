@@ -64,7 +64,7 @@ The proof-carrying contract is split deliberately:
 
 This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
 
-On the client side, checkpoint refresh is now batched across notes and epoch-grouped before witness construction. The wallet also pads per-epoch sync batches with cover requests, so archive sync no longer has to look exactly like “the notes being spent right now”.
+On the client side, checkpoint refresh is now routed through a mesh-learned archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests, request missing epoch shards from the chosen provider over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet rotates provider selection by sync round, batches across notes, pads provider/epoch buckets with cover traffic, and rerandomizes each provider response before it becomes durable checkpoint state. That means repeated refreshes do not have to hit the same archive provider for the same note history, and the stored checkpoint transcript root is not byte-identical to what any provider produced.
 
 ## Service Boundary
 
@@ -91,12 +91,12 @@ The public CLI is intentionally phrased in product terms:
 
 ## Privacy Frontier
 
-The live runtime already proves shielded spends with succinct STARK receipts and avoids validator nullifier bloat. The next research-grade frontier is not “make spends private” anymore; it is making archive synchronization more oblivious and more batched without weakening the PQ story.
+The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, and rerandomizes provider responses before they enter the proof witness.
 
-That future work should improve:
+The next research-grade frontier is now narrower:
 
-- provider privacy under repeated checkpoint extension queries
-- batch proof amortization across many notes
-- long-horizon data-availability for archived nullifier epochs
+- stronger DA economics and distribution for very long historical horizons
+- batch proof amortization across many notes and many checkpoint-response segments
+- provider-oblivious archive retrieval beyond padded batching and schedule rotation
 
-It should not reintroduce an unbounded RocksDB nullifier column as canonical state.
+It should still not reintroduce an unbounded RocksDB nullifier column as canonical state.
