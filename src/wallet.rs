@@ -1,4 +1,5 @@
 use crate::{
+    canonical,
     crypto::{
         self, Address, MlKem768SecretKey, TaggedKemPublicKey, TaggedSigningPublicKey,
         ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES, OTP_PK_BYTES,
@@ -6,8 +7,6 @@ use crate::{
     storage::Store,
 };
 use aws_lc_rs::unstable::signature::PqdsaKeyPair;
-#[cfg(feature = "classical_perimeter")]
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
@@ -61,66 +60,6 @@ pub struct Wallet {
     kem_sk: MlKem768SecretKey,
     lock_seed: [u8; 32],
     address: Address,
-}
-
-// ---------------------------------------------------------------------
-// Meta-transfer (EIP-3009-like) authorization document (module scope)
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaAuthCoinV2 {
-    pub coin_id: [u8; 32],
-    pub receiver_commitment: crate::transfer::ReceiverLockCommitment,
-    /// KEM: ML-KEM-768 ciphertext to facilitator; AEAD: XChaCha20-Poly1305 nonce||ciphertext.
-    pub kem_ct: Vec<u8>,
-    pub aead_nonce24: [u8; 24],
-    pub unlock_preimage_ct: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaTransferAuthV2 {
-    pub version: u8,
-    pub chain_id: [u8; 32],
-    pub from_address: Address,
-    pub from_signing_pk: TaggedSigningPublicKey,
-    pub to_handle: String,
-    pub total_amount: u64,
-    pub valid_after_epoch: u64,
-    pub valid_before_epoch: u64,
-    pub nonce: [u8; 32],
-    pub coins: Vec<MetaAuthCoinV2>,
-    pub sig: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaTransferAuthSignableV2 {
-    pub version: u8,
-    pub chain_id: [u8; 32],
-    pub from_address: Address,
-    pub from_signing_pk: TaggedSigningPublicKey,
-    pub to_handle: String,
-    pub total_amount: u64,
-    pub valid_after_epoch: u64,
-    pub valid_before_epoch: u64,
-    pub nonce: [u8; 32],
-    pub coins: Vec<MetaAuthCoinV2>,
-}
-
-fn keydoc_signable_bytes(
-    version: u8,
-    chain_id: &[u8; 32],
-    signing_pk: &TaggedSigningPublicKey,
-    kem_pk: &TaggedKemPublicKey,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8 + 32 + signing_pk.bytes.len() + kem_pk.bytes.len());
-    msg.extend_from_slice(b"bind-v2");
-    msg.push(version);
-    msg.extend_from_slice(chain_id);
-    msg.push(signing_pk.algorithm as u8);
-    msg.extend_from_slice(signing_pk.as_slice());
-    msg.push(kem_pk.algorithm as u8);
-    msg.extend_from_slice(kem_pk.as_slice());
-    msg
 }
 
 impl Wallet {
@@ -285,7 +224,12 @@ impl Wallet {
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         let chain_id = store.get_chain_id()?;
-        let msg = keydoc_signable_bytes(KEY_DOC_VERSION, &chain_id, &self.signing_pk, &self.kem_pk);
+        let msg = canonical::encode_key_doc_signable(
+            KEY_DOC_VERSION,
+            &chain_id,
+            &self.signing_pk,
+            &self.kem_pk,
+        )?;
         let sig = crypto::ml_dsa_65_sign(&self.signing_key, &msg)?;
         let doc = KeyDocV2 {
             version: KEY_DOC_VERSION,
@@ -310,7 +254,12 @@ impl Wallet {
         if doc.version != KEY_DOC_VERSION {
             bail!("Unsupported KeyDoc version: {}", doc.version);
         }
-        let msg = keydoc_signable_bytes(doc.version, &doc.chain_id, &doc.signing_pk, &doc.kem_pk);
+        let msg = canonical::encode_key_doc_signable(
+            doc.version,
+            &doc.chain_id,
+            &doc.signing_pk,
+            &doc.kem_pk,
+        )?;
         doc.signing_pk.verify(&msg, &doc.sig)?;
         Ok((crate::crypto::address_from_pk(&doc.signing_pk), doc.kem_pk))
     }
@@ -873,153 +822,6 @@ impl Wallet {
         Ok(SendOutcome { spends })
     }
 
-    fn build_receiver_commitment_for_coin(
-        &self,
-        receiver_paycode: &str,
-        coin: &crate::coin::Coin,
-        note_s: &[u8],
-        chain_id: &[u8; 32],
-    ) -> Result<crate::transfer::ReceiverLockCommitment> {
-        let (recipient_addr, receiver_kem_pk) = self.parse_recipient_handle(receiver_paycode)?;
-        let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
-        let value_tag = coin.value.to_le_bytes();
-        let seed =
-            crate::crypto::stealth_seed_v3(&shared, &recipient_addr, &kem_ct, &value_tag, chain_id);
-        let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
-        let s_next = crate::crypto::derive_next_lock_secret_with_note(
-            &shared, &kem_ct, coin.value, &coin.id, chain_id, note_s,
-        );
-        let next_lock_hash = crate::crypto::lock_hash_from_preimage(chain_id, &coin.id, &s_next);
-        let mut one_time_pk = [0u8; OTP_PK_BYTES];
-        one_time_pk.copy_from_slice(&ot_pk_bytes);
-        Ok(crate::transfer::ReceiverLockCommitment {
-            one_time_pk,
-            kem_ct,
-            next_lock_hash,
-            commitment_id: crate::crypto::commitment_id_v1(
-                &one_time_pk,
-                &kem_ct,
-                &next_lock_hash,
-                &coin.id,
-                coin.value,
-                chain_id,
-            ),
-            amount_le: coin.value,
-        })
-    }
-
-    fn compute_current_unlock_preimage(
-        &self,
-        coin: &crate::coin::Coin,
-        chain_id: &[u8; 32],
-        note_s: &[u8],
-    ) -> Result<[u8; 32]> {
-        let store = self
-            ._db
-            .upgrade()
-            .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        if let Some(prev_spend) = store.get_spend(&coin.id)? {
-            prev_spend
-                .to
-                .derive_lock_secret(&self.kem_sk, &coin.id, chain_id, note_s)
-        } else {
-            Ok(self.compute_genesis_lock_secret(&coin.id, chain_id))
-        }
-    }
-
-    /// Produce a signed MetaTransferAuthV2 document for facilitator submission.
-    pub fn authorize_meta_transfer(
-        &self,
-        to_handle: &str,
-        amount: u64,
-        valid_after_epoch: u64,
-        valid_before_epoch: u64,
-        facilitator_kem_pk: &TaggedKemPublicKey,
-        note_binding_opt: Option<[u8; 32]>,
-    ) -> Result<MetaTransferAuthV2> {
-        if valid_before_epoch <= valid_after_epoch {
-            anyhow::bail!("valid_before_epoch must be > valid_after_epoch");
-        }
-        let store = self
-            ._db
-            .upgrade()
-            .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        let chain_id = store.get_chain_id()?;
-        let coins = self.select_inputs(amount)?;
-        let binding = note_binding_opt.unwrap_or([0u8; 32]);
-
-        // Prepare per-coin entries
-        let mut out_coins: Vec<MetaAuthCoinV2> = Vec::new();
-        let mut sum: u64 = 0;
-        for coin in coins {
-            let preimage = self.compute_current_unlock_preimage(
-                &coin,
-                &chain_id,
-                if binding == [0u8; 32] { &[] } else { &binding },
-            )?;
-            sum = sum.saturating_add(coin.value);
-            let rc = self.build_receiver_commitment_for_coin(
-                to_handle,
-                &coin,
-                if binding == [0u8; 32] { &[] } else { &binding },
-                &chain_id,
-            )?;
-            // KEM to facilitator and AEAD encrypt the preimage
-            let (kem_ct, key32) = crate::crypto::kem_encapsulate_to_ml_kem(facilitator_kem_pk)?;
-            let mut nonce = [0u8; 24];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-            let ct = crate::crypto::aead_encrypt_xchacha(&key32, &nonce, &preimage)?;
-            out_coins.push(MetaAuthCoinV2 {
-                coin_id: coin.id,
-                receiver_commitment: rc,
-                kem_ct: kem_ct.to_vec(),
-                aead_nonce24: nonce,
-                unlock_preimage_ct: ct,
-            });
-            if sum >= amount {
-                break;
-            }
-        }
-        if sum < amount {
-            anyhow::bail!("Insufficient funds: need {} have {}", amount, sum);
-        }
-
-        // Build signable and sign with ML-DSA-65.
-        let mut rng_nonce = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut rng_nonce);
-        let signable = MetaTransferAuthSignableV2 {
-            version: 2,
-            chain_id,
-            from_address: self.address,
-            from_signing_pk: self.signing_pk.clone(),
-            to_handle: to_handle.to_string(),
-            total_amount: amount,
-            valid_after_epoch,
-            valid_before_epoch,
-            nonce: rng_nonce,
-            coins: out_coins.clone(),
-        };
-        let bytes = bincode::serialize(&signable)?;
-        let mut dom = Vec::with_capacity(16 + bytes.len());
-        dom.extend_from_slice(b"meta-authz.sign.v2");
-        dom.extend_from_slice(&bytes);
-        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &dom)?;
-
-        Ok(MetaTransferAuthV2 {
-            version: 2,
-            chain_id,
-            from_address: self.address,
-            from_signing_pk: self.signing_pk.clone(),
-            to_handle: to_handle.to_string(),
-            total_amount: amount,
-            valid_after_epoch,
-            valid_before_epoch,
-            nonce: rng_nonce,
-            coins: out_coins,
-            sig,
-        })
-    }
-
     // Deprecated wrappers removed; use send_with_paycode_and_note
 
     /// Simple wrapper: pay using a recipient handle (address or KeyDoc JSON) with empty note.
@@ -1031,63 +833,6 @@ impl Wallet {
     ) -> Result<SendOutcome> {
         self.send_with_paycode_and_note(to, amount, network, &[])
             .await
-    }
-
-    /// x402 helper: pay with an explicit binding (note_s) to tie spends to an invoice/resource.
-    pub async fn pay_with_binding(
-        &self,
-        to: &str,
-        amount: u64,
-        network: &crate::network::NetHandle,
-        binding32: &[u8; 32],
-    ) -> Result<SendOutcome> {
-        self.send_with_paycode_and_note(to, amount, network, binding32)
-            .await
-    }
-
-    #[cfg(feature = "classical_perimeter")]
-    /// x402 client: handle a 402 challenge JSON and perform payment, returning an encoded receipt header value.
-    pub async fn x402_pay_from_challenge(
-        &self,
-        challenge_json: &str,
-        network: &crate::network::NetHandle,
-    ) -> Result<String> {
-        let ch: crate::x402::X402Challenge =
-            serde_json::from_str(challenge_json).context("invalid x402 challenge json")?;
-        if ch.methods.is_empty() {
-            anyhow::bail!("no methods in challenge");
-        }
-        // Pick first unchained method
-        let method = ch
-            .methods
-            .iter()
-            .find(|m| m.chain == "unchained")
-            .ok_or_else(|| anyhow::anyhow!("unchained method not offered"))?;
-        let binding = crate::x402::binding_bytes_from_b64(&method.note_binding_b64)?;
-        let note = binding; // 32 bytes
-        let outcome = self
-            .send_with_paycode_and_note(&method.recipient, method.amount, network, &note)
-            .await?;
-        let spend_hashes: Vec<String> = outcome
-            .spends
-            .iter()
-            .map(|sp| {
-                let mut txh = Vec::new();
-                txh.extend_from_slice(&sp.root);
-                txh.extend_from_slice(&sp.nullifier);
-                txh.extend_from_slice(&sp.commitment);
-                txh.extend_from_slice(&sp.to.canonical_bytes());
-                hex::encode(crate::crypto::blake3_hash(&txh))
-            })
-            .collect();
-        let any = crate::x402::X402AnyReceipt::Unchained {
-            invoice_id: ch.invoice_id,
-            spend_hashes,
-            amount: method.amount,
-            binding_b64: method.note_binding_b64.clone(),
-        };
-        let json = serde_json::to_vec(&any)?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
     }
 
     /// Check if a stealth output is addressed to this wallet (public accessor; hides secret fields).
@@ -1608,16 +1353,6 @@ pub struct SendOutcome {
 // ---------------- Signed Offer document (V2) ----------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OfferSignableV2 {
-    version: u8,
-    maker_address: Address,
-    maker_signing_pk: TaggedSigningPublicKey,
-    plan: HtlcPlanDoc,
-    price_bps: Option<u64>,
-    note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferDocV2 {
     pub version: u8,
     pub maker_address: Address,
@@ -1638,25 +1373,19 @@ impl Wallet {
     ) -> Result<OfferDocV2> {
         let maker_address = self.address;
         let maker_signing_pk = self.signing_pk.clone();
-        let signable = OfferSignableV2 {
+        let mut doc = OfferDocV2 {
             version: 2,
             maker_address,
             maker_signing_pk: maker_signing_pk.clone(),
             plan: plan.clone(),
             price_bps,
             note: note.clone(),
+            sig: Vec::new(),
         };
-        let bytes = bincode::serialize(&signable)?;
+        let bytes = canonical::encode_offer_doc_signable(&doc)?;
         let sig = crypto::ml_dsa_65_sign(&self.signing_key, &bytes)?;
-        Ok(OfferDocV2 {
-            version: 2,
-            maker_address,
-            maker_signing_pk,
-            plan,
-            price_bps,
-            note,
-            sig,
-        })
+        doc.sig = sig;
+        Ok(doc)
     }
 
     /// Verify an OfferDocV2 signature and address binding.
@@ -1664,15 +1393,7 @@ impl Wallet {
         if doc.version != 2 {
             anyhow::bail!("Unsupported offer doc version: {}", doc.version);
         }
-        let signable = OfferSignableV2 {
-            version: doc.version,
-            maker_address: doc.maker_address,
-            maker_signing_pk: doc.maker_signing_pk.clone(),
-            plan: doc.plan.clone(),
-            price_bps: doc.price_bps,
-            note: doc.note.clone(),
-        };
-        let bytes = bincode::serialize(&signable)?;
+        let bytes = canonical::encode_offer_doc_signable(doc)?;
         doc.maker_signing_pk.verify(&bytes, &doc.sig)?;
         // Address binding: ensure maker_address equals hash of PK
         let addr = crate::crypto::address_from_pk(&doc.maker_signing_pk);

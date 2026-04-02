@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
 use unchained::coin::Coin;
-use unchained::config::{Net, Offers, P2p};
+use unchained::config::{Net, P2p};
 use unchained::consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS};
 use unchained::crypto::TaggedSigningPublicKey;
 use unchained::epoch::{Anchor, MerkleTree};
@@ -130,20 +130,33 @@ fn build_p2p() -> P2p {
     }
 }
 
+fn provision_runtime_identity(
+    tempdir: &TempDir,
+    chain_id: Option<[u8; 32]>,
+    addresses: Vec<String>,
+) -> anyhow::Result<(String, String)> {
+    let (node_id, _) = node_identity::init_root_in_dir(tempdir.path())?;
+    let (_, request) = node_identity::prepare_auth_request_in_dir(
+        tempdir.path(),
+        PROTOCOL.version,
+        chain_id,
+        addresses,
+        None,
+    )?;
+    let (_, record) = node_identity::sign_auth_request_in_dir(tempdir.path(), &request, 30)?;
+    let (installed_node_id, installed_record) =
+        node_identity::install_node_record_in_dir(tempdir.path(), &record)?;
+    assert_eq!(installed_node_id, node_id);
+    Ok((installed_node_id, installed_record))
+}
+
 async fn spawn_test_node(
     tempdir: &TempDir,
     net_cfg: Net,
 ) -> anyhow::Result<(Arc<Store>, NetHandle, Arc<Mutex<SyncState>>)> {
     let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let net = network::spawn(
-        net_cfg,
-        build_p2p(),
-        Offers::default(),
-        db.clone(),
-        sync_state.clone(),
-    )
-    .await?;
+    let net = network::spawn(net_cfg, build_p2p(), db.clone(), sync_state.clone()).await?;
     Ok((db, net, sync_state))
 }
 
@@ -207,13 +220,13 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let port_b = pick_udp_port();
     let port_c = pick_udp_port();
     let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
 
-    let (_, bootstrap_a) = node_identity::load_local_identity_output_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(genesis.hash),
-        vec![addr_a.clone()],
-    )?;
+    let (_, bootstrap_a) =
+        provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
+    provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b])?;
+    provision_runtime_identity(&dir_c, Some(genesis.hash), vec![addr_c])?;
 
     drop(db_a_seed);
     drop(db_b_seed);
@@ -384,18 +397,10 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
     let addr_a = format!("127.0.0.1:{port_a}");
     let addr_b = format!("127.0.0.1:{port_b}");
 
-    let (node_id_a, bootstrap_a) = node_identity::load_local_identity_output_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(genesis.hash),
-        vec![addr_a.clone()],
-    )?;
-    let (node_id_b_before, _) = node_identity::load_local_identity_output_in_dir(
-        dir_b.path(),
-        PROTOCOL.version,
-        Some(genesis.hash),
-        vec![addr_b.clone()],
-    )?;
+    let (node_id_a, bootstrap_a) =
+        provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
+    let (node_id_b_before, _) =
+        provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b.clone()])?;
     let bootstrap_record_a = node_identity::NodeRecordV2::decode_compact(&bootstrap_a)?;
 
     drop(db_a_seed);
@@ -411,7 +416,7 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
     let remembered_a = db_b
         .load_node_records()?
         .into_iter()
-        .filter_map(|bytes| bincode::deserialize::<node_identity::NodeRecordV2>(&bytes).ok())
+        .filter_map(|bytes| unchained::canonical::decode_node_record(&bytes).ok())
         .any(|record| record.node_id == bootstrap_record_a.node_id);
     assert!(remembered_a, "node B did not persist node A record");
 
@@ -457,13 +462,11 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     let port_a = pick_udp_port();
     let port_b = pick_udp_port();
     let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
 
-    let (_, bootstrap_a) = node_identity::load_local_identity_output_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(genesis.hash),
-        vec![addr_a.clone()],
-    )?;
+    let (_, bootstrap_a) =
+        provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
+    provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b])?;
 
     drop(db_a_seed);
     drop(db_b_seed);
@@ -593,18 +596,19 @@ async fn pq_network_disconnects_peer_that_sends_invalid_envelope() -> anyhow::Re
 
     let port_victim = pick_udp_port();
     let addr_victim = format!("127.0.0.1:{port_victim}");
-    let (_, bootstrap_victim) = node_identity::load_local_identity_output_in_dir(
-        dir_victim.path(),
-        PROTOCOL.version,
-        Some(genesis.hash),
-        vec![addr_victim.clone()],
-    )?;
+    let (_, bootstrap_victim) =
+        provision_runtime_identity(&dir_victim, Some(genesis.hash), vec![addr_victim.clone()])?;
     let victim_record = node_identity::NodeRecordV2::decode_compact(&bootstrap_victim)?;
 
     let (db_victim, net_victim, _) =
         spawn_test_node(&dir_victim, build_net(port_victim, vec![])).await?;
 
-    let attacker_identity = node_identity::NodeIdentity::load_or_create_in_dir(
+    provision_runtime_identity(
+        &dir_attacker,
+        Some(genesis.hash),
+        vec!["127.0.0.1:0".to_string()],
+    )?;
+    let attacker_identity = node_identity::NodeIdentity::load_runtime_in_dir(
         dir_attacker.path(),
         PROTOCOL.version,
         Some(genesis.hash),

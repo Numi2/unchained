@@ -1,11 +1,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolRules {
     pub version: u32,
+    pub shielded_pool_version: u8,
     pub genesis_difficulty: u32,
     pub genesis_mem_kib: u32,
     pub retarget_interval: u64,
     pub target_coins_per_epoch: u64,
     pub max_coins_per_epoch: u32,
+    pub nullifier_epoch_length: u64,
+    pub max_historical_nullifier_batch: u32,
     pub difficulty_min: u32,
     pub difficulty_max: u32,
     pub min_mem_kib: u32,
@@ -16,11 +19,14 @@ pub struct ProtocolRules {
 
 pub const CURRENT: ProtocolRules = ProtocolRules {
     version: 1,
+    shielded_pool_version: 1,
     genesis_difficulty: 2,
     genesis_mem_kib: 16_192,
     retarget_interval: 2000,
     target_coins_per_epoch: 11,
     max_coins_per_epoch: 111,
+    nullifier_epoch_length: 32,
+    max_historical_nullifier_batch: 512,
     difficulty_min: 1,
     difficulty_max: 12,
     min_mem_kib: 16_192,

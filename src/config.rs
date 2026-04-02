@@ -16,8 +16,6 @@ pub struct Config {
     pub compact: Compact,
     #[serde(default)]
     pub offers: Offers,
-    #[serde(default)]
-    pub bridge: BridgeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -154,12 +152,6 @@ impl Default for Compact {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Offers {
-    /// Opt-in HTTP API surface for offers discovery.
-    #[serde(default)]
-    pub api_enabled: bool,
-    /// Bind address for the offers HTTP API (SSE + GET). Defaults to 127.0.0.1:9120
-    #[serde(default = "default_offers_bind")]
-    pub bind: String,
     /// TTL for offers durability window (seconds)
     #[serde(default = "default_offers_ttl_secs")]
     pub ttl_secs: u64,
@@ -183,118 +175,12 @@ pub struct Offers {
 impl Default for Offers {
     fn default() -> Self {
         Self {
-            api_enabled: false,
-            bind: default_offers_bind(),
             ttl_secs: default_offers_ttl_secs(),
             max_entries: default_offers_max_entries(),
             max_size_bytes: default_offers_max_size_bytes(),
             per_peer_daily: default_offers_per_peer_daily(),
             min_amount: default_offers_min_amount(),
             fee_bps_default: default_offers_fee_bps_default(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct BridgeConfig {
-    #[serde(default = "default_sui_rpc_url")]
-    pub sui_rpc_url: String,
-    #[serde(default = "default_sui_package_id")]
-    pub sui_package_id: String,
-    #[serde(default = "default_sui_config_object")]
-    pub sui_config_object: String,
-    /// Stealth paycode where Unchained coins are locked during bridge_out
-    #[serde(default)]
-    pub vault_paycode: Option<String>,
-    /// Optional admin token required for admin endpoints. If None, admin endpoints are open on localhost.
-    #[serde(default)]
-    pub admin_token: Option<String>,
-    #[serde(default = "default_bridge_enabled")]
-    pub bridge_enabled: bool,
-    #[serde(default = "default_bridge_min_amount")]
-    pub min_amount: u64,
-    #[serde(default = "default_bridge_max_amount")]
-    pub max_amount: u64,
-    #[serde(default = "default_bridge_fee_bps")]
-    pub fee_basis_points: u64,
-    /// Bind for the lightweight bridge HTTP RPC (JSON). Defaults to 127.0.0.1:9110
-    #[serde(default = "default_bridge_rpc_bind")]
-    pub rpc_bind: String,
-    /// Rolling window for rate limits (seconds)
-    #[serde(default = "default_bridge_rate_window_secs")]
-    pub rate_window_secs: u64,
-    /// Per-Unchained-sender daily cap (in coins)
-    #[serde(default = "default_bridge_per_address_daily_cap")]
-    pub per_address_daily_cap: u64,
-    /// Global daily cap (in coins)
-    #[serde(default = "default_bridge_global_daily_cap")]
-    pub global_daily_cap: u64,
-    /// Sui bridge module name containing the burn/mint events
-    #[serde(default = "default_sui_bridge_module")]
-    pub sui_bridge_module: String,
-    /// Sui burn event type name emitted on bridge burn
-    #[serde(default = "default_sui_burn_event")]
-    pub sui_burn_event: String,
-    /// Optional Sui coin type that must match in the burn event (e.g. 0x..::unch::UNCH)
-    #[serde(default)]
-    pub sui_coin_type: Option<String>,
-    // --- x402 payment integration (served via bridge RPC bind) ---
-    #[serde(default = "default_x402_enabled")]
-    pub x402_enabled: bool,
-    /// Minimum confirmations required for x402 receipts (currently only 0 is supported)
-    #[serde(default = "default_x402_min_confs")]
-    pub x402_min_confs: u32,
-    /// Invoice TTL in milliseconds
-    #[serde(default = "default_x402_invoice_ttl_ms")]
-    pub x402_invoice_ttl_ms: u64,
-    /// Recipient handle (stealth address or KeyDoc). If None, server wallet address is used.
-    #[serde(default)]
-    pub x402_recipient_handle: Option<String>,
-    /// Path prefixes that will be protected and require x402 payment if accessed via HTTP
-    #[serde(default = "default_x402_protected_prefixes")]
-    pub x402_protected_prefixes: Vec<String>,
-    /// Optional EVM x402 facilitator (e.g., Base Sepolia/Testnet or Mainnet URL)
-    #[serde(default)]
-    pub x402_facilitator_url: Option<String>,
-    /// EVM network name (e.g., "base-sepolia", "base") for informational display
-    #[serde(default)]
-    pub x402_evm_network: Option<String>,
-    /// EVM recipient address for facilitator-based payments
-    #[serde(default)]
-    pub x402_evm_recipient: Option<String>,
-    /// Static price in USD micros for protected resources when offering EVM method
-    #[serde(default)]
-    pub x402_price_usd_micros: Option<u64>,
-}
-
-impl Default for BridgeConfig {
-    fn default() -> Self {
-        Self {
-            sui_rpc_url: default_sui_rpc_url(),
-            sui_package_id: default_sui_package_id(),
-            sui_config_object: default_sui_config_object(),
-            vault_paycode: None,
-            admin_token: None,
-            bridge_enabled: default_bridge_enabled(),
-            min_amount: default_bridge_min_amount(),
-            max_amount: default_bridge_max_amount(),
-            fee_basis_points: default_bridge_fee_bps(),
-            rpc_bind: default_bridge_rpc_bind(),
-            rate_window_secs: default_bridge_rate_window_secs(),
-            per_address_daily_cap: default_bridge_per_address_daily_cap(),
-            global_daily_cap: default_bridge_global_daily_cap(),
-            sui_bridge_module: default_sui_bridge_module(),
-            sui_burn_event: default_sui_burn_event(),
-            sui_coin_type: default_sui_coin_type(),
-            x402_enabled: default_x402_enabled(),
-            x402_min_confs: default_x402_min_confs(),
-            x402_invoice_ttl_ms: default_x402_invoice_ttl_ms(),
-            x402_recipient_handle: None,
-            x402_protected_prefixes: default_x402_protected_prefixes(),
-            x402_facilitator_url: None,
-            x402_evm_network: None,
-            x402_evm_recipient: None,
-            x402_price_usd_micros: None,
         }
     }
 }
@@ -401,68 +287,7 @@ fn default_compact_max_missing_pct() -> u8 {
     20
 }
 
-// Bridge defaults (Sui Testnet deployment provided by user)
-fn default_sui_rpc_url() -> String {
-    "https://fullnode.testnet.sui.io:443".into()
-}
-fn default_sui_package_id() -> String {
-    "0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089".into()
-}
-fn default_sui_config_object() -> String {
-    "0x37f9f48977d272674bae2d4d217e842398dac2073868ff638a8ff019c0bdc50e".into()
-}
-fn default_bridge_enabled() -> bool {
-    false
-}
-fn default_bridge_min_amount() -> u64 {
-    1
-}
-fn default_bridge_max_amount() -> u64 {
-    1_000_000
-}
-fn default_bridge_fee_bps() -> u64 {
-    10
-}
-fn default_bridge_rpc_bind() -> String {
-    "127.0.0.1:9110".into()
-}
-fn default_bridge_rate_window_secs() -> u64 {
-    24 * 60 * 60
-}
-fn default_bridge_per_address_daily_cap() -> u64 {
-    1_000_000_000
-}
-fn default_bridge_global_daily_cap() -> u64 {
-    10_000_000_000
-}
-fn default_sui_bridge_module() -> String {
-    "simple_bridge".into()
-}
-fn default_sui_burn_event() -> String {
-    "Burn".into()
-}
-fn default_sui_coin_type() -> Option<String> {
-    Some("0xbf27e02789a91a48ac1356c3416fe44638d9a477a616fa74d6317403e4116089::unch::UNCH".into())
-}
-
-// x402 defaults
-fn default_x402_enabled() -> bool {
-    false
-}
-fn default_x402_min_confs() -> u32 {
-    0
-}
-fn default_x402_invoice_ttl_ms() -> u64 {
-    5 * 60 * 1000
-}
-fn default_x402_protected_prefixes() -> Vec<String> {
-    vec!["/paid".into()]
-}
-
 // Offers defaults
-fn default_offers_bind() -> String {
-    "127.0.0.1:9120".into()
-}
 fn default_offers_ttl_secs() -> u64 {
     60 * 60
 } // 1 hour
@@ -531,7 +356,7 @@ fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
     let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers", "bridge",
+        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers",
     ]
     .into_iter()
     .collect();
@@ -607,44 +432,12 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ("offers", TomlValue::Table(t)) => warn_unknown_keys_in(
                     t,
                     &[
-                        "api_enabled",
-                        "bind",
                         "ttl_secs",
                         "max_entries",
                         "max_size_bytes",
                         "per_peer_daily",
                         "min_amount",
                         "fee_bps_default",
-                    ],
-                ),
-                ("bridge", TomlValue::Table(t)) => warn_unknown_keys_in(
-                    t,
-                    &[
-                        "sui_rpc_url",
-                        "sui_package_id",
-                        "sui_config_object",
-                        "vault_paycode",
-                        "admin_token",
-                        "bridge_enabled",
-                        "min_amount",
-                        "max_amount",
-                        "fee_basis_points",
-                        "rpc_bind",
-                        "rate_window_secs",
-                        "per_address_daily_cap",
-                        "global_daily_cap",
-                        "sui_bridge_module",
-                        "sui_burn_event",
-                        "sui_coin_type",
-                        "x402_enabled",
-                        "x402_min_confs",
-                        "x402_invoice_ttl_ms",
-                        "x402_recipient_handle",
-                        "x402_protected_prefixes",
-                        "x402_facilitator_url",
-                        "x402_evm_network",
-                        "x402_evm_recipient",
-                        "x402_price_usd_micros",
                     ],
                 ),
                 _ => {}

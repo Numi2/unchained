@@ -4,6 +4,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request as HRequest, Response as HResponse, StatusCode};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,7 +104,7 @@ impl MetricsAggregator {
         use std::sync::atomic::Ordering;
 
         // Gauges (absolute)
-        let gauges: [(&'static str, i64); 8] = [
+        let gauges: [(&'static str, i64); 7] = [
             ("unchained_peer_count", PEERS.value.load(Ordering::Relaxed)),
             (
                 "unchained_epoch_height",
@@ -124,10 +125,6 @@ impl MetricsAggregator {
             (
                 "unchained_selection_threshold_u64",
                 SELECTION_THRESHOLD_U64.value.load(Ordering::Relaxed),
-            ),
-            (
-                "unchained_bridge_pending_ops",
-                BRIDGE_PENDING_OPS.value.load(Ordering::Relaxed),
             ),
             (
                 "unchained_net_pending_cmds",
@@ -200,35 +197,6 @@ impl MetricsAggregator {
         counter_delta!("unchained_net_cmd_dropped_dup_total", NET_CMDS_DROPPED_DUP);
         counter_delta!("unchained_net_publish_fail_total", NET_PUBLISH_FAILS);
         counter_delta!("unchained_net_cmd_published_total", NET_CMDS_PUBLISHED_OK);
-        // Bridge counters
-        counter_delta!("unchained_bridge_out_requests_total", BRIDGE_OUT_REQUESTS);
-        counter_delta!(
-            "unchained_bridge_out_locked_coins_total",
-            BRIDGE_OUT_LOCKED_COINS
-        );
-        counter_delta!(
-            "unchained_bridge_in_unlocked_coins_total",
-            BRIDGE_IN_UNLOCKED_COINS
-        );
-        counter_delta!("unchained_bridge_errors_total", BRIDGE_ERRORS);
-        counter_delta!("unchained_bridge_verify_ok_total", BRIDGE_VERIFY_OK);
-        counter_delta!("unchained_bridge_verify_fail_total", BRIDGE_VERIFY_FAIL);
-        counter_delta!(
-            "unchained_bridge_replay_attempts_total",
-            BRIDGE_REPLAY_ATTEMPTS
-        );
-        counter_delta!(
-            "unchained_bridge_pending_expired_total",
-            BRIDGE_PENDING_EXPIRED
-        );
-        counter_delta!(
-            "unchained_bridge_pending_confirmed_total",
-            BRIDGE_PENDING_CONFIRMED
-        );
-        counter_delta!(
-            "unchained_bridge_pending_failed_total",
-            BRIDGE_PENDING_FAILED
-        );
 
         // Histograms (stats for the last interval)
         let hist = self.hist.lock().ok();
@@ -579,76 +547,6 @@ pub static NET_CMDS_PUBLISHED_OK: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
-// --- Bridge metrics ---
-pub static BRIDGE_OUT_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_out_requests_total",
-        "Bridge-out submissions received",
-    )
-    .unwrap()
-});
-pub static BRIDGE_OUT_LOCKED_COINS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_out_locked_coins_total",
-        "Coins locked for bridge-out",
-    )
-    .unwrap()
-});
-pub static BRIDGE_IN_UNLOCKED_COINS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_in_unlocked_coins_total",
-        "Coins unlocked via Sui burn proof",
-    )
-    .unwrap()
-});
-pub static BRIDGE_ERRORS: Lazy<IntCounter> =
-    Lazy::new(|| IntCounter::new("unchained_bridge_errors_total", "Bridge errors").unwrap());
-pub static BRIDGE_PENDING_OPS: Lazy<IntGauge> = Lazy::new(|| {
-    IntGauge::new("unchained_bridge_pending_ops", "Current pending bridge ops").unwrap()
-});
-pub static BRIDGE_VERIFY_OK: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_verify_ok_total",
-        "Successful Sui burn proof verifications",
-    )
-    .unwrap()
-});
-pub static BRIDGE_VERIFY_FAIL: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_verify_fail_total",
-        "Failed Sui burn proof verifications",
-    )
-    .unwrap()
-});
-pub static BRIDGE_REPLAY_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_replay_attempts_total",
-        "Rejected replayed Sui digests",
-    )
-    .unwrap()
-});
-pub static BRIDGE_PENDING_EXPIRED: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_pending_expired_total",
-        "Pending bridge ops expired by sweeper",
-    )
-    .unwrap()
-});
-pub static BRIDGE_PENDING_CONFIRMED: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_pending_confirmed_total",
-        "Pending bridge ops marked confirmed",
-    )
-    .unwrap()
-});
-pub static BRIDGE_PENDING_FAILED: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_bridge_pending_failed_total",
-        "Pending bridge ops marked failed",
-    )
-    .unwrap()
-});
-
 // --- Offers metrics ---
 pub static OFFERS_RECEIVED: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
@@ -679,8 +577,14 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
     // Initialize some defaults
     PEERS.set(0);
 
-    // Start an HTTP server offering a single SSE endpoint at /logs.
-    let bind_addr = cfg.bind.clone();
+    // Observability is loopback-only so the shipped product has no non-PQ remote service surface.
+    let bind_addr: SocketAddr = cfg.bind.parse().map_err(|_| {
+        anyhow::anyhow!("metrics.bind must be a socket address like 127.0.0.1:9100")
+    })?;
+    if !bind_addr.ip().is_loopback() {
+        anyhow::bail!("metrics.bind must use a loopback address");
+    }
+    let bind_addr = bind_addr.to_string();
     tokio::spawn(async move {
         let mut addr = bind_addr.clone();
         let listener = loop {

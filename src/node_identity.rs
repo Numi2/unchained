@@ -1,3 +1,4 @@
+use crate::canonical::{self, CanonicalReader, CanonicalWriter};
 use anyhow::{anyhow, bail, Context, Result};
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
@@ -21,12 +22,17 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 const NODE_ROOT_KEY_PATH: &str = "node_root.p8";
+const NODE_ROOT_INFO_PATH: &str = "node_root_public.bin";
 const NODE_AUTH_KEY_PATH: &str = "node_auth.p8";
+const NODE_AUTH_REQUEST_PATH: &str = "node_auth_request.bin";
 const NODE_RECORD_PATH: &str = "node_record.bin";
 const NODE_RECORD_VERSION: u8 = 2;
-const NODE_RECORD_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-const NODE_RECORD_RENEW_BEFORE_MS: u64 = 12 * 60 * 60 * 1000;
+const NODE_ROOT_INFO_VERSION: u8 = 1;
+const NODE_AUTH_REQUEST_VERSION: u8 = 1;
+const NODE_RECORD_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const NODE_RECORD_RENEW_BEFORE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 const NODE_RECORD_DOMAIN: &[u8] = b"unchained-node-record-v2";
+const NODE_AUTH_REQUEST_DOMAIN: &[u8] = b"unchained-node-auth-request-v1";
 const ENVELOPE_DOMAIN: &[u8] = b"unchained-wire-envelope-v2";
 const ENVELOPE_LIFETIME_MS: u64 = 30_000;
 const ENVELOPE_MAX_CLOCK_SKEW_MS: u64 = 5_000;
@@ -74,6 +80,38 @@ pub struct SignedEnvelope {
     pub message_id: [u8; 32],
     pub payload: Vec<u8>,
     pub sig: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeRootInfoV1 {
+    pub version: u8,
+    pub node_id: [u8; 32],
+    pub root_spki: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeAuthRequestV1 {
+    pub version: u8,
+    pub protocol_version: u32,
+    pub node_id: [u8; 32],
+    pub chain_id: Option<[u8; 32]>,
+    pub root_spki: Vec<u8>,
+    pub auth_spki: Vec<u8>,
+    pub addresses: Vec<String>,
+    pub issued_unix_ms: u64,
+    pub sig: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NodeAuthRequestSignableV1 {
+    version: u8,
+    protocol_version: u32,
+    node_id: [u8; 32],
+    chain_id: Option<[u8; 32]>,
+    root_spki: Vec<u8>,
+    auth_spki: Vec<u8>,
+    addresses: Vec<String>,
+    issued_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,7 +268,8 @@ impl NodeRecordV2 {
     }
 
     pub fn encode_compact(&self) -> Result<String> {
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(self)?))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(canonical::encode_node_record(self)?))
     }
 
     pub fn decode_compact(value: &str) -> Result<Self> {
@@ -238,7 +277,7 @@ impl NodeRecordV2 {
             .decode(value.trim())
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value.trim()))
             .context("invalid base64 bootstrap record")?;
-        Ok(bincode::deserialize(&bytes)?)
+        canonical::decode_node_record(&bytes)
     }
 }
 
@@ -268,7 +307,8 @@ impl TrustUpdateV1 {
     }
 
     pub fn encode_compact(&self) -> Result<String> {
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bincode::serialize(self)?))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(canonical::encode_trust_update(self)?))
     }
 
     pub fn decode_compact(value: &str) -> Result<Self> {
@@ -276,7 +316,7 @@ impl TrustUpdateV1 {
             .decode(value.trim())
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value.trim()))
             .context("invalid base64 trust update")?;
-        Ok(bincode::deserialize(&bytes)?)
+        canonical::decode_trust_update(&bytes)
     }
 
     pub fn validate(
@@ -347,6 +387,54 @@ impl TrustUpdateV1 {
     }
 }
 
+impl NodeRootInfoV1 {
+    pub fn encode_compact(&self) -> Result<String> {
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encode_root_info(self)?))
+    }
+
+    pub fn decode_compact(value: &str) -> Result<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value.trim())
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value.trim()))
+            .context("invalid base64 root info")?;
+        decode_root_info(&bytes)
+    }
+}
+
+impl NodeAuthRequestV1 {
+    pub fn validate(&self, now_unix_ms: u64) -> Result<()> {
+        if self.version != NODE_AUTH_REQUEST_VERSION {
+            bail!("unsupported auth request version {}", self.version);
+        }
+        if self.issued_unix_ms > now_unix_ms.saturating_add(ENVELOPE_MAX_CLOCK_SKEW_MS) {
+            bail!("auth request issued in the future");
+        }
+        if self.addresses.is_empty() {
+            bail!("auth request has no addresses");
+        }
+        if self.node_id != derive_node_id(&self.root_spki) {
+            bail!("auth request node_id does not match root key");
+        }
+        let bytes = auth_request_signable_bytes(&NodeAuthRequestSignableV1::from(self.clone()))?;
+        UnparsedPublicKey::new(&ML_DSA_65, self.auth_spki.as_slice())
+            .verify(&bytes, self.sig.as_slice())
+            .map_err(|_| anyhow!("auth request signature verification failed"))?;
+        Ok(())
+    }
+
+    pub fn encode_compact(&self) -> Result<String> {
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encode_auth_request(self)?))
+    }
+
+    pub fn decode_compact(value: &str) -> Result<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value.trim())
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value.trim()))
+            .context("invalid base64 auth request")?;
+        decode_auth_request(&bytes)
+    }
+}
+
 impl From<TrustUpdateV1> for TrustUpdateSignableV1 {
     fn from(value: TrustUpdateV1) -> Self {
         Self {
@@ -355,6 +443,21 @@ impl From<TrustUpdateV1> for TrustUpdateSignableV1 {
             subject_node_id: value.subject_node_id,
             replacement_node_id: value.replacement_node_id,
             replacement_root_spki: value.replacement_root_spki,
+            issued_unix_ms: value.issued_unix_ms,
+        }
+    }
+}
+
+impl From<NodeAuthRequestV1> for NodeAuthRequestSignableV1 {
+    fn from(value: NodeAuthRequestV1) -> Self {
+        Self {
+            version: value.version,
+            protocol_version: value.protocol_version,
+            node_id: value.node_id,
+            chain_id: value.chain_id,
+            root_spki: value.root_spki,
+            auth_spki: value.auth_spki,
+            addresses: value.addresses,
             issued_unix_ms: value.issued_unix_ms,
         }
     }
@@ -566,13 +669,8 @@ impl NodeIdentity {
         fs::create_dir_all(&dir)?;
 
         let root = Arc::new(load_or_create_key(&dir.join(NODE_ROOT_KEY_PATH))?);
-        let root_spki = root
-            .public_key()
-            .as_der()
-            .map_err(|_| anyhow!("failed to DER-encode node root public key"))?
-            .as_ref()
-            .to_vec();
-        let node_id = derive_node_id(&root_spki);
+        let root_info = root_info_from_key(root.as_ref())?;
+        persist_root_info(&dir, &root_info)?;
 
         let persisted = load_persisted_record(&dir).ok();
         let now = now_unix_ms();
@@ -582,8 +680,8 @@ impl NodeIdentity {
                 record.protocol_version != protocol_version
                     || record.chain_id != chain_id
                     || record.addresses != addresses
-                    || record.root_spki != root_spki
-                    || record.node_id != node_id
+                    || record.root_spki != root_info.root_spki
+                    || record.node_id != root_info.node_id
                     || record.expires_unix_ms.saturating_sub(now) <= NODE_RECORD_RENEW_BEFORE_MS
             })
             .unwrap_or(true);
@@ -601,35 +699,17 @@ impl NodeIdentity {
                 .unwrap_or(true);
 
         let record = if needs_refresh {
-            let signable = NodeRecordSignableV2 {
-                version: NODE_RECORD_VERSION,
+            let record = sign_node_record(
+                root.as_ref(),
                 protocol_version,
-                node_id,
                 chain_id,
-                root_spki: root_spki.clone(),
-                auth_spki: auth_spki.clone(),
+                root_info.node_id,
+                root_info.root_spki.clone(),
+                auth_spki,
                 addresses,
-                issued_unix_ms: now,
-                expires_unix_ms: now.saturating_add(NODE_RECORD_LIFETIME_MS),
-            };
-            let signable_bytes = record_signable_bytes(&signable)?;
-            let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-            let sig_len = root
-                .sign(&signable_bytes, &mut sig)
-                .map_err(|_| anyhow!("failed to sign node record"))?;
-            sig.truncate(sig_len);
-            let record = NodeRecordV2 {
-                version: signable.version,
-                protocol_version,
-                node_id,
-                chain_id,
-                root_spki: signable.root_spki,
-                auth_spki: signable.auth_spki,
-                addresses: signable.addresses,
-                issued_unix_ms: signable.issued_unix_ms,
-                expires_unix_ms: signable.expires_unix_ms,
-                sig,
-            };
+                now,
+                now.saturating_add(NODE_RECORD_LIFETIME_MS),
+            )?;
             persist_record(&dir, &record)?;
             record
         } else {
@@ -638,6 +718,69 @@ impl NodeIdentity {
 
         let certified_key = Arc::new(build_certified_key(auth.clone())?);
 
+        Ok(Self {
+            dir,
+            node_id: root_info.node_id,
+            auth_key: auth,
+            certified_key,
+            record,
+        })
+    }
+
+    pub fn load_runtime_in_dir(
+        dir: impl AsRef<Path>,
+        protocol_version: u32,
+        chain_id: Option<[u8; 32]>,
+        addresses: Vec<String>,
+    ) -> Result<Self> {
+        let dir = identity_dir(dir.as_ref());
+        fs::create_dir_all(&dir)?;
+
+        let auth_path = dir.join(NODE_AUTH_KEY_PATH);
+        if !auth_path.exists() {
+            bail!(
+                "missing runtime auth key at {}. run `unchained node auth-prepare` first",
+                auth_path.display()
+            );
+        }
+        let record_path = dir.join(NODE_RECORD_PATH);
+        if !record_path.exists() {
+            bail!(
+                "missing signed node record at {}. run `unchained node auth-install` after offline signing",
+                record_path.display()
+            );
+        }
+
+        let auth = Arc::new(load_key(&auth_path)?);
+        let auth_spki = auth
+            .public_key()
+            .as_der()
+            .map_err(|_| anyhow!("failed to DER-encode node auth public key"))?
+            .as_ref()
+            .to_vec();
+        let record = load_persisted_record(&dir)?;
+        record.validate(now_unix_ms())?;
+        if record.protocol_version != protocol_version {
+            bail!(
+                "installed node record protocol version {} does not match runtime {}",
+                record.protocol_version,
+                protocol_version
+            );
+        }
+        if record.chain_id != chain_id {
+            bail!("installed node record chain_id does not match local chain");
+        }
+        if record.addresses != addresses {
+            bail!("installed node record addresses differ from configured published addresses");
+        }
+        if record.auth_spki != auth_spki {
+            bail!("runtime auth key does not match the installed signed node record");
+        }
+        let node_id = derive_node_id(&record.root_spki);
+        if node_id != record.node_id {
+            bail!("installed node record node_id does not match root key");
+        }
+        let certified_key = Arc::new(build_certified_key(auth.clone())?);
         Ok(Self {
             dir,
             node_id,
@@ -653,18 +796,15 @@ impl NodeIdentity {
         chain_id: Option<[u8; 32]>,
         addresses: Vec<String>,
     ) -> Result<bool> {
-        if self.record.protocol_version == protocol_version
-            && self.record.chain_id == chain_id
-            && self.record.addresses == addresses
-            && self.record.expires_unix_ms.saturating_sub(now_unix_ms())
-                > NODE_RECORD_RENEW_BEFORE_MS
-        {
-            return Ok(false);
-        }
         let refreshed =
-            Self::load_or_create_in_dir(&self.dir, protocol_version, chain_id, addresses)?;
-        *self = refreshed;
-        Ok(true)
+            Self::load_runtime_in_dir(&self.dir, protocol_version, chain_id, addresses)?;
+        let changed = self.record != refreshed.record
+            || self.node_id != refreshed.node_id
+            || self.auth_key.public_key().as_ref() != refreshed.auth_key.public_key().as_ref();
+        if changed {
+            *self = refreshed;
+        }
+        Ok(changed)
     }
 
     pub fn certified_key(&self) -> Arc<CertifiedKey> {
@@ -726,7 +866,7 @@ pub fn load_local_identity_output_in_dir(
     chain_id: Option<[u8; 32]>,
     addresses: Vec<String>,
 ) -> Result<(String, String)> {
-    let identity = NodeIdentity::load_or_create_in_dir(dir, protocol_version, chain_id, addresses)?;
+    let identity = NodeIdentity::load_runtime_in_dir(dir, protocol_version, chain_id, addresses)?;
     Ok((
         hex::encode(identity.node_id()),
         identity.record().encode_compact()?,
@@ -740,12 +880,186 @@ pub fn load_local_node_id() -> Result<String> {
 pub fn load_local_node_id_in_dir(dir: impl AsRef<Path>) -> Result<String> {
     let dir = identity_dir(dir.as_ref());
     fs::create_dir_all(&dir)?;
-    let root = load_or_create_key(&dir.join(NODE_ROOT_KEY_PATH))?;
-    let root_spki = root
-        .public_key()
-        .as_der()
-        .map_err(|_| anyhow!("failed to DER-encode node root public key"))?;
-    Ok(hex::encode(derive_node_id(root_spki.as_ref())))
+    if let Ok(record) = load_persisted_record(&dir) {
+        return Ok(hex::encode(record.node_id));
+    }
+    if let Ok(info) = load_root_info(&dir) {
+        return Ok(hex::encode(info.node_id));
+    }
+    if dir.join(NODE_ROOT_KEY_PATH).exists() {
+        let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))?;
+        let root_spki = root
+            .public_key()
+            .as_der()
+            .map_err(|_| anyhow!("failed to DER-encode node root public key"))?;
+        return Ok(hex::encode(derive_node_id(root_spki.as_ref())));
+    }
+    bail!("no node identity present; run `unchained node init-root` and the auth ceremony first")
+}
+
+pub fn init_root_in_dir(dir: impl AsRef<Path>) -> Result<(String, String)> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let root = if dir.join(NODE_ROOT_KEY_PATH).exists() {
+        load_key(&dir.join(NODE_ROOT_KEY_PATH))?
+    } else {
+        generate_key(&dir.join(NODE_ROOT_KEY_PATH))?
+    };
+    let info = root_info_from_key(&root)?;
+    persist_root_info(&dir, &info)?;
+    Ok((hex::encode(info.node_id), info.encode_compact()?))
+}
+
+pub fn prepare_auth_request_in_dir(
+    dir: impl AsRef<Path>,
+    protocol_version: u32,
+    chain_id: Option<[u8; 32]>,
+    addresses: Vec<String>,
+    root_info_source: Option<&str>,
+) -> Result<(String, String)> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let root_info = if let Some(source) = root_info_source {
+        let info = load_root_info_item(source)?;
+        persist_root_info(&dir, &info)?;
+        info
+    } else {
+        load_root_info(&dir)?
+    };
+    if addresses.is_empty() {
+        bail!("auth request requires at least one published address");
+    }
+    let auth = Arc::new(generate_key(&dir.join(NODE_AUTH_KEY_PATH))?);
+    let auth_spki = auth_spki_from_key(auth.as_ref())?;
+    let issued_unix_ms = now_unix_ms();
+    let signable = NodeAuthRequestSignableV1 {
+        version: NODE_AUTH_REQUEST_VERSION,
+        protocol_version,
+        node_id: root_info.node_id,
+        chain_id,
+        root_spki: root_info.root_spki.clone(),
+        auth_spki: auth_spki.clone(),
+        addresses: addresses.clone(),
+        issued_unix_ms,
+    };
+    let signable_bytes = auth_request_signable_bytes(&signable)?;
+    let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+    let sig_len = auth
+        .sign(&signable_bytes, &mut sig)
+        .map_err(|_| anyhow!("failed to sign auth request"))?;
+    sig.truncate(sig_len);
+    let request = NodeAuthRequestV1 {
+        version: NODE_AUTH_REQUEST_VERSION,
+        protocol_version,
+        node_id: root_info.node_id,
+        chain_id,
+        root_spki: root_info.root_spki,
+        auth_spki,
+        addresses,
+        issued_unix_ms,
+        sig,
+    };
+    request.validate(now_unix_ms())?;
+    persist_auth_request(&dir, &request)?;
+    Ok((hex::encode(request.node_id), request.encode_compact()?))
+}
+
+pub fn sign_auth_request_in_dir(
+    dir: impl AsRef<Path>,
+    request_source: &str,
+    lifetime_days: u64,
+) -> Result<(String, String)> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))?;
+    let root_info = root_info_from_key(&root)?;
+    persist_root_info(&dir, &root_info)?;
+    let request = load_auth_request_item(request_source)?;
+    request.validate(now_unix_ms())?;
+    if request.root_spki != root_info.root_spki || request.node_id != root_info.node_id {
+        bail!("auth request does not target this node root");
+    }
+    let days = lifetime_days.clamp(1, 3650);
+    let issued_unix_ms = now_unix_ms();
+    let expires_unix_ms = issued_unix_ms.saturating_add(days.saturating_mul(24 * 60 * 60 * 1000));
+    let record = sign_node_record(
+        &root,
+        request.protocol_version,
+        request.chain_id,
+        root_info.node_id,
+        root_info.root_spki,
+        request.auth_spki,
+        request.addresses,
+        issued_unix_ms,
+        expires_unix_ms,
+    )?;
+    Ok((hex::encode(record.node_id), record.encode_compact()?))
+}
+
+pub fn install_node_record_in_dir(
+    dir: impl AsRef<Path>,
+    record_source: &str,
+) -> Result<(String, String)> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let record = load_node_record_item(record_source)?;
+    record.validate(now_unix_ms())?;
+    let auth = load_key(&dir.join(NODE_AUTH_KEY_PATH)).map_err(|_| {
+        anyhow!("missing runtime auth key; run `unchained node auth-prepare` first")
+    })?;
+    let auth_spki = auth_spki_from_key(&auth)?;
+    if auth_spki != record.auth_spki {
+        bail!("record auth key does not match the local runtime auth key");
+    }
+    if let Ok(root_info) = load_root_info(&dir) {
+        if root_info.node_id != record.node_id || root_info.root_spki != record.root_spki {
+            bail!("record does not match the installed node root info");
+        }
+    }
+    persist_record(&dir, &record)?;
+    Ok((hex::encode(record.node_id), record.encode_compact()?))
+}
+
+pub fn create_trust_update_revoke(subject_node_id: [u8; 32]) -> Result<String> {
+    TrustUpdateV1::new_revocation(subject_node_id).encode_compact()
+}
+
+pub fn create_trust_update_replace(
+    subject_node_id: [u8; 32],
+    replacement_source: &str,
+) -> Result<String> {
+    let replacement = load_node_record_item(replacement_source)?;
+    TrustUpdateV1::new_replacement(subject_node_id, &replacement).encode_compact()
+}
+
+pub fn approve_trust_update_in_dir(dir: impl AsRef<Path>, update_source: &str) -> Result<String> {
+    let dir = identity_dir(dir.as_ref());
+    let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))
+        .map_err(|_| anyhow!("missing node root key; run `unchained node init-root` first"))?;
+    let root_info = root_info_from_key(&root)?;
+    let mut update = load_trust_update(update_source)?;
+    let signable = trust_update_signable_bytes(&TrustUpdateSignableV1::from(update.clone()))?;
+    let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+    let sig_len = root
+        .sign(&signable, &mut sig)
+        .map_err(|_| anyhow!("failed to sign trust update"))?;
+    sig.truncate(sig_len);
+    let signer_node_id = root_info.node_id;
+    if let Some(existing) = update
+        .approvals
+        .iter_mut()
+        .find(|approval| approval.signer_node_id == signer_node_id)
+    {
+        existing.signer_root_spki = root_info.root_spki;
+        existing.sig = sig;
+    } else {
+        update.approvals.push(TrustApprovalV1 {
+            signer_node_id,
+            signer_root_spki: root_info.root_spki,
+            sig,
+        });
+    }
+    update.encode_compact()
 }
 
 pub fn build_server_config(identity: &NodeIdentity) -> Result<rustls::ServerConfig> {
@@ -799,18 +1113,44 @@ pub fn verify_record_matches_tls(record: &NodeRecordV2, tls_spki: &[u8]) -> Resu
 }
 
 fn identity_dir(base: &Path) -> PathBuf {
-    base.join("node_identity")
+    if base
+        .file_name()
+        .map(|name| name == std::ffi::OsStr::new("node_identity"))
+        .unwrap_or(false)
+    {
+        base.to_path_buf()
+    } else {
+        base.join("node_identity")
+    }
 }
 
 fn load_persisted_record(dir: &Path) -> Result<NodeRecordV2> {
     let bytes = fs::read(dir.join(NODE_RECORD_PATH))?;
-    Ok(bincode::deserialize(&bytes)?)
+    canonical::decode_node_record(&bytes)
 }
 
 fn persist_record(dir: &Path, record: &NodeRecordV2) -> Result<()> {
-    let bytes = bincode::serialize(record)?;
+    let bytes = canonical::encode_node_record(record)?;
     let path = dir.join(NODE_RECORD_PATH);
     fs::write(&path, bytes)?;
+    set_private_permissions(&path)?;
+    Ok(())
+}
+
+fn load_root_info(dir: &Path) -> Result<NodeRootInfoV1> {
+    let bytes = fs::read(dir.join(NODE_ROOT_INFO_PATH))?;
+    decode_root_info(&bytes)
+}
+
+fn persist_root_info(dir: &Path, info: &NodeRootInfoV1) -> Result<()> {
+    let path = dir.join(NODE_ROOT_INFO_PATH);
+    fs::write(&path, encode_root_info(info)?)?;
+    Ok(())
+}
+
+fn persist_auth_request(dir: &Path, request: &NodeAuthRequestV1) -> Result<()> {
+    let path = dir.join(NODE_AUTH_REQUEST_PATH);
+    fs::write(&path, encode_auth_request(request)?)?;
     set_private_permissions(&path)?;
     Ok(())
 }
@@ -870,6 +1210,71 @@ fn build_certified_key(auth_key: Arc<PqdsaKeyPair>) -> Result<CertifiedKey> {
     Ok(CertifiedKey::new(cert, signing_key))
 }
 
+fn root_info_from_key(root: &PqdsaKeyPair) -> Result<NodeRootInfoV1> {
+    let root_spki = root
+        .public_key()
+        .as_der()
+        .map_err(|_| anyhow!("failed to DER-encode node root public key"))?
+        .as_ref()
+        .to_vec();
+    Ok(NodeRootInfoV1 {
+        version: NODE_ROOT_INFO_VERSION,
+        node_id: derive_node_id(&root_spki),
+        root_spki,
+    })
+}
+
+fn auth_spki_from_key(auth_key: &PqdsaKeyPair) -> Result<Vec<u8>> {
+    Ok(auth_key
+        .public_key()
+        .as_der()
+        .map_err(|_| anyhow!("failed to DER-encode node auth public key"))?
+        .as_ref()
+        .to_vec())
+}
+
+fn sign_node_record(
+    root: &PqdsaKeyPair,
+    protocol_version: u32,
+    chain_id: Option<[u8; 32]>,
+    node_id: [u8; 32],
+    root_spki: Vec<u8>,
+    auth_spki: Vec<u8>,
+    addresses: Vec<String>,
+    issued_unix_ms: u64,
+    expires_unix_ms: u64,
+) -> Result<NodeRecordV2> {
+    let signable = NodeRecordSignableV2 {
+        version: NODE_RECORD_VERSION,
+        protocol_version,
+        node_id,
+        chain_id,
+        root_spki: root_spki.clone(),
+        auth_spki: auth_spki.clone(),
+        addresses: addresses.clone(),
+        issued_unix_ms,
+        expires_unix_ms,
+    };
+    let signable_bytes = record_signable_bytes(&signable)?;
+    let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+    let sig_len = root
+        .sign(&signable_bytes, &mut sig)
+        .map_err(|_| anyhow!("failed to sign node record"))?;
+    sig.truncate(sig_len);
+    Ok(NodeRecordV2 {
+        version: NODE_RECORD_VERSION,
+        protocol_version,
+        node_id,
+        chain_id,
+        root_spki,
+        auth_spki,
+        addresses,
+        issued_unix_ms,
+        expires_unix_ms,
+        sig,
+    })
+}
+
 fn derive_node_id(root_spki: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new_derive_key("unchained-node-id-v2")
         .update(root_spki)
@@ -878,21 +1283,64 @@ fn derive_node_id(root_spki: &[u8]) -> [u8; 32] {
 }
 
 fn record_signable_bytes(signable: &NodeRecordSignableV2) -> Result<Vec<u8>> {
-    let mut bytes = NODE_RECORD_DOMAIN.to_vec();
-    bytes.extend(bincode::serialize(signable)?);
-    Ok(bytes)
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(NODE_RECORD_DOMAIN)?;
+    writer.write_u8(signable.version);
+    writer.write_u32(signable.protocol_version);
+    writer.write_fixed(&signable.node_id);
+    write_option_fixed32(&mut writer, &signable.chain_id);
+    writer.write_bytes(&signable.root_spki)?;
+    writer.write_bytes(&signable.auth_spki)?;
+    writer.write_vec(&signable.addresses, |writer, address| {
+        writer.write_string(address)
+    })?;
+    writer.write_u64(signable.issued_unix_ms);
+    writer.write_u64(signable.expires_unix_ms);
+    Ok(writer.into_vec())
 }
 
 fn trust_update_signable_bytes(signable: &TrustUpdateSignableV1) -> Result<Vec<u8>> {
-    let mut bytes = TRUST_UPDATE_DOMAIN.to_vec();
-    bytes.extend(bincode::serialize(signable)?);
-    Ok(bytes)
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(TRUST_UPDATE_DOMAIN)?;
+    writer.write_u8(signable.version);
+    write_trust_update_action(&mut writer, &signable.action);
+    writer.write_fixed(&signable.subject_node_id);
+    write_option_fixed32(&mut writer, &signable.replacement_node_id);
+    write_option_bytes(&mut writer, &signable.replacement_root_spki)?;
+    writer.write_u64(signable.issued_unix_ms);
+    Ok(writer.into_vec())
 }
 
 fn envelope_signable_bytes(signable: &EnvelopeSignable) -> Result<Vec<u8>> {
-    let mut bytes = ENVELOPE_DOMAIN.to_vec();
-    bytes.extend(bincode::serialize(signable)?);
-    Ok(bytes)
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(ENVELOPE_DOMAIN)?;
+    writer.write_u8(signable.version);
+    writer.write_u32(signable.protocol_version);
+    writer.write_fixed(&signable.node_id);
+    write_option_fixed32(&mut writer, &signable.chain_id);
+    writer.write_u64(signable.issued_unix_ms);
+    writer.write_u64(signable.expires_unix_ms);
+    write_option_fixed32(&mut writer, &signable.response_to_message_id);
+    writer.write_fixed(&signable.nonce);
+    writer.write_fixed(&signable.message_id);
+    writer.write_bytes(&signable.payload)?;
+    Ok(writer.into_vec())
+}
+
+fn auth_request_signable_bytes(signable: &NodeAuthRequestSignableV1) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(NODE_AUTH_REQUEST_DOMAIN)?;
+    writer.write_u8(signable.version);
+    writer.write_u32(signable.protocol_version);
+    writer.write_fixed(&signable.node_id);
+    write_option_fixed32(&mut writer, &signable.chain_id);
+    writer.write_bytes(&signable.root_spki)?;
+    writer.write_bytes(&signable.auth_spki)?;
+    writer.write_vec(&signable.addresses, |writer, address| {
+        writer.write_string(address)
+    })?;
+    writer.write_u64(signable.issued_unix_ms);
+    Ok(writer.into_vec())
 }
 
 fn envelope_message_id(
@@ -931,24 +1379,144 @@ fn envelope_message_id(
     *hasher.finalize().as_bytes()
 }
 
+fn write_option_fixed32(writer: &mut CanonicalWriter, value: &Option<[u8; 32]>) {
+    writer.write_bool(value.is_some());
+    if let Some(value) = value {
+        writer.write_fixed(value);
+    }
+}
+
+fn read_option_fixed32(reader: &mut CanonicalReader<'_>) -> Result<Option<[u8; 32]>> {
+    if reader.read_bool()? {
+        Ok(Some(reader.read_fixed()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_option_bytes(writer: &mut CanonicalWriter, value: &Option<Vec<u8>>) -> Result<()> {
+    writer.write_bool(value.is_some());
+    if let Some(value) = value {
+        writer.write_bytes(value)?;
+    }
+    Ok(())
+}
+
+fn write_trust_update_action(writer: &mut CanonicalWriter, action: &TrustUpdateAction) {
+    writer.write_u8(match action {
+        TrustUpdateAction::Revoke => 1,
+        TrustUpdateAction::Replace => 2,
+    });
+}
+
+fn encode_root_info(info: &NodeRootInfoV1) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(info.version);
+    writer.write_fixed(&info.node_id);
+    writer.write_bytes(&info.root_spki)?;
+    Ok(writer.into_vec())
+}
+
+fn decode_root_info(bytes: &[u8]) -> Result<NodeRootInfoV1> {
+    let mut reader = CanonicalReader::new(bytes);
+    let info = NodeRootInfoV1 {
+        version: reader.read_u8()?,
+        node_id: reader.read_fixed()?,
+        root_spki: reader.read_bytes()?,
+    };
+    reader.finish()?;
+    if info.version != NODE_ROOT_INFO_VERSION {
+        bail!("unsupported root info version {}", info.version);
+    }
+    if derive_node_id(&info.root_spki) != info.node_id {
+        bail!("root info node_id does not match root key");
+    }
+    Ok(info)
+}
+
+fn encode_auth_request(request: &NodeAuthRequestV1) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(request.version);
+    writer.write_u32(request.protocol_version);
+    writer.write_fixed(&request.node_id);
+    write_option_fixed32(&mut writer, &request.chain_id);
+    writer.write_bytes(&request.root_spki)?;
+    writer.write_bytes(&request.auth_spki)?;
+    writer.write_vec(&request.addresses, |writer, address| {
+        writer.write_string(address)
+    })?;
+    writer.write_u64(request.issued_unix_ms);
+    writer.write_bytes(&request.sig)?;
+    Ok(writer.into_vec())
+}
+
+fn decode_auth_request(bytes: &[u8]) -> Result<NodeAuthRequestV1> {
+    let mut reader = CanonicalReader::new(bytes);
+    let request = NodeAuthRequestV1 {
+        version: reader.read_u8()?,
+        protocol_version: reader.read_u32()?,
+        node_id: reader.read_fixed()?,
+        chain_id: read_option_fixed32(&mut reader)?,
+        root_spki: reader.read_bytes()?,
+        auth_spki: reader.read_bytes()?,
+        addresses: reader.read_vec(|reader| reader.read_string())?,
+        issued_unix_ms: reader.read_u64()?,
+        sig: reader.read_bytes()?,
+    };
+    reader.finish()?;
+    Ok(request)
+}
+
 pub fn load_trust_update(item: &str) -> Result<TrustUpdateV1> {
     let trimmed = item.trim();
     if Path::new(trimmed).exists() {
         let bytes = fs::read(trimmed)?;
-        if let Ok(update) = bincode::deserialize::<TrustUpdateV1>(&bytes) {
+        if let Ok(update) = canonical::decode_trust_update(&bytes) {
             return Ok(update);
         }
         let text = String::from_utf8(bytes).context("trust update file is not valid UTF-8")?;
-        return parse_trust_update_text(text.trim());
+        return TrustUpdateV1::decode_compact(text.trim());
     }
-    parse_trust_update_text(trimmed)
+    TrustUpdateV1::decode_compact(trimmed)
 }
 
-fn parse_trust_update_text(text: &str) -> Result<TrustUpdateV1> {
-    if text.starts_with('{') {
-        return Ok(serde_json::from_str(text).context("invalid trust update JSON")?);
+fn load_root_info_item(item: &str) -> Result<NodeRootInfoV1> {
+    let trimmed = item.trim();
+    if Path::new(trimmed).exists() {
+        let bytes = fs::read(trimmed)?;
+        if let Ok(info) = decode_root_info(&bytes) {
+            return Ok(info);
+        }
+        let text = String::from_utf8(bytes).context("root info file is not valid UTF-8")?;
+        return NodeRootInfoV1::decode_compact(text.trim());
     }
-    TrustUpdateV1::decode_compact(text)
+    NodeRootInfoV1::decode_compact(trimmed)
+}
+
+fn load_auth_request_item(item: &str) -> Result<NodeAuthRequestV1> {
+    let trimmed = item.trim();
+    if Path::new(trimmed).exists() {
+        let bytes = fs::read(trimmed)?;
+        if let Ok(request) = decode_auth_request(&bytes) {
+            return Ok(request);
+        }
+        let text = String::from_utf8(bytes).context("auth request file is not valid UTF-8")?;
+        return NodeAuthRequestV1::decode_compact(text.trim());
+    }
+    NodeAuthRequestV1::decode_compact(trimmed)
+}
+
+fn load_node_record_item(item: &str) -> Result<NodeRecordV2> {
+    let trimmed = item.trim();
+    if Path::new(trimmed).exists() {
+        let bytes = fs::read(trimmed)?;
+        if let Ok(record) = canonical::decode_node_record(&bytes) {
+            return Ok(record);
+        }
+        let text = String::from_utf8(bytes).context("node record file is not valid UTF-8")?;
+        return NodeRecordV2::decode_compact(text.trim());
+    }
+    NodeRecordV2::decode_compact(trimmed)
 }
 
 fn required_trust_approvals(trustee_count: usize) -> usize {
@@ -1203,6 +1771,32 @@ mod tests {
         let mut expired = envelope.clone();
         expired.expires_unix_ms = expired.issued_unix_ms;
         assert!(expired.verify(identity.record(), now_unix_ms()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn auth_ceremony_installs_runtime_identity_without_online_root_key() -> Result<()> {
+        let dir = TempDir::new()?;
+        let chain_id = Some([4u8; 32]);
+        let addresses = vec!["127.0.0.1:4040".to_string()];
+
+        let (node_id, root_info) = init_root_in_dir(dir.path())?;
+        let (_, request) = prepare_auth_request_in_dir(
+            dir.path(),
+            7,
+            chain_id,
+            addresses.clone(),
+            Some(&root_info),
+        )?;
+        let (_, record) = sign_auth_request_in_dir(dir.path(), &request, 30)?;
+        let (installed_node_id, _) = install_node_record_in_dir(dir.path(), &record)?;
+        assert_eq!(installed_node_id, node_id);
+
+        fs::remove_file(identity_dir(dir.path()).join(NODE_ROOT_KEY_PATH))?;
+
+        let runtime = NodeIdentity::load_runtime_in_dir(dir.path(), 7, chain_id, addresses)?;
+        assert_eq!(hex::encode(runtime.node_id()), installed_node_id);
+        runtime.record().validate(now_unix_ms())?;
         Ok(())
     }
 

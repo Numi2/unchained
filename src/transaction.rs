@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::{storage::Store, transfer::Spend};
+use crate::{canonical, storage::Store, transfer::Spend};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tx {
@@ -21,7 +21,7 @@ impl Tx {
     }
 
     pub fn id(&self) -> Result<[u8; 32]> {
-        let bytes = bincode::serialize(self).context("serialize tx")?;
+        let bytes = canonical::encode_tx(self).context("serialize tx")?;
         Ok(crate::crypto::blake3_hash(&bytes))
     }
 
@@ -56,7 +56,7 @@ impl Tx {
             .cf_handle("tx")
             .ok_or_else(|| anyhow!("tx CF missing"))?;
         let mut batch = rocksdb::WriteBatch::default();
-        let tx_bytes = bincode::serialize(self).context("serialize tx")?;
+        let tx_bytes = canonical::encode_tx(self).context("serialize tx")?;
         batch.put_cf(tx_cf, &tx_id, &tx_bytes);
         for spend in &self.spends {
             spend.apply_to_batch(db, &mut batch)?;

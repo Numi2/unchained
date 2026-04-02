@@ -8,6 +8,7 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 - Proof of work: Argon2id
 - Hashing: BLAKE3
 - Network transport: QUIC over TLS 1.3 raw public keys with ML-KEM-768 key exchange and ML-DSA-65 authentication
+- Wire and signed-doc encoding: explicit canonical byte codec in [`src/canonical.rs`](/Users/home/unchgit/unchained/src/canonical.rs)
 - Persistence: RocksDB
 - Recipient privacy: ML-KEM-768-based private recipient docs and opaque one-time outputs
 - Signatures: ML-DSA-65
@@ -28,9 +29,20 @@ This is a private transfer system, but it is not yet a full global shielded-note
 
 - `protocol / consensus core`
 - `wallet / privacy client`
-- `edge services`
+- `pq mesh runtime`
 
-Edge services include `offers` and `message`. The classical perimeter (`bridge` and `x402`) is built separately behind `--features classical_perimeter` and is not part of consensus.
+The product is now a single PQ-only runtime. Remote interaction happens over the signed PQ mesh, while wallet, offers, and messaging flows are expressed through the CLI and the node-to-node protocol rather than separate HTTP perimeter services.
+
+The only remaining HTTP surface is the metrics/log stream, and it is loopback-only for local observability.
+
+Node identity is provisioned through an offline-root ceremony:
+
+- `node init-root`
+- `node auth-prepare`
+- `node auth-sign`
+- `node auth-install`
+
+The runtime only requires the installed ML-DSA auth key and signed node record. The root key is not needed online after provisioning.
 
 ## Build
 
@@ -56,6 +68,10 @@ cargo run --release --bin unchained -- wallet receive
 The primary user journeys are:
 
 - `node start`
+- `node init-root`
+- `node auth-prepare`
+- `node auth-sign`
+- `node auth-install`
 - `wallet receive`
 - `wallet send`
 - `wallet balance`
@@ -66,11 +82,12 @@ The primary user journeys are:
 
 Operational and protocol-maintenance workflows live under `advanced`.
 
-Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, and message aliases. `x402-pay` exists only in classical-perimeter builds.
+Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, and message aliases.
 
 ## Docs
 
 - [README.md](/Users/home/unchgit/unchained/README.md): concise project summary
 - [ARCHITECTURE.md](/Users/home/unchgit/unchained/ARCHITECTURE.md): system boundaries and current design
+- [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md): shielded-pool successor design and currently landed core
 
 Older Markdown files are archival unless rewritten to match the live code.

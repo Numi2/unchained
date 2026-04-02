@@ -149,7 +149,6 @@ impl Store {
             "spend",
             "nullifier", // legacy CF; no longer canonical in the spend-chain model
             "commitment_used",
-            "meta_authz_used", // EIP-3009-style meta-transfer replay protection (from||nonce)
             "otp_sk",
             "otp_index",
             "peers",
@@ -158,14 +157,11 @@ impl Store {
             // Offer discovery CFs
             "offers",       // id -> OfferStored
             "offers_quota", // day||peer_hash -> u64 count
-            // Bridge-related CFs
-            "bridge_state",         // serialized BridgeState summary
-            "bridge_pending",       // op_id -> PendingBridgeOp
-            "bridge_processed_sui", // sui_tx_hash -> 1
-            "bridge_locked",        // coin_id -> op_id
-            "bridge_op_coins",      // op_id -> Vec<coin_id>
-            "bridge_events",        // append-only event log (key: millis||rand)
-            "bridge_invoices",      // invoice_id -> X402InvoiceRecord
+            // Shielded pool state
+            "shielded_note_tree", // singleton canonical note commitment tree
+            "shielded_nullifier_epoch", // epoch -> ArchivedNullifierEpoch
+            "shielded_root_ledger", // singleton historical nullifier root ledger
+            "shielded_checkpoint", // note_commitment -> HistoricalUnspentCheckpoint
         ];
 
         // Configure column family options with sane production defaults
@@ -916,6 +912,116 @@ impl Store {
             }
         }
         Ok(addrs)
+    }
+
+    pub fn store_shielded_note_tree(
+        &self,
+        tree: &crate::shielded::NoteCommitmentTree,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_note_tree")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_note_tree' column family missing"))?;
+        let bytes = crate::canonical::encode_note_commitment_tree(tree)?;
+        self.db.put_cf(cf, b"global", bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_note_tree(&self) -> Result<Option<crate::shielded::NoteCommitmentTree>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_note_tree")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_note_tree' column family missing"))?;
+        match self.db.get_cf(cf, b"global")? {
+            Some(bytes) => Ok(Some(crate::canonical::decode_note_commitment_tree(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn store_shielded_nullifier_epoch(
+        &self,
+        epoch: &crate::shielded::ArchivedNullifierEpoch,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_nullifier_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
+        let bytes = crate::canonical::encode_archived_nullifier_epoch(epoch)?;
+        self.db.put_cf(cf, &epoch.epoch.to_le_bytes(), bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_nullifier_epoch(
+        &self,
+        epoch: u64,
+    ) -> Result<Option<crate::shielded::ArchivedNullifierEpoch>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_nullifier_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
+        match self.db.get_cf(cf, &epoch.to_le_bytes())? {
+            Some(bytes) => Ok(Some(crate::canonical::decode_archived_nullifier_epoch(
+                &bytes,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn store_shielded_root_ledger(
+        &self,
+        ledger: &crate::shielded::NullifierRootLedger,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_root_ledger")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_root_ledger' column family missing"))?;
+        let bytes = crate::canonical::encode_nullifier_root_ledger(ledger)?;
+        self.db.put_cf(cf, b"ledger", bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_root_ledger(
+        &self,
+    ) -> Result<Option<crate::shielded::NullifierRootLedger>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_root_ledger")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_root_ledger' column family missing"))?;
+        match self.db.get_cf(cf, b"ledger")? {
+            Some(bytes) => Ok(Some(crate::canonical::decode_nullifier_root_ledger(
+                &bytes,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn store_shielded_checkpoint(
+        &self,
+        checkpoint: &crate::shielded::HistoricalUnspentCheckpoint,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_checkpoint")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_checkpoint' column family missing"))?;
+        let bytes = crate::canonical::encode_historical_unspent_checkpoint(checkpoint)?;
+        self.db.put_cf(cf, &checkpoint.note_commitment, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_checkpoint(
+        &self,
+        note_commitment: &[u8; 32],
+    ) -> Result<Option<crate::shielded::HistoricalUnspentCheckpoint>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_checkpoint")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_checkpoint' column family missing"))?;
+        match self.db.get_cf(cf, note_commitment)? {
+            Some(bytes) => Ok(Some(
+                crate::canonical::decode_historical_unspent_checkpoint(&bytes)?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// Gets selected coin IDs for an epoch

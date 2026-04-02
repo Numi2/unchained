@@ -1,3 +1,4 @@
+use crate::canonical::{self, CanonicalReader, CanonicalWriter};
 use crate::consensus::{
     calculate_retarget_consensus, DEFAULT_MEM_KIB, RETARGET_INTERVAL, TARGET_LEADING_ZEROS,
 };
@@ -192,6 +193,171 @@ enum WireMessage {
     Envelope(SignedEnvelope),
 }
 
+fn wire_topic_id(topic: WireTopic) -> u8 {
+    match topic {
+        WireTopic::Anchor => 1,
+        WireTopic::CoinCandidate => 2,
+        WireTopic::Coin => 3,
+        WireTopic::Tx => 4,
+        WireTopic::CompactEpoch => 5,
+        WireTopic::RateLimited => 6,
+        WireTopic::Offer => 7,
+        WireTopic::EpochLeaves => 8,
+        WireTopic::EpochSelectedResponse => 9,
+        WireTopic::EpochCandidatesResponse => 10,
+        WireTopic::EpochHeadersResponse => 11,
+        WireTopic::EpochByHashResponse => 12,
+        WireTopic::CoinProofResponse => 13,
+        WireTopic::RequestEpoch => 14,
+        WireTopic::RequestEpochHeadersRange => 15,
+        WireTopic::RequestEpochByHash => 16,
+        WireTopic::RequestCoin => 17,
+        WireTopic::RequestLatestEpoch => 18,
+        WireTopic::RequestCoinProof => 19,
+        WireTopic::RequestEpochTxn => 20,
+        WireTopic::EpochTxn => 21,
+        WireTopic::RequestEpochSelected => 22,
+        WireTopic::RequestEpochLeaves => 23,
+        WireTopic::RequestEpochCandidates => 24,
+    }
+}
+
+fn decode_wire_topic(id: u8) -> Result<WireTopic> {
+    Ok(match id {
+        1 => WireTopic::Anchor,
+        2 => WireTopic::CoinCandidate,
+        3 => WireTopic::Coin,
+        4 => WireTopic::Tx,
+        5 => WireTopic::CompactEpoch,
+        6 => WireTopic::RateLimited,
+        7 => WireTopic::Offer,
+        8 => WireTopic::EpochLeaves,
+        9 => WireTopic::EpochSelectedResponse,
+        10 => WireTopic::EpochCandidatesResponse,
+        11 => WireTopic::EpochHeadersResponse,
+        12 => WireTopic::EpochByHashResponse,
+        13 => WireTopic::CoinProofResponse,
+        14 => WireTopic::RequestEpoch,
+        15 => WireTopic::RequestEpochHeadersRange,
+        16 => WireTopic::RequestEpochByHash,
+        17 => WireTopic::RequestCoin,
+        18 => WireTopic::RequestLatestEpoch,
+        19 => WireTopic::RequestCoinProof,
+        20 => WireTopic::RequestEpochTxn,
+        21 => WireTopic::EpochTxn,
+        22 => WireTopic::RequestEpochSelected,
+        23 => WireTopic::RequestEpochLeaves,
+        24 => WireTopic::RequestEpochCandidates,
+        other => bail!("unsupported wire topic {}", other),
+    })
+}
+
+fn encode_u64_body(value: u64) -> Vec<u8> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u64(value);
+    writer.into_vec()
+}
+
+fn decode_u64_body(bytes: &[u8]) -> Result<u64> {
+    let mut reader = CanonicalReader::new(bytes);
+    let value = reader.read_u64()?;
+    reader.finish()?;
+    Ok(value)
+}
+
+fn encode_bytes32_body(value: &[u8; 32]) -> Vec<u8> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(value);
+    writer.into_vec()
+}
+
+fn decode_bytes32_body(bytes: &[u8]) -> Result<[u8; 32]> {
+    let mut reader = CanonicalReader::new(bytes);
+    let value = reader.read_fixed()?;
+    reader.finish()?;
+    Ok(value)
+}
+
+fn encode_empty_body() -> Vec<u8> {
+    Vec::new()
+}
+
+fn decode_empty_body(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        Ok(())
+    } else {
+        bail!("expected empty wire body")
+    }
+}
+
+fn encode_topic_frame(topic: WireTopic, body: Vec<u8>) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(wire_topic_id(topic));
+    writer.write_bytes(&body)?;
+    Ok(writer.into_vec())
+}
+
+fn decode_topic_frame(bytes: &[u8]) -> Result<TopicFrame> {
+    let mut reader = CanonicalReader::new(bytes);
+    let topic = decode_wire_topic(reader.read_u8()?)?;
+    let body = reader.read_bytes()?;
+    reader.finish()?;
+    Ok(TopicFrame { topic, body })
+}
+
+fn encode_hello_message(message: &HelloMessage) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(&canonical::encode_node_record(&message.record)?)?;
+    writer.write_vec(&message.known_records, |writer, record| {
+        writer.write_bytes(&canonical::encode_node_record(record)?)?;
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+fn decode_hello_message(bytes: &[u8]) -> Result<HelloMessage> {
+    let mut reader = CanonicalReader::new(bytes);
+    let record = canonical::decode_node_record(&reader.read_bytes()?)?;
+    let known_records = reader.read_vec(|reader| {
+        let bytes = reader.read_bytes()?;
+        canonical::decode_node_record(&bytes)
+    })?;
+    reader.finish()?;
+    Ok(HelloMessage {
+        record,
+        known_records,
+    })
+}
+
+fn encode_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    match message {
+        WireMessage::Hello(message) => {
+            writer.write_u8(1);
+            writer.write_bytes(&encode_hello_message(message)?)?;
+        }
+        WireMessage::Envelope(envelope) => {
+            writer.write_u8(2);
+            writer.write_bytes(&canonical::encode_signed_envelope(envelope)?)?;
+        }
+    }
+    Ok(writer.into_vec())
+}
+
+fn decode_wire_message(bytes: &[u8]) -> Result<WireMessage> {
+    let mut reader = CanonicalReader::new(bytes);
+    let kind = reader.read_u8()?;
+    let payload = reader.read_bytes()?;
+    reader.finish()?;
+    match kind {
+        1 => Ok(WireMessage::Hello(decode_hello_message(&payload)?)),
+        2 => Ok(WireMessage::Envelope(canonical::decode_signed_envelope(
+            &payload,
+        )?)),
+        other => bail!("unsupported wire message {}", other),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingAnchor {
     anchor: Anchor,
@@ -360,7 +526,7 @@ impl RuntimeState {
             }
         }
         if should_store {
-            let bytes = bincode::serialize(&record)?;
+            let bytes = canonical::encode_node_record(&record)?;
             self.db.store_node_record(&record.node_id, &bytes)?;
         }
         self.expected_peers.remember(&record);
@@ -437,7 +603,7 @@ impl RuntimeState {
         envelope: SignedEnvelope,
         exclude: Option<[u8; 32]>,
     ) -> Result<()> {
-        let bytes = bincode::serialize(&WireMessage::Envelope(envelope))?;
+        let bytes = encode_wire_message(&WireMessage::Envelope(envelope))?;
         let peers = {
             let guard = self.peers.read().await;
             guard
@@ -470,7 +636,7 @@ impl RuntimeState {
         body: Vec<u8>,
         response_to_message_id: Option<[u8; 32]>,
     ) -> Result<SignedEnvelope> {
-        let payload = bincode::serialize(&TopicFrame { topic, body })?;
+        let payload = encode_topic_frame(topic, body)?;
         let identity = self.identity.read().await.clone();
         let envelope = SignedEnvelope::new_related(
             &identity,
@@ -495,7 +661,7 @@ impl RuntimeState {
         body: Vec<u8>,
         response_to_message_id: Option<[u8; 32]>,
     ) -> Result<bool> {
-        let bytes = bincode::serialize(&WireMessage::Envelope(
+        let bytes = encode_wire_message(&WireMessage::Envelope(
             self.sign_topic_envelope_related(topic, body, response_to_message_id)
                 .await?,
         ))?;
@@ -512,7 +678,7 @@ impl RuntimeState {
         if targets.is_empty() {
             return Ok(0);
         }
-        let bytes = bincode::serialize(&WireMessage::Envelope(
+        let bytes = encode_wire_message(&WireMessage::Envelope(
             self.sign_topic_envelope(topic, body).await?,
         ))?;
         let mut sent = 0usize;
@@ -712,7 +878,7 @@ impl RuntimeState {
                             break;
                         }
                     };
-                    let message: WireMessage = match bincode::deserialize(&bytes) {
+                    let message: WireMessage = match decode_wire_message(&bytes) {
                         Ok(message) => message,
                         Err(e) => {
                             net_log!(
@@ -764,7 +930,7 @@ impl RuntimeState {
     async fn handle_envelope(&self, record: NodeRecordV2, envelope: SignedEnvelope) -> Result<()> {
         envelope.verify(&record, unix_ms())?;
         let first_time = self.mark_message_seen(envelope.message_id).await;
-        let frame: TopicFrame = bincode::deserialize(&envelope.payload)?;
+        let frame: TopicFrame = decode_topic_frame(&envelope.payload)?;
         if first_time && should_relay_topic(frame.topic) {
             self.broadcast_envelope(envelope.clone(), Some(record.node_id))
                 .await?;
@@ -780,11 +946,11 @@ impl RuntimeState {
     ) -> Result<()> {
         match frame.topic {
             WireTopic::Anchor | WireTopic::EpochByHashResponse => {
-                let anchor = bincode::deserialize::<Anchor>(&frame.body)?;
+                let anchor = canonical::decode_anchor(&frame.body)?;
                 self.handle_anchor(anchor).await?;
             }
             WireTopic::CoinCandidate => {
-                let candidate = crate::coin::decode_candidate(&frame.body)?;
+                let candidate = canonical::decode_coin_candidate(&frame.body)?;
                 if validate_coin_candidate(&candidate, &self.db).is_ok() {
                     let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
                     self.db.put("coin_candidate", &key, &candidate)?;
@@ -793,7 +959,7 @@ impl RuntimeState {
                 }
             }
             WireTopic::Coin => {
-                let coin = bincode::deserialize::<Coin>(&frame.body)?;
+                let coin = canonical::decode_coin(&frame.body)?;
                 self.db.put("coin", &coin.id, &coin)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("anchor", &coin.epoch_hash) {
                     let _ = self.db.put_coin_epoch(&coin.id, anchor.num);
@@ -801,7 +967,7 @@ impl RuntimeState {
                 self.retry_pending_txs_for_coin(coin.id).await?;
             }
             WireTopic::Tx => {
-                let tx = bincode::deserialize::<crate::transaction::Tx>(&frame.body)?;
+                let tx = canonical::decode_tx(&frame.body)?;
                 match validate_tx(&tx, &self.db) {
                     Ok(()) => {
                         tx.apply(&self.db)?;
@@ -813,35 +979,35 @@ impl RuntimeState {
                 }
             }
             WireTopic::CompactEpoch => {
-                let compact = bincode::deserialize::<CompactEpoch>(&frame.body)?;
+                let compact = canonical::decode_compact_epoch(&frame.body)?;
                 metrics::COMPACT_EPOCHS_RECV.inc();
                 self.handle_anchor(compact.anchor).await?;
             }
             WireTopic::RateLimited => {
-                let msg = bincode::deserialize::<RateLimitedMessage>(&frame.body)?;
+                let msg = canonical::decode_rate_limited_message(&frame.body)?;
                 let _ = self.rate_limited_tx.send(msg);
             }
             WireTopic::Offer => {
-                let offer = bincode::deserialize::<crate::wallet::OfferDocV2>(&frame.body)?;
+                let offer = canonical::decode_offer_doc(&frame.body)?;
                 Wallet::verify_offer_doc(&offer)?;
                 metrics::OFFERS_RECEIVED.inc();
                 store_offer(&self.db, &frame.body)?;
                 let _ = self.offers_tx.send(offer);
             }
             WireTopic::EpochLeaves => {
-                let bundle = bincode::deserialize::<EpochLeavesBundle>(&frame.body)?;
+                let bundle = canonical::decode_epoch_leaves_bundle(&frame.body)?;
                 let epoch_num = bundle.epoch_num;
                 self.store_epoch_leaves_bundle(bundle)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
             WireTopic::EpochSelectedResponse => {
-                let bundle = bincode::deserialize::<SelectedIdsBundle>(&frame.body)?;
+                let bundle = canonical::decode_selected_ids_bundle(&frame.body)?;
                 let epoch_num = bundle.epoch_num;
                 self.store_selected_ids_bundle(bundle)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
             WireTopic::EpochCandidatesResponse => {
-                let response = bincode::deserialize::<EpochCandidatesResponse>(&frame.body)?;
+                let response = canonical::decode_epoch_candidates_response(&frame.body)?;
                 for candidate in response.candidates {
                     if validate_coin_candidate(&candidate, &self.db).is_ok() {
                         let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
@@ -850,7 +1016,7 @@ impl RuntimeState {
                 }
             }
             WireTopic::EpochHeadersResponse => {
-                let batch = bincode::deserialize::<EpochHeadersBatch>(&frame.body)?;
+                let batch = canonical::decode_epoch_headers_batch(&frame.body)?;
                 if let Some(last) = batch.headers.last() {
                     if let Ok(mut sync) = self.sync_state.lock() {
                         sync.highest_seen_epoch = sync.highest_seen_epoch.max(last.num);
@@ -859,24 +1025,24 @@ impl RuntimeState {
                 let _ = self.headers_tx.send(batch);
             }
             WireTopic::CoinProofResponse => {
-                let response = bincode::deserialize::<CoinProofResponse>(&frame.body)?;
+                let response = canonical::decode_coin_proof_response(&frame.body)?;
                 let _ = self.proof_tx.send(response);
             }
             WireTopic::RequestEpoch => {
-                let epoch = bincode::deserialize::<u64>(&frame.body)?;
+                let epoch = decode_u64_body(&frame.body)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch.to_le_bytes()) {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::Anchor,
-                            bincode::serialize(&anchor)?,
+                            canonical::encode_anchor(&anchor)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestEpochHeadersRange => {
-                let range = bincode::deserialize::<EpochHeadersRange>(&frame.body)?;
+                let range = canonical::decode_epoch_headers_range(&frame.body)?;
                 let mut headers = Vec::new();
                 let end = range.start_height.saturating_add(range.count as u64);
                 for height in range.start_height..end {
@@ -894,79 +1060,80 @@ impl RuntimeState {
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::EpochHeadersResponse,
-                            bincode::serialize(&batch)?,
+                            canonical::encode_epoch_headers_batch(&batch)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestEpochByHash => {
-                let req = bincode::deserialize::<EpochByHash>(&frame.body)?;
+                let req = canonical::decode_epoch_by_hash(&frame.body)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("anchor", &req.hash) {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::EpochByHashResponse,
-                            bincode::serialize(&anchor)?,
+                            canonical::encode_anchor(&anchor)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestCoin => {
-                let coin_id = bincode::deserialize::<[u8; 32]>(&frame.body)?;
+                let coin_id = decode_bytes32_body(&frame.body)?;
                 if let Ok(Some(coin)) = self.db.get::<Coin>("coin", &coin_id) {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::Coin,
-                            bincode::serialize(&coin)?,
+                            canonical::encode_coin(&coin)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestLatestEpoch => {
+                decode_empty_body(&frame.body)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::Anchor,
-                            bincode::serialize(&anchor)?,
+                            canonical::encode_anchor(&anchor)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestCoinProof => {
-                let req = bincode::deserialize::<CoinProofRequest>(&frame.body)?;
+                let req = canonical::decode_coin_proof_request(&frame.body)?;
                 if let Ok(Some(response)) = build_coin_proof_response(&self.db, req.coin_id) {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::CoinProofResponse,
-                            bincode::serialize(&response)?,
+                            canonical::encode_coin_proof_response(&response)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestEpochTxn => {
-                let req = bincode::deserialize::<EpochGetTxn>(&frame.body)?;
+                let req = canonical::decode_epoch_get_txn(&frame.body)?;
                 let txn = self.lookup_epoch_txn(&req)?;
                 if !txn.coins.is_empty() {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::EpochTxn,
-                            bincode::serialize(&txn)?,
+                            canonical::encode_epoch_txn(&txn)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::EpochTxn => {
-                let txn = bincode::deserialize::<EpochTxn>(&frame.body)?;
+                let txn = canonical::decode_epoch_txn(&frame.body)?;
                 let epoch_num = self
                     .db
                     .get::<Anchor>("anchor", &txn.epoch_hash)?
@@ -979,7 +1146,7 @@ impl RuntimeState {
                 self.repair_epoch_state(epoch_num).await?;
             }
             WireTopic::RequestEpochSelected => {
-                let epoch_num = bincode::deserialize::<u64>(&frame.body)?;
+                let epoch_num = decode_u64_body(&frame.body)?;
                 let ids = self.db.get_selected_coin_ids_for_epoch(epoch_num)?;
                 if !ids.is_empty() {
                     let merkle_root = MerkleTree::build_root(&ids.iter().copied().collect());
@@ -992,14 +1159,14 @@ impl RuntimeState {
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::EpochSelectedResponse,
-                            bincode::serialize(&bundle)?,
+                            canonical::encode_selected_ids_bundle(&bundle)?,
                             Some(request_message_id),
                         )
                         .await?;
                 }
             }
             WireTopic::RequestEpochLeaves => {
-                let epoch_num = bincode::deserialize::<u64>(&frame.body)?;
+                let epoch_num = decode_u64_body(&frame.body)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
                     if let Ok(Some(leaves)) = self.db.get_epoch_leaves(epoch_num) {
                         let bundle = EpochLeavesBundle {
@@ -1011,7 +1178,7 @@ impl RuntimeState {
                             .sign_and_send_to_peer_related(
                                 record.node_id,
                                 WireTopic::EpochLeaves,
-                                bincode::serialize(&bundle)?,
+                                canonical::encode_epoch_leaves_bundle(&bundle)?,
                                 Some(request_message_id),
                             )
                             .await?;
@@ -1019,7 +1186,7 @@ impl RuntimeState {
                 }
             }
             WireTopic::RequestEpochCandidates => {
-                let epoch_hash = bincode::deserialize::<[u8; 32]>(&frame.body)?;
+                let epoch_hash = decode_bytes32_body(&frame.body)?;
                 let candidates = self.db.get_coin_candidates_by_epoch_hash(&epoch_hash)?;
                 if !candidates.is_empty() {
                     let response = EpochCandidatesResponse {
@@ -1030,7 +1197,7 @@ impl RuntimeState {
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::EpochCandidatesResponse,
-                            bincode::serialize(&response)?,
+                            canonical::encode_epoch_candidates_response(&response)?,
                             Some(request_message_id),
                         )
                         .await?;
@@ -1177,7 +1344,7 @@ impl RuntimeState {
             let _ = self
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochSelected,
-                    bincode::serialize(&epoch_num)?,
+                    encode_u64_body(epoch_num),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
@@ -1192,7 +1359,7 @@ impl RuntimeState {
                 let _ = self
                     .sign_and_send_to_targets(
                         WireTopic::RequestEpochTxn,
-                        bincode::serialize(&EpochGetTxn {
+                        canonical::encode_epoch_get_txn(&EpochGetTxn {
                             epoch_hash: anchor.hash,
                             indexes,
                         })?,
@@ -1205,7 +1372,7 @@ impl RuntimeState {
             let _ = self
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochLeaves,
-                    bincode::serialize(&epoch_num)?,
+                    encode_u64_body(epoch_num),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
@@ -1367,7 +1534,7 @@ impl RuntimeState {
                     let _ = self
                         .sign_and_send_to_targets(
                             WireTopic::RequestEpoch,
-                            bincode::serialize(&anchor.num.saturating_sub(1))?,
+                            encode_u64_body(anchor.num.saturating_sub(1)),
                             REQUEST_FANOUT_RECOVERY,
                         )
                         .await;
@@ -1381,7 +1548,7 @@ impl RuntimeState {
                         let _ = self
                             .sign_and_send_to_targets(
                                 WireTopic::RequestEpochHeadersRange,
-                                bincode::serialize(&range)?,
+                                canonical::encode_epoch_headers_range(&range),
                                 REQUEST_FANOUT_HEADERS,
                             )
                             .await;
@@ -1412,7 +1579,6 @@ impl RuntimeState {
 pub async fn spawn(
     net_cfg: config::Net,
     _p2p_cfg: config::P2p,
-    _offers_cfg: crate::config::Offers,
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
 ) -> Result<NetHandle> {
@@ -1421,7 +1587,7 @@ pub async fn spawn(
     }
 
     let published_addresses = published_addresses(&net_cfg);
-    let identity = NodeIdentity::load_or_create_in_dir(
+    let identity = NodeIdentity::load_runtime_in_dir(
         db.base_path(),
         PROTOCOL.version,
         db.get_chain_id().ok(),
@@ -1634,39 +1800,48 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
     match command {
         NetworkCommand::GossipAnchor(anchor) => {
             state
-                .sign_and_broadcast(WireTopic::Anchor, bincode::serialize(&anchor)?)
+                .sign_and_broadcast(WireTopic::Anchor, canonical::encode_anchor(&anchor)?)
                 .await?;
         }
         NetworkCommand::GossipCoin(coin) => {
             state
-                .sign_and_broadcast(WireTopic::CoinCandidate, bincode::serialize(&coin)?)
+                .sign_and_broadcast(
+                    WireTopic::CoinCandidate,
+                    canonical::encode_coin_candidate(&coin)?,
+                )
                 .await?;
         }
         NetworkCommand::GossipTx(tx) => {
             state
-                .sign_and_broadcast(WireTopic::Tx, bincode::serialize(&tx)?)
+                .sign_and_broadcast(WireTopic::Tx, canonical::encode_tx(&tx)?)
                 .await?;
         }
         NetworkCommand::GossipCompactEpoch(compact) => {
             state
-                .sign_and_broadcast(WireTopic::CompactEpoch, bincode::serialize(&compact)?)
+                .sign_and_broadcast(
+                    WireTopic::CompactEpoch,
+                    canonical::encode_compact_epoch(&compact)?,
+                )
                 .await?;
         }
         NetworkCommand::GossipRateLimited(msg) => {
             state
-                .sign_and_broadcast(WireTopic::RateLimited, bincode::serialize(&msg)?)
+                .sign_and_broadcast(
+                    WireTopic::RateLimited,
+                    canonical::encode_rate_limited_message(&msg)?,
+                )
                 .await?;
         }
         NetworkCommand::GossipOffer(offer) => {
             state
-                .sign_and_broadcast(WireTopic::Offer, bincode::serialize(&offer)?)
+                .sign_and_broadcast(WireTopic::Offer, canonical::encode_offer_doc(&offer)?)
                 .await?;
         }
         NetworkCommand::RequestEpoch(epoch) => {
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpoch,
-                    bincode::serialize(&epoch)?,
+                    encode_u64_body(epoch),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1675,7 +1850,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpoch,
-                    bincode::serialize(&epoch)?,
+                    encode_u64_body(epoch),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
@@ -1684,7 +1859,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochHeadersRange,
-                    bincode::serialize(&range)?,
+                    canonical::encode_epoch_headers_range(&range),
                     REQUEST_FANOUT_HEADERS,
                 )
                 .await?;
@@ -1693,7 +1868,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochByHash,
-                    bincode::serialize(&EpochByHash { hash })?,
+                    canonical::encode_epoch_by_hash(&EpochByHash { hash }),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1702,7 +1877,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestCoin,
-                    bincode::serialize(&coin_id)?,
+                    encode_bytes32_body(&coin_id),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1711,7 +1886,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestLatestEpoch,
-                    bincode::serialize(&())?,
+                    encode_empty_body(),
                     REQUEST_FANOUT_TIP,
                 )
                 .await?;
@@ -1720,7 +1895,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestCoinProof,
-                    bincode::serialize(&CoinProofRequest { coin_id })?,
+                    canonical::encode_coin_proof_request(&CoinProofRequest { coin_id }),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1729,7 +1904,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochTxn,
-                    bincode::serialize(&req)?,
+                    canonical::encode_epoch_get_txn(&req)?,
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1738,7 +1913,7 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochSelected,
-                    bincode::serialize(&epoch_num)?,
+                    encode_u64_body(epoch_num),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1747,21 +1922,24 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochLeaves,
-                    bincode::serialize(&epoch_num)?,
+                    encode_u64_body(epoch_num),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
         NetworkCommand::GossipEpochLeaves(bundle) => {
             state
-                .sign_and_broadcast(WireTopic::EpochLeaves, bincode::serialize(&bundle)?)
+                .sign_and_broadcast(
+                    WireTopic::EpochLeaves,
+                    canonical::encode_epoch_leaves_bundle(&bundle)?,
+                )
                 .await?;
         }
         NetworkCommand::RequestEpochCandidates(epoch_hash) => {
             let _ = state
                 .sign_and_send_to_targets(
                     WireTopic::RequestEpochCandidates,
-                    bincode::serialize(&epoch_hash)?,
+                    encode_bytes32_body(&epoch_hash),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -1964,20 +2142,18 @@ pub fn encode_wire_hello(
     record: NodeRecordV2,
     known_records: Vec<NodeRecordV2>,
 ) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(&WireMessage::Hello(HelloMessage {
+    encode_wire_message(&WireMessage::Hello(HelloMessage {
         record,
         known_records,
-    }))?)
+    }))
 }
 
 pub fn encode_wire_envelope(envelope: &SignedEnvelope) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(&WireMessage::Envelope(
-        envelope.clone(),
-    ))?)
+    encode_wire_message(&WireMessage::Envelope(envelope.clone()))
 }
 
 async fn write_wire_message(send: &mut quinn::SendStream, message: &WireMessage) -> Result<()> {
-    let bytes = bincode::serialize(message)?;
+    let bytes = encode_wire_message(message)?;
     send.write_all(&bytes).await?;
     send.finish()?;
     Ok(())
@@ -1985,7 +2161,7 @@ async fn write_wire_message(send: &mut quinn::SendStream, message: &WireMessage)
 
 async fn read_hello_message(recv: &mut quinn::RecvStream) -> Result<HelloMessage> {
     let bytes = recv.read_to_end(MAX_WIRE_BYTES).await?;
-    let message: WireMessage = bincode::deserialize(&bytes)?;
+    let message = decode_wire_message(&bytes)?;
     match message {
         WireMessage::Hello(hello) => Ok(hello),
         WireMessage::Envelope(_) => bail!("expected hello message"),
@@ -2025,7 +2201,7 @@ fn load_bootstrap_record(item: &str) -> Result<NodeRecordV2> {
     let trimmed = item.trim();
     if Path::new(trimmed).exists() {
         let bytes = fs::read(trimmed)?;
-        if let Ok(record) = bincode::deserialize::<NodeRecordV2>(&bytes) {
+        if let Ok(record) = canonical::decode_node_record(&bytes) {
             return Ok(record);
         }
         let text = String::from_utf8(bytes).context("bootstrap file is not valid UTF-8")?;
@@ -2037,7 +2213,7 @@ fn load_bootstrap_record(item: &str) -> Result<NodeRecordV2> {
 fn load_persisted_records(db: &Store, banned: &HashSet<[u8; 32]>) -> Result<Vec<NodeRecordV2>> {
     let mut out = Vec::new();
     for bytes in db.load_node_records()? {
-        let Ok(record) = bincode::deserialize::<NodeRecordV2>(&bytes) else {
+        let Ok(record) = canonical::decode_node_record(&bytes) else {
             continue;
         };
         if banned.contains(&record.node_id) {
@@ -2059,7 +2235,7 @@ fn unix_ms() -> u64 {
 
 fn request_route_key(topic: WireTopic, body: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("unchained-request-route-v1");
-    hasher.update(&[topic as u8]);
+    hasher.update(&[wire_topic_id(topic)]);
     hasher.update(body);
     *hasher.finalize().as_bytes()
 }

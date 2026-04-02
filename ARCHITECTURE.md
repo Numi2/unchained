@@ -4,11 +4,13 @@ This repository treats the system as three separate concerns:
 
 - `protocol / consensus core`
 - `wallet / privacy client`
-- `edge services`
+- `pq mesh runtime`
 
 ## Canonical Rules
 
 Consensus policy is versioned and protocol-locked in [src/protocol.rs](/Users/home/unchgit/unchained/src/protocol.rs).
+
+All signed remote objects and mesh payloads use an explicit canonical byte codec in [src/canonical.rs](/Users/home/unchgit/unchained/src/canonical.rs). The live protocol does not depend on serde or `bincode` layout choices for node records, trust updates, envelopes, or wire topics.
 
 Runtime config may tune operational behavior, but it does not redefine:
 
@@ -32,7 +34,7 @@ The current system is therefore a private spend chain over stable coin identitie
 
 ## Privacy Model
 
-Wallet privacy comes from private recipient addresses, Kyber-derived one-time outputs, and hashlock-based ownership transfer.
+Wallet privacy comes from private recipient addresses, ML-KEM-derived one-time outputs, and hashlock-based ownership transfer.
 
 Important consequence:
 
@@ -53,26 +55,31 @@ Spend validation is commit-epoch aware:
 
 ## Service Boundary
 
-Auxiliary HTTP and discovery surfaces are opt-in:
+The product boundary is PQ-only by construction:
 
-- offers API requires `[offers].api_enabled = true`
-- bridge/x402 RPC requires `[bridge].bridge_enabled = true` or `[bridge].x402_enabled = true`
-
-The node should not expose non-consensus APIs by default.
+- node-to-node communication runs over the signed PQ mesh
+- the mesh trust root is an offline ML-DSA node root that signs time-bounded runtime node records
+- the online runtime presents only its delegated ML-DSA auth key plus installed signed node record
+- wallet, offer, and message workflows are driven through the CLI and protocol messages
+- no bridge, x402, or separate offers HTTP perimeter exists in the default product
+- the metrics/log stream is loopback-only and not part of the remote protocol surface
 
 ## Product Surface
 
 The public CLI is intentionally phrased in product terms:
 
+- `node init-root`, `node auth-prepare`, `node auth-sign`, and `node auth-install` implement the offline-root provisioning flow
 - `node start` is the explicit runtime entrypoint
 - `wallet receive`, `wallet send`, `wallet balance`, and `wallet history` are the primary wallet journeys
-- `offers`, `message`, and `x402` are grouped as edge-service commands
+- `offers` and `message` are mesh-native product commands
 - `advanced` contains protocol and maintenance tooling
 - older flat command names remain only as compatibility aliases
 
 ## If Re-Architecting Further
 
-If Unchained moves to a full shielded-note design, the right target is:
+The shielded-pool successor is now being defined in [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md) and implemented in [src/shielded.rs](/Users/home/unchgit/unchained/src/shielded.rs).
+
+The target remains:
 
 - one global note commitment tree
 - one compact spent-set commitment or accumulator

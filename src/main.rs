@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
 
-#[cfg(feature = "classical_perimeter")]
-pub mod bridge;
+pub mod canonical;
 pub mod coin;
 pub mod config;
 pub mod consensus;
@@ -17,15 +16,13 @@ pub mod metrics;
 pub mod miner;
 pub mod network;
 pub mod node_identity;
-pub mod offers;
 pub mod protocol;
+pub mod shielded;
 pub mod storage;
 pub mod sync;
 pub mod transaction;
 pub mod transfer;
 pub mod wallet;
-#[cfg(feature = "classical_perimeter")]
-pub mod x402;
 use crate::network::RateLimitedMessage;
 use qrcode::render::unicode;
 use qrcode::QrCode;
@@ -102,7 +99,7 @@ fn short_text(value: &str) -> String {
     long_about = "Run an Unchained node: start the runtime explicitly, manage a wallet, and send private hashlock transfers.\n\
 \nSending accepts a single receiver address or verified recipient document. Use flags for automation or run interactively for a guided flow.",
     help_template = "{name} {version}\n{about}\n\nUSAGE:\n  {usage}\n\nOPTIONS:\n{options}\n\nCOMMANDS:\n{subcommands}\n\n{after-help}",
-    after_help = "Examples:\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n"
+    after_help = "Examples:\n  unchained node init-root\n  unchained node auth-prepare --out auth_request.txt\n  unchained node auth-sign --request auth_request.txt --out node_record.txt\n  unchained node auth-install --record node_record.txt\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
@@ -137,12 +134,6 @@ enum Cmd {
     Message {
         #[command(subcommand)]
         cmd: MessageCmd,
-    },
-    #[cfg(feature = "classical_perimeter")]
-    /// x402 payment commands
-    X402 {
-        #[command(subcommand)]
-        cmd: X402Cmd,
     },
     /// Advanced protocol and maintenance commands
     Advanced {
@@ -186,10 +177,6 @@ enum Cmd {
     /// Show wallet transaction history
     #[command(hide = true)]
     History(HistoryArgs),
-    #[cfg(feature = "classical_perimeter")]
-    /// x402: Pay a 402 challenge at a protected URL and print X-PAYMENT header
-    #[command(hide = true)]
-    X402Pay(X402PayArgs),
     /// HTLC: Plan an offer (sender) and output a JSON plan
     #[command(hide = true)]
     HtlcPlan {
@@ -357,50 +344,73 @@ enum Cmd {
         #[arg(long)]
         input: String,
     },
-    #[cfg(feature = "classical_perimeter")]
-    /// Bridge: Lock UNCH on Unchained for a Sui recipient
-    #[command(hide = true)]
-    BridgeOut {
-        /// Sui recipient address (0x-prefixed lowercase hex)
-        #[arg(long)]
-        sui_recipient: String,
-        /// Amount to lock
-        #[arg(long)]
-        amount: u64,
-        /// Seconds to pre-warm coin proofs before submitting (0 to disable)
-        #[arg(long, default_value_t = 12)]
-        prewarm_secs: u64,
-    },
-    #[cfg(feature = "classical_perimeter")]
-    /// Meta: Create a signed authorization for facilitator to submit spends (EIP-3009-like)
-    #[command(hide = true)]
-    MetaAuthzCreate {
-        /// Receiver paycode (base64-url)
-        #[arg(long)]
-        to: String,
-        /// Total amount to authorize
-        #[arg(long)]
-        amount: u64,
-        /// Valid after this epoch (inclusive)
-        #[arg(long)]
-        valid_after: u64,
-        /// Valid before this epoch (exclusive)
-        #[arg(long)]
-        valid_before: u64,
-        /// Facilitator ML-KEM-768 public key (base64-url)
-        #[arg(long)]
-        facilitator_kyber_b64: String,
-        /// Optional x402-style 32-byte binding (base64-url)
-        #[arg(long)]
-        binding_b64: Option<String>,
-        /// Output file for the JSON document
-        #[arg(long)]
-        out: String,
-    },
 }
 
 #[derive(Subcommand)]
 enum NodeCmd {
+    /// Create or load the offline node root and print its compact root-info document
+    InitRoot {
+        /// Optional file path for the compact root-info document
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Prepare a runtime auth key and signed auth request for offline approval
+    AuthPrepare {
+        /// Optional compact root-info document or file path to pin the expected root
+        #[arg(long)]
+        root_info: Option<String>,
+        /// Optional file path for the compact auth-request document
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Approve an auth request with the offline node root and produce a signed node record
+    AuthSign {
+        /// Compact auth-request document or file path
+        #[arg(long)]
+        request: String,
+        /// Signed node-record lifetime in days
+        #[arg(long, default_value_t = 30)]
+        lifetime_days: u64,
+        /// Optional file path for the compact node-record document
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Install a signed node record for runtime use
+    AuthInstall {
+        /// Compact node-record document or file path
+        #[arg(long)]
+        record: String,
+    },
+    /// Create a compact trust-update revocation document
+    TrustRevoke {
+        /// Subject node ID as 64 hex characters
+        #[arg(long)]
+        node_id: String,
+        /// Optional file path for the compact trust-update document
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Create a compact trust-update replacement document
+    TrustReplace {
+        /// Subject node ID as 64 hex characters
+        #[arg(long)]
+        node_id: String,
+        /// Replacement compact node-record document or file path
+        #[arg(long)]
+        replacement: String,
+        /// Optional file path for the compact trust-update document
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Approve a compact trust-update document with the offline node root
+    TrustApprove {
+        /// Compact trust-update document or file path
+        #[arg(long)]
+        update: String,
+        /// Optional file path for the compact trust-update document
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Start the node runtime
     Start {
         /// Force mining on for this run
@@ -505,17 +515,6 @@ struct MessageListenArgs {
     count: Option<u64>,
 }
 
-#[cfg(feature = "classical_perimeter")]
-#[derive(Args, Clone)]
-struct X402PayArgs {
-    /// URL to the protected resource (server will return 402 with challenge)
-    #[arg(long)]
-    url: String,
-    /// Auto-resubmit and print the resource body after paying
-    #[arg(long, default_value_t = true)]
-    auto_resubmit: bool,
-}
-
 #[derive(Subcommand)]
 enum WalletCmd {
     /// Show your shareable receiving address
@@ -603,13 +602,6 @@ enum MessageCmd {
     Listen(MessageListenArgs),
 }
 
-#[cfg(feature = "classical_perimeter")]
-#[derive(Subcommand)]
-enum X402Cmd {
-    /// Pay a 402 challenge and optionally fetch the protected resource
-    Pay(X402PayArgs),
-}
-
 #[derive(Subcommand)]
 enum AdvancedCmd {
     /// Request a coin proof and verify it locally
@@ -693,34 +685,6 @@ enum AdvancedCmd {
     ImportAnchors {
         #[arg(long)]
         input: String,
-    },
-    #[cfg(feature = "classical_perimeter")]
-    /// Lock UNCH on Unchained for a Sui recipient
-    BridgeOut {
-        #[arg(long)]
-        sui_recipient: String,
-        #[arg(long)]
-        amount: u64,
-        #[arg(long, default_value_t = 12)]
-        prewarm_secs: u64,
-    },
-    #[cfg(feature = "classical_perimeter")]
-    /// Create a signed authorization for facilitator submission
-    MetaAuthzCreate {
-        #[arg(long)]
-        to: String,
-        #[arg(long)]
-        amount: u64,
-        #[arg(long)]
-        valid_after: u64,
-        #[arg(long)]
-        valid_before: u64,
-        #[arg(long)]
-        facilitator_kyber_b64: String,
-        #[arg(long)]
-        binding_b64: Option<String>,
-        #[arg(long)]
-        out: String,
     },
 }
 
@@ -993,15 +957,7 @@ fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> anyhow::
 fn print_peer_id_output(cfg: &config::Config) -> anyhow::Result<()> {
     let db = storage::Store::open(&cfg.storage.path)?;
     let chain_id = db.get_chain_id().ok();
-    let addresses = vec![std::net::SocketAddr::new(
-        cfg.net
-            .public_ip
-            .as_ref()
-            .and_then(|raw| raw.parse::<std::net::IpAddr>().ok())
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-        cfg.net.listen_port,
-    )
-    .to_string()];
+    let addresses = published_identity_addresses(cfg);
     let (id, bootstrap_record) = node_identity::load_local_identity_output_in_dir(
         &cfg.storage.path,
         protocol::CURRENT.version,
@@ -1018,143 +974,152 @@ fn print_peer_id_output(cfg: &config::Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "classical_perimeter")]
-async fn run_x402_pay(
-    wallet: &wallet::Wallet,
-    net: &network::NetHandle,
-    url: &str,
-    auto_resubmit: bool,
-) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let resp = client.get(url).send().await?;
-    if resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
-        eprintln!("Expected 402, got {}", resp.status());
-        return Err(anyhow::anyhow!("not a 402"));
-    }
-    let challenge_json = resp.text().await?;
-    let header = wallet.x402_pay_from_challenge(&challenge_json, net).await?;
-    println!("X-PAYMENT: {}", header);
-    if auto_resubmit {
-        let resp2 = client
-            .get(url)
-            .header(crate::x402::HEADER_X_PAYMENT, header)
-            .send()
-            .await?;
-        if !resp2.status().is_success() {
-            eprintln!("Resubmit failed: {}", resp2.status());
-            return Err(anyhow::anyhow!("resubmit failed"));
-        }
-        let body = resp2.text().await.unwrap_or_default();
-        println!("{}", body);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "classical_perimeter")]
-async fn run_bridge_out(
-    cfg: &config::Config,
-    db: Arc<storage::Store>,
-    wallet: Arc<wallet::Wallet>,
-    net: network::NetHandle,
-    sui_recipient: String,
-    amount: u64,
-    prewarm_secs: u64,
-) -> anyhow::Result<()> {
-    if prewarm_secs > 0 {
-        match wallet.select_inputs(amount) {
-            Ok(coins) => {
-                let mut rx = net.proof_subscribe();
-                for c in coins.iter() {
-                    net.request_coin_proof(c.id).await;
-                }
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(prewarm_secs);
-                loop {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    if let Ok(Ok(resp)) = tokio::time::timeout(remaining, rx.recv()).await {
-                        if coins.iter().any(|c| c.id == resp.coin.id) {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("⚠️  Could not pre-warm proofs: {}", e);
-            }
-        }
-    }
-
-    match bridge::submit_bridge_out_direct(
-        cfg.bridge.clone(),
-        db,
-        wallet,
-        net,
-        amount,
-        sui_recipient,
+fn published_identity_addresses(cfg: &config::Config) -> Vec<String> {
+    vec![std::net::SocketAddr::new(
+        cfg.net
+            .public_ip
+            .as_ref()
+            .and_then(|raw| raw.parse::<std::net::IpAddr>().ok())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        cfg.net.listen_port,
     )
-    .await
-    {
-        Ok(bridge::BridgeOutResult::Locked { tx_hash }) => {
-            println!("✅ Locked. tx_hash={}", tx_hash);
-        }
-        Ok(bridge::BridgeOutResult::Pending { op_id }) => {
-            println!("⏳ Submitted pending op. op_id={}", op_id);
-        }
-        Err(e) => {
-            eprintln!("❌ bridge_out failed: {}", e);
-        }
+    .to_string()]
+}
+
+fn load_identity_chain_id(storage_path: &str) -> anyhow::Result<Option<[u8; 32]>> {
+    let db = storage::Store::open(storage_path)?;
+    Ok(db.get_chain_id().ok())
+}
+
+fn write_compact_output(path: Option<&str>, value: &str) -> anyhow::Result<()> {
+    if let Some(path) = path {
+        std::fs::write(path, format!("{value}\n"))?;
+        println!("Wrote {}", path);
+        println!();
     }
     Ok(())
 }
 
-#[cfg(feature = "classical_perimeter")]
-fn run_meta_authz_create(
-    wallet: &wallet::Wallet,
-    to: &str,
-    amount: u64,
-    valid_after: u64,
-    valid_before: u64,
-    facilitator_kyber_b64: &str,
-    binding_b64: Option<&String>,
-    out: &str,
+fn print_compact_document(
+    label: &str,
+    node_id: Option<&str>,
+    value: &str,
+    out: Option<&str>,
 ) -> anyhow::Result<()> {
-    let fac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(facilitator_kyber_b64.trim())
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(facilitator_kyber_b64.trim()))
-        .map_err(|_| anyhow::anyhow!("invalid base64 for facilitator ML-KEM public key"))?;
-    let fac_pk = crate::crypto::TaggedKemPublicKey::from_ml_kem_768_bytes(&fac_bytes)
-        .map_err(|_| anyhow::anyhow!("invalid facilitator ML-KEM-768 public key bytes"))?;
-    let binding_opt: Option<[u8; 32]> = if let Some(b) = binding_b64 {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(b.trim())
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b.trim()))
-            .map_err(|_| anyhow::anyhow!("invalid base64 for binding"))?;
-        if raw.len() != 32 {
-            return Err(anyhow::anyhow!("binding must be 32 bytes"));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&raw);
-        Some(arr)
-    } else {
-        None
-    };
-    let authz = wallet.authorize_meta_transfer(
-        to,
-        amount,
-        valid_after,
-        valid_before,
-        &fac_pk,
-        binding_opt,
-    )?;
-    let json = serde_json::to_string_pretty(&authz)?;
-    std::fs::write(out, json)?;
-    println!("✅ Wrote meta authorization JSON");
+    write_compact_output(out, value)?;
+    if let Some(node_id) = node_id {
+        println!("Node ID");
+        println!();
+        println!("{node_id}");
+        println!();
+    }
+    println!("{label}");
+    println!();
+    println!("{value}");
     Ok(())
+}
+
+fn parse_node_id_hex(value: &str) -> anyhow::Result<[u8; 32]> {
+    let raw = hex::decode(value.trim())?;
+    if raw.len() != 32 {
+        return Err(anyhow::anyhow!("node id must be exactly 32 bytes"));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn handle_node_operator_command(cmd: &Option<Cmd>, cfg: &config::Config) -> anyhow::Result<bool> {
+    match cmd {
+        Some(Cmd::Node {
+            cmd: NodeCmd::InitRoot { out },
+        }) => {
+            let (node_id, root_info) = node_identity::init_root_in_dir(&cfg.storage.path)?;
+            print_compact_document("Root Info", Some(&node_id), &root_info, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd: NodeCmd::AuthPrepare { root_info, out },
+        }) => {
+            let chain_id = load_identity_chain_id(&cfg.storage.path)?;
+            let addresses = published_identity_addresses(cfg);
+            let (node_id, request) = node_identity::prepare_auth_request_in_dir(
+                &cfg.storage.path,
+                protocol::CURRENT.version,
+                chain_id,
+                addresses,
+                root_info.as_deref(),
+            )?;
+            print_compact_document("Auth Request", Some(&node_id), &request, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd:
+                NodeCmd::AuthSign {
+                    request,
+                    lifetime_days,
+                    out,
+                },
+        }) => {
+            let (node_id, record) = node_identity::sign_auth_request_in_dir(
+                &cfg.storage.path,
+                request,
+                *lifetime_days,
+            )?;
+            print_compact_document("Node Record", Some(&node_id), &record, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd: NodeCmd::AuthInstall { record },
+        }) => {
+            let (node_id, installed_record) =
+                node_identity::install_node_record_in_dir(&cfg.storage.path, record)?;
+            print_compact_document(
+                "Installed Node Record",
+                Some(&node_id),
+                &installed_record,
+                None,
+            )?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd: NodeCmd::TrustRevoke { node_id, out },
+        }) => {
+            let update = node_identity::create_trust_update_revoke(parse_node_id_hex(node_id)?)?;
+            print_compact_document("Trust Update", None, &update, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd:
+                NodeCmd::TrustReplace {
+                    node_id,
+                    replacement,
+                    out,
+                },
+        }) => {
+            let update = node_identity::create_trust_update_replace(
+                parse_node_id_hex(node_id)?,
+                replacement,
+            )?;
+            print_compact_document("Trust Update", None, &update, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd: NodeCmd::TrustApprove { update, out },
+        }) => {
+            let approved = node_identity::approve_trust_update_in_dir(&cfg.storage.path, update)?;
+            print_compact_document("Approved Trust Update", None, &approved, out.as_deref())?;
+            Ok(true)
+        }
+        Some(Cmd::Node {
+            cmd: NodeCmd::PeerId,
+        })
+        | Some(Cmd::PeerId) => {
+            print_peer_id_output(cfg)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[tokio::main]
@@ -1233,28 +1198,6 @@ async fn main() -> anyhow::Result<()> {
     if force_mine {
         cfg.mining.enabled = true;
     }
-
-    #[cfg(not(feature = "classical_perimeter"))]
-    if cfg.bridge.bridge_enabled || cfg.bridge.x402_enabled {
-        return Err(anyhow::anyhow!(
-            "this build excludes the classical perimeter. disable [bridge] in config or rebuild with `--features classical_perimeter`"
-        ));
-    }
-
-    if matches!(
-        &cli.cmd,
-        Some(Cmd::Node {
-            cmd: NodeCmd::PeerId
-        }) | Some(Cmd::PeerId)
-    ) {
-        print_peer_id_output(&cfg)?;
-        return Ok(());
-    }
-
-    // Apply quiet logging preference: CLI flag overrides config
-    if cli.quiet_net {
-        network::set_quiet_logging(true);
-    }
     if std::path::Path::new(&cfg.storage.path).is_relative() {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -1263,6 +1206,15 @@ async fn main() -> anyhow::Result<()> {
             .join(".unchained")
             .join("unchained_data");
         cfg.storage.path = abs.to_string_lossy().into_owned();
+    }
+
+    if handle_node_operator_command(&cli.cmd, &cfg)? {
+        return Ok(());
+    }
+
+    // Apply quiet logging preference: CLI flag overrides config
+    if cli.quiet_net {
+        network::set_quiet_logging(true);
     }
 
     // If no CLI quiet flag, honor config default
@@ -1333,7 +1285,6 @@ async fn main() -> anyhow::Result<()> {
     let net = network::spawn(
         cfg.net.clone(),
         cfg.p2p.clone(),
-        cfg.offers.clone(),
         db.clone(),
         sync_state.clone(),
     )
@@ -2039,14 +1990,6 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote claim CHs for {} coins", doc.claims.len());
             return Ok(());
         }
-        #[cfg(feature = "classical_perimeter")]
-        Some(Cmd::X402 {
-            cmd: X402Cmd::Pay(X402PayArgs { url, auto_resubmit }),
-        })
-        | Some(Cmd::X402Pay(X402PayArgs { url, auto_resubmit })) => {
-            run_x402_pay(wallet.as_ref(), &net, url, *auto_resubmit).await?;
-            return Ok(());
-        }
         Some(Cmd::Advanced {
             cmd: AdvancedCmd::RepairSpends,
         })
@@ -2108,65 +2051,6 @@ async fn main() -> anyhow::Result<()> {
         | Some(Cmd::ImportAnchors { input }) => {
             let added = db.import_anchors_snapshot(input)?;
             println!("✅ Imported {} anchors from {}", added, input);
-            return Ok(());
-        }
-        #[cfg(feature = "classical_perimeter")]
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::BridgeOut {
-                    sui_recipient,
-                    amount,
-                    prewarm_secs,
-                },
-        })
-        | Some(Cmd::BridgeOut {
-            sui_recipient,
-            amount,
-            prewarm_secs,
-        }) => {
-            run_bridge_out(
-                &cfg,
-                db.clone(),
-                wallet.clone(),
-                net.clone(),
-                sui_recipient.clone(),
-                *amount,
-                *prewarm_secs,
-            )
-            .await?;
-        }
-        #[cfg(feature = "classical_perimeter")]
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::MetaAuthzCreate {
-                    to,
-                    amount,
-                    valid_after,
-                    valid_before,
-                    facilitator_kyber_b64,
-                    binding_b64,
-                    out,
-                },
-        })
-        | Some(Cmd::MetaAuthzCreate {
-            to,
-            amount,
-            valid_after,
-            valid_before,
-            facilitator_kyber_b64,
-            binding_b64,
-            out,
-        }) => {
-            run_meta_authz_create(
-                wallet.as_ref(),
-                to,
-                *amount,
-                *valid_after,
-                *valid_before,
-                facilitator_kyber_b64,
-                binding_b64.as_ref(),
-                out,
-            )?;
             return Ok(());
         }
         // commitment commands removed
@@ -2261,6 +2145,27 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Node {
             cmd: NodeCmd::PeerId,
         })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::InitRoot { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::AuthPrepare { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::AuthSign { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::AuthInstall { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::TrustRevoke { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::TrustReplace { .. },
+        })
+        | Some(Cmd::Node {
+            cmd: NodeCmd::TrustApprove { .. },
+        })
         | Some(Cmd::PeerId)
         | Some(Cmd::Wallet {
             cmd: WalletCmd::Receive(_),
@@ -2286,26 +2191,6 @@ async fn main() -> anyhow::Result<()> {
 
     let _metrics_bind = cfg.metrics.bind.clone();
     metrics::serve(cfg.metrics)?;
-    // Start offers HTTP API only when explicitly enabled.
-    if cfg.offers.api_enabled {
-        let offers_cfg = cfg.offers.clone();
-        let db_h = db.clone();
-        let net_h = net.clone();
-        tokio::spawn(async move {
-            let _ = offers::serve(offers_cfg, db_h, net_h).await;
-        });
-    }
-    #[cfg(feature = "classical_perimeter")]
-    // Start bridge/x402 RPC only when explicitly enabled.
-    if cfg.bridge.bridge_enabled || cfg.bridge.x402_enabled {
-        let bridge_cfg = cfg.bridge.clone();
-        let db_h = db.clone();
-        let wallet_h = wallet.clone();
-        let net_h = net.clone();
-        tokio::spawn(async move {
-            let _ = bridge::serve(bridge_cfg, db_h, wallet_h, net_h).await;
-        });
-    }
 
     println!();
     println!("Unchained node is running.");

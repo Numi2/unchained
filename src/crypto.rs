@@ -4,10 +4,6 @@ use atty;
 use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
 use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaPublicKey, ML_DSA_65, ML_DSA_65_SIGNING};
 use blake3::Hasher;
-use chacha20poly1305::{
-    aead::{Aead, NewAead},
-    Key, XChaCha20Poly1305, XNonce,
-};
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use once_cell::sync::OnceCell;
@@ -523,41 +519,17 @@ pub fn derive_next_lock_secret_with_note(
     *h.finalize().as_bytes()
 }
 
-/// Derive a 32-byte AEAD key from a shared secret using domain-separated BLAKE3.
+/// Derive a stable 32-byte key from an ML-KEM shared secret.
 #[inline]
-pub fn derive_meta_authz_aead_key(shared_secret: &[u8]) -> [u8; 32] {
+fn derive_kem_shared_key32(shared_secret: &[u8]) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
         (len as u32).to_le_bytes()
     }
     let mut h = Hasher::new();
-    h.update(b"meta-authz.aead.key.v1");
+    h.update(b"ml-kem.shared-key.v1");
     h.update(&lp(shared_secret.len()));
     h.update(shared_secret);
     *h.finalize().as_bytes()
-}
-
-/// AEAD encrypt with XChaCha20-Poly1305.
-pub fn aead_encrypt_xchacha(
-    key32: &[u8; 32],
-    nonce24: &[u8; 24],
-    plaintext: &[u8],
-) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
-    Ok(cipher
-        .encrypt(XNonce::from_slice(nonce24), plaintext)
-        .map_err(|e| anyhow!("AEAD encrypt: {}", e))?)
-}
-
-/// AEAD decrypt with XChaCha20-Poly1305.
-pub fn aead_decrypt_xchacha(
-    key32: &[u8; 32],
-    nonce24: &[u8; 24],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key32));
-    Ok(cipher
-        .decrypt(XNonce::from_slice(nonce24), ciphertext)
-        .map_err(|_| anyhow!("AEAD decrypt failed"))?)
 }
 
 /// Perform an ML-KEM-768 KEM encapsulation. Returns (ciphertext, aead_key32).
@@ -570,21 +542,7 @@ pub fn kem_encapsulate_to_ml_kem(
         .map_err(|_| anyhow!("ML-KEM-768 encapsulation failed"))?;
     let mut kem_ct = [0u8; ML_KEM_768_CT_BYTES];
     kem_ct.copy_from_slice(ciphertext.as_slice());
-    Ok((kem_ct, derive_meta_authz_aead_key(shared_secret.as_slice())))
-}
-
-/// Decapsulate an ML-KEM-768 ciphertext with the facilitator secret key to derive the AEAD key.
-pub fn kem_decapsulate_ml_kem(sk: &MlKem768SecretKey, kem_ct_bytes: &[u8]) -> Result<[u8; 32]> {
-    if kem_ct_bytes.len() != ML_KEM_768_CT_BYTES {
-        bail!(
-            "invalid ML-KEM-768 ciphertext length: expected {}, got {}",
-            ML_KEM_768_CT_BYTES,
-            kem_ct_bytes.len()
-        );
-    }
-    let mut ciphertext = [0u8; ML_KEM_768_CT_BYTES];
-    ciphertext.copy_from_slice(kem_ct_bytes);
-    ml_kem_768_decapsulate(sk, &ciphertext)
+    Ok((kem_ct, derive_kem_shared_key32(shared_secret.as_slice())))
 }
 
 pub fn ml_kem_768_decapsulate(
