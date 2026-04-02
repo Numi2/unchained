@@ -426,3 +426,93 @@ fn archive_replica_reports_and_custody_assignments_track_durability() -> Result<
     assert_ne!(custodians[0], custodians[1]);
     Ok(())
 }
+
+#[test]
+fn checkpoint_extensions_packetize_large_segment_sets() -> Result<()> {
+    let chain_id = [81u8; 32];
+    let note_key = [82u8; 32];
+    let note = fixed_note(5, note_key, [83u8; 32], [84u8; 32]);
+    let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=10 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest =
+        local_archive_provider_manifest([44u8; 32], provider.root_ledger(), 1, &available_epochs)?;
+
+    let mut segments = Vec::new();
+    for epoch in 5u64..=10 {
+        let segment_checkpoint = HistoricalUnspentCheckpoint {
+            version: checkpoint.version,
+            note_commitment: checkpoint.note_commitment,
+            birth_epoch: checkpoint.birth_epoch,
+            covered_through_epoch: epoch.saturating_sub(1),
+            transcript_root: checkpoint.transcript_root,
+            verified_epoch_count: checkpoint.verified_epoch_count,
+        };
+        let response = provider.serve_checkpoint(
+            &manifest,
+            &segment_checkpoint,
+            &[EvolvingNullifierQuery {
+                epoch,
+                nullifier: note.derive_evolving_nullifier(&note_key, &chain_id, epoch)?,
+            }],
+        )?;
+        segments.push(response.rerandomize([epoch as u8; 32]));
+    }
+
+    let extension = HistoricalUnspentExtension::aggregate(&checkpoint, segments, [91u8; 32])?;
+    assert!(extension.packets.len() > 1);
+    assert_eq!(
+        extension
+            .packets
+            .iter()
+            .map(|packet| packet.segments.len())
+            .sum::<usize>(),
+        6
+    );
+    let updated = checkpoint.apply_extension(&extension, provider.root_ledger())?;
+    assert_eq!(updated.covered_through_epoch, 10);
+    Ok(())
+}
+
+#[test]
+fn archive_operator_scorecards_reward_long_retention() -> Result<()> {
+    let mut provider = ShieldedSyncServer::new();
+    for epoch in 5u64..=8 {
+        provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
+    }
+    let available_epochs = provider.root_ledger().roots.keys().copied().collect();
+    let manifest_a =
+        local_archive_provider_manifest([51u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let manifest_b =
+        local_archive_provider_manifest([52u8; 32], provider.root_ledger(), 2, &available_epochs)?;
+    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+    )?;
+    let mut replicas =
+        local_archive_replica_attestations(manifest_a.provider_id, &base_directory, 16)?;
+    replicas.extend(local_archive_replica_attestations(
+        manifest_b.provider_id,
+        &base_directory,
+        64,
+    )?);
+    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
+        provider.root_ledger(),
+        2,
+        vec![manifest_a.clone(), manifest_b.clone()],
+        replicas,
+    )?;
+
+    let mut scorecards = directory.operator_scorecards(2, 32);
+    scorecards.sort_by_key(|scorecard| scorecard.provider_id);
+    assert_eq!(scorecards.len(), 2);
+    let score_a = &scorecards[0];
+    let score_b = &scorecards[1];
+    assert!(score_b.retention_surplus_epochs > score_a.retention_surplus_epochs);
+    assert!(score_b.reward_weight > score_a.reward_weight);
+    Ok(())
+}

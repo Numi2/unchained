@@ -64,7 +64,7 @@ The proof-carrying contract is split deliberately:
 
 This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
 
-On the client side, checkpoint refresh is now routed through a replica-aware mesh archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests plus replica attestations, request missing epoch shards over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet no longer treats a historical refresh as one provider, one proof. It splits each note history into shard-aligned checkpoint segments, routes those segments across multiple providers, pads provider/shard buckets with cover traffic, rerandomizes every provider segment reply, and only then aggregates the segments into one checkpoint extension. That means no single provider needs to see the full note history for a refresh, and the durable checkpoint transcript root is not byte-identical to what any provider produced.
+On the client side, checkpoint refresh is now routed through a replica-aware mesh archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests plus replica attestations, request missing epoch shards over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet no longer treats a historical refresh as one provider, one proof. It runs a fixed-cadence refresh loop, splits each note history into shard-aligned checkpoint segments, routes those segments across multiple providers, pads provider/shard buckets with cover traffic, rerandomizes every provider segment reply, compresses those segments into packet-level checkpoint accumulators, and only then aggregates the packets into one checkpoint extension. That means no single provider needs to see the full note history for a refresh, spend timing is less query-shaped, and the durable checkpoint transcript root is not byte-identical to what any provider produced.
 
 ## Service Boundary
 
@@ -91,12 +91,12 @@ The public CLI is intentionally phrased in product terms:
 
 ## Archive Layer
 
-The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, rerandomizes provider responses before they enter the proof witness, and rebalances deterministic shard custody toward the protocol replica target.
+The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, rerandomizes provider responses before they enter the proof witness, packetizes those rerandomized segment batches one layer deeper inside the checkpoint witness, computes deterministic operator scorecards for long-horizon archive custody, and rebalances deterministic shard custody toward the protocol replica target.
 
 That leaves a narrower remaining frontier:
 
-- fixed-cadence background refresh so spend timing is even less query-shaped
-- stronger external operator incentives or accounting for very long historical horizons
-- proof-system-level accumulation that compresses many rerandomized checkpoint segments further inside the private witness
+- stronger operator economics beyond deterministic scorecards and route bias
+- archive DA that survives very long historical horizons without relying on a small operator set
+- proof-system-level accumulation that turns packet-level checkpoint witnesses into even smaller recursive witness objects
 
 It still must not reintroduce an unbounded RocksDB nullifier column as canonical state.

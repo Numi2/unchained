@@ -22,8 +22,8 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 - Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
 - Canonical transactions carry a succinct STARK receipt over a private witness, while validators only see the current nullifiers, encrypted outputs, and the proof journal bindings required to update state.
 - Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
-- Wallet checkpoint refresh now stripes each note history across shard-aligned checkpoint segments, routes those segments across multiple archive providers discovered on the PQ mesh, pads provider buckets with cover traffic, rerandomizes each provider reply, and only then aggregates them into one durable checkpoint extension.
-- Archived nullifier history is organized into content-addressed epoch shards with provider manifests and replica attestations advertised over the PQ mesh. Nodes deterministically rebalance shard custody so the archive layer converges toward the protocol replica target without pulling historical nullifier bulk back into validator state.
+- Wallet checkpoint refresh now runs on a fixed cadence, not only at spend time. Each cycle stripes note history across shard-aligned checkpoint segments, routes those segments across multiple archive providers discovered on the PQ mesh, pads provider buckets with cover traffic, rerandomizes each provider reply, packetizes the resulting segment transcript, and only then aggregates it into one durable checkpoint extension.
+- Archived nullifier history is organized into content-addressed epoch shards with provider manifests, replica attestations, and deterministic operator scorecards advertised or derived over the PQ mesh. Nodes deterministically rebalance shard custody so the archive layer converges toward the protocol replica target without pulling historical nullifier bulk back into validator state.
 
 ## Architecture
 

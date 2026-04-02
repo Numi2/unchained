@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
+use tokio::time::{Duration, MissedTickBehavior};
 
 pub mod canonical;
 pub mod coin;
@@ -874,6 +875,35 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Background: fixed-cadence oblivious refresh so archive queries are less spend-shaped.
+    {
+        let net_clone = net.clone();
+        let wallet_clone = wallet.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let interval_secs = crate::protocol::CURRENT
+                .oblivious_sync_refresh_interval_secs
+                .max(1);
+            let initial_delay = wallet_clone.fixed_cadence_refresh_offset_secs(interval_secs);
+            tokio::select! {
+                _ = shutdown_rx.recv() => return,
+                _ = tokio::time::sleep(Duration::from_secs(initial_delay)) => {}
+            }
+            let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = tick.tick() => {
+                        if let Err(e) = wallet_clone.run_oblivious_refresh_cycle(&net_clone).await {
+                            eprintln!("Oblivious wallet refresh failed: {}", e);
                         }
                     }
                 }

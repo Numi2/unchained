@@ -90,13 +90,15 @@ for a contiguous checkpoint range. In the live runtime, that service is exposed
 over the PQ mesh as batched checkpoint request/response messages rather than as
 a local-only helper.
 
-The live wallet no longer uses this in a one-note-at-a-time pattern. It builds
-batched checkpoint-extension requests across many owned notes, splits each note
-history into shard-aligned segments, routes those segments through a rotating
-multi-provider schedule, pads each provider/shard bucket with cover requests up
-to a power-of-two bucket, rerandomizes every provider response segment, and
-only then aggregates the rerandomized segments into the checkpoint extension
-that becomes durable local state.
+The live wallet no longer uses this in a one-note-at-a-time pattern. It runs a
+fixed-cadence background refresh loop, builds batched checkpoint-extension
+requests across many owned notes, splits each note history into shard-aligned
+segments, routes those segments through a rotating multi-provider schedule,
+pads each provider/shard bucket with cover requests up to a power-of-two
+bucket, rerandomizes every provider response segment, packetizes those
+rerandomized segments into a deeper checkpoint compression layer, and only then
+aggregates the packets into the checkpoint extension that becomes durable local
+state.
 
 `HistoricalUnspentCheckpoint::apply_extension()` verifies those records against
 the `NullifierRootLedger` and advances the checkpoint without requiring the
@@ -114,6 +116,7 @@ Historical roots are also organized into content-addressed archive shards.
 - contiguous epoch-root shards
 - provider manifests learned from the PQ mesh
 - replica attestations and retention horizons per shard
+- deterministic operator scorecards from public custody and retention data
 - a provider-selection schedule for checkpoint refresh
 - deterministic shard-custody assignments for replication repair
 
@@ -143,13 +146,13 @@ blinding, the provider manifest digest, and the segment historical root digest
 before that segment becomes durable state.
 
 `HistoricalUnspentExtension::aggregate()` is the next step. It takes many
-rerandomized provider segments and compresses them into one checkpoint
-extension with:
+rerandomized provider segments, compresses them into packet-level accumulators,
+and then compresses those packets into one checkpoint extension with:
 
 - one note commitment
 - one prior checkpoint root
 - one aggregate historical-root digest
-- one segment-commitment root
+- one packet-commitment root
 - one final aggregate rerandomization step
 
 The checkpoint layer is no longer a public transaction field. It is private
@@ -208,11 +211,13 @@ The live runtime now already has:
 
 1. segmented multi-provider checkpoint retrieval
 2. rerandomized checkpoint-segment accumulation
-3. mesh-discovered archive providers and shard exchange
-4. replica attestations plus deterministic shard-custody rebalancing
+3. fixed-cadence background checkpoint refresh with cover traffic
+4. packet-level checkpoint compression above raw segments
+5. mesh-discovered archive providers and shard exchange
+6. replica attestations, deterministic operator scorecards, and shard-custody rebalancing
 
 What remains is narrower:
 
-1. fixed-cadence background refresh so spending is even less query-shaped
-2. stronger long-horizon external operator incentives or accounting
-3. deeper proof-system compression across many rerandomized segment accumulators
+1. stronger operator economics beyond deterministic scorecards and routing bias
+2. archive-DA durability for very long historical horizons
+3. deeper recursive compression across packet-level checkpoint accumulators

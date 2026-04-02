@@ -624,6 +624,7 @@ impl RuntimeState {
             .write()
             .await
             .insert(manifest.provider_id, manifest.clone());
+        let _ = self.refresh_archive_operator_scorecards().await;
         Ok(manifest)
     }
 
@@ -672,6 +673,8 @@ impl RuntimeState {
             self.db.store_shielded_archive_replica(replica)?;
             guard.insert((replica.provider_id, replica.shard_id), replica.clone());
         }
+        drop(guard);
+        let _ = self.refresh_archive_operator_scorecards().await;
         Ok(replicas)
     }
 
@@ -707,6 +710,18 @@ impl RuntimeState {
             providers,
             replicas,
         )
+    }
+
+    async fn refresh_archive_operator_scorecards(&self) -> Result<()> {
+        let directory = self.local_archive_directory().await?;
+        for scorecard in directory.operator_scorecards(
+            PROTOCOL.archive_provider_replica_count as usize,
+            PROTOCOL.archive_retention_horizon_epochs,
+        ) {
+            self.db
+                .store_shielded_archive_operator_scorecard(&scorecard)?;
+        }
+        Ok(())
     }
 
     async fn build_local_checkpoint_batch_response(
@@ -766,6 +781,7 @@ impl RuntimeState {
             .write()
             .await
             .insert(manifest.provider_id, manifest);
+        self.refresh_archive_operator_scorecards().await?;
         Ok(())
     }
 
@@ -784,6 +800,7 @@ impl RuntimeState {
             .write()
             .await
             .insert((replica.provider_id, replica.shard_id), replica);
+        self.refresh_archive_operator_scorecards().await?;
         Ok(())
     }
 

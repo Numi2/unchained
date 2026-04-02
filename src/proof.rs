@@ -4,6 +4,7 @@ use proof_core::{
     HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
     HistoricalUnspentCheckpoint as ProofHistoricalUnspentCheckpoint,
     HistoricalUnspentExtension as ProofHistoricalUnspentExtension,
+    HistoricalUnspentPacket as ProofHistoricalUnspentPacket,
     HistoricalUnspentSegment as ProofHistoricalUnspentSegment,
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
@@ -17,8 +18,8 @@ use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, 
 use crate::{
     shielded::{
         HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
-        HistoricalUnspentSegment, NoteMembershipProof, NullifierMembershipWitness,
-        NullifierNonMembershipProof, ShieldedNote,
+        HistoricalUnspentPacket, HistoricalUnspentSegment, NoteMembershipProof,
+        NullifierMembershipWitness, NullifierNonMembershipProof, ShieldedNote,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
@@ -169,10 +170,22 @@ fn extension_to_proof(extension: &HistoricalUnspentExtension) -> ProofHistorical
         through_epoch: extension.through_epoch,
         prior_transcript_root: extension.prior_transcript_root,
         historical_root_digest: extension.historical_root_digest,
-        segment_commitment_root: extension.segment_commitment_root,
+        packet_commitment_root: extension.packet_commitment_root,
         aggregate_rerandomization_blinding: extension.aggregate_rerandomization_blinding,
         new_transcript_root: extension.new_transcript_root,
-        segments: extension.segments.iter().map(segment_to_proof).collect(),
+        packets: extension.packets.iter().map(packet_to_proof).collect(),
+    }
+}
+
+fn packet_to_proof(packet: &HistoricalUnspentPacket) -> ProofHistoricalUnspentPacket {
+    ProofHistoricalUnspentPacket {
+        from_epoch: packet.from_epoch,
+        through_epoch: packet.through_epoch,
+        packet_historical_root_digest: packet.packet_historical_root_digest,
+        segment_commitment_root: packet.segment_commitment_root,
+        packet_rerandomization_blinding: packet.packet_rerandomization_blinding,
+        packet_transcript_root: packet.packet_transcript_root,
+        segments: packet.segments.iter().map(segment_to_proof).collect(),
     }
 }
 

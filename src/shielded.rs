@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +24,9 @@ const CHECKPOINT_SEGMENT_BASE_DOMAIN: &str = "unchained-shielded-checkpoint-segm
 const CHECKPOINT_SERVICE_DOMAIN: &str = "unchained-shielded-checkpoint-service-v1";
 const CHECKPOINT_RERANDOMIZE_DOMAIN: &str = "unchained-shielded-checkpoint-rerandomize-v1";
 const CHECKPOINT_SEGMENT_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-segment-commit-v1";
+const CHECKPOINT_PACKET_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-packet-commit-v1";
+const CHECKPOINT_PACKET_ACCUMULATE_DOMAIN: &str =
+    "unchained-shielded-checkpoint-packet-accumulate-v1";
 const CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN: &str = "unchained-shielded-checkpoint-accumulate-v1";
 const PRESENTATION_DOMAIN: &str = "unchained-shielded-presentation-v1";
 const ARCHIVE_SHARD_DOMAIN: &str = "unchained-shielded-archive-shard-v1";
@@ -143,6 +147,17 @@ pub struct HistoricalUnspentSegment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalUnspentPacket {
+    pub from_epoch: u64,
+    pub through_epoch: u64,
+    pub packet_historical_root_digest: [u8; 32],
+    pub segment_commitment_root: [u8; 32],
+    pub packet_rerandomization_blinding: [u8; 32],
+    pub packet_transcript_root: [u8; 32],
+    pub segments: Vec<HistoricalUnspentSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoricalUnspentExtension {
     pub version: u8,
     pub note_commitment: [u8; 32],
@@ -150,10 +165,10 @@ pub struct HistoricalUnspentExtension {
     pub through_epoch: u64,
     pub prior_transcript_root: [u8; 32],
     pub historical_root_digest: [u8; 32],
-    pub segment_commitment_root: [u8; 32],
+    pub packet_commitment_root: [u8; 32],
     pub aggregate_rerandomization_blinding: [u8; 32],
     pub new_transcript_root: [u8; 32],
-    pub segments: Vec<HistoricalUnspentSegment>,
+    pub packets: Vec<HistoricalUnspentPacket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +195,18 @@ pub struct ArchiveCustodyAssignment {
     pub shard_id: u64,
     pub shard_digest: [u8; 32],
     pub custodians: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveOperatorScorecard {
+    pub provider_id: [u8; 32],
+    pub provider_manifest_digest: [u8; 32],
+    pub advertised_shard_count: u32,
+    pub assigned_shard_count: u32,
+    pub fulfilled_custody_count: u32,
+    pub retention_surplus_epochs: u64,
+    pub availability_bps: u16,
+    pub reward_weight: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -667,10 +694,10 @@ impl HistoricalUnspentCheckpoint {
             through_epoch: self.covered_through_epoch,
             prior_transcript_root: self.transcript_root,
             historical_root_digest: proof_core::historical_root_digest_from_pairs(&[]),
-            segment_commitment_root: [0u8; 32],
+            packet_commitment_root: [0u8; 32],
             aggregate_rerandomization_blinding: [0u8; 32],
             new_transcript_root: self.transcript_root,
-            segments: Vec::new(),
+            packets: Vec::new(),
         }
     }
 
@@ -693,7 +720,7 @@ impl HistoricalUnspentCheckpoint {
         }
 
         let expected_from = self.covered_through_epoch.saturating_add(1);
-        if extension.segments.is_empty() {
+        if extension.packets.is_empty() {
             if extension.from_epoch != expected_from {
                 bail!("empty extension starts at the wrong epoch");
             }
@@ -703,8 +730,8 @@ impl HistoricalUnspentCheckpoint {
             if extension.new_transcript_root != self.transcript_root {
                 bail!("empty extension must preserve the transcript root");
             }
-            if extension.segment_commitment_root != [0u8; 32] {
-                bail!("empty extension must use the zero segment commitment root");
+            if extension.packet_commitment_root != [0u8; 32] {
+                bail!("empty extension must use the zero packet commitment root");
             }
             return Ok(self.clone());
         }
@@ -715,36 +742,43 @@ impl HistoricalUnspentCheckpoint {
 
         let mut expected_epoch = extension.from_epoch;
         let mut historical_roots = Vec::new();
-        for segment in &extension.segments {
-            segment.verify_against_note(&self.note_commitment)?;
-            if segment.records.is_empty() {
-                bail!("historical extension segments cannot be empty");
+        let mut packet_digests = Vec::with_capacity(extension.packets.len());
+        for packet in &extension.packets {
+            packet.verify_against_note(&self.note_commitment)?;
+            if packet.segments.is_empty() {
+                bail!("historical extension packets cannot be empty");
             }
-            if segment.from_epoch != expected_epoch {
-                bail!("historical extension segments must be contiguous");
+            if packet.from_epoch != expected_epoch {
+                bail!("historical extension packets must be contiguous");
             }
-            let mut segment_pairs = Vec::with_capacity(segment.records.len());
-            for record in &segment.records {
-                if record.epoch != expected_epoch {
-                    bail!("extension epochs must stay contiguous across segment boundaries");
+            let mut packet_pairs = Vec::new();
+            for segment in &packet.segments {
+                if segment.from_epoch != expected_epoch {
+                    bail!("historical extension segments must stay contiguous inside packets");
                 }
-                if record.nullifier != record.proof.queried_nullifier {
-                    bail!("extension record nullifier does not match the proof");
+                for record in &segment.records {
+                    if record.epoch != expected_epoch {
+                        bail!("extension epochs must stay contiguous across segment boundaries");
+                    }
+                    if record.nullifier != record.proof.queried_nullifier {
+                        bail!("extension record nullifier does not match the proof");
+                    }
+                    let root = ledger.root_for_epoch(record.epoch)?;
+                    if root != record.proof.root {
+                        bail!("extension proof root does not match the historical root ledger");
+                    }
+                    record.proof.verify()?;
+                    packet_pairs.push((record.epoch, root));
+                    historical_roots.push((record.epoch, root));
+                    expected_epoch = expected_epoch.saturating_add(1);
                 }
-                let root = ledger.root_for_epoch(record.epoch)?;
-                if root != record.proof.root {
-                    bail!("extension proof root does not match the historical root ledger");
-                }
-                record.proof.verify()?;
-                segment_pairs.push((record.epoch, root));
-                historical_roots.push((record.epoch, root));
-                expected_epoch = expected_epoch.saturating_add(1);
             }
             let expected_segment_digest =
-                proof_core::historical_root_digest_from_pairs(&segment_pairs);
-            if segment.segment_historical_root_digest != expected_segment_digest {
-                bail!("segment historical root digest mismatch");
+                proof_core::historical_root_digest_from_pairs(&packet_pairs);
+            if packet.packet_historical_root_digest != expected_segment_digest {
+                bail!("packet historical root digest mismatch");
             }
+            packet_digests.push(packet.commitment_digest());
         }
 
         if extension.through_epoch != expected_epoch.saturating_sub(1) {
@@ -755,15 +789,9 @@ impl HistoricalUnspentCheckpoint {
         if extension.historical_root_digest != expected_historical_root_digest {
             bail!("extension historical root digest mismatch");
         }
-        let expected_segment_commitment_root = checkpoint_segment_commitment_root(
-            &extension
-                .segments
-                .iter()
-                .map(HistoricalUnspentSegment::commitment_digest)
-                .collect::<Vec<_>>(),
-        );
-        if extension.segment_commitment_root != expected_segment_commitment_root {
-            bail!("extension segment commitment root mismatch");
+        let expected_packet_commitment_root = checkpoint_packet_commitment_root(&packet_digests);
+        if extension.packet_commitment_root != expected_packet_commitment_root {
+            bail!("extension packet commitment root mismatch");
         }
         let rerandomized_root = accumulated_checkpoint_root(
             &self.transcript_root,
@@ -771,7 +799,7 @@ impl HistoricalUnspentCheckpoint {
             extension.from_epoch,
             extension.through_epoch,
             &extension.historical_root_digest,
-            &extension.segment_commitment_root,
+            &extension.packet_commitment_root,
             &extension.aggregate_rerandomization_blinding,
         );
         if extension.new_transcript_root != rerandomized_root {
@@ -888,6 +916,119 @@ impl HistoricalUnspentSegment {
     }
 }
 
+impl HistoricalUnspentPacket {
+    pub fn aggregate(
+        note_commitment: &[u8; 32],
+        mut segments: Vec<HistoricalUnspentSegment>,
+        blinding: [u8; 32],
+    ) -> Result<Self> {
+        if segments.is_empty() {
+            bail!("historical packets cannot be empty");
+        }
+        segments.sort_by_key(|segment| (segment.from_epoch, segment.through_epoch));
+        let from_epoch = segments[0].from_epoch;
+        let mut expected_epoch = from_epoch;
+        let mut historical_pairs = Vec::new();
+        let mut segment_digests = Vec::with_capacity(segments.len());
+        for segment in &segments {
+            if segment.from_epoch != expected_epoch {
+                bail!("historical packet segments must stay contiguous");
+            }
+            segment.verify_against_note(note_commitment)?;
+            for record in &segment.records {
+                if record.epoch != expected_epoch {
+                    bail!("historical packet records must remain contiguous");
+                }
+                if record.nullifier != record.proof.queried_nullifier {
+                    bail!("historical packet record nullifier mismatch");
+                }
+                historical_pairs.push((record.epoch, record.proof.root));
+                expected_epoch = expected_epoch.saturating_add(1);
+            }
+            segment_digests.push(segment.commitment_digest());
+        }
+        let through_epoch = expected_epoch.saturating_sub(1);
+        let packet_historical_root_digest =
+            proof_core::historical_root_digest_from_pairs(&historical_pairs);
+        let segment_commitment_root = checkpoint_segment_commitment_root(&segment_digests);
+        let packet_transcript_root = accumulated_packet_root(
+            note_commitment,
+            from_epoch,
+            through_epoch,
+            &packet_historical_root_digest,
+            &segment_commitment_root,
+            &blinding,
+        );
+        Ok(Self {
+            from_epoch,
+            through_epoch,
+            packet_historical_root_digest,
+            segment_commitment_root,
+            packet_rerandomization_blinding: blinding,
+            packet_transcript_root,
+            segments,
+        })
+    }
+
+    pub fn verify_against_note(&self, note_commitment: &[u8; 32]) -> Result<()> {
+        if self.segments.is_empty() {
+            bail!("historical packet cannot be empty");
+        }
+        let mut expected_epoch = self.from_epoch;
+        let mut historical_pairs = Vec::new();
+        let mut segment_digests = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            if segment.from_epoch != expected_epoch {
+                bail!("historical packet segments must stay contiguous");
+            }
+            segment.verify_against_note(note_commitment)?;
+            for record in &segment.records {
+                if record.epoch != expected_epoch {
+                    bail!("historical packet records must remain contiguous");
+                }
+                historical_pairs.push((record.epoch, record.proof.root));
+                expected_epoch = expected_epoch.saturating_add(1);
+            }
+            segment_digests.push(segment.commitment_digest());
+        }
+        if self.through_epoch != expected_epoch.saturating_sub(1) {
+            bail!("historical packet through_epoch does not match the final record");
+        }
+        let expected_historical_root_digest =
+            proof_core::historical_root_digest_from_pairs(&historical_pairs);
+        if self.packet_historical_root_digest != expected_historical_root_digest {
+            bail!("historical packet root digest mismatch");
+        }
+        let expected_segment_commitment_root = checkpoint_segment_commitment_root(&segment_digests);
+        if self.segment_commitment_root != expected_segment_commitment_root {
+            bail!("historical packet segment commitment root mismatch");
+        }
+        let expected_packet_root = accumulated_packet_root(
+            note_commitment,
+            self.from_epoch,
+            self.through_epoch,
+            &self.packet_historical_root_digest,
+            &self.segment_commitment_root,
+            &self.packet_rerandomization_blinding,
+        );
+        if self.packet_transcript_root != expected_packet_root {
+            bail!("historical packet transcript root mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn commitment_digest(&self) -> [u8; 32] {
+        checkpoint_packet_commitment_digest(
+            self.from_epoch,
+            self.through_epoch,
+            &self.packet_historical_root_digest,
+            &self.segment_commitment_root,
+            &self.packet_transcript_root,
+            self.segments.len() as u32,
+        )
+    }
+}
+
 impl HistoricalUnspentExtension {
     pub fn aggregate(
         checkpoint: &HistoricalUnspentCheckpoint,
@@ -900,7 +1041,6 @@ impl HistoricalUnspentExtension {
         segments.sort_by_key(|segment| (segment.from_epoch, segment.through_epoch));
         let mut expected_epoch = checkpoint.covered_through_epoch.saturating_add(1);
         let mut historical_pairs = Vec::new();
-        let mut segment_digests = Vec::with_capacity(segments.len());
         for segment in &segments {
             if segment.from_epoch != expected_epoch {
                 bail!("historical segments must cover a contiguous range");
@@ -920,21 +1060,41 @@ impl HistoricalUnspentExtension {
                 historical_pairs.push((record.epoch, record.proof.root));
                 expected_epoch = expected_epoch.saturating_add(1);
             }
-            segment_digests.push(segment.commitment_digest());
         }
 
         let from_epoch = checkpoint.covered_through_epoch.saturating_add(1);
         let through_epoch = expected_epoch.saturating_sub(1);
         let historical_root_digest =
             proof_core::historical_root_digest_from_pairs(&historical_pairs);
-        let segment_commitment_root = checkpoint_segment_commitment_root(&segment_digests);
+        let packet_target = crate::protocol::CURRENT
+            .archive_checkpoint_packet_segments
+            .max(1) as usize;
+        let mut packets = Vec::new();
+        let mut packet_start = 0usize;
+        while packet_start < segments.len() {
+            let packet_end = (packet_start + packet_target).min(segments.len());
+            let mut packet_blinding = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut packet_blinding);
+            packets.push(HistoricalUnspentPacket::aggregate(
+                &checkpoint.note_commitment,
+                segments[packet_start..packet_end].to_vec(),
+                packet_blinding,
+            )?);
+            packet_start = packet_end;
+        }
+        let packet_commitment_root = checkpoint_packet_commitment_root(
+            &packets
+                .iter()
+                .map(HistoricalUnspentPacket::commitment_digest)
+                .collect::<Vec<_>>(),
+        );
         let new_transcript_root = accumulated_checkpoint_root(
             &checkpoint.transcript_root,
             &checkpoint.note_commitment,
             from_epoch,
             through_epoch,
             &historical_root_digest,
-            &segment_commitment_root,
+            &packet_commitment_root,
             &aggregate_blinding,
         );
         Ok(Self {
@@ -944,10 +1104,10 @@ impl HistoricalUnspentExtension {
             through_epoch,
             prior_transcript_root: checkpoint.transcript_root,
             historical_root_digest,
-            segment_commitment_root,
+            packet_commitment_root,
             aggregate_rerandomization_blinding: aggregate_blinding,
             new_transcript_root,
-            segments,
+            packets,
         })
     }
 }
@@ -1333,6 +1493,90 @@ impl ArchiveDirectory {
             .unwrap_or(0)
     }
 
+    pub fn operator_scorecards(
+        &self,
+        replica_count: usize,
+        retention_horizon_epochs: u64,
+    ) -> Vec<ArchiveOperatorScorecard> {
+        let mut candidate_nodes = self
+            .providers
+            .iter()
+            .map(|provider| provider.provider_id)
+            .collect::<Vec<_>>();
+        candidate_nodes.sort();
+        candidate_nodes.dedup();
+        let assignments = self.custody_assignments(&candidate_nodes, replica_count);
+        self.providers
+            .iter()
+            .map(|provider| {
+                let advertised_shard_count = provider.shard_ids.len() as u32;
+                let assigned = assignments
+                    .iter()
+                    .filter(|assignment| assignment.custodians.contains(&provider.provider_id))
+                    .collect::<Vec<_>>();
+                let assigned_shard_count = assigned.len() as u32;
+                let mut fulfilled_custody_count = 0u32;
+                let mut retention_surplus_epochs = 0u64;
+                for shard_id in &provider.shard_ids {
+                    let retention =
+                        self.provider_retention_for_shard(&provider.provider_id, *shard_id);
+                    let Some(shard) = self.shard(*shard_id) else {
+                        continue;
+                    };
+                    retention_surplus_epochs = retention_surplus_epochs.saturating_add(
+                        retention
+                            .saturating_sub(shard.last_epoch)
+                            .min(retention_horizon_epochs),
+                    );
+                }
+                for assignment in assigned {
+                    let Some(shard) = self.shard(assignment.shard_id) else {
+                        continue;
+                    };
+                    let required_retention =
+                        shard.last_epoch.saturating_add(retention_horizon_epochs);
+                    if self.provider_retention_for_shard(&provider.provider_id, assignment.shard_id)
+                        >= required_retention
+                    {
+                        fulfilled_custody_count = fulfilled_custody_count.saturating_add(1);
+                    }
+                }
+                let availability_bps = if assigned_shard_count == 0 {
+                    10_000
+                } else {
+                    ((fulfilled_custody_count as u64 * 10_000) / assigned_shard_count as u64)
+                        .min(10_000) as u16
+                };
+                let reward_weight = 1u64
+                    .saturating_add((fulfilled_custody_count as u64).saturating_mul(1_000_000))
+                    .saturating_add((retention_surplus_epochs.min(u32::MAX as u64)) * 1_000)
+                    .saturating_add(advertised_shard_count as u64);
+                ArchiveOperatorScorecard {
+                    provider_id: provider.provider_id,
+                    provider_manifest_digest: provider.manifest_digest,
+                    advertised_shard_count,
+                    assigned_shard_count,
+                    fulfilled_custody_count,
+                    retention_surplus_epochs,
+                    availability_bps,
+                    reward_weight,
+                }
+            })
+            .collect()
+    }
+
+    pub fn operator_scorecard(
+        &self,
+        provider_id: &[u8; 32],
+        replica_count: usize,
+        retention_horizon_epochs: u64,
+    ) -> Result<ArchiveOperatorScorecard> {
+        self.operator_scorecards(replica_count, retention_horizon_epochs)
+            .into_iter()
+            .find(|scorecard| &scorecard.provider_id == provider_id)
+            .ok_or_else(|| anyhow!("missing archive operator scorecard"))
+    }
+
     pub fn pick_provider_for_segment(
         &self,
         note_commitment: &[u8; 32],
@@ -1355,6 +1599,13 @@ impl ArchiveDirectory {
         eligible.sort_by_key(|provider| {
             let used_penalty = used_providers.contains(&provider.provider_id) as u8;
             let provider_load = *provider_loads.get(&provider.provider_id).unwrap_or(&0) as u32;
+            let scorecard = self
+                .operator_scorecard(
+                    &provider.provider_id,
+                    crate::protocol::CURRENT.archive_provider_replica_count as usize,
+                    crate::protocol::CURRENT.archive_retention_horizon_epochs,
+                )
+                .ok();
             let min_replica_count = range_shards
                 .iter()
                 .filter_map(|shard| self.replica_report(shard.shard_id).ok())
@@ -1371,6 +1622,7 @@ impl ArchiveDirectory {
             (
                 used_penalty,
                 provider_load,
+                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
                 u64::MAX.saturating_sub(min_retention),
                 u32::MAX.saturating_sub(min_replica_count),
                 provider_selection_score(
@@ -1430,7 +1682,15 @@ impl ArchiveDirectory {
         }
         eligible.sort_by_key(|provider| {
             let retention = self.provider_retention_for_shard(&provider.provider_id, shard_id);
+            let scorecard = self
+                .operator_scorecard(
+                    &provider.provider_id,
+                    crate::protocol::CURRENT.archive_provider_replica_count as usize,
+                    crate::protocol::CURRENT.archive_retention_horizon_epochs,
+                )
+                .ok();
             (
+                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
                 u64::MAX.saturating_sub(retention),
                 provider_selection_score(
                     &provider.provider_id,
@@ -2059,13 +2319,58 @@ fn checkpoint_segment_commitment_root(segment_digests: &[[u8; 32]]) -> [u8; 32] 
     *hasher.finalize().as_bytes()
 }
 
+fn checkpoint_packet_commitment_digest(
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    segment_commitment_root: &[u8; 32],
+    packet_transcript_root: &[u8; 32],
+    segment_count: u32,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(segment_commitment_root);
+    hasher.update(packet_transcript_root);
+    hasher.update(&segment_count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn checkpoint_packet_commitment_root(packet_digests: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
+    hasher.update(&(packet_digests.len() as u32).to_le_bytes());
+    for digest in packet_digests {
+        hasher.update(digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn accumulated_packet_root(
+    note_commitment: &[u8; 32],
+    from_epoch: u64,
+    through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    segment_commitment_root: &[u8; 32],
+    blinding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_ACCUMULATE_DOMAIN);
+    hasher.update(note_commitment);
+    hasher.update(&from_epoch.to_le_bytes());
+    hasher.update(&through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(segment_commitment_root);
+    hasher.update(blinding);
+    *hasher.finalize().as_bytes()
+}
+
 fn accumulated_checkpoint_root(
     prior_transcript_root: &[u8; 32],
     note_commitment: &[u8; 32],
     from_epoch: u64,
     through_epoch: u64,
     historical_root_digest: &[u8; 32],
-    segment_commitment_root: &[u8; 32],
+    packet_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN);
@@ -2074,7 +2379,7 @@ fn accumulated_checkpoint_root(
     hasher.update(&from_epoch.to_le_bytes());
     hasher.update(&through_epoch.to_le_bytes());
     hasher.update(historical_root_digest);
-    hasher.update(segment_commitment_root);
+    hasher.update(packet_commitment_root);
     hasher.update(blinding);
     *hasher.finalize().as_bytes()
 }

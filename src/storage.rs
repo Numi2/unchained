@@ -144,6 +144,7 @@ impl Store {
             "shielded_spent_note", // note_commitment -> spent marker
             "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
             "shielded_archive_replica", // provider_id||shard_id -> ArchiveReplicaAttestation
+            "shielded_archive_operator", // provider_id -> ArchiveOperatorScorecard
         ];
 
         // Configure column family options with sane production defaults
@@ -931,6 +932,35 @@ impl Store {
             )?);
         }
         Ok(replicas)
+    }
+
+    pub fn store_shielded_archive_operator_scorecard(
+        &self,
+        scorecard: &crate::shielded::ArchiveOperatorScorecard,
+    ) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_operator")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
+        let bytes = crate::canonical::encode_archive_operator_scorecard(scorecard)?;
+        self.db.put_cf(cf, &scorecard.provider_id, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_shielded_archive_operator_scorecards(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchiveOperatorScorecard>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_archive_operator")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut scorecards = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            scorecards.push(crate::canonical::decode_archive_operator_scorecard(&value)?);
+        }
+        Ok(scorecards)
     }
 
     pub fn store_shielded_output(

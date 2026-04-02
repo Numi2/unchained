@@ -44,6 +44,9 @@ const SENT_TX_PREFIX: &[u8] = b"shielded_sent_tx/";
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
 const SHIELDED_SYNC_ROUND_KEY: &[u8] = b"shielded_sync_round";
+const SHIELDED_REFRESH_OFFSET_DOMAIN: &str = "unchained-wallet-shielded-refresh-offset-v1";
+const SHIELDED_COVER_COMMIT_DOMAIN: &str = "unchained-wallet-shielded-cover-commitment-v1";
+const SHIELDED_COVER_NULLIFIER_DOMAIN: &str = "unchained-wallet-shielded-cover-nullifier-v1";
 
 #[derive(Serialize, Deserialize)]
 struct WalletSecretsV3 {
@@ -483,6 +486,21 @@ impl Wallet {
             ._db
             .upgrade()
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_round(notes, network, rotation_round)
+            .await
+    }
+
+    async fn refresh_owned_shielded_checkpoints_with_round(
+        &self,
+        notes: &mut [OwnedShieldedNote],
+        network: &crate::network::NetHandle,
+        rotation_round: u64,
+    ) -> Result<()> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
         transaction::ensure_shielded_runtime_state(store.as_ref())?;
         let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
         let Some(through_epoch) = current_epoch.checked_sub(1) else {
@@ -516,7 +534,6 @@ impl Wallet {
             return Ok(());
         }
 
-        let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
         let extensions = network
             .request_historical_extensions(&requests, rotation_round)
             .await?;
@@ -544,6 +561,108 @@ impl Wallet {
             .unwrap_or(0);
         store.put("meta", SHIELDED_SYNC_ROUND_KEY, &round.saturating_add(1))?;
         Ok(round)
+    }
+
+    pub fn fixed_cadence_refresh_offset_secs(&self, interval_secs: u64) -> u64 {
+        if interval_secs <= 1 {
+            return 0;
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(SHIELDED_REFRESH_OFFSET_DOMAIN);
+        hasher.update(&self.address);
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(bytes) % interval_secs
+    }
+
+    fn build_cover_checkpoint_requests(
+        &self,
+        current_epoch: u64,
+        rotation_round: u64,
+        count: usize,
+    ) -> Vec<shielded::CheckpointExtensionRequest> {
+        let Some(through_epoch) = current_epoch.checked_sub(1) else {
+            return Vec::new();
+        };
+        let count = count.max(1);
+        let earliest_epoch = through_epoch.saturating_sub(
+            crate::protocol::CURRENT
+                .archive_retention_horizon_epochs
+                .saturating_sub(1),
+        );
+        let epoch_span = through_epoch
+            .saturating_sub(earliest_epoch)
+            .saturating_add(1)
+            .max(1);
+        let mut requests = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut epoch_hasher = blake3::Hasher::new_derive_key(SHIELDED_REFRESH_OFFSET_DOMAIN);
+            epoch_hasher.update(&self.address);
+            epoch_hasher.update(&rotation_round.to_le_bytes());
+            epoch_hasher.update(&(index as u64).to_le_bytes());
+            let mut epoch_bytes = [0u8; 8];
+            epoch_bytes.copy_from_slice(&epoch_hasher.finalize().as_bytes()[..8]);
+            let cover_epoch = earliest_epoch + (u64::from_le_bytes(epoch_bytes) % epoch_span);
+
+            let mut commitment_hasher =
+                blake3::Hasher::new_derive_key(SHIELDED_COVER_COMMIT_DOMAIN);
+            commitment_hasher.update(&self.address);
+            commitment_hasher.update(&rotation_round.to_le_bytes());
+            commitment_hasher.update(&(index as u64).to_le_bytes());
+            commitment_hasher.update(&cover_epoch.to_le_bytes());
+            let cover_commitment = *commitment_hasher.finalize().as_bytes();
+
+            let mut nullifier_hasher =
+                blake3::Hasher::new_derive_key(SHIELDED_COVER_NULLIFIER_DOMAIN);
+            nullifier_hasher.update(&self.address);
+            nullifier_hasher.update(&rotation_round.to_le_bytes());
+            nullifier_hasher.update(&(index as u64).to_le_bytes());
+            nullifier_hasher.update(&cover_epoch.to_le_bytes());
+            let cover_nullifier = *nullifier_hasher.finalize().as_bytes();
+
+            requests.push(shielded::CheckpointExtensionRequest {
+                checkpoint: shielded::HistoricalUnspentCheckpoint::genesis(
+                    cover_commitment,
+                    cover_epoch,
+                ),
+                queries: vec![shielded::EvolvingNullifierQuery {
+                    epoch: cover_epoch,
+                    nullifier: cover_nullifier,
+                }],
+            });
+        }
+        requests
+    }
+
+    pub async fn run_oblivious_refresh_cycle(
+        &self,
+        network: &crate::network::NetHandle,
+    ) -> Result<()> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        transaction::ensure_shielded_runtime_state(store.as_ref())?;
+        self.sync_owned_shielded_notes()?;
+        let mut notes = self.load_owned_shielded_notes(false, true)?;
+        if notes.is_empty() {
+            return Ok(());
+        }
+        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
+        let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_round(&mut notes, network, rotation_round)
+            .await?;
+        let cover_requests = self.build_cover_checkpoint_requests(
+            current_epoch,
+            rotation_round,
+            crate::protocol::CURRENT.oblivious_sync_cover_queries as usize,
+        );
+        if !cover_requests.is_empty() {
+            let _ = network
+                .request_historical_extensions(&cover_requests, rotation_round)
+                .await?;
+        }
+        Ok(())
     }
 
     fn build_shielded_output(
