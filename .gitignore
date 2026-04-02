@@ -1,30 +1,37 @@
-# Peer identity files (should not be shared between nodes)
+# Node-local identity and secrets
 peer_identity.key
 pq_identity.enc
 node_kyber.enc
-context.md
 network_dili.key
-src/network/runtime.rs
-data/
+paycode.txt
 test_stealth_address.txt
 .test_stealth_address.txt
-.test_chain_data
-.cargo
-aucition.md
-config.send-test.toml
 
-decode_coins
-paycode.txt
-v3.md
-
-# Blockchain data
+# Local chain state and runtime data
+data/
 blockchain_data/
-node_kyber.enc
-pq_identity.enc
+.test_chain_data
+
+# Local cargo/tooling config
+.cargo/
 
 # Build artifacts
 target/
 **/*.rs.bk
+decode_coins
+
+# Proof/prover local artifacts
+methods/guest/Cargo.lock
+vendor/**/Cargo.lock
+*.metallib
+*.ips
+
+# Temporary files
+tmp
+tmp.rs
+
+# Logs
+*.log
 
 # IDE files
 .vscode/
@@ -33,26 +40,25 @@ target/
 # OS files
 .DS_Store
 Thumbs.db
-notes.md
-y
+
+# Local notes and scratch files
 context.md
-htlc_cli_guide.md
-
-# Logs
-*.log
-
-peer_identity.key
-# Temporary files
-tmp
-tmp.rs
-
-# Frontend build output
-ui-dist/
+notes.md
 todayswork.md
+htlc_cli_guide.md
+aucition.md
+v3.md
+vr3.md
+y
 rust3
 rustyy.txt
-vr3.md
-pq_identity.enc
-node_kyber.enc
-peer_identity.key
+
+# Local config variants
+config.send-test.toml
 unchained-run.bat
+
+# Generated frontend output
+ui-dist/
+
+# Repo-local one-offs
+src/network/runtime.rs
