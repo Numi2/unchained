@@ -1,102 +1,167 @@
 # Unchained Architecture
 
-This repository treats the system as three separate concerns:
+This document describes the current repository architecture as implemented in
+the checked-in code.
+
+The runtime is easiest to reason about as three connected areas:
 
 - `protocol / consensus core`
-- `wallet / privacy client`
+- `wallet / shielded client`
 - `pq mesh runtime`
 
 ## Canonical Rules
 
-Consensus policy is versioned and protocol-locked in [src/protocol.rs](/Users/home/unchgit/unchained/src/protocol.rs).
+Consensus and protocol constants are locked in `src/protocol.rs` and then
+consumed by the rest of the system:
 
-All signed remote objects and mesh payloads use an explicit canonical byte codec in [src/canonical.rs](/Users/home/unchgit/unchained/src/canonical.rs). The live protocol does not depend on serde or `bincode` layout choices for node records, trust updates, envelopes, or wire topics.
+- proof-of-work and retarget rules in `src/consensus.rs`
+- epoch production and anchor handling in `src/epoch.rs`
+- nullifier rollover, archive shard sizing, and checkpoint routing in
+  `src/transaction.rs`, `src/shielded.rs`, and `src/network.rs`
+- wallet refresh cadence and cover-query behavior in `src/wallet.rs`
 
-Runtime config may tune operational behavior, but it does not redefine:
+Remote objects do not rely on Serde or `bincode` field layout for network
+compatibility. Canonical wire and signed-document encodings live in
+`src/canonical.rs` and are used for:
 
-- genesis parameters
-- retarget interval
-- target and maximum selected coins per epoch
-- difficulty and memory bounds
-- retarget bands
+- node records and trust updates
+- signed envelopes
+- transactions and shielded outputs
+- archive manifests, replica attestations, custody commitments, and receipts
 
-## Canonical State
+Runtime config changes operational behavior, but the protocol constants used by
+validation come from code rather than from `config.toml`.
 
-The live protocol model is:
+## State Model
 
-- epoch anchors commit mined coins
-- `coin_epoch` binds each coin to the epoch that committed it
-- each committed coin is deterministically lifted into a genesis shielded note
-- shielded note commitments are appended to the global note tree
-- current ownership is represented by unspent notes plus evolving-nullifier history
-- `Tx` is the canonical persistence, validation, and gossip unit
+The live shielded state transition is centered on these persisted objects:
 
-The current system is therefore a shielded note runtime rooted in an append-only note commitment tree rather than a `coin_id -> latest spend` chain.
+- anchors in the epoch store
+- the global shielded note commitment tree
+- the current active nullifier epoch
+- archived nullifier epochs plus the root ledger
+- proof-carrying `Tx` objects
 
-## Privacy Model
+Concrete flow:
 
-Wallet privacy comes from private recipient documents, ML-KEM-derived one-time outputs, and evolving nullifiers over shielded notes.
+1. Coins are committed by epoch anchors.
+2. `coin_epoch` binds a coin to the epoch that committed it.
+3. Committed coins can be deterministically materialized into genesis shielded
+   notes.
+4. Shielded note commitments are appended to the global note tree.
+5. Transactions spend by presenting current-epoch nullifiers plus a proof whose
+   journal binds historical and output state to the live chain.
 
-Important consequence:
+That means the canonical model is no longer a public `coin_id -> latest spend`
+table. Current ownership is represented by unspent shielded notes plus the
+active and archived nullifier structures.
 
-- deterministic nullifiers remain in the transaction data for domain-separated spend identity
-- the node does not persist a global historic nullifier set as canonical validator state
-- replay prevention comes from the active nullifier epoch plus historical unspent checkpoint validation
+## Validation Path
 
-This removes flat nullifier-set growth from the live path. In the current model, persisting every historic nullifier is redundant state.
+Shielded validation in the current code has two layers.
 
-## Validation Model
+Public validator checks in `src/transaction.rs`:
 
-Shielded validation is epoch-aware:
+- transaction shape is sane
+- active nullifier uniqueness holds for the current epoch
+- the proof receipt verifies
+- the proof journal chain ID, epoch, note-tree root, nullifiers, and output
+  bindings match local state
+- the historical root digest named by the proof matches the local
+  `NullifierRootLedger`
 
-- each input note proves membership in the global note commitment tree inside a private witness
-- each input carries a historical-unspent checkpoint plus extension up to the prior nullifier epoch inside that same private witness
-- validators enforce uniqueness in the current active nullifier epoch
-- validators verify a succinct STARK receipt and only consume its public journal bindings
-- validators can prune historic nullifier contents once the archived epoch commitments are fixed on chain
+Private witness checks in `proof-core` and the zkVM guests:
 
-The proof-carrying contract is split deliberately:
+- note membership proofs
+- historical checkpoint accumulator steps
+- hidden note plaintext and note-key material
+- historical absence records carried behind the receipt
 
-- [`proof-core`](/Users/home/unchgit/unchained/proof-core/src/lib.rs) defines the canonical witness and public journal semantics
-- [`methods/guest`](/Users/home/unchgit/unchained/methods/guest/src/main.rs) validates the witness inside the zkVM
-- [`src/proof.rs`](/Users/home/unchgit/unchained/src/proof.rs) produces and verifies succinct receipts
-- [`src/transaction.rs`](/Users/home/unchgit/unchained/src/transaction.rs) binds those public journal fields to live chain state before applying updates
+The proof split is:
 
-This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
+- `proof-core/src/lib.rs`: witness and journal contract
+- `methods/guest/src/main.rs`: shielded spend guest
+- `methods/checkpoint-guest/src/main.rs`: checkpoint accumulator guest
+- `src/proof.rs`: proving and local verification glue
 
-On the client side, checkpoint refresh is now routed through a replica-aware mesh archive directory. Nodes gossip node records over the PQ mesh, dial newly discovered operators directly, ingest provider-authored archive manifests plus replica attestations, request missing epoch shards over the same PQ transport, and answer checkpoint batch requests over that same PQ mesh. The wallet no longer treats a historical refresh as one provider, one proof. It runs a fixed-cadence refresh loop, still emits cover-only checkpoint traffic even when no note is about to spend, splits each note history into shard-aligned checkpoint segments, routes those segments across multiple providers, pads provider/shard buckets with cover traffic, rerandomizes every provider segment reply, compresses those segments into packet-level checkpoint accumulators, compresses packets into stratum-level accumulators, and only then aggregates the strata into one checkpoint extension. That means no single provider needs to see the full note history for a refresh, spend timing is less query-shaped, and the durable checkpoint transcript root is not byte-identical to what any provider produced.
+## Wallet And Archive Flow
 
-## Service Boundary
+The wallet owns the client-side shielded lifecycle in `src/wallet.rs`.
 
-The product boundary is PQ-only by construction:
+Implemented behavior:
 
-- node-to-node communication runs over the signed PQ mesh
-- the mesh trust root is an offline ML-DSA node root that signs time-bounded runtime node records
-- the online runtime presents only its delegated ML-DSA auth key plus installed signed node record
-- wallet and message workflows are driven through the CLI and protocol messages
-- no bridge, x402, offer market, or separate HTTP perimeter exists in the product
-- the metrics/log stream is loopback-only and not part of the remote protocol surface
+- recipient export uses signed KeyDoc JSON documents
+- owned genesis notes and received outputs are materialized locally
+- wallet balance and history derive from owned shielded notes and recorded sent
+  transactions
+- sends refresh checkpoints, build a witness, produce a succinct receipt, apply
+  the transaction locally, and then gossip it
 
-On Apple Silicon/macOS, the proving path is intentionally CPU-first. Metal kernels are not part of the correctness boundary and are not required for a working node or test run.
+When `node start` runs, the binary also spawns a fixed-cadence oblivious wallet
+refresh loop from `src/main.rs`.
 
-## Product Surface
+That refresh loop and the archive path are implemented across `src/wallet.rs`,
+`src/shielded.rs`, and `src/network.rs`:
 
-The public CLI is intentionally phrased in product terms:
+- requests are segmented by archive shard
+- segments are routed across providers chosen from the archive directory
+- provider/shard buckets are padded with synthetic cover traffic
+- service responses are rerandomized client-side
+- rerandomized segments are compressed into packets and strata
+- checkpoint accumulators are proved with succinct receipts
+- manifests, replicas, service ledgers, custody commitments, retrieval receipts,
+  availability certificates, and operator scorecards are persisted locally
+- the network runtime repairs missing archive shards and rebalances local shard
+  custody toward the configured replica target
 
-- `node init-root`, `node auth-prepare`, `node auth-sign`, and `node auth-install` implement the offline-root provisioning flow
-- `node start` is the explicit runtime entrypoint
-- `wallet receive`, `wallet send`, `wallet balance`, and `wallet history` are the primary wallet journeys
-- `message` is the mesh-native user command
-- `advanced` contains protocol and maintenance tooling
+## Network Boundary
 
-## Archive Layer
+The remote service boundary is PQ-only in the project-owned runtime:
 
-The live runtime already proves shielded spends with succinct STARK receipts, avoids validator nullifier bloat, rotates checkpoint queries across mesh-discovered archive providers, exchanges archived shards directly over the PQ mesh, serves remote checkpoint batches over that same transport, rerandomizes provider responses before they enter the proof witness, packetizes and stratifies those rerandomized segment batches deeper inside the checkpoint witness, records archive service ledgers from observed checkpoint/shard traffic, derives shard availability certificates from retention plus service evidence, computes deterministic operator scorecards for long-horizon archive custody, and rebalances deterministic shard custody toward the protocol replica target.
+- QUIC transport lives in `src/network.rs`
+- TLS setup and node identity ceremony live in `src/node_identity.rs`
+- runtime identities use ML-DSA raw public keys and ML-KEM-768 key exchange
+- node-to-node messages move through signed envelopes and canonical wire topics
 
-That leaves a narrower remaining frontier:
+The CLI in `src/main.rs` is the user-facing surface for:
 
-- explicit operator economics beyond scorecards and route bias
-- archive DA that survives very long historical horizons without relying on a small operator set
-- proof-system-level accumulation that turns stratum-level checkpoint witnesses into even smaller recursive witness objects
+- node provisioning
+- node start/peer identity
+- wallet receive/send/balance/history
+- message send/listen
+- maintenance tasks under `advanced`
 
-It still must not reintroduce an unbounded RocksDB nullifier column as canonical state.
+The only HTTP endpoint in the repository runtime is the local metrics/log stream
+in `src/metrics.rs`, and the server rejects non-loopback bind addresses.
+
+## Persistence Layout
+
+RocksDB is the canonical persistence layer (`src/storage.rs`).
+
+Relevant shielded/archive column families include:
+
+- `shielded_note_tree`
+- `shielded_nullifier_epoch`
+- `shielded_root_ledger`
+- `shielded_checkpoint`
+- `shielded_output`
+- `shielded_owned_note`
+- `shielded_active_nullifier`
+- `shielded_spent_note`
+- `shielded_archive_provider`
+- `shielded_archive_replica`
+- `shielded_archive_operator`
+- `shielded_archive_accounting`
+- `shielded_archive_custody`
+- `shielded_archive_receipt`
+
+## Verification Coverage
+
+The checked-in tests exercise the architecture at several levels:
+
+- `tests/shielded_pool.rs` covers note commitments, evolving nullifiers,
+  checkpoints, rerandomization, archive directory logic, and operator scoring
+- `tests/shielded_tx_flow.rs` covers end-to-end wallet send/receive with the
+  succinct proof path
+- `tests/pq_network.rs` covers PQ bootstrap, anchor propagation, archive shard
+  handling, and checkpoint request routing on the network side

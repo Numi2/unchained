@@ -1,56 +1,93 @@
 # Unchained
 
-Unchained is a post-quantum private asset node with a PQ-only default build.
+Unchained is a Rust node and CLI wallet for a post-quantum shielded asset system.
+The checked-in runtime path is PQ-only: node identity, peer transport, wallet
+recipient documents, and shielded outputs all use ML-KEM-768 and ML-DSA-65 in
+the live code.
 
-## Tech Choices
+This README is aligned to the current implementation in `src/`, `proof-core/`,
+`methods/`, and `tests/`.
 
-- Consensus: epoch-based proof of work
-- Proof of work: Argon2id
-- Hashing: BLAKE3
-- Network transport: QUIC over TLS 1.3 raw public keys with ML-KEM-768 key exchange and ML-DSA-65 authentication
-- Wire and signed-doc encoding: explicit canonical byte codec in [`src/canonical.rs`](/Users/home/unchgit/unchained/src/canonical.rs)
-- Persistence: RocksDB
-- Recipient privacy: ML-KEM-768-based private recipient docs and opaque one-time outputs
-- Signatures: ML-DSA-65
-- Canonical state transition: [`Tx`](/Users/home/unchgit/unchained/src/transaction.rs)
+## Verified Runtime Properties
 
-## Protocol Posture
+- Consensus is epoch-based proof of work with Argon2id work and BLAKE3 hashing
+  (`src/consensus.rs`, `src/epoch.rs`, `src/crypto.rs`).
+- Peer transport is QUIC over TLS 1.3 raw public keys with ML-KEM-768 key
+  exchange and ML-DSA-65 authentication
+  (`src/network.rs`, `src/node_identity.rs`).
+- Wire objects and signed documents use an explicit canonical byte codec rather
+  than relying on Serde or `bincode` layout for protocol compatibility
+  (`src/canonical.rs`, `src/node_identity.rs`).
+- Persistence uses RocksDB, including dedicated column families for anchors,
+  transactions, shielded state, and archive metadata (`src/storage.rs`).
+- Wallet recipient handles are signed KeyDoc JSON documents that bind a chain ID
+  to ML-DSA and ML-KEM public keys (`src/wallet.rs`).
+- Shielded outputs are ML-KEM-768 encrypted and carry opaque ciphertext plus a
+  public note commitment (`src/wallet.rs`, `src/transaction.rs`).
+- `Tx` is the canonical gossip, validation, and persistence unit
+  (`src/transaction.rs`).
 
-- Consensus rules are protocol-locked in [`src/protocol.rs`](/Users/home/unchgit/unchained/src/protocol.rs).
-- Epoch anchors commit mined coins.
-- Mined coins are deterministically materialized into genesis shielded notes.
-- Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
-- Canonical transactions carry a succinct STARK receipt over a private witness, while validators only see the current nullifiers, encrypted outputs, and the proof journal bindings required to update state.
-- Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
-- Wallet checkpoint refresh now runs on a fixed cadence, not only at spend time, and it still emits cover traffic even when there is no immediate spend-shaped refresh to perform. Each cycle stripes note history across shard-aligned checkpoint segments, routes those segments across multiple archive providers discovered on the PQ mesh, pads provider buckets with cover traffic, rerandomizes every provider reply, compresses segment replies into packets, compresses packets into strata, and only then aggregates the strata into one durable checkpoint extension.
-- Archived nullifier history is organized into content-addressed epoch shards with provider manifests, replica attestations, service ledgers, derived availability certificates, and deterministic operator scorecards over the PQ mesh. Nodes deterministically rebalance shard custody so the archive layer converges toward the protocol replica target without pulling historical nullifier bulk back into validator state, and routing now prefers providers that both retain shards deeply and actually serve checkpoint/archive traffic reliably.
+## Shielded State Model
 
-## Architecture
+- Protocol constants are locked in `src/protocol.rs` and consumed by consensus,
+  nullifier rollover, archive routing, and wallet refresh.
+- Mined coins can be deterministically lifted into genesis shielded notes and
+  appended to the global note commitment tree
+  (`src/transaction.rs`, `src/wallet.rs`, `src/shielded.rs`).
+- Canonical ownership is represented by the note commitment tree plus the active
+  and archived nullifier epochs (`src/transaction.rs`, `src/shielded.rs`).
+- Shielded transactions carry a succinct proof. Validators check the proof
+  journal against live chain state and only persist current nullifiers, outputs,
+  and the transaction itself (`src/proof.rs`, `src/transaction.rs`,
+  `proof-core/src/lib.rs`).
+- Historical unspent state is tracked as checkpoints and checkpoint
+  accumulators, not as an ever-growing validator nullifier table
+  (`src/wallet.rs`, `src/proof.rs`, `src/transaction.rs`).
 
-- `protocol / consensus core`
-- `wallet / privacy client`
-- `pq mesh runtime`
+## Wallet Refresh And Archive Layer
 
-The product is now a single PQ-only runtime. Remote interaction happens over the signed PQ mesh, while wallet and messaging flows are expressed through the CLI and the node-to-node protocol rather than separate HTTP perimeter services.
+- `node start` spawns a fixed-cadence oblivious refresh loop for wallet
+  checkpoints (`src/main.rs`, `src/wallet.rs`).
+- Each refresh can issue real checkpoint requests for owned notes and synthetic
+  cover requests even when no spend is pending (`src/wallet.rs`).
+- Checkpoint queries are segmented by archive shard, routed across providers,
+  padded with cover traffic to power-of-two batch sizes, rerandomized, and
+  aggregated into packets and strata before checkpoint accumulator proving
+  (`src/shielded.rs`, `src/network.rs`, `src/proof.rs`).
+- The live runtime persists and exchanges archive provider manifests, replica
+  attestations, service ledgers, custody commitments, retrieval receipts,
+  availability certificates, and operator scorecards
+  (`src/network.rs`, `src/shielded.rs`, `src/storage.rs`).
+- Archive shard repair and replica rebalancing are wired into the network
+  runtime (`src/network.rs`).
 
-The only remaining HTTP surface is the metrics/log stream, and it is loopback-only for local observability.
+## Service Boundary
 
-Node identity is provisioned through an offline-root ceremony:
+- The product runs as a single PQ mesh node. Remote interaction happens through
+  signed envelopes on the node-to-node transport
+  (`src/network.rs`, `src/node_identity.rs`).
+- The only HTTP surface in the checked-in runtime is the local metrics/log
+  stream, and the code enforces a loopback bind for it (`src/metrics.rs`).
+- Node identity supports an offline-root ceremony through
+  `unchained node init-root`, `unchained node auth-prepare`,
+  `unchained node auth-sign`, and `unchained node auth-install`
+  (`src/main.rs`, `src/node_identity.rs`).
+- Runtime operation only needs the installed auth key and signed node record;
+  the offline root is not required by `NodeIdentity::load_runtime_in_dir`
+  (`src/node_identity.rs`).
 
-- `node init-root`
-- `node auth-prepare`
-- `node auth-sign`
-- `node auth-install`
+## Proofs
 
-The runtime only requires the installed ML-DSA auth key and signed node record. The root key is not needed online after provisioning.
-
-Proof generation is now part of the live wallet path:
-
-- `proof-core` defines the canonical shielded witness and public journal contract
-- `methods/guest` is the zkVM guest that validates that witness
-- [`src/proof.rs`](/Users/home/unchgit/unchained/src/proof.rs) generates and verifies succinct STARK receipts
-
-On Apple Silicon, the repository treats CPU proving as the stable default. The build does not depend on a functioning Metal proving path.
+- `proof-core` defines the canonical shielded witness, checkpoint accumulator
+  journal, and public binding semantics (`proof-core/src/lib.rs`).
+- `methods/guest` validates shielded spend witnesses in the zkVM
+  (`methods/guest/src/main.rs`).
+- `methods/checkpoint-guest` validates checkpoint accumulator steps in the zkVM
+  (`methods/checkpoint-guest/src/main.rs`).
+- `src/proof.rs` generates and verifies succinct receipts, and wallet sends call
+  into that live path (`src/wallet.rs`, `src/proof.rs`).
+- The project code uses `risc0_zkvm::default_prover()`; Unchained does not
+  define a separate project-specific Metal proving path (`src/proof.rs`).
 
 ## Build
 
@@ -72,17 +109,31 @@ cargo run --release --bin unchained -- node start
 cargo run --release --bin unchained -- wallet receive
 ```
 
-`cargo test` now exercises the full end-to-end succinct-proof wallet roundtrip by default. On CPU-only proving hosts, `shielded_tx_flow` is materially slower than the rest of the suite.
+The default test suite includes:
+
+- `tests/shielded_tx_flow.rs`: end-to-end succinct-proof wallet send/receive
+  roundtrip
+- `tests/shielded_pool.rs`: shielded note, checkpoint, archive, and
+  rerandomization coverage
+- `tests/pq_network.rs`: PQ bootstrap, anchor recovery, and network
+  archive/proof flows
+
+`shielded_tx_flow` is materially slower than the rest of the suite on CPU-only
+proving hosts.
 
 ## CLI
 
-The primary user journeys are:
+Primary commands in the current binary:
 
 - `node start`
 - `node init-root`
 - `node auth-prepare`
 - `node auth-sign`
 - `node auth-install`
+- `node trust-revoke`
+- `node trust-replace`
+- `node trust-approve`
+- `node peer-id`
 - `wallet receive`
 - `wallet send`
 - `wallet balance`
@@ -91,13 +142,19 @@ The primary user journeys are:
 - `message listen`
 - `advanced replay-transactions`
 - `advanced rescan-wallet`
+- `advanced export-anchors --out <FILE>`
+- `advanced import-anchors --input <FILE>`
 
-Operational and protocol-maintenance workflows live under `advanced`.
+`wallet receive` exports a signed KeyDoc JSON recipient document, and
+`wallet send` validates that document before constructing a proof-backed
+shielded transaction (`src/wallet.rs`).
+
+`message send` and `message listen` operate on a shared text topic rather than a
+direct wallet-to-wallet transport (`src/main.rs`, `src/network.rs`).
 
 ## Docs
 
-- [README.md](/Users/home/unchgit/unchained/README.md): concise project summary
-- [ARCHITECTURE.md](/Users/home/unchgit/unchained/ARCHITECTURE.md): system boundaries and current design
-- [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md): live shielded-pool and proof-carrying state model
-
-Older Markdown files are archival unless rewritten to match the live code.
+- `README.md`: current project summary
+- `ARCHITECTURE.md`: broader design notes for the same runtime
+- `SHIELDED_POOL_V1.md`: shielded pool and archive/checkpoint model with the
+  terminology used by the code
