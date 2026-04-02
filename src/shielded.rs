@@ -792,6 +792,58 @@ impl HistoricalUnspentCheckpoint {
         }
     }
 
+    pub fn apply_accumulator(
+        &self,
+        accumulator: &proof_core::CheckpointAccumulatorJournal,
+        ledger: &NullifierRootLedger,
+    ) -> Result<Self> {
+        if self.version != SHIELDED_CHECKPOINT_VERSION {
+            bail!("unsupported checkpoint version {}", self.version);
+        }
+        if accumulator.note_commitment != self.note_commitment {
+            bail!("checkpoint accumulator note mismatch");
+        }
+        if accumulator.birth_epoch != self.birth_epoch {
+            bail!("checkpoint accumulator birth epoch mismatch");
+        }
+        if accumulator.covered_through_epoch < self.covered_through_epoch {
+            bail!("checkpoint accumulator regresses the covered epoch");
+        }
+
+        let expected_historical_root_digest =
+            if accumulator.covered_through_epoch < self.birth_epoch {
+                proof_core::checkpoint_accumulator_historical_digest_from_pairs(&[])
+            } else {
+                let mut pairs = Vec::new();
+                for epoch in self.birth_epoch..=accumulator.covered_through_epoch {
+                    pairs.push((epoch, ledger.root_for_epoch(epoch)?));
+                }
+                proof_core::checkpoint_accumulator_historical_digest_from_pairs(&pairs)
+            };
+        if accumulator.historical_root_digest != expected_historical_root_digest {
+            bail!("checkpoint accumulator historical root digest mismatch");
+        }
+        let expected_root = proof_core::checkpoint_accumulator_root(
+            &self.note_commitment,
+            self.birth_epoch,
+            accumulator.covered_through_epoch,
+            &accumulator.historical_root_digest,
+            &accumulator.stratum_commitment_root,
+        );
+        if accumulator.checkpoint_root != expected_root {
+            bail!("checkpoint accumulator root mismatch");
+        }
+
+        Ok(Self {
+            version: self.version,
+            note_commitment: self.note_commitment,
+            birth_epoch: self.birth_epoch,
+            covered_through_epoch: accumulator.covered_through_epoch,
+            transcript_root: accumulator.checkpoint_root,
+            verified_epoch_count: accumulator.verified_epoch_count,
+        })
+    }
+
     pub fn apply_extension(
         &self,
         extension: &HistoricalUnspentExtension,

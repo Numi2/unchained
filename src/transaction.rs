@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use methods::CHECKPOINT_ACCUMULATOR_METHOD_ID;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use std::collections::{BTreeSet, HashSet};
@@ -118,6 +119,16 @@ impl Tx {
             }
             if current_epoch > 0 && binding.historical_through_epoch != current_epoch - 1 {
                 bail!("historical range does not end at the prior epoch");
+            }
+            if binding.historical_from_epoch <= binding.historical_through_epoch
+                && binding.historical_accumulator_image_id != CHECKPOINT_ACCUMULATOR_METHOD_ID
+            {
+                bail!("historical accumulator method mismatch");
+            }
+            if binding.historical_from_epoch > binding.historical_through_epoch
+                && binding.historical_accumulator_image_id != [0u32; 8]
+            {
+                bail!("empty historical range must not reference an accumulator method");
             }
             let expected_digest = historical_root_digest_for_range(
                 &ledger,
@@ -300,13 +311,13 @@ fn historical_root_digest_for_range(
     through_epoch: u64,
 ) -> Result<[u8; 32]> {
     if from_epoch > through_epoch {
-        return Ok(proof_core::historical_root_digest_from_pairs(&[]));
+        return Ok(proof_core::checkpoint_accumulator_historical_digest_from_pairs(&[]));
     }
     let mut pairs = Vec::new();
     for epoch in from_epoch..=through_epoch {
         pairs.push((epoch, ledger.root_for_epoch(epoch)?));
     }
-    Ok(proof_core::historical_root_digest_from_pairs(&pairs))
+    Ok(proof_core::checkpoint_accumulator_historical_digest_from_pairs(&pairs))
 }
 
 pub fn local_available_archive_epochs(

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 pub const SHIELDED_NOTE_VERSION: u8 = 1;
 pub const SHIELDED_CHECKPOINT_VERSION: u8 = 1;
 pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
+pub const CHECKPOINT_ACCUMULATOR_VERSION: u8 = 1;
 pub const SHIELDED_OUTPUT_NONCE_LEN: usize = 24;
 
 const NOTE_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-note-key-v1";
@@ -24,6 +25,12 @@ const CHECKPOINT_STRATUM_COMMIT_DOMAIN: &str = "unchained-shielded-checkpoint-st
 const CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN: &str =
     "unchained-shielded-checkpoint-stratum-accumulate-v1";
 const CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN: &str = "unchained-shielded-checkpoint-accumulate-v1";
+const CHECKPOINT_ACCUMULATOR_HISTORICAL_DOMAIN: &str =
+    "unchained-shielded-checkpoint-accumulator-historical-v1";
+const CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN: &str =
+    "unchained-shielded-checkpoint-accumulator-stratum-v1";
+const CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN: &str =
+    "unchained-shielded-checkpoint-accumulator-root-v1";
 const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
 
@@ -132,6 +139,29 @@ pub struct HistoricalUnspentStratum {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAccumulatorJournal {
+    pub version: u8,
+    pub accumulator_image_id: [u32; 8],
+    pub note_commitment: [u8; 32],
+    pub birth_epoch: u64,
+    pub covered_through_epoch: u64,
+    pub historical_root_digest: [u8; 32],
+    pub stratum_commitment_root: [u8; 32],
+    pub checkpoint_root: [u8; 32],
+    pub verified_epoch_count: u32,
+    pub stratum_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAccumulatorStepWitness {
+    pub accumulator_image_id: [u32; 8],
+    pub note_commitment: [u8; 32],
+    pub birth_epoch: u64,
+    pub prior_accumulator: Option<CheckpointAccumulatorJournal>,
+    pub stratum: HistoricalUnspentStratum,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProofShieldedOutputPlaintext {
     pub note: ProofShieldedNote,
     pub note_key: [u8; 32],
@@ -153,7 +183,8 @@ pub struct ProofShieldedInputWitness {
     pub note_key: [u8; 32],
     pub membership_proof: NoteMembershipProof,
     pub historical_checkpoint: HistoricalUnspentCheckpoint,
-    pub historical_extension: HistoricalUnspentExtension,
+    pub historical_accumulator: Option<CheckpointAccumulatorJournal>,
+    pub historical_accumulator_receipt: Option<Vec<u8>>,
     pub current_nullifier: [u8; 32],
 }
 
@@ -178,6 +209,7 @@ pub struct ProofShieldedInputBinding {
     pub historical_from_epoch: u64,
     pub historical_through_epoch: u64,
     pub historical_root_digest: [u8; 32],
+    pub historical_accumulator_image_id: [u32; 8],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,16 +266,50 @@ pub fn validate_shielded_tx_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let updated_checkpoint = input
-            .historical_checkpoint
-            .apply_extension(&input.historical_extension)?;
-        if witness.current_epoch == 0 {
-            if !input.historical_extension.strata.is_empty() {
-                bail!("epoch-zero spends must not include historical records");
+        let genesis_checkpoint =
+            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_image_id,
+        ) = match &input.historical_accumulator {
+            Some(accumulator) => {
+                if input
+                    .historical_accumulator_receipt
+                    .as_ref()
+                    .map_or(true, Vec::is_empty)
+                {
+                    bail!("historical accumulator receipt is missing");
+                }
+                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
+                if witness.current_epoch == 0
+                    || accumulator.covered_through_epoch != witness.current_epoch - 1
+                {
+                    bail!("historical checkpoint does not cover all prior epochs");
+                }
+                (
+                    input.note.birth_epoch,
+                    accumulator.covered_through_epoch,
+                    accumulator.historical_root_digest,
+                    accumulator.accumulator_image_id,
+                )
             }
-        } else if updated_checkpoint.covered_through_epoch != witness.current_epoch - 1 {
-            bail!("historical checkpoint does not cover all prior epochs");
-        }
+            None => {
+                if witness.current_epoch != input.note.birth_epoch {
+                    bail!("historical accumulator proof missing");
+                }
+                if input.historical_checkpoint != genesis_checkpoint {
+                    bail!("historical checkpoint mismatch");
+                }
+                (
+                    input.note.birth_epoch,
+                    input.historical_checkpoint.covered_through_epoch,
+                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
+                    [0u32; 8],
+                )
+            }
+        };
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.chain_id,
@@ -255,9 +321,10 @@ pub fn validate_shielded_tx_witness(
         total_in = total_in.saturating_add(input.note.value as u128);
         input_bindings.push(ProofShieldedInputBinding {
             current_nullifier: input.current_nullifier,
-            historical_from_epoch: input.historical_extension.from_epoch,
-            historical_through_epoch: input.historical_extension.through_epoch,
-            historical_root_digest: input.historical_extension.historical_root_digest,
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_image_id,
         });
     }
 
@@ -545,6 +612,140 @@ impl HistoricalUnspentCheckpoint {
     }
 }
 
+impl CheckpointAccumulatorJournal {
+    pub fn validate_against_checkpoint(
+        &self,
+        checkpoint: &HistoricalUnspentCheckpoint,
+    ) -> Result<()> {
+        if self.version != CHECKPOINT_ACCUMULATOR_VERSION {
+            bail!(
+                "unsupported checkpoint accumulator version {}",
+                self.version
+            );
+        }
+        if self.note_commitment != checkpoint.note_commitment {
+            bail!("checkpoint accumulator note mismatch");
+        }
+        if self.birth_epoch != checkpoint.birth_epoch {
+            bail!("checkpoint accumulator birth epoch mismatch");
+        }
+        if self.covered_through_epoch < self.birth_epoch.saturating_sub(1) {
+            bail!("checkpoint accumulator covered range is invalid");
+        }
+        let expected_root = checkpoint_accumulator_root(
+            &self.note_commitment,
+            self.birth_epoch,
+            self.covered_through_epoch,
+            &self.historical_root_digest,
+            &self.stratum_commitment_root,
+        );
+        if self.checkpoint_root != expected_root {
+            bail!("checkpoint accumulator root mismatch");
+        }
+        if checkpoint.covered_through_epoch != self.covered_through_epoch {
+            bail!("checkpoint covered range mismatch");
+        }
+        if checkpoint.transcript_root != self.checkpoint_root {
+            bail!("checkpoint transcript root mismatch");
+        }
+        if checkpoint.verified_epoch_count != self.verified_epoch_count {
+            bail!("checkpoint verified epoch count mismatch");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_checkpoint_accumulator_step_witness(
+    witness: &CheckpointAccumulatorStepWitness,
+) -> Result<CheckpointAccumulatorJournal> {
+    witness
+        .stratum
+        .verify_against_note(&witness.note_commitment)?;
+    let (
+        mut historical_root_digest,
+        stratum_commitment_root,
+        expected_from_epoch,
+        verified_epoch_count,
+        stratum_count,
+    ) = match witness.prior_accumulator.as_ref() {
+        Some(prior) => {
+            if prior.version != CHECKPOINT_ACCUMULATOR_VERSION {
+                bail!(
+                    "unsupported checkpoint accumulator version {}",
+                    prior.version
+                );
+            }
+            if prior.accumulator_image_id != witness.accumulator_image_id {
+                bail!("checkpoint accumulator image id mismatch");
+            }
+            if prior.note_commitment != witness.note_commitment {
+                bail!("checkpoint accumulator note mismatch");
+            }
+            if prior.birth_epoch != witness.birth_epoch {
+                bail!("checkpoint accumulator birth epoch mismatch");
+            }
+            (
+                prior.historical_root_digest,
+                prior.stratum_commitment_root,
+                prior.covered_through_epoch.saturating_add(1),
+                prior.verified_epoch_count,
+                prior.stratum_count,
+            )
+        }
+        None => (
+            checkpoint_accumulator_historical_digest_from_pairs(&[]),
+            checkpoint_accumulator_stratum_root(&[]),
+            witness.birth_epoch,
+            0,
+            0,
+        ),
+    };
+    if witness.stratum.from_epoch != expected_from_epoch {
+        bail!("checkpoint accumulator strata must be contiguous");
+    }
+
+    let mut added_epochs = 0u32;
+    for packet in &witness.stratum.packets {
+        for segment in &packet.segments {
+            for record in &segment.records {
+                historical_root_digest = checkpoint_accumulator_historical_digest_append(
+                    &historical_root_digest,
+                    record.epoch,
+                    &record.proof.root,
+                );
+                added_epochs = added_epochs.saturating_add(1);
+            }
+        }
+    }
+
+    let stratum_commitment_root = checkpoint_accumulator_stratum_root_append(
+        &stratum_commitment_root,
+        &witness.stratum.commitment_digest(),
+    );
+    let covered_through_epoch = witness.stratum.through_epoch;
+    let verified_epoch_count = verified_epoch_count.saturating_add(added_epochs);
+    let stratum_count = stratum_count.saturating_add(1);
+
+    Ok(CheckpointAccumulatorJournal {
+        version: CHECKPOINT_ACCUMULATOR_VERSION,
+        accumulator_image_id: witness.accumulator_image_id,
+        note_commitment: witness.note_commitment,
+        birth_epoch: witness.birth_epoch,
+        covered_through_epoch,
+        historical_root_digest,
+        stratum_commitment_root,
+        checkpoint_root: checkpoint_accumulator_root(
+            &witness.note_commitment,
+            witness.birth_epoch,
+            covered_through_epoch,
+            &historical_root_digest,
+            &stratum_commitment_root,
+        ),
+        verified_epoch_count,
+        stratum_count,
+    })
+}
+
 impl HistoricalUnspentSegment {
     pub fn verify_against_note(&self, note_commitment: &[u8; 32]) -> Result<()> {
         if self.records.is_empty() {
@@ -738,6 +939,59 @@ pub fn historical_root_digest_from_pairs(pairs: &[(u64, [u8; 32])]) -> [u8; 32] 
         hasher.update(&epoch.to_le_bytes());
         hasher.update(root);
     }
+    *hasher.finalize().as_bytes()
+}
+
+pub fn checkpoint_accumulator_historical_digest_from_pairs(pairs: &[(u64, [u8; 32])]) -> [u8; 32] {
+    pairs.iter().fold([0u8; 32], |digest, (epoch, root)| {
+        checkpoint_accumulator_historical_digest_append(&digest, *epoch, root)
+    })
+}
+
+pub fn checkpoint_accumulator_historical_digest_append(
+    prior_digest: &[u8; 32],
+    epoch: u64,
+    root: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_HISTORICAL_DOMAIN);
+    hasher.update(prior_digest);
+    hasher.update(&epoch.to_le_bytes());
+    hasher.update(root);
+    *hasher.finalize().as_bytes()
+}
+
+pub fn checkpoint_accumulator_stratum_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
+    stratum_digests
+        .iter()
+        .fold([0u8; 32], |digest, stratum_digest| {
+            checkpoint_accumulator_stratum_root_append(&digest, stratum_digest)
+        })
+}
+
+pub fn checkpoint_accumulator_stratum_root_append(
+    prior_root: &[u8; 32],
+    stratum_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN);
+    hasher.update(prior_root);
+    hasher.update(stratum_digest);
+    *hasher.finalize().as_bytes()
+}
+
+pub fn checkpoint_accumulator_root(
+    note_commitment: &[u8; 32],
+    birth_epoch: u64,
+    covered_through_epoch: u64,
+    historical_root_digest: &[u8; 32],
+    stratum_commitment_root: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN);
+    hasher.update(&checkpoint_base_root(note_commitment, birth_epoch));
+    hasher.update(note_commitment);
+    hasher.update(&birth_epoch.to_le_bytes());
+    hasher.update(&covered_through_epoch.to_le_bytes());
+    hasher.update(historical_root_digest);
+    hasher.update(stratum_commitment_root);
     *hasher.finalize().as_bytes()
 }
 
@@ -1226,7 +1480,7 @@ mod tests {
         ProofShieldedOutputWitness {
             plaintext: ProofShieldedOutputPlaintext {
                 checkpoint: HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch),
-                note,
+                note: note.clone(),
                 note_key,
             },
             public_output: ProofShieldedOutput {
@@ -1239,7 +1493,30 @@ mod tests {
         }
     }
 
-    fn sample_witness(output_value: u64) -> (ProofShieldedTxWitness, HistoricalUnspentExtension) {
+    fn sample_accumulator(
+        checkpoint: &HistoricalUnspentCheckpoint,
+        extension: &HistoricalUnspentExtension,
+        image_id: [u32; 8],
+    ) -> CheckpointAccumulatorJournal {
+        let mut prior = None;
+        let mut current = None;
+        for stratum in &extension.strata {
+            let witness = CheckpointAccumulatorStepWitness {
+                accumulator_image_id: image_id,
+                note_commitment: checkpoint.note_commitment,
+                birth_epoch: checkpoint.birth_epoch,
+                prior_accumulator: prior.clone(),
+                stratum: stratum.clone(),
+            };
+            let journal =
+                validate_checkpoint_accumulator_step_witness(&witness).expect("valid accumulator");
+            prior = Some(journal.clone());
+            current = Some(journal);
+        }
+        current.expect("non-empty extension")
+    }
+
+    fn sample_witness(output_value: u64) -> (ProofShieldedTxWitness, CheckpointAccumulatorJournal) {
         let chain_id = [7u8; 32];
         let current_epoch = 2;
         let (input_note, input_note_key) = sample_note(11, 7, 1);
@@ -1252,6 +1529,15 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
+        let accumulator = sample_accumulator(&checkpoint, &extension, [9u32; 8]);
+        let updated_checkpoint = HistoricalUnspentCheckpoint {
+            version: checkpoint.version,
+            note_commitment: checkpoint.note_commitment,
+            birth_epoch: checkpoint.birth_epoch,
+            covered_through_epoch: accumulator.covered_through_epoch,
+            transcript_root: accumulator.checkpoint_root,
+            verified_epoch_count: accumulator.verified_epoch_count,
+        };
         let current_nullifier = input_note
             .derive_evolving_nullifier(&input_note_key, &chain_id, current_epoch)
             .expect("derive current nullifier");
@@ -1265,19 +1551,20 @@ mod tests {
                     note: input_note,
                     note_key: input_note_key,
                     membership_proof,
-                    historical_checkpoint: checkpoint,
-                    historical_extension: extension.clone(),
+                    historical_checkpoint: updated_checkpoint,
+                    historical_accumulator: Some(accumulator.clone()),
+                    historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
                 outputs: vec![output],
             },
-            extension,
+            accumulator,
         )
     }
 
     #[test]
     fn valid_witness_yields_public_journal_bindings() {
-        let (witness, extension) = sample_witness(7);
+        let (witness, accumulator) = sample_witness(7);
         let journal = validate_shielded_tx_witness(&witness).expect("valid witness");
         assert_eq!(journal.chain_id, witness.chain_id);
         assert_eq!(journal.current_epoch, witness.current_epoch);
@@ -1290,15 +1577,19 @@ mod tests {
         );
         assert_eq!(
             journal.inputs[0].historical_from_epoch,
-            extension.from_epoch
+            accumulator.birth_epoch
         );
         assert_eq!(
             journal.inputs[0].historical_through_epoch,
-            extension.through_epoch
+            accumulator.covered_through_epoch
         );
         assert_eq!(
             journal.inputs[0].historical_root_digest,
-            extension.historical_root_digest
+            accumulator.historical_root_digest
+        );
+        assert_eq!(
+            journal.inputs[0].historical_accumulator_image_id,
+            accumulator.accumulator_image_id
         );
         assert_eq!(
             journal.outputs[0].note_commitment,
@@ -1311,13 +1602,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_historical_extension_is_rejected() {
+    fn invalid_historical_accumulator_is_rejected() {
         let (mut witness, _) = sample_witness(7);
-        witness.inputs[0].historical_extension.new_transcript_root[0] ^= 0x80;
-        let err = validate_shielded_tx_witness(&witness).expect_err("invalid extension");
+        witness.inputs[0]
+            .historical_accumulator
+            .as_mut()
+            .expect("accumulator")
+            .checkpoint_root[0] ^= 0x80;
+        let err = validate_shielded_tx_witness(&witness).expect_err("invalid accumulator");
         assert!(
             err.to_string()
-                .contains("extension transcript root mismatch"),
+                .contains("checkpoint accumulator root mismatch"),
             "unexpected error: {err:?}"
         );
     }

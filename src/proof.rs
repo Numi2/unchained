@@ -1,9 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
-use methods::{SHIELDED_SPEND_METHOD_ELF, SHIELDED_SPEND_METHOD_ID};
+use methods::{
+    CHECKPOINT_ACCUMULATOR_METHOD_ELF, CHECKPOINT_ACCUMULATOR_METHOD_ID, SHIELDED_SPEND_METHOD_ELF,
+    SHIELDED_SPEND_METHOD_ID,
+};
 use proof_core::{
+    CheckpointAccumulatorJournal, CheckpointAccumulatorStepWitness,
     HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
     HistoricalUnspentCheckpoint as ProofHistoricalUnspentCheckpoint,
-    HistoricalUnspentExtension as ProofHistoricalUnspentExtension,
     HistoricalUnspentPacket as ProofHistoricalUnspentPacket,
     HistoricalUnspentSegment as ProofHistoricalUnspentSegment,
     HistoricalUnspentStratum as ProofHistoricalUnspentStratum,
@@ -15,6 +18,7 @@ use proof_core::{
     ProofShieldedTxWitness,
 };
 use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, Receipt};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     shielded::{
@@ -25,10 +29,34 @@ use crate::{
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAccumulatorProof {
+    pub journal: CheckpointAccumulatorJournal,
+    pub receipt: Vec<u8>,
+}
+
 pub fn prove_shielded_tx(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(Receipt, ProofShieldedTxJournal)> {
-    let env = ExecutorEnv::builder()
+    let mut builder = ExecutorEnv::builder();
+    for input in &witness.inputs {
+        match (
+            input.historical_accumulator.as_ref(),
+            input.historical_accumulator_receipt.as_ref(),
+        ) {
+            (Some(accumulator), Some(bytes)) => {
+                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                if &journal != accumulator {
+                    bail!("historical accumulator witness does not match its receipt");
+                }
+                builder.add_assumption(receipt_from_bytes(bytes)?);
+            }
+            (Some(_), None) => bail!("historical accumulator receipt is missing"),
+            (None, Some(_)) => bail!("unexpected accumulator receipt without a journal"),
+            (None, None) => {}
+        }
+    }
+    let env = builder
         .write(witness)
         .context("serialize shielded proof witness")?
         .build()
@@ -49,7 +77,7 @@ pub fn prove_shielded_tx(
 }
 
 pub fn verify_shielded_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
-    let receipt: Receipt = bincode::deserialize(bytes).context("decode shielded receipt bytes")?;
+    let receipt = receipt_from_bytes(bytes)?;
     match &receipt.inner {
         InnerReceipt::Succinct(_) => {}
         _ => bail!("only succinct STARK receipts are accepted"),
@@ -62,6 +90,100 @@ pub fn verify_shielded_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJour
 
 pub fn receipt_to_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
     bincode::serialize(receipt).context("serialize shielded receipt")
+}
+
+pub fn prove_checkpoint_accumulator(
+    checkpoint: &HistoricalUnspentCheckpoint,
+    extension: &HistoricalUnspentExtension,
+    prior: Option<&CheckpointAccumulatorProof>,
+) -> Result<CheckpointAccumulatorProof> {
+    if extension.strata.is_empty() {
+        bail!("checkpoint accumulator requires a non-empty extension");
+    }
+    if prior.is_none()
+        && checkpoint
+            != &HistoricalUnspentCheckpoint::genesis(
+                checkpoint.note_commitment,
+                checkpoint.birth_epoch,
+            )
+    {
+        bail!("checkpoint accumulator bootstrap must start from genesis");
+    }
+    if let Some(prior) = prior {
+        if prior.journal.note_commitment != checkpoint.note_commitment {
+            bail!("prior accumulator note mismatch");
+        }
+        if prior.journal.birth_epoch != checkpoint.birth_epoch {
+            bail!("prior accumulator birth epoch mismatch");
+        }
+    }
+
+    let mut prior_journal = prior.map(|proof| proof.journal.clone());
+    let mut prior_receipt = prior
+        .map(|proof| receipt_from_bytes(&proof.receipt))
+        .transpose()?;
+    let mut current_receipt = None;
+    let mut current_journal = None;
+
+    for stratum in &extension.strata {
+        let mut builder = ExecutorEnv::builder();
+        if let Some(receipt) = prior_receipt.as_ref() {
+            builder.add_assumption(receipt.clone());
+        }
+        let env = builder
+            .write(&CheckpointAccumulatorStepWitness {
+                accumulator_image_id: CHECKPOINT_ACCUMULATOR_METHOD_ID,
+                note_commitment: checkpoint.note_commitment,
+                birth_epoch: checkpoint.birth_epoch,
+                prior_accumulator: prior_journal.clone(),
+                stratum: stratum_to_proof(stratum),
+            })
+            .context("serialize checkpoint accumulator step witness")?
+            .build()
+            .context("build checkpoint accumulator executor environment")?;
+        let prove_info = default_prover()
+            .prove_with_opts(
+                env,
+                CHECKPOINT_ACCUMULATOR_METHOD_ELF,
+                &ProverOpts::succinct(),
+            )
+            .context("prove checkpoint accumulator step")?;
+        let receipt = prove_info.receipt;
+        match &receipt.inner {
+            InnerReceipt::Succinct(_) => {}
+            _ => bail!("checkpoint accumulator requires a succinct STARK receipt"),
+        }
+        receipt
+            .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
+            .context("verify locally generated checkpoint accumulator receipt")?;
+        let journal = decode_checkpoint_accumulator_journal(&receipt)?;
+        prior_journal = Some(journal.clone());
+        prior_receipt = Some(receipt.clone());
+        current_journal = Some(journal);
+        current_receipt = Some(receipt);
+    }
+
+    Ok(CheckpointAccumulatorProof {
+        journal: current_journal
+            .ok_or_else(|| anyhow!("missing checkpoint accumulator journal"))?,
+        receipt: receipt_to_bytes(
+            &current_receipt.ok_or_else(|| anyhow!("missing checkpoint accumulator receipt"))?,
+        )?,
+    })
+}
+
+pub fn verify_checkpoint_accumulator_receipt_bytes(
+    bytes: &[u8],
+) -> Result<CheckpointAccumulatorJournal> {
+    let receipt = receipt_from_bytes(bytes)?;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("only succinct checkpoint accumulator receipts are accepted"),
+    }
+    receipt
+        .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
+        .context("verify checkpoint accumulator receipt")?;
+    decode_checkpoint_accumulator_journal(&receipt)
 }
 
 pub fn output_binding(output: &ShieldedOutput) -> ProofShieldedOutputBinding {
@@ -107,7 +229,7 @@ pub fn input_witness_from_local(
     note_key: &[u8; 32],
     membership_proof: &NoteMembershipProof,
     historical_checkpoint: &HistoricalUnspentCheckpoint,
-    historical_extension: &HistoricalUnspentExtension,
+    historical_accumulator: Option<&CheckpointAccumulatorProof>,
     current_nullifier: &[u8; 32],
 ) -> ProofShieldedInputWitness {
     ProofShieldedInputWitness {
@@ -115,7 +237,8 @@ pub fn input_witness_from_local(
         note_key: *note_key,
         membership_proof: membership_proof_to_proof(membership_proof),
         historical_checkpoint: checkpoint_to_proof(historical_checkpoint),
-        historical_extension: extension_to_proof(historical_extension),
+        historical_accumulator: historical_accumulator.map(|proof| proof.journal.clone()),
+        historical_accumulator_receipt: historical_accumulator.map(|proof| proof.receipt.clone()),
         current_nullifier: *current_nullifier,
     }
 }
@@ -125,6 +248,19 @@ fn decode_shielded_tx_journal(receipt: &Receipt) -> Result<ProofShieldedTxJourna
         .journal
         .decode()
         .map_err(|err| anyhow!("decode shielded receipt journal: {err}"))
+}
+
+fn decode_checkpoint_accumulator_journal(
+    receipt: &Receipt,
+) -> Result<CheckpointAccumulatorJournal> {
+    receipt
+        .journal
+        .decode()
+        .map_err(|err| anyhow!("decode checkpoint accumulator receipt journal: {err}"))
+}
+
+fn receipt_from_bytes(bytes: &[u8]) -> Result<Receipt> {
+    bincode::deserialize(bytes).context("decode receipt bytes")
 }
 
 fn note_to_proof(note: &ShieldedNote) -> ProofShieldedNote {
@@ -160,21 +296,6 @@ fn checkpoint_to_proof(
         covered_through_epoch: checkpoint.covered_through_epoch,
         transcript_root: checkpoint.transcript_root,
         verified_epoch_count: checkpoint.verified_epoch_count,
-    }
-}
-
-fn extension_to_proof(extension: &HistoricalUnspentExtension) -> ProofHistoricalUnspentExtension {
-    ProofHistoricalUnspentExtension {
-        version: extension.version,
-        note_commitment: extension.note_commitment,
-        from_epoch: extension.from_epoch,
-        through_epoch: extension.through_epoch,
-        prior_transcript_root: extension.prior_transcript_root,
-        historical_root_digest: extension.historical_root_digest,
-        stratum_commitment_root: extension.stratum_commitment_root,
-        aggregate_rerandomization_blinding: extension.aggregate_rerandomization_blinding,
-        new_transcript_root: extension.new_transcript_root,
-        strata: extension.strata.iter().map(stratum_to_proof).collect(),
     }
 }
 

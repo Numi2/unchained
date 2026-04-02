@@ -70,6 +70,7 @@ pub struct OwnedShieldedNote {
     pub note: shielded::ShieldedNote,
     pub note_key: [u8; 32],
     pub checkpoint: shielded::HistoricalUnspentCheckpoint,
+    pub checkpoint_accumulator: Option<proof::CheckpointAccumulatorProof>,
     pub source: OwnedShieldedNoteSource,
 }
 
@@ -363,6 +364,7 @@ impl Wallet {
                     note: note.clone(),
                     note_key,
                     checkpoint,
+                    checkpoint_accumulator: None,
                     source: OwnedShieldedNoteSource::Genesis { coin_id: coin.id },
                 };
                 store.store_shielded_owned_note(&note.commitment, &owned)?;
@@ -422,6 +424,7 @@ impl Wallet {
                 note: plaintext.note.clone(),
                 note_key: plaintext.note_key,
                 checkpoint: plaintext.checkpoint,
+                checkpoint_accumulator: None,
                 source: OwnedShieldedNoteSource::Received {
                     tx_id,
                     output_index,
@@ -510,8 +513,18 @@ impl Wallet {
 
         let mut requests = Vec::new();
         let mut request_note_indexes = Vec::new();
+        let mut request_checkpoints = Vec::new();
         for (note_index, owned) in notes.iter().enumerate() {
-            let from_epoch = owned.checkpoint.covered_through_epoch.saturating_add(1);
+            let request_checkpoint = owned.checkpoint_accumulator.as_ref().map_or_else(
+                || {
+                    shielded::HistoricalUnspentCheckpoint::genesis(
+                        owned.note.commitment,
+                        owned.note.birth_epoch,
+                    )
+                },
+                |_| owned.checkpoint.clone(),
+            );
+            let from_epoch = request_checkpoint.covered_through_epoch.saturating_add(1);
             if through_epoch < from_epoch {
                 continue;
             }
@@ -524,8 +537,9 @@ impl Wallet {
                 queries.push(shielded::EvolvingNullifierQuery { epoch, nullifier });
             }
             request_note_indexes.push(note_index);
+            request_checkpoints.push(request_checkpoint.clone());
             requests.push(shielded::CheckpointExtensionRequest {
-                checkpoint: owned.checkpoint.clone(),
+                checkpoint: request_checkpoint,
                 queries,
             });
         }
@@ -542,15 +556,21 @@ impl Wallet {
             .ok_or_else(|| anyhow!("missing shielded root ledger"))?;
 
         for (request_index, note_index) in request_note_indexes.into_iter().enumerate() {
-            let updated = notes[note_index]
-                .checkpoint
-                .apply_extension(&extensions[request_index], &ledger)?;
-            notes[note_index].checkpoint = updated.clone();
+            if !extensions[request_index].strata.is_empty() {
+                let accumulator = proof::prove_checkpoint_accumulator(
+                    &request_checkpoints[request_index],
+                    &extensions[request_index],
+                    notes[note_index].checkpoint_accumulator.as_ref(),
+                )?;
+                notes[note_index].checkpoint = request_checkpoints[request_index]
+                    .apply_accumulator(&accumulator.journal, &ledger)?;
+                notes[note_index].checkpoint_accumulator = Some(accumulator);
+            }
             store.store_shielded_owned_note(
                 &notes[note_index].note.commitment,
                 &notes[note_index],
             )?;
-            store.store_shielded_checkpoint(&updated)?;
+            store.store_shielded_checkpoint(&notes[note_index].checkpoint)?;
         }
         Ok(())
     }
@@ -776,6 +796,7 @@ impl Wallet {
                 note: plaintext.note.clone(),
                 note_key: plaintext.note_key,
                 checkpoint: plaintext.checkpoint,
+                checkpoint_accumulator: None,
                 source: OwnedShieldedNoteSource::Received {
                     tx_id,
                     output_index: output_index as u32,
@@ -863,7 +884,7 @@ impl Wallet {
                 &owned.note_key,
                 &membership_proof,
                 &owned.checkpoint,
-                &owned.checkpoint.empty_extension(),
+                owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
             ));
         }
