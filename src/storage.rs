@@ -62,6 +62,10 @@ pub struct OtpSkRecordV1 {
 }
 
 impl Store {
+    pub fn base_path(&self) -> &str {
+        &self.path
+    }
+
     /// Perform database health check and recovery
     pub fn health_check(&self) -> Result<()> {
         // Check basic connectivity
@@ -861,18 +865,41 @@ impl Store {
         Ok(None)
     }
 
-    /// Persist a peer multiaddr string into the peers CF (deduped by key)
+    /// Persist a signed node record into the peers CF keyed by node_id.
+    pub fn store_node_record(&self, node_id: &[u8; 32], record_bytes: &[u8]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("peers")
+            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
+        self.db.put_cf(cf, node_id, record_bytes)?;
+        Ok(())
+    }
+
+    /// Load all known signed node records as raw bytes.
+    pub fn load_node_records(&self) -> Result<Vec<Vec<u8>>> {
+        let cf = self
+            .db
+            .cf_handle("peers")
+            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut records = Vec::new();
+        for item in iter {
+            let (_k, v) = item?;
+            records.push(v.to_vec());
+        }
+        Ok(records)
+    }
+
+    /// Legacy peer-address helpers retained until the network module replacement lands.
     pub fn store_peer_addr(&self, addr: &str) -> Result<()> {
         let cf = self
             .db
             .cf_handle("peers")
             .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
-        // Key is the multiaddr string bytes; value empty
         self.db.put_cf(cf, addr.as_bytes(), &[])?;
         Ok(())
     }
 
-    /// Load all known peer multiaddr strings
     pub fn load_peer_addrs(&self) -> Result<Vec<String>> {
         let cf = self
             .db
@@ -881,9 +908,11 @@ impl Store {
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut addrs = Vec::new();
         for item in iter {
-            let (k, _v) = item?;
-            if let Ok(s) = std::str::from_utf8(&k) {
-                addrs.push(s.to_string());
+            let (k, v) = item?;
+            if v.is_empty() {
+                if let Ok(s) = std::str::from_utf8(&k) {
+                    addrs.push(s.to_string());
+                }
             }
         }
         Ok(addrs)

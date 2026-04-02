@@ -1,37 +1,22 @@
 use crate::{
     crypto::{
-        self, Address, DILITHIUM3_PK_BYTES, DILITHIUM3_SK_BYTES, KYBER768_PK_BYTES,
-        KYBER768_SK_BYTES, OTP_PK_BYTES,
+        self, Address, MlKem768SecretKey, TaggedKemPublicKey, TaggedSigningPublicKey,
+        ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES, OTP_PK_BYTES,
     },
     storage::Store,
 };
+use aws_lc_rs::unstable::signature::PqdsaKeyPair;
+#[cfg(feature = "classical_perimeter")]
 use base64::Engine;
-use pqcrypto_dilithium::dilithium3::{
-    detached_sign as dili_detached_sign, verify_detached_signature as dili_verify_detached,
-    DetachedSignature as DiliDetachedSignature,
-};
-use pqcrypto_dilithium::dilithium3::{PublicKey, SecretKey};
-use pqcrypto_kyber::kyber768::{PublicKey as KyberPk, SecretKey as KyberSk};
-use pqcrypto_traits::kem::PublicKey as KyberPkTrait; // enables KyberPk::from_bytes()
-use pqcrypto_traits::kem::SecretKey as KyberSkTrait; // enables KyberSk::as_bytes()/from_bytes()
-use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
-use pqcrypto_traits::sign::DetachedSignature as _;
 use serde::{Deserialize, Serialize};
-
-// V3 wire format for recipient addresses. User-facing surfaces call these simply
-// "addresses"; privacy is an inherent property of the address type.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct StealthAddressDocV3 {
-    version: u8,
-    recipient_addr: Address,
-    kyber_pk: Vec<u8>,
-}
+use serde_big_array::BigArray;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyDocV1 {
+pub struct KeyDocV2 {
+    pub version: u8,
     pub chain_id: [u8; 32],
-    pub dili_pk: Vec<u8>,
-    pub kyber_pk: Vec<u8>,
+    pub signing_pk: TaggedSigningPublicKey,
+    pub kem_pk: TaggedKemPublicKey,
     pub sig: Vec<u8>,
 }
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,7 +25,6 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     Key, XChaCha20Poly1305, XNonce,
 };
-use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
 use std::sync::Arc;
 // no AEAD usage in deterministic OTP flow
 use atty;
@@ -49,30 +33,33 @@ use rand::RngCore;
 use rpassword;
 
 const WALLET_KEY: &[u8] = b"default_keypair";
+const WALLET_FORMAT_MAGIC: &[u8; 4] = b"UCW3";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
-const WALLET_VERSION_ENCRYPTED: u8 = 1;
-const WALLET_VERSION_WITH_KYBER: u8 = 2;
+const WALLET_VERSION_STANDARDIZED: u8 = 3;
+const KEY_DOC_VERSION: u8 = 2;
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
 
 #[derive(Serialize, Deserialize)]
-struct WalletSecretsV2 {
-    #[serde(with = "serde_big_array::BigArray")]
-    dili_sk: [u8; DILITHIUM3_SK_BYTES],
-    #[serde(with = "serde_big_array::BigArray")]
-    kyber_sk: [u8; KYBER768_SK_BYTES],
-    #[serde(with = "serde_big_array::BigArray")]
-    kyber_pk: [u8; KYBER768_PK_BYTES],
+struct WalletSecretsV3 {
+    signing_key_pkcs8: Vec<u8>,
+    #[serde(with = "BigArray")]
+    kem_sk: [u8; ML_KEM_768_SK_BYTES],
+    #[serde(with = "BigArray")]
+    kem_pk: [u8; ML_KEM_768_PK_BYTES],
+    #[serde(with = "BigArray")]
+    lock_seed: [u8; 32],
 }
 
 pub struct Wallet {
     _db: std::sync::Weak<Store>,
-    pk: PublicKey,
-    sk: SecretKey,
-    kyber_pk: KyberPk,
-    kyber_sk: KyberSk,
+    signing_pk: TaggedSigningPublicKey,
+    signing_key: PqdsaKeyPair,
+    kem_pk: TaggedKemPublicKey,
+    kem_sk: MlKem768SecretKey,
+    lock_seed: [u8; 32],
     address: Address,
 }
 
@@ -81,42 +68,59 @@ pub struct Wallet {
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaAuthCoinV1 {
+pub struct MetaAuthCoinV2 {
     pub coin_id: [u8; 32],
     pub receiver_commitment: crate::transfer::ReceiverLockCommitment,
-    /// KEM: Kyber768 ciphertext to facilitator; AEAD: XChaCha20-Poly1305 nonce||ciphertext
+    /// KEM: ML-KEM-768 ciphertext to facilitator; AEAD: XChaCha20-Poly1305 nonce||ciphertext.
     pub kem_ct: Vec<u8>,
     pub aead_nonce24: [u8; 24],
     pub unlock_preimage_ct: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaTransferAuthV1 {
+pub struct MetaTransferAuthV2 {
     pub version: u8,
     pub chain_id: [u8; 32],
     pub from_address: Address,
-    pub from_dili_pk: Vec<u8>,
+    pub from_signing_pk: TaggedSigningPublicKey,
     pub to_handle: String,
     pub total_amount: u64,
     pub valid_after_epoch: u64,
     pub valid_before_epoch: u64,
     pub nonce: [u8; 32],
-    pub coins: Vec<MetaAuthCoinV1>,
+    pub coins: Vec<MetaAuthCoinV2>,
     pub sig: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetaTransferAuthSignableV1 {
+pub struct MetaTransferAuthSignableV2 {
     pub version: u8,
     pub chain_id: [u8; 32],
     pub from_address: Address,
-    pub from_dili_pk: Vec<u8>,
+    pub from_signing_pk: TaggedSigningPublicKey,
     pub to_handle: String,
     pub total_amount: u64,
     pub valid_after_epoch: u64,
     pub valid_before_epoch: u64,
     pub nonce: [u8; 32],
-    pub coins: Vec<MetaAuthCoinV1>,
+    pub coins: Vec<MetaAuthCoinV2>,
+}
+
+fn keydoc_signable_bytes(
+    version: u8,
+    chain_id: &[u8; 32],
+    signing_pk: &TaggedSigningPublicKey,
+    kem_pk: &TaggedKemPublicKey,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8 + 32 + signing_pk.bytes.len() + kem_pk.bytes.len());
+    msg.extend_from_slice(b"bind-v2");
+    msg.push(version);
+    msg.extend_from_slice(chain_id);
+    msg.push(signing_pk.algorithm as u8);
+    msg.extend_from_slice(signing_pk.as_slice());
+    msg.push(kem_pk.algorithm as u8);
+    msg.extend_from_slice(kem_pk.as_slice());
+    msg
 }
 
 impl Wallet {
@@ -140,18 +144,18 @@ impl Wallet {
         }
 
         if let Some(encoded) = db.get::<Vec<u8>>("wallet", WALLET_KEY)? {
-            if encoded.len() < DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN {
+            if encoded.len() < WALLET_FORMAT_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN {
                 bail!("Unsupported wallet encoding");
             }
-
-            // --- Encrypted wallet path ---
-            let pk_bytes = &encoded[0..DILITHIUM3_PK_BYTES];
-            let version = encoded[DILITHIUM3_PK_BYTES];
-            if version != WALLET_VERSION_ENCRYPTED && version != WALLET_VERSION_WITH_KYBER {
+            if &encoded[..WALLET_FORMAT_MAGIC.len()] != WALLET_FORMAT_MAGIC {
+                bail!("Unsupported wallet format; remove the old wallet and create a fresh ML-DSA/ML-KEM wallet");
+            }
+            let version = encoded[WALLET_FORMAT_MAGIC.len()];
+            if version != WALLET_VERSION_STANDARDIZED {
                 bail!("Unsupported wallet version: {}", version);
             }
 
-            let salt_start = DILITHIUM3_PK_BYTES + 1;
+            let salt_start = WALLET_FORMAT_MAGIC.len() + 1;
             let nonce_start = salt_start + SALT_LEN;
             let ct_start = nonce_start + NONCE_LEN;
 
@@ -172,93 +176,36 @@ impl Wallet {
                 .decrypt(XNonce::from_slice(nonce), ciphertext)
                 .map_err(|_| anyhow!("Invalid pass-phrase"))?;
 
-            let pk =
-                PublicKey::from_bytes(pk_bytes).with_context(|| "Failed to decode public key")?;
-            let (sk, kyber_pk, kyber_sk) = if version == WALLET_VERSION_ENCRYPTED {
-                // V1: only Dilithium SK present; migrate to V2 by adding Kyber keys
-                let sk = SecretKey::from_bytes(&decrypted)
-                    .with_context(|| "Failed to decode secret key bytes")?;
-                let (kpk, ksk) = pqcrypto_kyber::kyber768::keypair();
-                // Write back as V2
-                let passphrase =
-                    obtain_passphrase("Upgrade wallet: confirm pass-phrase to re-encrypt: ")?;
-                let mut salt = [0u8; SALT_LEN];
-                OsRng.fill_bytes(&mut salt);
-                let mut key2 = [0u8; 32];
-                let params2 = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
-                    .map_err(|e| anyhow!("Invalid Argon2id params: {}", e))?;
-                Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params2)
-                    .hash_password_into(passphrase.as_bytes(), &salt, &mut key2)
-                    .map_err(|e| anyhow!("Argon2id key derivation failed: {}", e))?;
-                let cipher2 = XChaCha20Poly1305::new(Key::from_slice(&key2));
-                let mut nonce2 = [0u8; NONCE_LEN];
-                OsRng.fill_bytes(&mut nonce2);
-                let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES];
-                dili_sk.copy_from_slice(sk.as_bytes());
-                let mut kyb_sk = [0u8; KYBER768_SK_BYTES];
-                kyb_sk.copy_from_slice(ksk.as_bytes());
-                let mut kyb_pk = [0u8; KYBER768_PK_BYTES];
-                kyb_pk.copy_from_slice(kpk.as_bytes());
-                let secrets = WalletSecretsV2 {
-                    dili_sk,
-                    kyber_sk: kyb_sk,
-                    kyber_pk: kyb_pk,
-                };
-                let plaintext2 = bincode::serialize(&secrets)?;
-                let ciphertext2 = cipher2
-                    .encrypt(XNonce::from_slice(&nonce2), plaintext2.as_ref())
-                    .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
-                // zeroize key material
-                key2.iter_mut().for_each(|b| *b = 0);
-                let mut new_encoded = Vec::with_capacity(
-                    DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext2.len(),
-                );
-                new_encoded.extend_from_slice(pk.as_bytes());
-                new_encoded.push(WALLET_VERSION_WITH_KYBER);
-                new_encoded.extend_from_slice(&salt);
-                new_encoded.extend_from_slice(&nonce2);
-                new_encoded.extend_from_slice(&ciphertext2);
-                db.put("wallet", WALLET_KEY, &new_encoded)?;
-                (sk, kpk, ksk)
-            } else {
-                // V2: parse composite secrets
-                let secrets: WalletSecretsV2 = bincode::deserialize(&decrypted)
-                    .map_err(|_| anyhow!("Corrupted wallet payload (V2)"))?;
-                let sk = SecretKey::from_bytes(&secrets.dili_sk)
-                    .with_context(|| "Failed to decode Dilithium secret key")?;
-                let kyber_pk = KyberPk::from_bytes(&secrets.kyber_pk)
-                    .map_err(|_| anyhow!("Invalid Kyber PK in wallet"))?;
-                let kyber_sk = KyberSk::from_bytes(&secrets.kyber_sk)
-                    .map_err(|_| anyhow!("Invalid Kyber SK in wallet"))?;
-                (sk, kyber_pk, kyber_sk)
-            };
-            // zeroize key and decrypted buffer
+            let secrets: WalletSecretsV3 = bincode::deserialize(&decrypted)
+                .map_err(|_| anyhow!("Corrupted wallet payload"))?;
+            let signing_key = crypto::ml_dsa_65_keypair_from_pkcs8(&secrets.signing_key_pkcs8)?;
+            let signing_pk = crypto::ml_dsa_65_public_key(&signing_key);
+            let kem_sk = crypto::ml_kem_768_secret_key_from_bytes(&secrets.kem_sk);
+            let kem_pk = TaggedKemPublicKey::from_ml_kem_768_array(secrets.kem_pk);
             let mut key_zero = key;
             key_zero.iter_mut().for_each(|b| *b = 0);
 
-            let address = crypto::address_from_pk(&pk);
-            // Avoid printing address unless explicitly requested via logs
             return Ok(Wallet {
                 _db: Arc::downgrade(&db),
-                pk,
-                sk,
-                kyber_pk,
-                kyber_sk,
-                address,
+                signing_pk: signing_pk.clone(),
+                signing_key,
+                kem_pk,
+                kem_sk,
+                lock_seed: secrets.lock_seed,
+                address: crypto::address_from_pk(&signing_pk),
             });
         }
 
-        // --- Brand new wallet ---
         println!("✨ No wallet found, creating a new one...");
-        // Generate fresh Dilithium3 and Kyber keypairs for the new wallet
         let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        let (pk, sk) = pqcrypto_dilithium::dilithium3::keypair();
-        let (kyber_pk, kyber_sk) = pqcrypto_kyber::kyber768::keypair();
-        let address = crypto::address_from_pk(&pk);
-
-        // passphrase and salt are already set above for deterministic seed
+        let signing_key = crypto::ml_dsa_65_generate()?;
+        let signing_pk = crypto::ml_dsa_65_public_key(&signing_key);
+        let (kem_sk, kem_pk) = crypto::ml_kem_768_generate();
+        let address = crypto::address_from_pk(&signing_pk);
+        let mut lock_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut lock_seed);
 
         let mut key = [0u8; 32];
         let params = Params::new(WALLET_KDF_MEM_KIB, WALLET_KDF_TIME_COST, 1, None)
@@ -270,29 +217,23 @@ impl Wallet {
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        // V2 composite secrets: encrypt Dilithium SK + Kyber SK/PK
-        let mut dili_sk = [0u8; DILITHIUM3_SK_BYTES];
-        dili_sk.copy_from_slice(sk.as_bytes());
-        let mut kyb_sk = [0u8; KYBER768_SK_BYTES];
-        kyb_sk.copy_from_slice(kyber_sk.as_bytes());
-        let mut kyb_pk = [0u8; KYBER768_PK_BYTES];
-        kyb_pk.copy_from_slice(kyber_pk.as_bytes());
-        let secrets = WalletSecretsV2 {
-            dili_sk,
-            kyber_sk: kyb_sk,
-            kyber_pk: kyb_pk,
+        let secrets = WalletSecretsV3 {
+            signing_key_pkcs8: crypto::ml_dsa_65_keypair_to_pkcs8(&signing_key)?,
+            kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&kem_sk),
+            kem_pk: kem_pk.bytes,
+            lock_seed,
         };
         let plaintext = bincode::serialize(&secrets)?;
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
             .map_err(|e| anyhow!("Failed to encrypt secret payload: {}", e))?;
-        // best-effort zeroize
         key.iter_mut().for_each(|b| *b = 0);
 
-        let mut encoded =
-            Vec::with_capacity(DILITHIUM3_PK_BYTES + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
-        encoded.extend_from_slice(pk.as_bytes());
-        encoded.push(WALLET_VERSION_WITH_KYBER);
+        let mut encoded = Vec::with_capacity(
+            WALLET_FORMAT_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ciphertext.len(),
+        );
+        encoded.extend_from_slice(WALLET_FORMAT_MAGIC);
+        encoded.push(WALLET_VERSION_STANDARDIZED);
         encoded.extend_from_slice(&salt);
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
@@ -301,10 +242,11 @@ impl Wallet {
         println!("✅ New wallet created and saved");
         Ok(Wallet {
             _db: Arc::downgrade(&db),
-            pk,
-            sk,
-            kyber_pk,
-            kyber_sk,
+            signing_pk,
+            signing_key,
+            kem_pk,
+            kem_sk,
+            lock_seed,
             address,
         })
     }
@@ -314,14 +256,14 @@ impl Wallet {
     }
 
     /// Gets the public key
-    pub fn public_key(&self) -> &PublicKey {
-        &self.pk
+    pub fn public_key(&self) -> &TaggedSigningPublicKey {
+        &self.signing_pk
     }
-    pub fn kyber_public_key(&self) -> &KyberPk {
-        &self.kyber_pk
+    pub fn kem_public_key(&self) -> &TaggedKemPublicKey {
+        &self.kem_pk
     }
-    pub fn kyber_secret_key(&self) -> &KyberSk {
-        &self.kyber_sk
+    pub fn kem_secret_key(&self) -> &MlKem768SecretKey {
+        &self.kem_sk
     }
 
     /// INTERNAL: compute genesis lock secret deterministically for a coin we created.
@@ -330,110 +272,80 @@ impl Wallet {
         coin_id: &[u8; 32],
         chain_id32: &[u8; 32],
     ) -> [u8; 32] {
-        crate::crypto::derive_genesis_lock_secret(&self.sk, coin_id, chain_id32)
+        crate::crypto::derive_genesis_lock_secret(&self.lock_seed, coin_id, chain_id32)
     }
 
     // ---------------------------------------------------------------------
-    // Address export/import: authenticated Kyber key distribution
+    // Address export/import: authenticated ML-KEM key distribution
     // ---------------------------------------------------------------------
-    // Format (bincode then base64-url):
-    // { version: u8=1, recipient_addr: [u8;32], dili_pk: [u8;DILITHIUM3_PK_BYTES], kyber_pk: [u8;crypto::KYBER768_PK_BYTES], sig: Dilithium sig over ("stealth_addr_v1" || addr || kyber_pk) }
-
-    pub fn export_address(&self) -> String {
-        let doc = StealthAddressDocV3 {
-            version: 3,
-            recipient_addr: self.address,
-            kyber_pk: self.kyber_pk.as_bytes().to_vec(),
+    // Recipient handles are signed KeyDoc JSON documents. Unsigned address blobs are no longer accepted.
+    pub fn export_address(&self) -> Result<String> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        let chain_id = store.get_chain_id()?;
+        let msg = keydoc_signable_bytes(KEY_DOC_VERSION, &chain_id, &self.signing_pk, &self.kem_pk);
+        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &msg)?;
+        let doc = KeyDocV2 {
+            version: KEY_DOC_VERSION,
+            chain_id,
+            signing_pk: self.signing_pk.clone(),
+            kem_pk: self.kem_pk.clone(),
+            sig,
         };
-        let bytes = bincode::serialize(&doc).expect("serialize address doc");
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        serde_json::to_string(&doc).context("serialize recipient KeyDoc")
     }
 
-    pub fn export_stealth_address(&self) -> String {
+    pub fn export_stealth_address(&self) -> Result<String> {
         self.export_address()
     }
 
-    pub fn parse_address(addr_str: &str) -> Result<(Address, KyberPk)> {
-        // Be tolerant to surrounding whitespace and accidental padding from clipboard
+    pub fn parse_address(addr_str: &str) -> Result<(Address, TaggedKemPublicKey)> {
         let s = addr_str.trim();
-        // Strip common accidental wrappers
-        let s = s.trim_matches('"');
-        let s = s.trim_matches('\'');
-        let s = s.trim_matches('`');
-        // Try URL_SAFE_NO_PAD first, then URL_SAFE with padding
-        let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s) {
-            Ok(b) => b,
-            Err(_) => base64::engine::general_purpose::URL_SAFE
-                .decode(s)
-                .map_err(|_| anyhow!("Invalid address encoding"))?,
-        };
-        let doc = bincode::deserialize::<StealthAddressDocV3>(&bytes)
-            .map_err(|_| anyhow!("Invalid address payload"))?;
-        if doc.version != 3 {
-            bail!("Unsupported address version");
+        if !(s.starts_with('{') && s.ends_with('}')) {
+            bail!("Recipient handle must be a signed KeyDoc JSON document");
         }
-        let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
-            .map_err(|_| anyhow!("Invalid Kyber PK in address"))?;
-        Ok((doc.recipient_addr, kyber_pk))
+        let doc: KeyDocV2 = serde_json::from_str(s).context("Invalid KeyDoc JSON")?;
+        if doc.version != KEY_DOC_VERSION {
+            bail!("Unsupported KeyDoc version: {}", doc.version);
+        }
+        let msg = keydoc_signable_bytes(doc.version, &doc.chain_id, &doc.signing_pk, &doc.kem_pk);
+        doc.signing_pk.verify(&msg, &doc.sig)?;
+        Ok((crate::crypto::address_from_pk(&doc.signing_pk), doc.kem_pk))
     }
 
-    pub fn parse_stealth_address(addr_str: &str) -> Result<(Address, KyberPk)> {
+    pub fn parse_stealth_address(addr_str: &str) -> Result<(Address, TaggedKemPublicKey)> {
         Self::parse_address(addr_str)
     }
 
     // Batch commitment token flow removed; replaced by paycodes and OOB spend notes.
 
     /// Accepts a recipient handle that can be either:
-    /// - A V3 address string, or
-    /// - A KeyDoc JSON string: {chain_id,dili_pk,kyber_pk,sig=sign("bind"|chain_id|dili_pk|kyber_pk)}
-    /// Returns (recipient_addr, receiver_kyber_pk) after full verification.
-    fn parse_recipient_handle(&self, handle: &str) -> Result<(Address, KyberPk)> {
-        // 1) Try address first.
-        if let Ok(t) = Self::parse_address(handle) {
-            return Ok(t);
-        }
-
-        // 2) Try KeyDoc JSON (E2EE/OOB). Never published on-chain or network.
-        let s = handle.trim();
-        if s.starts_with('{') && s.ends_with('}') {
-            let doc: KeyDocV1 = serde_json::from_str(s).context("Invalid KeyDoc JSON")?;
-            // Chain binding
+    /// - A KeyDoc JSON string with algorithm-tagged ML-DSA/ML-KEM bindings.
+    /// Returns (recipient_addr, receiver_kem_pk) after full verification.
+    fn parse_recipient_handle(&self, handle: &str) -> Result<(Address, TaggedKemPublicKey)> {
+        if let Ok((addr, kem_pk)) = Self::parse_address(handle) {
             let store = self
                 ._db
                 .upgrade()
                 .ok_or_else(|| anyhow!("Database connection dropped"))?;
             let chain_id = store.get_chain_id()?;
+            let doc: KeyDocV2 =
+                serde_json::from_str(handle.trim()).context("Invalid KeyDoc JSON")?;
             if doc.chain_id != chain_id {
                 anyhow::bail!("KeyDoc chain_id mismatch");
             }
-
-            // Verify signature over "bind"|chain_id|dili_pk|kyber_pk
-            let pk = PublicKey::from_bytes(&doc.dili_pk)
-                .map_err(|_| anyhow!("Invalid KeyDoc Dilithium PK"))?;
-            let kyber_pk = KyberPk::from_bytes(&doc.kyber_pk)
-                .map_err(|_| anyhow!("Invalid KeyDoc Kyber PK"))?;
-            let mut msg = Vec::with_capacity(4 + 32 + doc.dili_pk.len() + doc.kyber_pk.len());
-            msg.extend_from_slice(b"bind");
-            msg.extend_from_slice(&doc.chain_id);
-            msg.extend_from_slice(&doc.dili_pk);
-            msg.extend_from_slice(&doc.kyber_pk);
-            let sig = DiliDetachedSignature::from_bytes(&doc.sig)
-                .map_err(|_| anyhow!("Invalid KeyDoc signature bytes"))?;
-            dili_verify_detached(&sig, &msg, &pk)
-                .map_err(|_| anyhow!("KeyDoc signature verification failed"))?;
-
-            let addr = crate::crypto::address_from_pk(&pk);
-            return Ok((addr, kyber_pk));
+            return Ok((addr, kem_pk));
         }
 
         // Friendly hint for future paycode inputs without cached binding
+        let s = handle.trim();
         if s.starts_with("ucsp1") {
-            anyhow::bail!(
-                "Paycode detected but no cached binding. Paste the KeyDoc JSON or use an address."
-            );
+            anyhow::bail!("Paycode detected but no cached binding. Paste the signed KeyDoc JSON.");
         }
 
-        anyhow::bail!("Invalid recipient address")
+        anyhow::bail!("Invalid recipient handle")
     }
 
     pub fn validate_recipient_handle(&self, handle: &str) -> Result<()> {
@@ -563,7 +475,7 @@ impl Wallet {
                     let chain_id = store.get_chain_id()?;
                     if sp
                         .to
-                        .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                        .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                         .is_ok()
                     {
                         utxos.push(coin);
@@ -581,7 +493,7 @@ impl Wallet {
     }
 
     /// Deterministically process a received spend for this wallet (idempotent).
-    /// - If our Kyber SK can derive the OTP SK using our Dilithium PK and amount, we consider it ours.
+    /// - If our ML-KEM secret key can recover the stealth output for our signing identity, we consider it ours.
     /// - Inserts coin ownership into wallet view implicitly through balance/list_unspent logic.
     pub fn scan_spend_for_me(&self, spend: &crate::transfer::Spend) -> Result<()> {
         let store = self
@@ -594,7 +506,7 @@ impl Wallet {
             let chain_id = store.get_chain_id()?;
             if spend
                 .to
-                .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                 .is_ok()
             {
                 // Persist OTP marker (no SK to store since we use opaque OTP bytes)
@@ -623,7 +535,7 @@ impl Wallet {
             let chain_id = store.get_chain_id()?;
             if spend
                 .to
-                .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                 .is_ok()
             {
                 // Mark this spend as potentially ours for later confirmation when coin arrives
@@ -729,7 +641,7 @@ impl Wallet {
                     let chain_id = store.get_chain_id()?;
                     if sp
                         .to
-                        .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                        .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                         .is_ok()
                     {
                         sum = sum.saturating_add(coin.value);
@@ -758,7 +670,7 @@ impl Wallet {
                     let chain_id = store.get_chain_id()?;
                     if sp
                         .to
-                        .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                        .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                         .is_ok()
                     {
                         // Prefer coin.value if available; else fall back to spend's embedded amount
@@ -821,7 +733,7 @@ impl Wallet {
 
     /// Sends private V3 hashlock spends to a recipient using an address or recipient document.
     /// Commitment gossip is removed. The caller must provide an OOB spend note `s_bytes`
-    /// and a receiver handle containing a Kyber public key.
+    /// and a receiver handle containing an ML-KEM public key.
     pub async fn send_with_paycode_and_note(
         &self,
         receiver_paycode: &str,
@@ -830,7 +742,7 @@ impl Wallet {
         _s_bytes: &[u8],
     ) -> Result<SendOutcome> {
         // Accept either an address or a verified recipient document.
-        let (recipient_addr, receiver_kyber_pk) = self
+        let (recipient_addr, receiver_kem_pk) = self
             .parse_recipient_handle(receiver_paycode)
             .context("Invalid receiver handle")?;
         let store = self
@@ -853,7 +765,7 @@ impl Wallet {
             // Verify current ownership against latest spend record (race-safe)
             let owned = if let Some(sp) = store.get_spend(&coin.id)? {
                 sp.to
-                    .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id_sel)
+                    .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id_sel)
                     .is_ok()
             } else {
                 coin.creator_address == self.address
@@ -866,7 +778,7 @@ impl Wallet {
             if let Some(prev_spend) = store.get_spend(&coin.id)? {
                 if prev_spend
                     .to
-                    .derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id_sel, _s_bytes)
+                    .derive_lock_secret(&self.kem_sk, &coin.id, &chain_id_sel, _s_bytes)
                     .is_err()
                 {
                     continue;
@@ -889,41 +801,34 @@ impl Wallet {
 
         for coin in coins_to_spend {
             // Locally construct receiver lock commitment from paycode and OOB note
-            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
             let chain_id = store.get_chain_id()?;
             let value_tag = coin.value.to_le_bytes();
             let seed = crate::crypto::stealth_seed_v3(
-                shared.as_bytes(),
+                &shared,
                 &recipient_addr,
-                ct.as_bytes(),
+                &kem_ct,
                 &value_tag,
                 &chain_id,
             );
             let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
             // View tag for receiver filtering
-            let vt = crate::crypto::view_tag(shared.as_bytes());
-            // Derive the receiver's next-hop lock secret and hash from Kyber context
+            let vt = crate::crypto::view_tag(&shared);
+            // Derive the receiver's next-hop lock secret and hash from ML-KEM context
             let s_next = crate::crypto::derive_next_lock_secret_with_note(
-                shared.as_bytes(),
-                ct.as_bytes(),
-                coin.value,
-                &coin.id,
-                &chain_id,
-                _s_bytes,
+                &shared, &kem_ct, coin.value, &coin.id, &chain_id, _s_bytes,
             );
             let next_lock_hash =
                 crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
             let mut one_time_pk = [0u8; OTP_PK_BYTES];
             one_time_pk.copy_from_slice(&ot_pk_bytes);
-            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-            kyber_ct.copy_from_slice(ct.as_bytes());
             let receiver_commitment = crate::transfer::ReceiverLockCommitment {
                 one_time_pk,
-                kyber_ct,
+                kem_ct,
                 next_lock_hash,
                 commitment_id: crate::crypto::commitment_id_v1(
                     &one_time_pk,
-                    &kyber_ct,
+                    &kem_ct,
                     &next_lock_hash,
                     &coin.id,
                     coin.value,
@@ -940,7 +845,7 @@ impl Wallet {
                 // Previous spend exists: derive the previously committed next-lock secret (V3 only)
                 prev_spend
                     .to
-                    .derive_lock_secret(&self.kyber_sk, &coin.id, &chain_id, _s_bytes)?
+                    .derive_lock_secret(&self.kem_sk, &coin.id, &chain_id, _s_bytes)?
             } else {
                 // Genesis: derive s0 from our long-term secret key
                 self.compute_genesis_lock_secret(&coin.id, &chain_id)
@@ -975,37 +880,25 @@ impl Wallet {
         note_s: &[u8],
         chain_id: &[u8; 32],
     ) -> Result<crate::transfer::ReceiverLockCommitment> {
-        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(receiver_paycode)?;
-        let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+        let (recipient_addr, receiver_kem_pk) = self.parse_recipient_handle(receiver_paycode)?;
+        let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
         let value_tag = coin.value.to_le_bytes();
-        let seed = crate::crypto::stealth_seed_v3(
-            shared.as_bytes(),
-            &recipient_addr,
-            ct.as_bytes(),
-            &value_tag,
-            chain_id,
-        );
+        let seed =
+            crate::crypto::stealth_seed_v3(&shared, &recipient_addr, &kem_ct, &value_tag, chain_id);
         let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
         let s_next = crate::crypto::derive_next_lock_secret_with_note(
-            shared.as_bytes(),
-            ct.as_bytes(),
-            coin.value,
-            &coin.id,
-            chain_id,
-            note_s,
+            &shared, &kem_ct, coin.value, &coin.id, chain_id, note_s,
         );
         let next_lock_hash = crate::crypto::lock_hash_from_preimage(chain_id, &coin.id, &s_next);
         let mut one_time_pk = [0u8; OTP_PK_BYTES];
         one_time_pk.copy_from_slice(&ot_pk_bytes);
-        let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-        kyber_ct.copy_from_slice(ct.as_bytes());
         Ok(crate::transfer::ReceiverLockCommitment {
             one_time_pk,
-            kyber_ct,
+            kem_ct,
             next_lock_hash,
             commitment_id: crate::crypto::commitment_id_v1(
                 &one_time_pk,
-                &kyber_ct,
+                &kem_ct,
                 &next_lock_hash,
                 &coin.id,
                 coin.value,
@@ -1028,22 +921,22 @@ impl Wallet {
         if let Some(prev_spend) = store.get_spend(&coin.id)? {
             prev_spend
                 .to
-                .derive_lock_secret(&self.kyber_sk, &coin.id, chain_id, note_s)
+                .derive_lock_secret(&self.kem_sk, &coin.id, chain_id, note_s)
         } else {
             Ok(self.compute_genesis_lock_secret(&coin.id, chain_id))
         }
     }
 
-    /// Produce a signed MetaTransferAuthV1 document for facilitator submission.
+    /// Produce a signed MetaTransferAuthV2 document for facilitator submission.
     pub fn authorize_meta_transfer(
         &self,
         to_handle: &str,
         amount: u64,
         valid_after_epoch: u64,
         valid_before_epoch: u64,
-        facilitator_kyber_pk: &pqcrypto_kyber::kyber768::PublicKey,
+        facilitator_kem_pk: &TaggedKemPublicKey,
         note_binding_opt: Option<[u8; 32]>,
-    ) -> Result<MetaTransferAuthV1> {
+    ) -> Result<MetaTransferAuthV2> {
         if valid_before_epoch <= valid_after_epoch {
             anyhow::bail!("valid_before_epoch must be > valid_after_epoch");
         }
@@ -1056,7 +949,7 @@ impl Wallet {
         let binding = note_binding_opt.unwrap_or([0u8; 32]);
 
         // Prepare per-coin entries
-        let mut out_coins: Vec<MetaAuthCoinV1> = Vec::new();
+        let mut out_coins: Vec<MetaAuthCoinV2> = Vec::new();
         let mut sum: u64 = 0;
         for coin in coins {
             let preimage = self.compute_current_unlock_preimage(
@@ -1072,11 +965,11 @@ impl Wallet {
                 &chain_id,
             )?;
             // KEM to facilitator and AEAD encrypt the preimage
-            let (kem_ct, key32) = crate::crypto::kem_encapsulate_to_kyber(facilitator_kyber_pk);
+            let (kem_ct, key32) = crate::crypto::kem_encapsulate_to_ml_kem(facilitator_kem_pk)?;
             let mut nonce = [0u8; 24];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             let ct = crate::crypto::aead_encrypt_xchacha(&key32, &nonce, &preimage)?;
-            out_coins.push(MetaAuthCoinV1 {
+            out_coins.push(MetaAuthCoinV2 {
                 coin_id: coin.id,
                 receiver_commitment: rc,
                 kem_ct: kem_ct.to_vec(),
@@ -1091,14 +984,14 @@ impl Wallet {
             anyhow::bail!("Insufficient funds: need {} have {}", amount, sum);
         }
 
-        // Build signable and sign with Dilithium
+        // Build signable and sign with ML-DSA-65.
         let mut rng_nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut rng_nonce);
-        let signable = MetaTransferAuthSignableV1 {
-            version: 1,
+        let signable = MetaTransferAuthSignableV2 {
+            version: 2,
             chain_id,
             from_address: self.address,
-            from_dili_pk: self.pk.as_bytes().to_vec(),
+            from_signing_pk: self.signing_pk.clone(),
             to_handle: to_handle.to_string(),
             total_amount: amount,
             valid_after_epoch,
@@ -1108,22 +1001,22 @@ impl Wallet {
         };
         let bytes = bincode::serialize(&signable)?;
         let mut dom = Vec::with_capacity(16 + bytes.len());
-        dom.extend_from_slice(b"meta-authz.sign.v1");
+        dom.extend_from_slice(b"meta-authz.sign.v2");
         dom.extend_from_slice(&bytes);
-        let sig = dili_detached_sign(&dom, &self.sk);
+        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &dom)?;
 
-        Ok(MetaTransferAuthV1 {
-            version: 1,
+        Ok(MetaTransferAuthV2 {
+            version: 2,
             chain_id,
             from_address: self.address,
-            from_dili_pk: self.pk.as_bytes().to_vec(),
+            from_signing_pk: self.signing_pk.clone(),
             to_handle: to_handle.to_string(),
             total_amount: amount,
             valid_after_epoch,
             valid_before_epoch,
             nonce: rng_nonce,
             coins: out_coins,
-            sig: sig.as_bytes().to_vec(),
+            sig,
         })
     }
 
@@ -1152,6 +1045,7 @@ impl Wallet {
             .await
     }
 
+    #[cfg(feature = "classical_perimeter")]
     /// x402 client: handle a 402 challenge JSON and perform payment, returning an encoded receipt header value.
     pub async fn x402_pay_from_challenge(
         &self,
@@ -1202,7 +1096,7 @@ impl Wallet {
         out: &crate::transfer::StealthOutput,
         chain_id32: &[u8; 32],
     ) -> bool {
-        out.is_for_receiver(&self.kyber_sk, &self.pk, chain_id32)
+        out.is_for_receiver(&self.kem_sk, &self.signing_pk, chain_id32)
             .is_ok()
     }
 
@@ -1265,7 +1159,7 @@ impl Wallet {
                 let chain_id = store.get_chain_id()?;
                 if spend
                     .to
-                    .is_for_receiver(&self.kyber_sk, &self.pk, &chain_id)
+                    .is_for_receiver(&self.kem_sk, &self.signing_pk, &chain_id)
                     .is_ok()
                 {
                     history.push(TransactionRecord {
@@ -1370,7 +1264,7 @@ impl Wallet {
         refund_secrets_out: Option<&str>,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = self
+        let (recipient_addr, receiver_kem_pk) = self
             .parse_recipient_handle(&plan.paycode)
             .context("Invalid receiver handle in plan")?;
         let store = self
@@ -1394,18 +1288,18 @@ impl Wallet {
             let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Build receiver commitment with composite HTLC next_lock_hash
-            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
             let chain_id = plan.chain_id;
             let value_tag = coin.value.to_le_bytes();
             let seed = crate::crypto::stealth_seed_v3(
-                shared.as_bytes(),
+                &shared,
                 &recipient_addr,
-                ct.as_bytes(),
+                &kem_ct,
                 &value_tag,
                 &chain_id,
             );
             let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
-            let vt = crate::crypto::view_tag(shared.as_bytes());
+            let vt = crate::crypto::view_tag(&shared);
             // ch_claim from receiver (per coin)
             let ch_claim = *ch_claim_map
                 .get(&coin.id)
@@ -1436,15 +1330,13 @@ impl Wallet {
 
             let mut one_time_pk = [0u8; OTP_PK_BYTES];
             one_time_pk.copy_from_slice(&ot_pk_bytes);
-            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-            kyber_ct.copy_from_slice(ct.as_bytes());
             let receiver_commitment = crate::transfer::ReceiverLockCommitment {
                 one_time_pk,
-                kyber_ct,
+                kem_ct,
                 next_lock_hash,
                 commitment_id: crate::crypto::commitment_id_v1(
                     &one_time_pk,
-                    &kyber_ct,
+                    &kem_ct,
                     &next_lock_hash,
                     &coin.id,
                     coin.value,
@@ -1456,7 +1348,7 @@ impl Wallet {
             // Determine unlock preimage for current input
             let unlock_preimage = if let Some(prev_spend) = store.get_spend(&coin.id)? {
                 prev_spend.to.derive_lock_secret(
-                    &self.kyber_sk,
+                    &self.kem_sk,
                     &coin.id,
                     &chain_id,
                     note_s.unwrap_or(&[]),
@@ -1515,7 +1407,7 @@ impl Wallet {
         network: &crate::network::NetHandle,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(paycode)?;
+        let (recipient_addr, receiver_kem_pk) = self.parse_recipient_handle(paycode)?;
         let store = self
             ._db
             .upgrade()
@@ -1534,20 +1426,20 @@ impl Wallet {
             let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Build next receiver commitment (normal next-hop lock)
-            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
             let value_tag = coin.value.to_le_bytes();
             let seed = crate::crypto::stealth_seed_v3(
-                shared.as_bytes(),
+                &shared,
                 &recipient_addr,
-                ct.as_bytes(),
+                &kem_ct,
                 &value_tag,
                 &chain_id,
             );
             let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
-            let vt = crate::crypto::view_tag(shared.as_bytes());
+            let vt = crate::crypto::view_tag(&shared);
             let s_next = crate::crypto::derive_next_lock_secret_with_note(
-                shared.as_bytes(),
-                ct.as_bytes(),
+                &shared,
+                &kem_ct,
                 coin.value,
                 &coin.id,
                 &chain_id,
@@ -1557,15 +1449,13 @@ impl Wallet {
                 crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
             let mut one_time_pk = [0u8; OTP_PK_BYTES];
             one_time_pk.copy_from_slice(&ot_pk_bytes);
-            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-            kyber_ct.copy_from_slice(ct.as_bytes());
             let receiver_commitment = crate::transfer::ReceiverLockCommitment {
                 one_time_pk,
-                kyber_ct,
+                kem_ct,
                 next_lock_hash,
                 commitment_id: crate::crypto::commitment_id_v1(
                     &one_time_pk,
-                    &kyber_ct,
+                    &kem_ct,
                     &next_lock_hash,
                     &coin.id,
                     coin.value,
@@ -1616,7 +1506,7 @@ impl Wallet {
         network: &crate::network::NetHandle,
         note_s: Option<&[u8]>,
     ) -> Result<SendOutcome> {
-        let (recipient_addr, receiver_kyber_pk) = self.parse_recipient_handle(paycode)?;
+        let (recipient_addr, receiver_kem_pk) = self.parse_recipient_handle(paycode)?;
         let store = self
             ._db
             .upgrade()
@@ -1630,20 +1520,20 @@ impl Wallet {
             let (anchor, proof) = Self::build_coin_proof_local(store.as_ref(), &coin)?;
 
             // Next receiver commitment (normal next-hop lock)
-            let (shared, ct) = pqcrypto_kyber::kyber768::encapsulate(&receiver_kyber_pk);
+            let (kem_ct, shared) = receiver_kem_pk.encapsulate()?;
             let value_tag = coin.value.to_le_bytes();
             let seed = crate::crypto::stealth_seed_v3(
-                shared.as_bytes(),
+                &shared,
                 &recipient_addr,
-                ct.as_bytes(),
+                &kem_ct,
                 &value_tag,
                 &chain_id,
             );
             let ot_pk_bytes = crate::crypto::derive_one_time_pk_bytes(seed);
-            let vt = crate::crypto::view_tag(shared.as_bytes());
+            let vt = crate::crypto::view_tag(&shared);
             let s_next = crate::crypto::derive_next_lock_secret_with_note(
-                shared.as_bytes(),
-                ct.as_bytes(),
+                &shared,
+                &kem_ct,
                 coin.value,
                 &coin.id,
                 &chain_id,
@@ -1653,15 +1543,13 @@ impl Wallet {
                 crate::crypto::lock_hash_from_preimage(&chain_id, &coin.id, &s_next);
             let mut one_time_pk = [0u8; OTP_PK_BYTES];
             one_time_pk.copy_from_slice(&ot_pk_bytes);
-            let mut kyber_ct = [0u8; crate::crypto::KYBER768_CT_BYTES];
-            kyber_ct.copy_from_slice(ct.as_bytes());
             let receiver_commitment = crate::transfer::ReceiverLockCommitment {
                 one_time_pk,
-                kyber_ct,
+                kem_ct,
                 next_lock_hash,
                 commitment_id: crate::crypto::commitment_id_v1(
                     &one_time_pk,
-                    &kyber_ct,
+                    &kem_ct,
                     &next_lock_hash,
                     &coin.id,
                     coin.value,
@@ -1717,23 +1605,23 @@ pub struct SendOutcome {
     pub spends: Vec<crate::transfer::Spend>,
 }
 
-// ---------------- Signed Offer document (V1) ----------------
+// ---------------- Signed Offer document (V2) ----------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OfferSignableV1 {
+struct OfferSignableV2 {
     version: u8,
     maker_address: Address,
-    maker_dili_pk: Vec<u8>,
+    maker_signing_pk: TaggedSigningPublicKey,
     plan: HtlcPlanDoc,
     price_bps: Option<u64>,
     note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfferDocV1 {
+pub struct OfferDocV2 {
     pub version: u8,
     pub maker_address: Address,
-    pub maker_dili_pk: Vec<u8>,
+    pub maker_signing_pk: TaggedSigningPublicKey,
     pub plan: HtlcPlanDoc,
     pub price_bps: Option<u64>,
     pub note: Option<String>,
@@ -1741,58 +1629,53 @@ pub struct OfferDocV1 {
 }
 
 impl Wallet {
-    /// Create and sign an OfferDocV1 from an HTLC plan and optional pricing metadata.
+    /// Create and sign an OfferDocV2 from an HTLC plan and optional pricing metadata.
     pub fn create_offer_doc(
         &self,
         plan: HtlcPlanDoc,
         price_bps: Option<u64>,
         note: Option<String>,
-    ) -> Result<OfferDocV1> {
+    ) -> Result<OfferDocV2> {
         let maker_address = self.address;
-        let maker_dili_pk = self.pk.as_bytes().to_vec();
-        let signable = OfferSignableV1 {
-            version: 1,
+        let maker_signing_pk = self.signing_pk.clone();
+        let signable = OfferSignableV2 {
+            version: 2,
             maker_address,
-            maker_dili_pk: maker_dili_pk.clone(),
+            maker_signing_pk: maker_signing_pk.clone(),
             plan: plan.clone(),
             price_bps,
             note: note.clone(),
         };
         let bytes = bincode::serialize(&signable)?;
-        let sig = dili_detached_sign(&bytes, &self.sk);
-        Ok(OfferDocV1 {
-            version: 1,
+        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &bytes)?;
+        Ok(OfferDocV2 {
+            version: 2,
             maker_address,
-            maker_dili_pk,
+            maker_signing_pk,
             plan,
             price_bps,
             note,
-            sig: sig.as_bytes().to_vec(),
+            sig,
         })
     }
 
-    /// Verify an OfferDocV1 signature and address binding.
-    pub fn verify_offer_doc(doc: &OfferDocV1) -> Result<()> {
-        if doc.version != 1 {
+    /// Verify an OfferDocV2 signature and address binding.
+    pub fn verify_offer_doc(doc: &OfferDocV2) -> Result<()> {
+        if doc.version != 2 {
             anyhow::bail!("Unsupported offer doc version: {}", doc.version);
         }
-        let pk = PublicKey::from_bytes(&doc.maker_dili_pk)
-            .map_err(|_| anyhow!("Invalid maker Dilithium PK in offer"))?;
-        let signable = OfferSignableV1 {
+        let signable = OfferSignableV2 {
             version: doc.version,
             maker_address: doc.maker_address,
-            maker_dili_pk: doc.maker_dili_pk.clone(),
+            maker_signing_pk: doc.maker_signing_pk.clone(),
             plan: doc.plan.clone(),
             price_bps: doc.price_bps,
             note: doc.note.clone(),
         };
         let bytes = bincode::serialize(&signable)?;
-        let sig = DiliDetachedSignature::from_bytes(&doc.sig)
-            .map_err(|_| anyhow!("Invalid offer signature bytes"))?;
-        dili_verify_detached(&sig, &bytes, &pk)
-            .map_err(|_| anyhow!("Offer signature verification failed"))?;
+        doc.maker_signing_pk.verify(&bytes, &doc.sig)?;
         // Address binding: ensure maker_address equals hash of PK
-        let addr = crate::crypto::address_from_pk(&pk);
+        let addr = crate::crypto::address_from_pk(&doc.maker_signing_pk);
         if addr != doc.maker_address {
             anyhow::bail!("Offer maker address mismatch");
         }

@@ -24,7 +24,9 @@ pub struct Config {
 pub struct Net {
     pub listen_port: u16,
     #[serde(default)]
-    pub bootstrap: Vec<String>, // multiaddrs
+    pub bootstrap: Vec<String>, // signed NodeRecordV2 strings or file paths
+    #[serde(default)]
+    pub trust_updates: Vec<String>, // signed TrustUpdateV1 strings or file paths
     #[serde(default)]
     pub peer_exchange: bool, // gossip known peers
     #[serde(default = "default_max_peers")]
@@ -35,7 +37,7 @@ pub struct Net {
     pub public_ip: Option<String>,
     #[serde(default = "default_sync_timeout")]
     pub sync_timeout_secs: u64,
-    /// Optional static ban list of libp2p PeerIds. Connections and dials to these peers are blocked.
+    /// Optional static ban list of node IDs (hex). Connections and dials to these peers are blocked.
     #[serde(default)]
     pub banned_peer_ids: Vec<String>,
     /// Suppress routine network gossip logs by default (overridden by CLI --quiet-net)
@@ -529,8 +531,7 @@ fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
     let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers",
-        "bridge",
+        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers", "bridge",
     ]
     .into_iter()
     .collect();
@@ -546,12 +547,14 @@ fn warn_unknown_keys(val: &TomlValue) {
                     &[
                         "listen_port",
                         "bootstrap",
+                        "trust_updates",
                         "peer_exchange",
                         "max_peers",
                         "connection_timeout_secs",
                         "public_ip",
                         "sync_timeout_secs",
                         "banned_peer_ids",
+                        "quiet_by_default",
                     ],
                 ),
                 ("p2p", TomlValue::Table(t)) => warn_unknown_keys_in(

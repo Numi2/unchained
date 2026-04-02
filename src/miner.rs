@@ -6,7 +6,6 @@ use crate::{
     storage::Store,
     wallet::Wallet,
 };
-use pqcrypto_traits::sign::PublicKey as _;
 use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -557,10 +556,9 @@ impl Miner {
                 // Finding a coin proves the current epoch is still active.
                 self.last_heartbeat = time::Instant::now();
 
-                let mut creator_pk = [0u8; crate::crypto::DILITHIUM3_PK_BYTES];
-                creator_pk.copy_from_slice(self.wallet.public_key().as_bytes());
+                let creator_pk = self.wallet.public_key().clone();
                 let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_addr);
-                // Compute genesis lock for this coin deterministically from our Dilithium SK
+                // Compute genesis lock for this coin deterministically from the wallet lock seed.
                 let chain_id = self.db.get_chain_id()?;
                 let s0 = self
                     .wallet

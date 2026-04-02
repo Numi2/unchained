@@ -4,34 +4,30 @@
 
 //! Stealth transfer implementation (V3 hashlock only).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{
     address_from_pk, commitment_id_v1, commitment_of_stealth_ct, derive_next_lock_secret_with_note,
-    stealth_seed_v3, Address, KYBER768_CT_BYTES as KYBER_CT_BYTES, OTP_PK_BYTES,
+    ml_kem_768_decapsulate, stealth_seed_v3, Address, MlKem768SecretKey, TaggedSigningPublicKey,
+    ML_KEM_768_CT_BYTES as KEM_CT_BYTES, OTP_PK_BYTES,
 };
-use pqcrypto_dilithium::dilithium3::PublicKey as DiliPk;
-
-use pqcrypto_kyber::kyber768::{decapsulate, Ciphertext as KyberCt, SecretKey as KyberSk};
-use pqcrypto_traits::kem::{Ciphertext as KyberCtTrait, SharedSecret as KyberSharedSecretTrait};
-
-use subtle::ConstantTimeEq;
 
 // ------------ Stealth Output ------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StealthOutput {
-    // One-time public bytes (opaque, used for recipient addressing). Do not parse as Dilithium key.
+    // One-time public bytes (opaque, used for recipient addressing).
     #[serde(with = "BigArray")]
     pub one_time_pk: [u8; OTP_PK_BYTES],
-    // Kyber768 ciphertext so recipient can derive the shared secret
+    // ML-KEM-768 ciphertext so the recipient can derive the shared secret.
     #[serde(with = "BigArray")]
-    pub kyber_ct: [u8; KYBER_CT_BYTES],
-    // Amount (little-endian on wire as u64)
+    pub kem_ct: [u8; KEM_CT_BYTES],
+    // Amount (little-endian on wire as u64).
     pub amount_le: u64,
-    /// Optional 1-byte view tag for cheap receiver-side filtering
+    /// Optional 1-byte view tag for cheap receiver-side filtering.
     #[serde(default)]
     pub view_tag: Option<u8>,
 }
@@ -39,9 +35,9 @@ pub struct StealthOutput {
 impl StealthOutput {
     /// Deterministic bytes used inside commitments.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(OTP_PK_BYTES + KYBER_CT_BYTES + 8 + 1);
+        let mut v = Vec::with_capacity(OTP_PK_BYTES + KEM_CT_BYTES + 8 + 1);
         v.extend_from_slice(&self.one_time_pk);
-        v.extend_from_slice(&self.kyber_ct);
+        v.extend_from_slice(&self.kem_ct);
         v.extend_from_slice(&self.amount_le.to_le_bytes());
         if let Some(vt) = self.view_tag {
             v.push(vt);
@@ -50,28 +46,25 @@ impl StealthOutput {
     }
 
     /// Check if this output is intended for the receiver by reproducing the
-    /// Kyber-bound one-time public bytes using deterministic hashing.
+    /// ML-KEM-bound one-time public bytes using deterministic hashing.
     pub fn is_for_receiver(
         &self,
-        kyber_sk: &KyberSk,
-        receiver_dili_pk: &DiliPk,
+        kem_sk: &MlKem768SecretKey,
+        receiver_signing_pk: &TaggedSigningPublicKey,
         chain_id32: &[u8; 32],
     ) -> Result<()> {
-        let ct = KyberCt::from_bytes(&self.kyber_ct).context("Invalid Kyber ciphertext")?;
-        let shared = decapsulate(&ct, kyber_sk);
-        // View tag check if present (cheap early filter)
+        let shared = ml_kem_768_decapsulate(kem_sk, &self.kem_ct)?;
         if let Some(vt) = self.view_tag {
-            if crate::crypto::view_tag(shared.as_bytes()) != vt {
+            if crate::crypto::view_tag(&shared) != vt {
                 return Err(anyhow!("View tag mismatch"));
             }
         }
         let value_tag = self.amount_le.to_le_bytes();
-        // Bind stealth seed to receiver address (stable identity) using V3 tag
-        let receiver_addr = address_from_pk(receiver_dili_pk);
+        let receiver_addr = address_from_pk(receiver_signing_pk);
         let seed_addr = stealth_seed_v3(
-            shared.as_bytes(),
+            &shared,
             &receiver_addr,
-            ct.as_bytes(),
+            &self.kem_ct,
             &value_tag,
             chain_id32,
         );
@@ -87,19 +80,18 @@ impl StealthOutput {
         Err(anyhow!("Derived OTP bytes mismatch"))
     }
 
-    /// Recipient derives the lock secret for next-hop ownership using Kyber shared secret and context.
+    /// Recipient derives the lock secret for next-hop ownership using ML-KEM shared secret and context.
     pub fn derive_lock_secret(
         &self,
-        kyber_sk: &KyberSk,
+        kem_sk: &MlKem768SecretKey,
         coin_id: &[u8; 32],
         chain_id32: &[u8; 32],
         note_s: &[u8],
     ) -> Result<[u8; 32]> {
-        let ct = KyberCt::from_bytes(&self.kyber_ct).context("Invalid Kyber ciphertext")?;
-        let shared = decapsulate(&ct, kyber_sk);
+        let shared = ml_kem_768_decapsulate(kem_sk, &self.kem_ct)?;
         Ok(derive_next_lock_secret_with_note(
-            shared.as_bytes(),
-            ct.as_bytes(),
+            &shared,
+            &self.kem_ct,
             self.amount_le,
             coin_id,
             chain_id32,
@@ -108,27 +100,20 @@ impl StealthOutput {
     }
 
     /// Compute the recipient Address-like hash from the opaque one-time public bytes.
-    /// Uses blake3_hash over the one-time public bytes; does not parse as a Dilithium key.
     pub fn recipient_address(&self) -> Result<Address> {
         Ok(crate::crypto::blake3_hash(&self.one_time_pk))
     }
 }
-// (Legacy V1 transfer has been fully removed.)
 
 // ------------ V3 Hashlock Spend ------------
 
 /// Receiver-supplied lock commitment for V3 hashlock spends.
-/// The receiver generates `kyber_ct` (encapsulated to their own Kyber PK), decapsulates to get
-/// the shared secret, derives the one-time public bytes deterministically using `stealth_seed_v3`,
-/// and computes the next-hop lock preimage `s_next` using `derive_next_lock_secret`.
-/// The receiver shares only commitment values: `one_time_pk`, `kyber_ct`, `next_lock_hash`, and
-/// the bound `amount_le`. The sender never learns `s_next`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReceiverLockCommitment {
     #[serde(with = "BigArray")]
     pub one_time_pk: [u8; OTP_PK_BYTES],
     #[serde(with = "BigArray")]
-    pub kyber_ct: [u8; KYBER_CT_BYTES],
+    pub kem_ct: [u8; KEM_CT_BYTES],
     pub next_lock_hash: [u8; 32],
     pub commitment_id: [u8; 32],
     pub amount_le: u64,
@@ -136,31 +121,31 @@ pub struct ReceiverLockCommitment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Spend {
-    /// The spent coin id
+    /// The spent coin id.
     pub coin_id: [u8; 32],
-    /// Merkle root of the epoch that committed this coin
+    /// Merkle root of the epoch that committed this coin.
     pub root: [u8; 32],
-    /// Inclusion proof path for the coin id's leaf
+    /// Inclusion proof path for the coin id's leaf.
     pub proof: Vec<([u8; 32], bool)>,
-    /// Stealth output commitment for the new recipient
+    /// Stealth output commitment for the new recipient.
     pub commitment: [u8; 32],
-    /// Nullifier (V3: H("unchained.nullifier.v3" || coin_id || unlock_preimage))
+    /// Nullifier.
     pub nullifier: [u8; 32],
-    /// The actual stealth output (one-time pk + enc payload)
+    /// The actual stealth output (one-time pk + enc payload).
     pub to: StealthOutput,
-    /// Hashlock unlock preimage (V3). When present, enables signatureless spends.
+    /// Hashlock unlock preimage.
     #[serde(default)]
     pub unlock_preimage: Option<[u8; 32]>,
-    /// Next-hop lock hash (V3), computed from Kyber shared secret and context.
+    /// Next-hop lock hash, computed from ML-KEM shared secret and context.
     #[serde(default)]
     pub next_lock_hash: Option<[u8; 32]>,
     /// Optional HTLC timeout epoch (epoch number T). If set, previous lock must be HTLC.
     #[serde(default)]
     pub htlc_timeout_epoch: Option<u64>,
-    /// Commitment hash for claim path: ch_claim = CH(chain_id, coin_id, s_claim)
+    /// Commitment hash for claim path: ch_claim = CH(chain_id, coin_id, s_claim).
     #[serde(default)]
     pub htlc_ch_claim: Option<[u8; 32]>,
-    /// Commitment hash for refund path: ch_refund = CH(chain_id, coin_id, s_refund)
+    /// Commitment hash for refund path: ch_refund = CH(chain_id, coin_id, s_refund).
     #[serde(default)]
     pub htlc_ch_refund: Option<[u8; 32]>,
 }
@@ -176,14 +161,12 @@ impl Spend {
         amount: u64,
         chain_id32: &[u8; 32],
     ) -> Result<Self> {
-        // Enforce amount binding to receiver commitment to avoid OTP/key mismatch
         if receiver_commitment.amount_le != amount {
             return Err(anyhow!("Receiver commitment amount mismatch"));
         }
-        // Cross-check commitment_id integrity deterministically
         let computed_cid = commitment_id_v1(
             &receiver_commitment.one_time_pk,
-            &receiver_commitment.kyber_ct,
+            &receiver_commitment.kem_ct,
             &receiver_commitment.next_lock_hash,
             &coin_id,
             amount,
@@ -192,21 +175,19 @@ impl Spend {
         if computed_cid != receiver_commitment.commitment_id {
             return Err(anyhow!("Receiver commitment_id mismatch"));
         }
-        let commitment = commitment_of_stealth_ct(&receiver_commitment.kyber_ct);
+        let commitment = commitment_of_stealth_ct(&receiver_commitment.kem_ct);
         let mut to = StealthOutput {
             one_time_pk: [0u8; OTP_PK_BYTES],
-            kyber_ct: [0u8; KYBER_CT_BYTES],
+            kem_ct: [0u8; KEM_CT_BYTES],
             amount_le: amount,
             view_tag: None,
         };
         to.one_time_pk
             .copy_from_slice(&receiver_commitment.one_time_pk);
-        to.kyber_ct.copy_from_slice(&receiver_commitment.kyber_ct);
+        to.kem_ct.copy_from_slice(&receiver_commitment.kem_ct);
 
-        // Nullifier (V3 updated): nf = BLAKE3("nf" || chain_id || coin_id || p)
         let nullifier =
             crate::crypto::nullifier_from_preimage(chain_id32, &coin_id, &unlock_preimage);
-        // Next-hop lock hash provided by receiver
         let next_lock_hash = receiver_commitment.next_lock_hash;
 
         Ok(Spend {
@@ -225,8 +206,6 @@ impl Spend {
     }
 
     /// Construct a signatureless HTLC-based spend (claim or refund path), with epoch timeout.
-    /// - Claim path valid if current_epoch < T and CH(p) == ch_claim
-    /// - Refund path valid if current_epoch >= T and CH(p) == ch_refund
     pub fn create_htlc_hashlock(
         coin_id: [u8; 32],
         anchor: &crate::epoch::Anchor,
@@ -239,14 +218,12 @@ impl Spend {
         ch_claim: [u8; 32],
         ch_refund: [u8; 32],
     ) -> Result<Self> {
-        // Enforce amount binding to receiver commitment
         if receiver_commitment.amount_le != amount {
             return Err(anyhow!("Receiver commitment amount mismatch"));
         }
-        // Cross-check commitment_id integrity deterministically
         let computed_cid = commitment_id_v1(
             &receiver_commitment.one_time_pk,
-            &receiver_commitment.kyber_ct,
+            &receiver_commitment.kem_ct,
             &receiver_commitment.next_lock_hash,
             &coin_id,
             amount,
@@ -255,21 +232,19 @@ impl Spend {
         if computed_cid != receiver_commitment.commitment_id {
             return Err(anyhow!("Receiver commitment_id mismatch"));
         }
-        let commitment = commitment_of_stealth_ct(&receiver_commitment.kyber_ct);
+        let commitment = commitment_of_stealth_ct(&receiver_commitment.kem_ct);
         let mut to = StealthOutput {
             one_time_pk: [0u8; OTP_PK_BYTES],
-            kyber_ct: [0u8; KYBER_CT_BYTES],
+            kem_ct: [0u8; KEM_CT_BYTES],
             amount_le: amount,
             view_tag: None,
         };
         to.one_time_pk
             .copy_from_slice(&receiver_commitment.one_time_pk);
-        to.kyber_ct.copy_from_slice(&receiver_commitment.kyber_ct);
+        to.kem_ct.copy_from_slice(&receiver_commitment.kem_ct);
 
-        // Nullifier
         let nullifier =
             crate::crypto::nullifier_from_preimage(chain_id32, &coin_id, &unlock_preimage);
-        // Next-hop lock hash provided by receiver (not HTLC for next hop by default)
         let next_lock_hash = receiver_commitment.next_lock_hash;
 
         Ok(Spend {
@@ -288,23 +263,16 @@ impl Spend {
     }
 
     /// Validate spend statelessly + against DB: proof, uniqueness, hashlock, commitment, nullifier.
-    /// Note: A spend is chainable. The presence of a prior spend means the last owner
-    /// is defined by that spend's one-time key or hashlock state.
     pub fn validate(&self, db: &crate::storage::Store) -> Result<()> {
-        // 1) Coin exists
         let coin: crate::coin::Coin = db
-            .get_coin(&self.coin_id)
-            .context("Failed to query coin")?
+            .get_coin(&self.coin_id)?
             .ok_or_else(|| anyhow!("Referenced coin does not exist"))?;
 
-        // 2) Validate inclusion against the epoch that actually committed this coin.
         let commit_epoch = db
-            .get_epoch_for_coin(&self.coin_id)
-            .context("Failed to query coin commit epoch")?
+            .get_epoch_for_coin(&self.coin_id)?
             .ok_or_else(|| anyhow!("Missing coin->epoch index"))?;
         let anchor: crate::epoch::Anchor = db
-            .get("epoch", &commit_epoch.to_le_bytes())
-            .context("Failed to query committing anchor")?
+            .get("epoch", &commit_epoch.to_le_bytes())?
             .ok_or_else(|| anyhow!("Committing anchor not found"))?;
         if anchor.merkle_root != self.root {
             return Err(anyhow!("Merkle root mismatch"));
@@ -314,40 +282,30 @@ impl Spend {
             return Err(anyhow!("Invalid Merkle inclusion proof"));
         }
 
-        // 4) Commitment check – must be H(kyber_ct)
-        let expected_commitment = crate::crypto::commitment_of_stealth_ct(&self.to.kyber_ct);
+        let expected_commitment = crate::crypto::commitment_of_stealth_ct(&self.to.kem_ct);
         if expected_commitment != self.commitment {
             return Err(anyhow!("Commitment mismatch"));
         }
-        // 4b) Amount must match the committed coin value (no splits/merges in spend path)
         if self.to.amount_le != coin.value {
             return Err(anyhow!("Amount mismatch with coin value"));
         }
 
-        // 5) Authorization: require V3 hashlock, potentially HTLC-gated by epoch.
-        // Current ownership is serialized by the latest spend stored under coin_id,
-        // so we do not need to persist a separate global nullifier set for replay
-        // prevention in this spend-chain model.
         let preimage = self
             .unlock_preimage
             .ok_or_else(|| anyhow!("V3 hashlock preimage required"))?;
-        // Determine expected previous lock hash
         let expected_lock_hash = if let Some(prev_spend) = db.get_spend(&self.coin_id)? {
             prev_spend
                 .next_lock_hash
                 .ok_or_else(|| anyhow!("Previous spend missing next_lock_hash"))?
         } else {
-            // Genesis lock hash stored in coin
             coin.lock_hash
         };
         let chain_id = db.get_chain_id()?;
-        // If HTLC params present, enforce HTLC epoch gating and composite lock
         if let (Some(t), Some(ch_claim), Some(ch_refund)) = (
             self.htlc_timeout_epoch,
             self.htlc_ch_claim,
             self.htlc_ch_refund,
         ) {
-            // Current epoch number
             let current_epoch = db
                 .get::<crate::epoch::Anchor>("epoch", b"latest")
                 .ok()
@@ -360,40 +318,32 @@ impl Spend {
                 if ch_of_pre != ch_claim {
                     return Err(anyhow!("HTLC claim path CH mismatch before timeout"));
                 }
-            } else {
-                if ch_of_pre != ch_refund {
-                    return Err(anyhow!("HTLC refund path CH mismatch at/after timeout"));
-                }
+            } else if ch_of_pre != ch_refund {
+                return Err(anyhow!("HTLC refund path CH mismatch at/after timeout"));
             }
-            // Verify composite HTLC lock equals expected previous lock
             let expected_htlc =
                 crate::crypto::htlc_lock_hash(&chain_id, &self.coin_id, t, &ch_claim, &ch_refund);
             if expected_lock_hash != expected_htlc {
                 return Err(anyhow!("HTLC composite lock mismatch"));
             }
-        } else {
-            // Standard single-path hashlock.
-            if expected_lock_hash != [0u8; 32] {
-                let lh_new =
-                    crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
-                if lh_new != expected_lock_hash {
-                    return Err(anyhow!("Invalid hashlock preimage"));
-                }
+        } else if expected_lock_hash != [0u8; 32] {
+            let lh_new =
+                crate::crypto::lock_hash_from_preimage(&chain_id, &self.coin_id, &preimage);
+            if lh_new != expected_lock_hash {
+                return Err(anyhow!("Invalid hashlock preimage"));
             }
         }
-        // Recompute nullifier from preimage.
         let exp_nf_new =
             crate::crypto::nullifier_from_preimage(&chain_id, &self.coin_id, &preimage);
         if exp_nf_new != self.nullifier {
             return Err(anyhow!("Nullifier mismatch"));
         }
-        // Enforce one-time use of receiver commitment via deterministic commitment_id
         let next_lock = self
             .next_lock_hash
             .ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
         let cid = commitment_id_v1(
             &self.to.one_time_pk,
-            &self.to.kyber_ct,
+            &self.to.kem_ct,
             &next_lock,
             &self.coin_id,
             self.to.amount_le,
@@ -403,15 +353,12 @@ impl Spend {
             return Err(anyhow!("Receiver commitment already used"));
         }
 
-        // 7) Basic sanity of `to` (strict size checks before parsing)
         if self.to.one_time_pk.len() != OTP_PK_BYTES {
             return Err(anyhow!("Invalid one-time pk length"));
         }
-        if self.to.kyber_ct.len() != KYBER_CT_BYTES {
-            return Err(anyhow!("Invalid Kyber ct length"));
+        if self.to.kem_ct.len() != KEM_CT_BYTES {
+            return Err(anyhow!("Invalid ML-KEM ciphertext length"));
         }
-        // Do not parse one_time_pk as a real Dilithium key; it's opaque bytes bound to Kyber
-        let _ = KyberCt::from_bytes(&self.to.kyber_ct).context("Invalid Kyber ct")?;
 
         Ok(())
     }
@@ -419,7 +366,7 @@ impl Spend {
     pub fn apply(&self, db: &crate::storage::Store) -> Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
         self.apply_to_batch(db, &mut batch)?;
-        db.write_batch(batch).context("write spend batch")?;
+        db.write_batch(batch)?;
         Ok(())
     }
 
@@ -432,7 +379,7 @@ impl Spend {
             return Err(anyhow!("Column family missing"));
         };
         let cid_cf = db.db.cf_handle("commitment_used");
-        let bytes = bincode::serialize(self).context("serialize spend")?;
+        let bytes = bincode::serialize(self)?;
         batch.put_cf(sp_cf, &self.coin_id, &bytes);
         if self.unlock_preimage.is_some() {
             if let Some(cf) = cid_cf {
@@ -442,7 +389,7 @@ impl Spend {
                     .ok_or_else(|| anyhow!("Missing next_lock_hash in V3 spend"))?;
                 let cid = commitment_id_v1(
                     &self.to.one_time_pk,
-                    &self.to.kyber_ct,
+                    &self.to.kem_ct,
                     &next_lock,
                     &self.coin_id,
                     self.to.amount_le,
@@ -454,5 +401,3 @@ impl Spend {
         Ok(())
     }
 }
-
-// (Legacy TransferRecord variant removed)

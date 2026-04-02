@@ -20,7 +20,7 @@ impl OffersService {
 }
 
 /// SSE stream of verified offers stored under CF `offers` with key prefix ts||hash.
-/// Streams JSON Lines of OfferDocV1. Optional redaction via `?redact_sig=1`.
+/// Streams JSON Lines of OfferDocV2. Optional redaction via `?redact_sig=1`.
 pub async fn serve(cfg: crate::config::Offers, db: Arc<Store>, net: NetHandle) -> Result<()> {
     let svc = Arc::new(OffersService::new(db, cfg, net));
     use std::net::TcpListener as StdTcpListener;
@@ -151,7 +151,7 @@ async fn sse_offers(svc: &Arc<OffersService>, req: HRequest<Body>) -> HResponse<
     tokio::spawn(async move {
         // Send initial snapshot
         for (ts, v) in initial_pairs {
-            if let Ok(mut offer) = bincode::deserialize::<crate::wallet::OfferDocV1>(&v) {
+            if let Ok(mut offer) = bincode::deserialize::<crate::wallet::OfferDocV2>(&v) {
                 if redact_sig {
                     offer.sig = Vec::new();
                 }
@@ -247,7 +247,7 @@ async fn get_offers(svc: &Arc<OffersService>, req: HRequest<Body>) -> HResponse<
     let mut out: Vec<serde_json::Value> = Vec::new();
     for item in it.take(limit as usize) {
         if let Ok((_k, v)) = item {
-            if let Ok(mut offer) = bincode::deserialize::<crate::wallet::OfferDocV1>(&v) {
+            if let Ok(mut offer) = bincode::deserialize::<crate::wallet::OfferDocV2>(&v) {
                 if redact_sig {
                     offer.sig = Vec::new();
                 }

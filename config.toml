@@ -18,13 +18,13 @@ sync_timeout_secs = 1800
 # The public IP address of this node, to be announced to other peers.
 # This is essential for nodes running behind a NAT.
 
-# Bootstrap nodes to connect to - add your seed nodes here for public deployment
-bootstrap = [ "/ip4/34.51.223.169/udp/31000/quic-v1/p2p/12D3KooWKt5kcwVA6SkDUmMGfmr3ouS9ydhHHgYPzSzuYHuvrhJg",
- "/ip4/34.174.37.168/udp/31000/quic-v1/p2p/12D3KooWJhgAAXunyAP7N4F3bJrp9kofgAsuapmXpofCzRb7ugUM",
-            
-              "/ip4/35.202.180.181/udp/31000/quic-v1/p2p/12D3KooWJLSZi2KFZqKAw75rEm8TjGBhTpuZWpueXtAwZRbfAdwL",
-              "/ip4/35.195.5.126/udp/31000/quic-v1/p2p/12D3KooWHnSAm1zzKUMGUH96YDgKQ9eptjLGK1VLJ2KUv2XAx2ob", 
-              "/ip4/34.174.127.124/udp/31000/quic-v1/p2p/12D3KooWLRWnLAT4QadiMEJd5dbeUJXN8ShSx8LGCrH4jN8p1AdG" ]
+# Bootstrap nodes to connect to.
+# Each entry must be a signed NodeRecordV2 compact string or a path to a file containing one.
+bootstrap = []
+
+# Optional signed trust-update documents for revocation/replacement of node roots.
+# Each entry must be a TrustUpdateV1 compact string or a path to a file containing one.
+trust_updates = []
 
 
 [p2p]
@@ -65,4 +65,3 @@ total_cap = 32768
 per_height_cap = 64
 ttl_secs = 300
 height_cooldown_secs = 1
-

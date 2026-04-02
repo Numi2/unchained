@@ -1,16 +1,16 @@
 # Unchained
 
-Unchained is a post-quantum private asset node.
+Unchained is a post-quantum private asset node with a PQ-only default build.
 
 ## Tech Choices
 
 - Consensus: epoch-based proof of work
 - Proof of work: Argon2id
 - Hashing: BLAKE3
-- Network transport: libp2p over QUIC
+- Network transport: QUIC over TLS 1.3 raw public keys with ML-KEM-768 key exchange and ML-DSA-65 authentication
 - Persistence: RocksDB
-- Recipient privacy: Kyber768-based private addresses and opaque one-time outputs
-- Signatures: Dilithium3
+- Recipient privacy: ML-KEM-768-based private recipient docs and opaque one-time outputs
+- Signatures: ML-DSA-65
 - Canonical state transition: [`Tx`](/Users/home/unchgit/unchained/src/transaction.rs)
 
 ## Protocol Posture
@@ -30,7 +30,7 @@ This is a private transfer system, but it is not yet a full global shielded-note
 - `wallet / privacy client`
 - `edge services`
 
-Edge services include `offers`, `message`, `bridge`, and `x402`. They are opt-in and not part of consensus.
+Edge services include `offers` and `message`. The classical perimeter (`bridge` and `x402`) is built separately behind `--features classical_perimeter` and is not part of consensus.
 
 ## Build
 
@@ -63,11 +63,10 @@ The primary user journeys are:
 - `offers watch`
 - `message send`
 - `message listen`
-- `x402 pay`
 
 Operational and protocol-maintenance workflows live under `advanced`.
 
-Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, `msg-send`, `msg-listen`, and `x402-pay`.
+Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, and message aliases. `x402-pay` exists only in classical-perimeter builds.
 
 ## Docs
 

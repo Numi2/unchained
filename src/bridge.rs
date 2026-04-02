@@ -6,10 +6,6 @@ use crate::{crypto::Address, storage::Store};
 use crate::{network::NetHandle, wallet::Wallet};
 use anyhow::{anyhow, Context, Result};
 use blake3;
-use pqcrypto_dilithium::dilithium3::{
-    DetachedSignature as DiliDetachedSignature, PublicKey as DiliPk,
-};
-use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _};
 use rocksdb;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -798,10 +794,19 @@ pub async fn serve(
                                                 svc_h.net.request_epoch_selected(n).await;
                                             }
                                         }
-                                        let vault_paycode =
-                                            svc_h.cfg.vault_paycode.clone().unwrap_or_else(|| {
-                                                svc_h.wallet.export_stealth_address()
-                                            });
+                                        let vault_paycode = match svc_h.cfg.vault_paycode.clone() {
+                                            Some(value) => value,
+                                            None => match svc_h.wallet.export_stealth_address() {
+                                                Ok(value) => value,
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "bridge vault handle unavailable: {}",
+                                                        e
+                                                    );
+                                                    continue;
+                                                }
+                                            },
+                                        };
                                         let mut note = [0u8; 32];
                                         let h = blake3::hash(
                                             std::str::from_utf8(&k).unwrap_or("").as_bytes(),
@@ -991,7 +996,8 @@ fn build_x402_challenge(svc: &Arc<BridgeService>, resource: &str) -> Result<x402
         .cfg
         .x402_recipient_handle
         .clone()
-        .unwrap_or_else(|| svc.wallet.export_stealth_address());
+        .map(Ok)
+        .unwrap_or_else(|| svc.wallet.export_stealth_address())?;
     let invoice_id = new_invoice_id(resource, 1);
     let amount = 1u64; // minimal sample amount; production should parameterize per resource
     let expiry_ms = std::time::SystemTime::now()
@@ -1414,7 +1420,8 @@ async fn bridge_out_submit(svc: &Arc<BridgeService>, req: BridgeOutReq) -> Resul
         .cfg
         .vault_paycode
         .clone()
-        .unwrap_or_else(|| svc.wallet.export_stealth_address());
+        .map(Ok)
+        .unwrap_or_else(|| svc.wallet.export_stealth_address())?;
     // Deterministic note from op_id to bind s_next and aid correlation
     let mut note = [0u8; 32];
     let h = blake3::hash(op_id.as_bytes());
@@ -1825,27 +1832,27 @@ async fn bridge_in_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Strin
 // -------- Meta-transfer facilitator path --------
 
 #[derive(serde::Deserialize)]
-struct MetaTransferAuthV1In {
+struct MetaTransferAuthV2In {
     version: u8,
     chain_id: [u8; 32],
     from_address: crate::crypto::Address,
-    from_dili_pk: Vec<u8>,
+    from_signing_pk: crate::crypto::TaggedSigningPublicKey,
     to_handle: String,
     total_amount: u64,
     valid_after_epoch: u64,
     valid_before_epoch: u64,
     nonce: [u8; 32],
-    coins: Vec<crate::wallet::MetaAuthCoinV1>,
+    coins: Vec<crate::wallet::MetaAuthCoinV2>,
     sig: Vec<u8>,
 }
 
 async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<Vec<String>> {
     // Accept JSON or bincode; try JSON first
-    let authz: MetaTransferAuthV1In = match serde_json::from_slice(body) {
+    let authz: MetaTransferAuthV2In = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => bincode::deserialize(body).context("invalid authz payload")?,
     };
-    if authz.version != 1 {
+    if authz.version != 2 {
         return Err(anyhow!("unsupported authz version"));
     }
     let chain_id = svc.db.get_chain_id()?;
@@ -1866,17 +1873,15 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
     }
 
     // Verify signature over signable
-    let pk = DiliPk::from_bytes(&authz.from_dili_pk)
-        .map_err(|_| anyhow!("invalid from Dilithium PK"))?;
-    let addr = crate::crypto::address_from_pk(&pk);
+    let addr = crate::crypto::address_from_pk(&authz.from_signing_pk);
     if addr != authz.from_address {
         return Err(anyhow!("from address mismatch"));
     }
-    let signable = crate::wallet::MetaTransferAuthSignableV1 {
+    let signable = crate::wallet::MetaTransferAuthSignableV2 {
         version: authz.version,
         chain_id: authz.chain_id,
         from_address: authz.from_address,
-        from_dili_pk: authz.from_dili_pk.clone(),
+        from_signing_pk: authz.from_signing_pk.clone(),
         to_handle: authz.to_handle.clone(),
         total_amount: authz.total_amount,
         valid_after_epoch: authz.valid_after_epoch,
@@ -1886,11 +1891,11 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
     };
     let bytes = bincode::serialize(&signable)?;
     let mut dom = Vec::with_capacity(16 + bytes.len());
-    dom.extend_from_slice(b"meta-authz.sign.v1");
+    dom.extend_from_slice(b"meta-authz.sign.v2");
     dom.extend_from_slice(&bytes);
-    let sig = DiliDetachedSignature::from_bytes(&authz.sig)
-        .map_err(|_| anyhow!("invalid authz signature bytes"))?;
-    pqcrypto_dilithium::dilithium3::verify_detached_signature(&sig, &dom, &pk)
+    authz
+        .from_signing_pk
+        .verify(&dom, &authz.sig)
         .map_err(|_| anyhow!("authz signature verify failed"))?;
 
     // Replay protection with two-phase (pending -> used)
@@ -1939,7 +1944,7 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
     for c in authz.coins.iter() {
         // Decrypt preimage using KEM
         let aead_key =
-            crate::crypto::kem_decapsulate_kyber(&svc.wallet.kyber_secret_key(), &c.kem_ct)?;
+            crate::crypto::kem_decapsulate_ml_kem(&svc.wallet.kem_secret_key(), &c.kem_ct)?;
         let preimage =
             crate::crypto::aead_decrypt_xchacha(&aead_key, &c.aead_nonce24, &c.unlock_preimage_ct)?;
         if preimage.len() != 32 {
@@ -1950,7 +1955,7 @@ async fn meta_transfer_submit(svc: &Arc<BridgeService>, body: &[u8]) -> Result<V
         // Verify commitment integrity
         let cid = crate::crypto::commitment_id_v1(
             &c.receiver_commitment.one_time_pk,
-            &c.receiver_commitment.kyber_ct,
+            &c.receiver_commitment.kem_ct,
             &c.receiver_commitment.next_lock_hash,
             &c.coin_id,
             c.receiver_commitment.amount_le,

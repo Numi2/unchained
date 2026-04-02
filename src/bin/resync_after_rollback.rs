@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
                                 if let Ok(chain_id) = db.get_chain_id() {
                                     let cid = unchained::crypto::commitment_id_v1(
                                         &spend.to.one_time_pk,
-                                        &spend.to.kyber_ct,
+                                        &spend.to.kem_ct,
                                         &next_lock,
                                         &spend.coin_id,
                                         spend.to.amount_le,

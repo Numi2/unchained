@@ -377,7 +377,7 @@ impl Histogram {
 }
 
 pub static PEERS: Lazy<IntGauge> =
-    Lazy::new(|| IntGauge::new("unchained_peer_count", "Connected libp2p peers").unwrap());
+    Lazy::new(|| IntGauge::new("unchained_peer_count", "Connected PQ transport peers").unwrap());
 pub static EPOCH_HEIGHT: Lazy<IntGauge> =
     Lazy::new(|| IntGauge::new("unchained_epoch_height", "Current epoch height").unwrap());
 pub static CANDIDATE_COINS: Lazy<IntGauge> = Lazy::new(|| {

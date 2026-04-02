@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
 
+#[cfg(feature = "classical_perimeter")]
 pub mod bridge;
 pub mod coin;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod epoch;
 pub mod metrics;
 pub mod miner;
 pub mod network;
+pub mod node_identity;
 pub mod offers;
 pub mod protocol;
 pub mod storage;
@@ -22,9 +24,9 @@ pub mod sync;
 pub mod transaction;
 pub mod transfer;
 pub mod wallet;
+#[cfg(feature = "classical_perimeter")]
 pub mod x402;
 use crate::network::RateLimitedMessage;
-use pqcrypto_traits::kem::PublicKey as KyberPkTrait;
 use qrcode::render::unicode;
 use qrcode::QrCode;
 fn print_qr_to_terminal(data: &str) -> anyhow::Result<()> {
@@ -100,7 +102,7 @@ fn short_text(value: &str) -> String {
     long_about = "Run an Unchained node: start the runtime explicitly, manage a wallet, and send private hashlock transfers.\n\
 \nSending accepts a single receiver address or verified recipient document. Use flags for automation or run interactively for a guided flow.",
     help_template = "{name} {version}\n{about}\n\nUSAGE:\n  {usage}\n\nOPTIONS:\n{options}\n\nCOMMANDS:\n{subcommands}\n\n{after-help}",
-    after_help = "Examples:\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n  unchained x402 pay --url https://example.com/protected\n"
+    after_help = "Examples:\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
@@ -136,6 +138,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MessageCmd,
     },
+    #[cfg(feature = "classical_perimeter")]
     /// x402 payment commands
     X402 {
         #[command(subcommand)]
@@ -149,7 +152,7 @@ enum Cmd {
     /// Start mining and block production (runs epoch manager and miners)
     #[command(hide = true)]
     Mine,
-    /// Print the local libp2p peer ID and exit
+    /// Print the local node ID and signed bootstrap record
     #[command(hide = true)]
     PeerId,
     /// Export your private receiving address (base64-url)
@@ -183,6 +186,7 @@ enum Cmd {
     /// Show wallet transaction history
     #[command(hide = true)]
     History(HistoryArgs),
+    #[cfg(feature = "classical_perimeter")]
     /// x402: Pay a 402 challenge at a protected URL and print X-PAYMENT header
     #[command(hide = true)]
     X402Pay(X402PayArgs),
@@ -353,6 +357,7 @@ enum Cmd {
         #[arg(long)]
         input: String,
     },
+    #[cfg(feature = "classical_perimeter")]
     /// Bridge: Lock UNCH on Unchained for a Sui recipient
     #[command(hide = true)]
     BridgeOut {
@@ -366,6 +371,7 @@ enum Cmd {
         #[arg(long, default_value_t = 12)]
         prewarm_secs: u64,
     },
+    #[cfg(feature = "classical_perimeter")]
     /// Meta: Create a signed authorization for facilitator to submit spends (EIP-3009-like)
     #[command(hide = true)]
     MetaAuthzCreate {
@@ -381,7 +387,7 @@ enum Cmd {
         /// Valid before this epoch (exclusive)
         #[arg(long)]
         valid_before: u64,
-        /// Facilitator Kyber768 public key (base64-url)
+        /// Facilitator ML-KEM-768 public key (base64-url)
         #[arg(long)]
         facilitator_kyber_b64: String,
         /// Optional x402-style 32-byte binding (base64-url)
@@ -401,7 +407,7 @@ enum NodeCmd {
         #[arg(long, default_value_t = false)]
         mine: bool,
     },
-    /// Print the local libp2p peer ID and shareable multiaddr
+    /// Print the local node ID and signed bootstrap record
     PeerId,
 }
 
@@ -499,6 +505,7 @@ struct MessageListenArgs {
     count: Option<u64>,
 }
 
+#[cfg(feature = "classical_perimeter")]
 #[derive(Args, Clone)]
 struct X402PayArgs {
     /// URL to the protected resource (server will return 402 with challenge)
@@ -596,6 +603,7 @@ enum MessageCmd {
     Listen(MessageListenArgs),
 }
 
+#[cfg(feature = "classical_perimeter")]
 #[derive(Subcommand)]
 enum X402Cmd {
     /// Pay a 402 challenge and optionally fetch the protected resource
@@ -686,6 +694,7 @@ enum AdvancedCmd {
         #[arg(long)]
         input: String,
     },
+    #[cfg(feature = "classical_perimeter")]
     /// Lock UNCH on Unchained for a Sui recipient
     BridgeOut {
         #[arg(long)]
@@ -695,6 +704,7 @@ enum AdvancedCmd {
         #[arg(long, default_value_t = 12)]
         prewarm_secs: u64,
     },
+    #[cfg(feature = "classical_perimeter")]
     /// Create a signed authorization for facilitator submission
     MetaAuthzCreate {
         #[arg(long)]
@@ -715,7 +725,7 @@ enum AdvancedCmd {
 }
 
 fn print_receive_output(wallet: &wallet::Wallet, args: &ReceiveArgs) -> anyhow::Result<()> {
-    let address = wallet.export_address();
+    let address = wallet.export_address()?;
     let copied = if args.copy {
         copy_to_clipboard(&address).is_ok()
     } else {
@@ -909,7 +919,7 @@ async fn run_send_flow(
 fn print_balance_output(wallet: &wallet::Wallet, args: &BalanceArgs) -> anyhow::Result<()> {
     let balance = wallet.balance()?;
     let outputs = wallet.list_unspent()?.len();
-    let address = wallet.export_address();
+    let address = wallet.export_address()?;
     if args.json {
         println!(
             "{}",
@@ -981,17 +991,169 @@ fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> anyhow::
 }
 
 fn print_peer_id_output(cfg: &config::Config) -> anyhow::Result<()> {
-    let id = network::peer_id_string()?;
-    println!("Peer ID");
+    let db = storage::Store::open(&cfg.storage.path)?;
+    let chain_id = db.get_chain_id().ok();
+    let addresses = vec![std::net::SocketAddr::new(
+        cfg.net
+            .public_ip
+            .as_ref()
+            .and_then(|raw| raw.parse::<std::net::IpAddr>().ok())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        cfg.net.listen_port,
+    )
+    .to_string()];
+    let (id, bootstrap_record) = node_identity::load_local_identity_output_in_dir(
+        &cfg.storage.path,
+        protocol::CURRENT.version,
+        chain_id,
+        addresses,
+    )?;
+    println!("Node ID");
     println!();
     println!("{id}");
-    if let Some(ip) = &cfg.net.public_ip {
-        println!();
-        println!(
-            "Shareable multiaddr: /ip4/{}/udp/{}/quic-v1/p2p/{}",
-            ip, cfg.net.listen_port, id
-        );
+    println!();
+    println!("Bootstrap Record");
+    println!();
+    println!("{bootstrap_record}");
+    Ok(())
+}
+
+#[cfg(feature = "classical_perimeter")]
+async fn run_x402_pay(
+    wallet: &wallet::Wallet,
+    net: &network::NetHandle,
+    url: &str,
+    auto_resubmit: bool,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await?;
+    if resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+        eprintln!("Expected 402, got {}", resp.status());
+        return Err(anyhow::anyhow!("not a 402"));
     }
+    let challenge_json = resp.text().await?;
+    let header = wallet.x402_pay_from_challenge(&challenge_json, net).await?;
+    println!("X-PAYMENT: {}", header);
+    if auto_resubmit {
+        let resp2 = client
+            .get(url)
+            .header(crate::x402::HEADER_X_PAYMENT, header)
+            .send()
+            .await?;
+        if !resp2.status().is_success() {
+            eprintln!("Resubmit failed: {}", resp2.status());
+            return Err(anyhow::anyhow!("resubmit failed"));
+        }
+        let body = resp2.text().await.unwrap_or_default();
+        println!("{}", body);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "classical_perimeter")]
+async fn run_bridge_out(
+    cfg: &config::Config,
+    db: Arc<storage::Store>,
+    wallet: Arc<wallet::Wallet>,
+    net: network::NetHandle,
+    sui_recipient: String,
+    amount: u64,
+    prewarm_secs: u64,
+) -> anyhow::Result<()> {
+    if prewarm_secs > 0 {
+        match wallet.select_inputs(amount) {
+            Ok(coins) => {
+                let mut rx = net.proof_subscribe();
+                for c in coins.iter() {
+                    net.request_coin_proof(c.id).await;
+                }
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(prewarm_secs);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    if let Ok(Ok(resp)) = tokio::time::timeout(remaining, rx.recv()).await {
+                        if coins.iter().any(|c| c.id == resp.coin.id) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️  Could not pre-warm proofs: {}", e);
+            }
+        }
+    }
+
+    match bridge::submit_bridge_out_direct(
+        cfg.bridge.clone(),
+        db,
+        wallet,
+        net,
+        amount,
+        sui_recipient,
+    )
+    .await
+    {
+        Ok(bridge::BridgeOutResult::Locked { tx_hash }) => {
+            println!("✅ Locked. tx_hash={}", tx_hash);
+        }
+        Ok(bridge::BridgeOutResult::Pending { op_id }) => {
+            println!("⏳ Submitted pending op. op_id={}", op_id);
+        }
+        Err(e) => {
+            eprintln!("❌ bridge_out failed: {}", e);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "classical_perimeter")]
+fn run_meta_authz_create(
+    wallet: &wallet::Wallet,
+    to: &str,
+    amount: u64,
+    valid_after: u64,
+    valid_before: u64,
+    facilitator_kyber_b64: &str,
+    binding_b64: Option<&String>,
+    out: &str,
+) -> anyhow::Result<()> {
+    let fac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(facilitator_kyber_b64.trim())
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(facilitator_kyber_b64.trim()))
+        .map_err(|_| anyhow::anyhow!("invalid base64 for facilitator ML-KEM public key"))?;
+    let fac_pk = crate::crypto::TaggedKemPublicKey::from_ml_kem_768_bytes(&fac_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid facilitator ML-KEM-768 public key bytes"))?;
+    let binding_opt: Option<[u8; 32]> = if let Some(b) = binding_b64 {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b.trim())
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b.trim()))
+            .map_err(|_| anyhow::anyhow!("invalid base64 for binding"))?;
+        if raw.len() != 32 {
+            return Err(anyhow::anyhow!("binding must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        Some(arr)
+    } else {
+        None
+    };
+    let authz = wallet.authorize_meta_transfer(
+        to,
+        amount,
+        valid_after,
+        valid_before,
+        &fac_pk,
+        binding_opt,
+    )?;
+    let json = serde_json::to_string_pretty(&authz)?;
+    std::fs::write(out, json)?;
+    println!("✅ Wrote meta authorization JSON");
     Ok(())
 }
 
@@ -1070,6 +1232,13 @@ async fn main() -> anyhow::Result<()> {
     };
     if force_mine {
         cfg.mining.enabled = true;
+    }
+
+    #[cfg(not(feature = "classical_perimeter"))]
+    if cfg.bridge.bridge_enabled || cfg.bridge.x402_enabled {
+        return Err(anyhow::anyhow!(
+            "this build excludes the classical perimeter. disable [bridge] in config or rebuild with `--features classical_perimeter`"
+        ));
     }
 
     if matches!(
@@ -1697,7 +1866,7 @@ async fn main() -> anyhow::Result<()> {
             cmd: OffersCmd::Verify { input },
         })
         | Some(Cmd::OfferVerify { input }) => {
-            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             println!("✅ Offer signature and maker address verified");
             return Ok(());
@@ -1718,7 +1887,7 @@ async fn main() -> anyhow::Result<()> {
             refund_secrets_out,
         }) => {
             // 1) Verify offer
-            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             // 2) Build receiver claim doc deterministically from provided claim_secret
             let s_bytes = {
@@ -1779,7 +1948,7 @@ async fn main() -> anyhow::Result<()> {
             cmd: OffersCmd::Publish { input },
         })
         | Some(Cmd::OfferPublish { input }) => {
-            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             // Publish via network
             // Use binary bincode payload to match network path
@@ -1839,7 +2008,7 @@ async fn main() -> anyhow::Result<()> {
             out,
         }) => {
             // Verify offer and emit receiver-side claim CHs for coins listed in maker plan
-            let offer: crate::wallet::OfferDocV1 = serde_json::from_slice(&std::fs::read(input)?)?;
+            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
             wallet::Wallet::verify_offer_doc(&offer)?;
             let s_bytes = {
                 let s = claim_secret.trim();
@@ -1870,36 +2039,12 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Wrote claim CHs for {} coins", doc.claims.len());
             return Ok(());
         }
+        #[cfg(feature = "classical_perimeter")]
         Some(Cmd::X402 {
             cmd: X402Cmd::Pay(X402PayArgs { url, auto_resubmit }),
         })
         | Some(Cmd::X402Pay(X402PayArgs { url, auto_resubmit })) => {
-            // Fetch challenge
-            let client = reqwest::Client::new();
-            let resp = client.get(url).send().await?;
-            if resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
-                eprintln!("Expected 402, got {}", resp.status());
-                return Err(anyhow::anyhow!("not a 402"));
-            }
-            let challenge_json = resp.text().await?;
-            // Pay using wallet and produce header
-            let header = wallet
-                .x402_pay_from_challenge(&challenge_json, &net)
-                .await?;
-            println!("X-PAYMENT: {}", header);
-            if *auto_resubmit {
-                let resp2 = client
-                    .get(url)
-                    .header(crate::x402::HEADER_X_PAYMENT, header)
-                    .send()
-                    .await?;
-                if !resp2.status().is_success() {
-                    eprintln!("Resubmit failed: {}", resp2.status());
-                    return Err(anyhow::anyhow!("resubmit failed"));
-                }
-                let body = resp2.text().await.unwrap_or_default();
-                println!("{}", body);
-            }
+            run_x402_pay(wallet.as_ref(), &net, url, *auto_resubmit).await?;
             return Ok(());
         }
         Some(Cmd::Advanced {
@@ -1965,6 +2110,7 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Imported {} anchors from {}", added, input);
             return Ok(());
         }
+        #[cfg(feature = "classical_perimeter")]
         Some(Cmd::Advanced {
             cmd:
                 AdvancedCmd::BridgeOut {
@@ -1978,60 +2124,18 @@ async fn main() -> anyhow::Result<()> {
             amount,
             prewarm_secs,
         }) => {
-            // Optional: pre-warm proofs for inputs that will cover the amount
-            if *prewarm_secs > 0 {
-                match wallet.select_inputs(*amount) {
-                    Ok(coins) => {
-                        let mut rx = net.proof_subscribe();
-                        for c in coins.iter() {
-                            net.request_coin_proof(c.id).await;
-                        }
-                        let deadline = std::time::Instant::now()
-                            + std::time::Duration::from_secs(*prewarm_secs);
-                        loop {
-                            let remaining =
-                                deadline.saturating_duration_since(std::time::Instant::now());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            if let Ok(Ok(resp)) = tokio::time::timeout(remaining, rx.recv()).await {
-                                // Stop early if we have observed at least one proof for our set
-                                if coins.iter().any(|c| c.id == resp.coin.id) {
-                                    // best-effort: a single hit means peers are responsive
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Could not pre-warm proofs: {}", e);
-                    }
-                }
-            }
-            // Submit directly via in-process bridge service to avoid HTTP dependency
-            match bridge::submit_bridge_out_direct(
-                cfg.bridge.clone(),
+            run_bridge_out(
+                &cfg,
                 db.clone(),
                 wallet.clone(),
                 net.clone(),
-                *amount,
                 sui_recipient.clone(),
+                *amount,
+                *prewarm_secs,
             )
-            .await
-            {
-                Ok(bridge::BridgeOutResult::Locked { tx_hash }) => {
-                    println!("✅ Locked. tx_hash={}", tx_hash);
-                }
-                Ok(bridge::BridgeOutResult::Pending { op_id }) => {
-                    println!("⏳ Submitted pending op. op_id={}", op_id);
-                }
-                Err(e) => {
-                    eprintln!("❌ bridge_out failed: {}", e);
-                }
-            }
+            .await?;
         }
+        #[cfg(feature = "classical_perimeter")]
         Some(Cmd::Advanced {
             cmd:
                 AdvancedCmd::MetaAuthzCreate {
@@ -2053,41 +2157,16 @@ async fn main() -> anyhow::Result<()> {
             binding_b64,
             out,
         }) => {
-            // Parse facilitator Kyber PK
-            let fac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(facilitator_kyber_b64.trim())
-                .or_else(|_| {
-                    base64::engine::general_purpose::URL_SAFE.decode(facilitator_kyber_b64.trim())
-                })
-                .map_err(|_| anyhow::anyhow!("invalid base64 for facilitator kyber pk"))?;
-            let fac_pk = pqcrypto_kyber::kyber768::PublicKey::from_bytes(&fac_bytes)
-                .map_err(|_| anyhow::anyhow!("invalid facilitator kyber pk bytes"))?;
-            // Optional binding
-            let binding_opt: Option<[u8; 32]> = if let Some(b) = binding_b64 {
-                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(b.trim())
-                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b.trim()))
-                    .map_err(|_| anyhow::anyhow!("invalid base64 for binding"))?;
-                if raw.len() != 32 {
-                    return Err(anyhow::anyhow!("binding must be 32 bytes"));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&raw);
-                Some(arr)
-            } else {
-                None
-            };
-            let authz = wallet.authorize_meta_transfer(
+            run_meta_authz_create(
+                wallet.as_ref(),
                 to,
                 *amount,
                 *valid_after,
                 *valid_before,
-                &fac_pk,
-                binding_opt,
+                facilitator_kyber_b64,
+                binding_b64.as_ref(),
+                out,
             )?;
-            let json = serde_json::to_string_pretty(&authz)?;
-            std::fs::write(out, json)?;
-            println!("✅ Wrote meta authorization JSON");
             return Ok(());
         }
         // commitment commands removed
@@ -2216,6 +2295,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = offers::serve(offers_cfg, db_h, net_h).await;
         });
     }
+    #[cfg(feature = "classical_perimeter")]
     // Start bridge/x402 RPC only when explicitly enabled.
     if cfg.bridge.bridge_enabled || cfg.bridge.x402_enabled {
         let bridge_cfg = cfg.bridge.clone();
@@ -2253,6 +2333,7 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("Shutdown signal received. Cleaning up...");
             let _ = shutdown_tx.send(());
+            net.shutdown().await;
             println!("Waiting for tasks to shut down gracefully...");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             if let Err(e) = db.close() {

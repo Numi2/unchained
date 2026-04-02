@@ -1,6 +1,5 @@
-use crate::crypto::{Address, DILITHIUM3_PK_BYTES};
+use crate::crypto::{Address, TaggedSigningPublicKey};
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 
 /// Confirmed coin committed in an epoch anchor (does not store PoW hash).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -10,9 +9,8 @@ pub struct Coin {
     pub epoch_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
-    /// New: full Dilithium3 public key of the coin creator (enables genesis V2 spend validation)
-    #[serde(with = "BigArray")]
-    pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
+    /// Full creator signing key tagged with its PQ signature algorithm.
+    pub creator_pk: TaggedSigningPublicKey,
     /// Signatureless spend lock: H(preimage_current). For genesis, set by miner.
     #[serde(default)]
     pub lock_hash: [u8; 32],
@@ -26,10 +24,9 @@ pub struct CoinCandidate {
     pub epoch_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
-    /// New: full Dilithium3 public key of the coin creator
-    #[serde(with = "BigArray")]
-    pub creator_pk: [u8; DILITHIUM3_PK_BYTES],
-    /// Signatureless spend lock to be committed at confirmation
+    /// Full creator signing key tagged with its PQ signature algorithm.
+    pub creator_pk: TaggedSigningPublicKey,
+    /// Signatureless spend lock to be committed at confirmation.
     #[serde(default)]
     pub lock_hash: [u8; 32],
     pub pow_hash: [u8; 32],
@@ -45,7 +42,7 @@ impl Coin {
         bytes
     }
 
-    /// Calculate the coin ID from its components
+    /// Calculate the coin ID from its components.
     pub fn calculate_id(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
         let mut id_hasher = blake3::Hasher::new();
         id_hasher.update(epoch_hash);
@@ -59,7 +56,7 @@ impl Coin {
         epoch_hash: [u8; 32],
         nonce: u64,
         creator_address: Address,
-        creator_pk: [u8; DILITHIUM3_PK_BYTES],
+        creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
     ) -> Self {
         let id = Self::calculate_id(&epoch_hash, nonce, &creator_address);
@@ -79,7 +76,7 @@ impl Coin {
             epoch_hash,
             nonce,
             creator_address,
-            [0u8; DILITHIUM3_PK_BYTES],
+            TaggedSigningPublicKey::zero_ml_dsa_65(),
             [0u8; 32],
         )
     }
@@ -95,7 +92,7 @@ impl CoinCandidate {
         epoch_hash: [u8; 32],
         nonce: u64,
         creator_address: Address,
-        creator_pk: [u8; DILITHIUM3_PK_BYTES],
+        creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
         pow_hash: [u8; 32],
     ) -> Self {
