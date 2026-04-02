@@ -1,5 +1,4 @@
 use anyhow;
-use base64::Engine;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -21,7 +20,6 @@ pub mod shielded;
 pub mod storage;
 pub mod sync;
 pub mod transaction;
-pub mod transfer;
 pub mod wallet;
 use crate::network::RateLimitedMessage;
 use qrcode::render::unicode;
@@ -95,11 +93,11 @@ fn short_text(value: &str) -> String {
 #[command(
     author,
     version,
-    about = "Private node and wallet CLI for Unchained",
-    long_about = "Run an Unchained node: start the runtime explicitly, manage a wallet, and send private hashlock transfers.\n\
-\nSending accepts a single receiver address or verified recipient document. Use flags for automation or run interactively for a guided flow.",
+    about = "Post-quantum shielded node and wallet CLI for Unchained",
+    long_about = "Run an Unchained node, manage a PQ wallet, and send shielded note transactions.\n\
+\nSending accepts a verified recipient document. Use flags for automation or run interactively for a guided flow.",
     help_template = "{name} {version}\n{about}\n\nUSAGE:\n  {usage}\n\nOPTIONS:\n{options}\n\nCOMMANDS:\n{subcommands}\n\n{after-help}",
-    after_help = "Examples:\n  unchained node init-root\n  unchained node auth-prepare --out auth_request.txt\n  unchained node auth-sign --request auth_request.txt --out node_record.txt\n  unchained node auth-install --record node_record.txt\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <ADDRESS> --amount 100\n  unchained wallet balance\n  unchained offers watch\n"
+    after_help = "Examples:\n  unchained node init-root\n  unchained node auth-prepare --out auth_request.txt\n  unchained node auth-sign --request auth_request.txt --out node_record.txt\n  unchained node auth-install --record node_record.txt\n  unchained node start\n  unchained wallet receive\n  unchained wallet send --to <KEYDOC_JSON> --amount 100\n  unchained wallet balance\n"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
@@ -125,11 +123,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WalletCmd,
     },
-    /// Offer market commands
-    Offers {
-        #[command(subcommand)]
-        cmd: OffersCmd,
-    },
     /// Messaging commands
     Message {
         #[command(subcommand)]
@@ -139,210 +132,6 @@ enum Cmd {
     Advanced {
         #[command(subcommand)]
         cmd: AdvancedCmd,
-    },
-    /// Start mining and block production (runs epoch manager and miners)
-    #[command(hide = true)]
-    Mine,
-    /// Print the local node ID and signed bootstrap record
-    #[command(hide = true)]
-    PeerId,
-    /// Export your private receiving address (base64-url)
-    #[command(alias = "stealth-address", hide = true)]
-    Address(ReceiveArgs),
-    /// Request a coin proof and verify it locally
-    #[command(hide = true)]
-    Proof(ProofArgs),
-    /// Send coins to a receiver address with an out-of-band spend note
-    #[command(hide = true)]
-    Send(SendArgs),
-    /// HTLC: Sender precomputes ch_refund (and optionally secrets) from plan
-    #[command(hide = true)]
-    HtlcRefundPrepare {
-        /// Plan JSON from HtlcPlan
-        #[arg(long)]
-        plan: String,
-        /// Optional hex/base64-url refund secret base; if omitted, random per-coin secrets are generated and saved
-        #[arg(long)]
-        refund_base: Option<String>,
-        /// Output JSON for ch_refund mapping
-        #[arg(long)]
-        out: String,
-        /// Optional output JSON to store refund secrets per coin (only used when refund_base is not provided)
-        #[arg(long)]
-        out_secrets: Option<String>,
-    },
-    /// Show the wallet balance
-    #[command(hide = true)]
-    Balance(BalanceArgs),
-    /// Show wallet transaction history
-    #[command(hide = true)]
-    History(HistoryArgs),
-    /// HTLC: Plan an offer (sender) and output a JSON plan
-    #[command(hide = true)]
-    HtlcPlan {
-        #[arg(long)]
-        paycode: String,
-        #[arg(long)]
-        amount: u64,
-        /// Timeout epoch number T
-        #[arg(long, value_parser = clap::value_parser!(u64))]
-        timeout: u64,
-        /// Output file to write the plan JSON
-        #[arg(long)]
-        out: String,
-    },
-    /// HTLC: Receiver computes claim CHs from claim secret and writes JSON
-    #[command(hide = true)]
-    HtlcClaimPrepare {
-        /// Claim secret s_claim (hex or base64-url)
-        #[arg(long)]
-        claim_secret: String,
-        /// Comma-separated coin ids (hex) to claim
-        #[arg(long)]
-        coins: String,
-        /// Output JSON file to write claim CHs
-        #[arg(long)]
-        out: String,
-    },
-    /// HTLC: Execute sender offer (build spends with HTLC locks) using plan and receiver claim doc
-    #[command(hide = true)]
-    HtlcOfferExecute {
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        claims: String,
-        /// Optional hex/base64-url refund secret base to derive per-coin refund secrets deterministically
-        #[arg(long)]
-        refund_base: Option<String>,
-        /// Optional path to write per-coin refund secrets; required if refund_base is not provided
-        #[arg(long)]
-        refund_secrets_out: Option<String>,
-    },
-    /// HTLC: Execute claim spends before timeout with claim secret
-    #[command(hide = true)]
-    HtlcClaim {
-        #[arg(long)]
-        timeout: u64,
-        #[arg(long)]
-        claim_secret: String,
-        /// JSON file mapping coin_id -> ch_refund (computed on sender during offer execute)
-        #[arg(long)]
-        refunds: String,
-        /// Receiver paycode for the next hop
-        #[arg(long)]
-        paycode: String,
-    },
-    /// HTLC: Execute refund at/after timeout with refund secret
-    #[command(hide = true)]
-    HtlcRefund {
-        #[arg(long)]
-        timeout: u64,
-        #[arg(long)]
-        refund_secret: String,
-        /// JSON file mapping coin_id -> ch_claim (from receiver)
-        #[arg(long)]
-        claims: String,
-        /// Sender paycode (destination for refunded coins)
-        #[arg(long)]
-        paycode: String,
-    },
-    /// Offer: Create and sign an offer from an HTLC plan
-    #[command(hide = true)]
-    OfferCreate {
-        /// Receiver paycode
-        #[arg(long)]
-        paycode: String,
-        /// Amount to offer
-        #[arg(long)]
-        amount: u64,
-        /// Timeout epoch number T
-        #[arg(long, value_parser = clap::value_parser!(u64))]
-        timeout: u64,
-        /// Optional maker price in basis points (10000 = 100%)
-        #[arg(long)]
-        price_bps: Option<u64>,
-        /// Optional note/label
-        #[arg(long)]
-        note: Option<String>,
-        /// Output JSON path for the signed offer
-        #[arg(long)]
-        out: String,
-    },
-    /// Offer: Publish a signed offer to the network
-    #[command(hide = true)]
-    OfferPublish {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-    },
-    /// Offer: Watch incoming offers (prints JSON lines)
-    #[command(hide = true)]
-    OfferWatch(OfferWatchArgs),
-    /// Offer: Verify a signed offer file
-    #[command(hide = true)]
-    OfferVerify {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-    },
-    /// Offer: Accept a signed offer file (deterministic secrets policy)
-    #[command(hide = true)]
-    OfferAccept {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-        /// Claim secret s_claim (hex or base64-url)
-        #[arg(long)]
-        claim_secret: String,
-        /// Refund base (deterministic per-coin), 32-byte hex/base64-url; if omitted, secrets are written to file
-        #[arg(long)]
-        refund_base: Option<String>,
-        /// Path to write generated refund secrets per coin (required if --refund_base is absent)
-        #[arg(long)]
-        refund_secrets_out: Option<String>,
-    },
-    /// Offer: Prepare receiver claim CHs from an offer and claim secret
-    #[command(hide = true)]
-    OfferAcceptPrepare {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-        /// Claim secret s_claim (hex or base64-url)
-        #[arg(long)]
-        claim_secret: String,
-        /// Output JSON file to write claim CHs
-        #[arg(long)]
-        out: String,
-    },
-    /// Scan and repair malformed spend entries (backs up and deletes invalid rows)
-    #[command(hide = true)]
-    RepairSpends,
-    // Commitment request/response tooling removed
-    /// P2P: Send a short text message (topic limited to 2 msgs/24h)
-    #[command(hide = true)]
-    MsgSend(MessageSendArgs),
-    /// P2P: Listen for incoming messages on the 24h-limited topic
-    #[command(hide = true)]
-    MsgListen(MessageListenArgs),
-    /// Re-gossip all spends from local DB (sender-side recovery)
-    #[command(hide = true)]
-    ReplaySpends,
-    /// Rescan local spends against this wallet (receiver-side recovery)
-    #[command(hide = true)]
-    RescanWallet,
-    /// Export all anchors into a compressed snapshot file
-    #[command(hide = true)]
-    ExportAnchors {
-        /// Output file path (e.g. anchors_snapshot.zst)
-        #[arg(long)]
-        out: String,
-    },
-    /// Import anchors from a compressed snapshot file
-    #[command(hide = true)]
-    ImportAnchors {
-        /// Input snapshot file path
-        #[arg(long)]
-        input: String,
     },
 }
 
@@ -442,18 +231,6 @@ struct SendArgs {
     /// Amount to send; if omitted, you will be prompted
     #[arg(long)]
     amount: Option<u64>,
-    /// Out-of-band spend note as hex or base64-url
-    #[arg(long)]
-    note: Option<String>,
-    /// Write the shareable receiver note bundle to a file
-    #[arg(long)]
-    note_out: Option<String>,
-    /// Copy the receiver note to the clipboard
-    #[arg(long, default_value_t = false)]
-    copy_note: bool,
-    /// Render the receiver note as a terminal QR code
-    #[arg(long, default_value_t = false)]
-    show_note_qr: bool,
     /// Output machine-readable JSON
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -474,28 +251,6 @@ struct HistoryArgs {
     /// Output machine-readable JSON
     #[arg(long, default_value_t = false)]
     json: bool,
-}
-
-#[derive(Args, Clone)]
-struct ProofArgs {
-    #[arg(long)]
-    coin_id: String,
-}
-
-#[derive(Args, Clone)]
-struct OfferWatchArgs {
-    /// Exit after receiving N offers (optional)
-    #[arg(long)]
-    count: Option<u64>,
-    /// Minimum amount filter
-    #[arg(long)]
-    min_amount: Option<u64>,
-    /// Filter by maker address (hex)
-    #[arg(long)]
-    maker: Option<String>,
-    /// Resume from millis cursor
-    #[arg(long)]
-    since: Option<u128>,
 }
 
 #[derive(Args, Clone)]
@@ -522,76 +277,10 @@ enum WalletCmd {
     Receive(ReceiveArgs),
     /// Send coins to a receiver, or run a guided send flow
     Send(SendArgs),
-    /// Show wallet balance and spendable outputs
+    /// Show wallet balance and owned shielded notes
     Balance(BalanceArgs),
     /// Show wallet transaction history
     History(HistoryArgs),
-}
-
-#[derive(Subcommand)]
-enum OffersCmd {
-    /// Watch incoming offers (prints JSON lines)
-    Watch(OfferWatchArgs),
-    /// Create and sign an offer from an HTLC plan
-    Create {
-        /// Receiver paycode
-        #[arg(long)]
-        paycode: String,
-        /// Amount to offer
-        #[arg(long)]
-        amount: u64,
-        /// Timeout epoch number T
-        #[arg(long, value_parser = clap::value_parser!(u64))]
-        timeout: u64,
-        /// Optional maker price in basis points (10000 = 100%)
-        #[arg(long)]
-        price_bps: Option<u64>,
-        /// Optional note/label
-        #[arg(long)]
-        note: Option<String>,
-        /// Output JSON path for the signed offer
-        #[arg(long)]
-        out: String,
-    },
-    /// Publish a signed offer to the network
-    Publish {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-    },
-    /// Verify a signed offer file
-    Verify {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-    },
-    /// Accept a signed offer file
-    Accept {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-        /// Claim secret s_claim (hex or base64-url)
-        #[arg(long)]
-        claim_secret: String,
-        /// Refund base (deterministic per-coin), 32-byte hex/base64-url
-        #[arg(long)]
-        refund_base: Option<String>,
-        /// Path to write generated refund secrets per coin
-        #[arg(long)]
-        refund_secrets_out: Option<String>,
-    },
-    /// Prepare receiver claim CHs from an offer and claim secret
-    AcceptPrepare {
-        /// Input offer JSON path
-        #[arg(long)]
-        input: String,
-        /// Claim secret s_claim (hex or base64-url)
-        #[arg(long)]
-        claim_secret: String,
-        /// Output JSON file to write claim CHs
-        #[arg(long)]
-        out: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -604,77 +293,9 @@ enum MessageCmd {
 
 #[derive(Subcommand)]
 enum AdvancedCmd {
-    /// Request a coin proof and verify it locally
-    Proof(ProofArgs),
-    /// HTLC: Sender precomputes refund commitments and secrets
-    HtlcRefundPrepare {
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        refund_base: Option<String>,
-        #[arg(long)]
-        out: String,
-        #[arg(long)]
-        out_secrets: Option<String>,
-    },
-    /// HTLC: Plan an offer (sender) and output a JSON plan
-    HtlcPlan {
-        #[arg(long)]
-        paycode: String,
-        #[arg(long)]
-        amount: u64,
-        #[arg(long, value_parser = clap::value_parser!(u64))]
-        timeout: u64,
-        #[arg(long)]
-        out: String,
-    },
-    /// HTLC: Receiver computes claim CHs from claim secret
-    HtlcClaimPrepare {
-        #[arg(long)]
-        claim_secret: String,
-        #[arg(long)]
-        coins: String,
-        #[arg(long)]
-        out: String,
-    },
-    /// HTLC: Execute sender offer using a plan and receiver claim doc
-    HtlcOfferExecute {
-        #[arg(long)]
-        plan: String,
-        #[arg(long)]
-        claims: String,
-        #[arg(long)]
-        refund_base: Option<String>,
-        #[arg(long)]
-        refund_secrets_out: Option<String>,
-    },
-    /// HTLC: Execute claim spends before timeout
-    HtlcClaim {
-        #[arg(long)]
-        timeout: u64,
-        #[arg(long)]
-        claim_secret: String,
-        #[arg(long)]
-        refunds: String,
-        #[arg(long)]
-        paycode: String,
-    },
-    /// HTLC: Execute refund at or after timeout
-    HtlcRefund {
-        #[arg(long)]
-        timeout: u64,
-        #[arg(long)]
-        refund_secret: String,
-        #[arg(long)]
-        claims: String,
-        #[arg(long)]
-        paycode: String,
-    },
-    /// Scan and repair malformed spend entries
-    RepairSpends,
-    /// Re-gossip all spends from local DB
-    ReplaySpends,
-    /// Rescan local spends against this wallet
+    /// Re-gossip all transactions from local DB
+    ReplayTransactions,
+    /// Rescan local transactions against this wallet
     RescanWallet,
     /// Export all anchors into a compressed snapshot file
     ExportAnchors {
@@ -731,39 +352,6 @@ fn print_receive_output(wallet: &wallet::Wallet, args: &ReceiveArgs) -> anyhow::
     Ok(())
 }
 
-fn parse_note_bytes(note: Option<&str>) -> anyhow::Result<(Vec<u8>, bool, String)> {
-    use rand::RngCore;
-
-    let bytes = if let Some(note) = note {
-        let t = note.trim();
-        if let Ok(b) = hex::decode(t.trim_start_matches("0x")) {
-            b
-        } else if let Ok(b) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t) {
-            b
-        } else {
-            anyhow::bail!("Invalid note encoding; use hex or base64-url")
-        }
-    } else {
-        let mut s = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut s);
-        s.to_vec()
-    };
-
-    let note_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-    Ok((bytes, note.is_none(), note_b64))
-}
-
-fn write_note_bundle(path: &str, note_b64: &str, to: &str, amount: u64) -> anyhow::Result<()> {
-    let payload = serde_json::json!({
-        "note": note_b64,
-        "encoding": "base64url",
-        "to": to,
-        "amount": amount,
-    });
-    std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
-    Ok(())
-}
-
 async fn run_send_flow(
     wallet: &Arc<wallet::Wallet>,
     net: &network::NetHandle,
@@ -777,7 +365,7 @@ async fn run_send_flow(
     }
     let to_raw = match &args.to {
         Some(to) => to.clone(),
-        None => prompt_line("Receiver address: ")?,
+        None => prompt_line("Recipient document: ")?,
     };
     let to = load_receiver_code(&to_raw)?;
     if to.is_empty() {
@@ -811,41 +399,18 @@ async fn run_send_flow(
         }
     }
 
-    let (note_bytes, note_generated, note_b64) = parse_note_bytes(args.note.as_deref())?;
-    if let Some(path) = &args.note_out {
-        write_note_bundle(path, &note_b64, &to, amount)?;
-    }
-    if args.copy_note {
-        let _ = copy_to_clipboard(&note_b64);
-    }
-
-    let outcome = wallet
-        .send_with_paycode_and_note(&to, amount, net, &note_bytes)
-        .await?;
+    let outcome = wallet.send_with_paycode_and_note(&to, amount, net).await?;
 
     if args.json {
-        let spends: Vec<serde_json::Value> = outcome
-            .spends
-            .iter()
-            .map(|sp| {
-                serde_json::json!({
-                    "coin_id": hex::encode(sp.coin_id),
-                    "commitment": hex::encode(sp.commitment),
-                    "nullifier": hex::encode(sp.nullifier),
-                })
-            })
-            .collect();
         println!(
             "{}",
             serde_json::json!({
                 "ok": true,
                 "to": to,
                 "amount": amount,
-                "spend_count": outcome.spends.len(),
-                "note": note_b64,
-                "note_generated": note_generated,
-                "note_out": args.note_out,
-                "spends": spends,
+                "tx_id": hex::encode(outcome.tx_id),
+                "input_count": outcome.input_count,
+                "output_count": outcome.output_count,
             })
         );
         return Ok(());
@@ -854,27 +419,16 @@ async fn run_send_flow(
     println!("Sent");
     println!();
     println!(
-        "Broadcast {} spend{} for {} coin{}.",
-        outcome.spends.len(),
-        if outcome.spends.len() == 1 { "" } else { "s" },
+        "Broadcast shielded transaction consuming {} note{} and creating {} note{} for {} coin{}.",
+        outcome.input_count,
+        if outcome.input_count == 1 { "" } else { "s" },
+        outcome.output_count,
+        if outcome.output_count == 1 { "" } else { "s" },
         amount,
         if amount == 1 { "" } else { "s" }
     );
     println!("Recipient: {}", short_text(&to));
-    println!();
-    println!("Share this receiver note privately:");
-    println!("{note_b64}");
-    if args.copy_note {
-        println!("Copied receiver note to clipboard.");
-    }
-    if args.show_note_qr || guided {
-        println!();
-        let _ = print_qr_to_terminal(&note_b64);
-    }
-    if let Some(path) = &args.note_out {
-        println!();
-        println!("Saved note bundle to {path}");
-    }
+    println!("Tx ID: {}", hex::encode(outcome.tx_id));
     println!();
     println!("Track confirmation with `unchained wallet history`.");
     Ok(())
@@ -882,7 +436,7 @@ async fn run_send_flow(
 
 fn print_balance_output(wallet: &wallet::Wallet, args: &BalanceArgs) -> anyhow::Result<()> {
     let balance = wallet.balance()?;
-    let outputs = wallet.list_unspent()?.len();
+    let outputs = wallet.list_owned_shielded_notes()?.len();
     let address = wallet.export_address()?;
     if args.json {
         println!(
@@ -1113,8 +667,7 @@ fn handle_node_operator_command(cmd: &Option<Cmd>, cfg: &config::Config) -> anyh
         }
         Some(Cmd::Node {
             cmd: NodeCmd::PeerId,
-        })
-        | Some(Cmd::PeerId) => {
+        }) => {
             print_peer_id_output(cfg)?;
             Ok(true)
         }
@@ -1138,14 +691,13 @@ async fn main() -> anyhow::Result<()> {
         &cli.cmd,
         Some(Cmd::Node {
             cmd: NodeCmd::Start { .. }
-        }) | Some(Cmd::Mine)
+        })
     );
     let force_mine = matches!(
         &cli.cmd,
-        Some(Cmd::Mine)
-            | Some(Cmd::Node {
-                cmd: NodeCmd::Start { mine: true }
-            })
+        Some(Cmd::Node {
+            cmd: NodeCmd::Start { mine: true }
+        })
     );
 
     // Try reading config from CLI path, then from the executable directory, else fallback to embedded default
@@ -1233,22 +785,19 @@ async fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Some(Cmd::Wallet {
             cmd: WalletCmd::Receive(args),
-        })
-        | Some(Cmd::Address(args)) => {
+        }) => {
             print_receive_output(wallet.as_ref(), args)?;
             return Ok(());
         }
         Some(Cmd::Wallet {
             cmd: WalletCmd::Balance(args),
-        })
-        | Some(Cmd::Balance(args)) => {
+        }) => {
             print_balance_output(wallet.as_ref(), args)?;
             return Ok(());
         }
         Some(Cmd::Wallet {
             cmd: WalletCmd::History(args),
-        })
-        | Some(Cmd::History(args)) => {
+        }) => {
             print_history_output(wallet.as_ref(), args)?;
             return Ok(());
         }
@@ -1310,24 +859,21 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     Ok(tx) = tx_rx.recv() => {
-                        for sp in tx.spends {
-                            let _ = wallet_clone.scan_spend_for_me(&sp);
-                        }
+                        let _ = wallet_clone.scan_tx_for_me(&tx);
                     },
                     Ok(_a) = anchor_rx.recv() => {
-                        // On anchor adoption, rescan all spends idempotently (bounded by CF contents)
-                        if let Some(cf) = db_clone.db.cf_handle("spend") {
+                        // On anchor adoption, refresh owned shielded notes and replay stored tx outputs.
+                        let _ = wallet_clone.sync_shielded_notes();
+                        if let Some(cf) = db_clone.db.cf_handle("tx") {
                             let iter = db_clone.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
                             for item in iter {
                                 if let Ok((_k, v)) = item {
-                                    if let Ok(sp) = db_clone.decode_spend_bytes(&v) {
-                                        let _ = wallet_clone.scan_spend_for_me(&sp);
+                                    if let Ok(tx) = canonical::decode_tx(&v) {
+                                        let _ = wallet_clone.scan_tx_for_me(&tx);
                                     }
                                 }
                             }
                         }
-                        // FIXED: Process any pending spend scans that were waiting for coins
-                        let _ = wallet_clone.process_pending_spend_scans();
                     }
                 }
             }
@@ -1349,8 +895,7 @@ async fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Some(Cmd::Node {
             cmd: NodeCmd::Start { .. },
-        })
-        | Some(Cmd::Mine) => {
+        }) => {
             if cfg.mining.enabled {
                 // Start epoch manager only when actively mining or running as a block producer
                 let epoch_mgr = epoch::Manager::new(
@@ -1470,585 +1015,22 @@ async fn main() -> anyhow::Result<()> {
                 println!("Starting node with mining disabled.");
             }
         }
-        Some(Cmd::Advanced {
-            cmd: AdvancedCmd::Proof(ProofArgs { coin_id }),
-        })
-        | Some(Cmd::Proof(ProofArgs { coin_id })) => {
-            // Parse coin id
-            let id_vec =
-                hex::decode(coin_id).map_err(|e| anyhow::anyhow!("Invalid coin_id hex: {}", e))?;
-            if id_vec.len() != 32 {
-                return Err(anyhow::anyhow!("coin_id must be 32 bytes"));
-            }
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&id_vec);
-
-            // Subscribe to proof responses and wait for matching coin_id
-            let mut rx = net.proof_subscribe();
-            net.request_coin_proof(id).await;
-            println!(
-                "📨 Requested proof for coin {} (waiting up to 30s)",
-                hex::encode(id)
-            );
-            let _start = std::time::Instant::now();
-            loop {
-                tokio::select! {
-                    Ok(resp) = rx.recv() => {
-                        if resp.coin.id == id {
-                            let leaf = crate::coin::Coin::id_to_leaf_hash(&resp.coin.id);
-                            let ok = crate::epoch::MerkleTree::verify_proof(&leaf, &resp.proof, &resp.anchor.merkle_root);
-                            println!("🔎 Proof verification for coin {}: {}", hex::encode(id), if ok {"OK"} else {"FAIL"});
-                            return if ok { Ok(()) } else { Err(anyhow::anyhow!("invalid proof")) };
-                        }
-                    },
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        return Err(anyhow::anyhow!("timeout waiting for proof"));
-                    }
-                }
-            }
-        }
         Some(Cmd::Wallet {
             cmd: WalletCmd::Send(args),
-        })
-        | Some(Cmd::Send(args)) => {
+        }) => {
             run_send_flow(&wallet, &net, args).await?;
             return Ok(());
         }
         Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcPlan {
-                    paycode,
-                    amount,
-                    timeout,
-                    out,
-                },
-        })
-        | Some(Cmd::HtlcPlan {
-            paycode,
-            amount,
-            timeout,
-            out,
-        }) => {
-            let plan = wallet.plan_htlc_offer(*amount, paycode, *timeout)?;
-            let json = serde_json::to_string_pretty(&plan)?;
-            std::fs::write(out, json)?;
-            println!("✅ Wrote HTLC plan to {} (timeout epoch {})", out, timeout);
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcClaimPrepare {
-                    claim_secret,
-                    coins,
-                    out,
-                },
-        })
-        | Some(Cmd::HtlcClaimPrepare {
-            claim_secret,
-            coins,
-            out,
-        }) => {
-            let claim_bytes = {
-                let s = claim_secret.trim();
-                if let Ok(b) = hex::decode(s.trim_start_matches("0x")) {
-                    b
-                } else {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?
-                }
-            };
-            if claim_bytes.is_empty() {
-                return Err(anyhow::anyhow!("claim_secret empty"));
-            }
-            let mut entries = Vec::new();
-            for hex_id in coins.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                let id_vec = hex::decode(hex_id)
-                    .map_err(|e| anyhow::anyhow!("Invalid coin id {}: {}", hex_id, e))?;
-                if id_vec.len() != 32 {
-                    return Err(anyhow::anyhow!("coin id {} must be 32 bytes", hex_id));
-                }
-                let mut coin_id = [0u8; 32];
-                coin_id.copy_from_slice(&id_vec);
-                let chain_id = db.get_chain_id()?;
-                let ch = crypto::commitment_hash_from_preimage(&chain_id, &coin_id, &claim_bytes);
-                entries.push(crate::wallet::HtlcClaimsDocEntry {
-                    coin_id,
-                    ch_claim: ch,
-                });
-            }
-            let doc = crate::wallet::HtlcClaimsDoc { claims: entries };
-            let json = serde_json::to_string_pretty(&doc)?;
-            std::fs::write(out, json)?;
-            println!("✅ Wrote HTLC claim CHs to {}", out);
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcOfferExecute {
-                    plan,
-                    claims,
-                    refund_base,
-                    refund_secrets_out,
-                },
-        })
-        | Some(Cmd::HtlcOfferExecute {
-            plan,
-            claims,
-            refund_base,
-            refund_secrets_out,
-        }) => {
-            let plan_doc: crate::wallet::HtlcPlanDoc =
-                serde_json::from_slice(&std::fs::read(plan)?)?;
-            let claims_doc: crate::wallet::HtlcClaimsDoc =
-                serde_json::from_slice(&std::fs::read(claims)?)?;
-            if refund_base.is_none() && refund_secrets_out.is_none() {
-                return Err(anyhow::anyhow!("Provide either --refund_base (deterministic) or --refund_secrets_out to persist generated secrets"));
-            }
-            let refund_base_bytes: Option<Vec<u8>> = if let Some(b) = refund_base {
-                let t = b.trim();
-                if let Ok(h) = hex::decode(t.trim_start_matches("0x")) {
-                    Some(h)
-                } else {
-                    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t)?)
-                }
-            } else {
-                None
-            };
-            let outcome = wallet
-                .execute_htlc_offer(
-                    &plan_doc,
-                    &claims_doc,
-                    &net,
-                    refund_base_bytes.as_deref(),
-                    refund_secrets_out.as_deref(),
-                    None,
-                )
-                .await?;
-            println!(
-                "✅ Built and broadcast {} HTLC offer spend(s)",
-                outcome.spends.len()
-            );
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcRefundPrepare {
-                    plan,
-                    refund_base,
-                    out,
-                    out_secrets,
-                },
-        })
-        | Some(Cmd::HtlcRefundPrepare {
-            plan,
-            refund_base,
-            out,
-            out_secrets,
-        }) => {
-            let plan_doc: crate::wallet::HtlcPlanDoc =
-                serde_json::from_slice(&std::fs::read(plan)?)?;
-            let chain_id = plan_doc.chain_id;
-            let mut refunds = Vec::new();
-            let mut secrets_dump: Vec<(String, String)> = Vec::new();
-            use rand::RngCore;
-            for c in &plan_doc.coins {
-                let secret: [u8; 32] = if let Some(b) = refund_base {
-                    let base_bytes = if let Ok(h) = hex::decode(b.trim().trim_start_matches("0x")) {
-                        h
-                    } else {
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b.trim())?
-                    };
-                    let mut h = blake3::Hasher::new_derive_key("unchained.htlc.refund.base");
-                    h.update(&base_bytes);
-                    h.update(&c.coin_id);
-                    let mut out = [0u8; 32];
-                    h.finalize_xof().fill(&mut out);
-                    out
-                } else {
-                    let mut s = [0u8; 32];
-                    rand::rngs::OsRng.fill_bytes(&mut s);
-                    secrets_dump.push((hex::encode(c.coin_id), hex::encode(s)));
-                    s
-                };
-                let ch = crypto::commitment_hash_from_preimage(&chain_id, &c.coin_id, &secret);
-                refunds.push(crate::wallet::HtlcRefundsDocEntry {
-                    coin_id: c.coin_id,
-                    ch_refund: ch,
-                });
-            }
-            let doc = crate::wallet::HtlcRefundsDoc { refunds };
-            std::fs::write(out, serde_json::to_string_pretty(&doc)?)?;
-            if refund_base.is_none() {
-                if let Some(path) = out_secrets {
-                    let json = serde_json::to_string_pretty(&secrets_dump)?;
-                    std::fs::write(path, json)?;
-                    println!("✅ Wrote per-coin refund secrets (keep safe)");
-                }
-            }
-            println!("✅ Wrote HTLC refund CHs to {}", out);
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcClaim {
-                    timeout,
-                    claim_secret,
-                    refunds,
-                    paycode,
-                },
-        })
-        | Some(Cmd::HtlcClaim {
-            timeout,
-            claim_secret,
-            refunds,
-            paycode,
-        }) => {
-            // Guard: Claim only valid when current_epoch < T
-            let current_epoch = db
-                .get::<epoch::Anchor>("epoch", b"latest")?
-                .map(|a| a.num)
-                .unwrap_or(0);
-            if current_epoch >= *timeout {
-                return Err(anyhow::anyhow!(
-                    "Claim path not valid: current_epoch={} ≥ T={}. Use htlc-refund instead.",
-                    current_epoch,
-                    timeout
-                ));
-            }
-            let refunds_doc: crate::wallet::HtlcRefundsDoc =
-                serde_json::from_slice(&std::fs::read(refunds)?)?;
-            let mut map = std::collections::HashMap::new();
-            for e in refunds_doc.refunds {
-                map.insert(e.coin_id, e.ch_refund);
-            }
-            let s_bytes = {
-                let s = claim_secret.trim();
-                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) {
-                    h
-                } else {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?
-                }
-            };
-            let outcome = wallet
-                .htlc_claim(*timeout, &s_bytes, &map, paycode, &net, None)
-                .await?;
-            println!(
-                "✅ Built and broadcast {} HTLC claim spend(s)",
-                outcome.spends.len()
-            );
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd:
-                AdvancedCmd::HtlcRefund {
-                    timeout,
-                    refund_secret,
-                    claims,
-                    paycode,
-                },
-        })
-        | Some(Cmd::HtlcRefund {
-            timeout,
-            refund_secret,
-            claims,
-            paycode,
-        }) => {
-            // Guard: Refund only valid when current_epoch ≥ T
-            let current_epoch = db
-                .get::<epoch::Anchor>("epoch", b"latest")?
-                .map(|a| a.num)
-                .unwrap_or(0);
-            if current_epoch < *timeout {
-                return Err(anyhow::anyhow!(
-                    "Refund path not valid: current_epoch={} < T={}. Use htlc-claim instead.",
-                    current_epoch,
-                    timeout
-                ));
-            }
-            let claims_doc: crate::wallet::HtlcClaimsDoc =
-                serde_json::from_slice(&std::fs::read(claims)?)?;
-            let mut map = std::collections::HashMap::new();
-            for e in claims_doc.claims {
-                map.insert(e.coin_id, e.ch_claim);
-            }
-            let s_bytes = {
-                let s = refund_secret.trim();
-                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) {
-                    h
-                } else {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?
-                }
-            };
-            let outcome = wallet
-                .htlc_refund(*timeout, &s_bytes, &map, paycode, &net, None)
-                .await?;
-            println!(
-                "✅ Built and broadcast {} HTLC refund spend(s)",
-                outcome.spends.len()
-            );
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd:
-                OffersCmd::Create {
-                    paycode,
-                    amount,
-                    timeout,
-                    price_bps,
-                    note,
-                    out,
-                },
-        })
-        | Some(Cmd::OfferCreate {
-            paycode,
-            amount,
-            timeout,
-            price_bps,
-            note,
-            out,
-        }) => {
-            let plan = wallet.plan_htlc_offer(*amount, paycode, *timeout)?;
-            let offer = wallet.create_offer_doc(plan, *price_bps, note.clone())?;
-            let json = serde_json::to_string_pretty(&offer)?;
-            std::fs::write(out, json)?;
-            println!("✅ Wrote signed offer to {}", out);
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd: OffersCmd::Verify { input },
-        })
-        | Some(Cmd::OfferVerify { input }) => {
-            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
-            wallet::Wallet::verify_offer_doc(&offer)?;
-            println!("✅ Offer signature and maker address verified");
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd:
-                OffersCmd::Accept {
-                    input,
-                    claim_secret,
-                    refund_base,
-                    refund_secrets_out,
-                },
-        })
-        | Some(Cmd::OfferAccept {
-            input,
-            claim_secret,
-            refund_base,
-            refund_secrets_out,
-        }) => {
-            // 1) Verify offer
-            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
-            wallet::Wallet::verify_offer_doc(&offer)?;
-            // 2) Build receiver claim doc deterministically from provided claim_secret
-            let s_bytes = {
-                let s = claim_secret.trim();
-                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) {
-                    h
-                } else {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?
-                }
-            };
-            if s_bytes.len() != 32 {
-                return Err(anyhow::anyhow!("claim_secret must be 32 bytes"));
-            }
-            let mut claims = Vec::new();
-            for c in &offer.plan.coins {
-                let ch = crypto::commitment_hash_from_preimage(
-                    &offer.plan.chain_id,
-                    &c.coin_id,
-                    &s_bytes,
-                );
-                claims.push(crate::wallet::HtlcClaimsDocEntry {
-                    coin_id: c.coin_id,
-                    ch_claim: ch,
-                });
-            }
-            let claims_doc = crate::wallet::HtlcClaimsDoc { claims };
-            // 3) Execute HTLC offer spends via wallet; never print secrets, only file output if requested
-            if refund_base.is_none() && refund_secrets_out.is_none() {
-                return Err(anyhow::anyhow!("Provide either --refund_base (deterministic) or --refund_secrets_out to persist generated secrets"));
-            }
-            let refund_base_bytes: Option<Vec<u8>> = if let Some(b) = refund_base {
-                let t = b.trim();
-                if let Ok(h) = hex::decode(t.trim_start_matches("0x")) {
-                    Some(h)
-                } else {
-                    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t)?)
-                }
-            } else {
-                None
-            };
-            let outcome = wallet
-                .execute_htlc_offer(
-                    &offer.plan,
-                    &claims_doc,
-                    &net,
-                    refund_base_bytes.as_deref(),
-                    refund_secrets_out.as_deref(),
-                    None,
-                )
-                .await?;
-            println!(
-                "✅ Accepted offer. Built and broadcast {} spend(s)",
-                outcome.spends.len()
-            );
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd: OffersCmd::Publish { input },
-        })
-        | Some(Cmd::OfferPublish { input }) => {
-            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
-            wallet::Wallet::verify_offer_doc(&offer)?;
-            // Publish via network
-            // Use binary bincode payload to match network path
-            // Reuse GossipOffer command
-            net.gossip_offer(&offer).await;
-            println!("📢 Published offer to network");
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd:
-                OffersCmd::Watch(OfferWatchArgs {
-                    count,
-                    min_amount,
-                    maker,
-                    since: _,
-                }),
-        })
-        | Some(Cmd::OfferWatch(OfferWatchArgs {
-            count,
-            min_amount,
-            maker,
-            since: _,
-        })) => {
-            // Local subscribe; apply filters; since is not used in local mode
-            let mut rx = net.offers_subscribe();
-            let mut remaining = *count;
-            loop {
-                tokio::select! {
-                    Ok(ofr) = rx.recv() => {
-                        if let Some(min) = *min_amount { if ofr.plan.amount < min { continue; } }
-                        if let Some(m) = maker.clone() {
-                            let want = m.trim_start_matches("0x");
-                            if hex::encode(ofr.maker_address) != want { continue; }
-                        }
-                        let json = serde_json::to_string(&ofr)?;
-                        println!("{}", json);
-                        if let Some(left) = remaining.as_mut() {
-                            if *left > 0 { *left -= 1; }
-                            if *left == 0 { break; }
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(Cmd::Offers {
-            cmd:
-                OffersCmd::AcceptPrepare {
-                    input,
-                    claim_secret,
-                    out,
-                },
-        })
-        | Some(Cmd::OfferAcceptPrepare {
-            input,
-            claim_secret,
-            out,
-        }) => {
-            // Verify offer and emit receiver-side claim CHs for coins listed in maker plan
-            let offer: crate::wallet::OfferDocV2 = serde_json::from_slice(&std::fs::read(input)?)?;
-            wallet::Wallet::verify_offer_doc(&offer)?;
-            let s_bytes = {
-                let s = claim_secret.trim();
-                if let Ok(h) = hex::decode(s.trim_start_matches("0x")) {
-                    h
-                } else {
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)?
-                }
-            };
-            if s_bytes.len() != 32 {
-                return Err(anyhow::anyhow!("claim_secret must be 32 bytes"));
-            }
-            let mut entries = Vec::new();
-            for c in &offer.plan.coins {
-                let ch = crypto::commitment_hash_from_preimage(
-                    &offer.plan.chain_id,
-                    &c.coin_id,
-                    &s_bytes,
-                );
-                entries.push(crate::wallet::HtlcClaimsDocEntry {
-                    coin_id: c.coin_id,
-                    ch_claim: ch,
-                });
-            }
-            let doc = crate::wallet::HtlcClaimsDoc { claims: entries };
-            let json = serde_json::to_string_pretty(&doc)?;
-            std::fs::write(out, json)?;
-            println!("✅ Wrote claim CHs for {} coins", doc.claims.len());
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
-            cmd: AdvancedCmd::RepairSpends,
-        })
-        | Some(Cmd::RepairSpends) => {
-            println!("🛠️  Scanning 'spend' CF for malformed entries...");
-            let cf = db
-                .db
-                .cf_handle("spend")
-                .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
-            let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-            let backup_dir = format!(
-                "{}/backups_spend_repair/{}",
-                cfg.storage.path,
-                chrono::Utc::now().format("%Y%m%d_%H%M%S")
-            );
-            std::fs::create_dir_all(&backup_dir).ok();
-            let mut batch = rocksdb::WriteBatch::default();
-            let mut scanned: u64 = 0;
-            let mut repaired: u64 = 0;
-            for item in iter {
-                if let Ok((k, v)) = item {
-                    scanned += 1;
-                    let valid = zstd::decode_all(&v[..])
-                        .ok()
-                        .and_then(|d| bincode::deserialize::<crate::transfer::Spend>(&d).ok())
-                        .or_else(|| bincode::deserialize::<crate::transfer::Spend>(&v[..]).ok())
-                        .is_some();
-                    if !valid {
-                        let key_hex = hex::encode(&k);
-                        let mut path = std::path::PathBuf::from(&backup_dir);
-                        path.push(format!("spend-{}.bin", key_hex));
-                        let _ = std::fs::write(&path, &v);
-                        batch.delete_cf(cf, &k);
-                        repaired += 1;
-                        println!("   - Deleted malformed spend key={} (backed up)", key_hex);
-                    }
-                }
-            }
-            if repaired > 0 {
-                db.write_batch(batch)?;
-            }
-            println!(
-                "✅ Repair complete. Scanned: {}, deleted malformed: {}. Backup dir: {}",
-                scanned, repaired, backup_dir
-            );
-            return Ok(());
-        }
-        Some(Cmd::Advanced {
             cmd: AdvancedCmd::ExportAnchors { out },
-        })
-        | Some(Cmd::ExportAnchors { out }) => {
+        }) => {
             let written = db.export_anchors_snapshot(out)?;
             println!("✅ Exported {} anchors to {}", written, out);
             return Ok(());
         }
         Some(Cmd::Advanced {
             cmd: AdvancedCmd::ImportAnchors { input },
-        })
-        | Some(Cmd::ImportAnchors { input }) => {
+        }) => {
             let added = db.import_anchors_snapshot(input)?;
             println!("✅ Imported {} anchors from {}", added, input);
             return Ok(());
@@ -2056,8 +1038,7 @@ async fn main() -> anyhow::Result<()> {
         // commitment commands removed
         Some(Cmd::Message {
             cmd: MessageCmd::Send(MessageSendArgs { text }),
-        })
-        | Some(Cmd::MsgSend(MessageSendArgs { text })) => {
+        }) => {
             let message = if let Some(t) = text {
                 t.clone()
             } else {
@@ -2080,8 +1061,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Message {
             cmd: MessageCmd::Listen(MessageListenArgs { once, count }),
-        })
-        | Some(Cmd::MsgListen(MessageListenArgs { once, count })) => {
+        }) => {
             println!("👂 Listening for P2P messages (24h-limited topic). Press Ctrl+C to exit.");
             let mut rx = net.rate_limited_subscribe();
             let mut remaining = count.unwrap_or(u64::MAX);
@@ -2102,19 +1082,17 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Cmd::Advanced {
-            cmd: AdvancedCmd::ReplaySpends,
-        })
-        | Some(Cmd::ReplaySpends) => {
+            cmd: AdvancedCmd::ReplayTransactions,
+        }) => {
             let cf = db
                 .db
-                .cf_handle("spend")
-                .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+                .cf_handle("tx")
+                .ok_or_else(|| anyhow::anyhow!("'tx' column family missing"))?;
             let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             let mut replayed = 0u64;
             for item in iter {
                 let (_k, v) = item?;
-                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
-                    let tx = crate::transaction::Tx::single_spend(sp);
+                if let Ok(tx) = canonical::decode_tx(&v) {
                     net.gossip_tx(&tx).await;
                     replayed += 1;
                 }
@@ -2124,22 +1102,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Advanced {
             cmd: AdvancedCmd::RescanWallet,
-        })
-        | Some(Cmd::RescanWallet) => {
+        }) => {
             let cf = db
                 .db
-                .cf_handle("spend")
-                .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+                .cf_handle("tx")
+                .ok_or_else(|| anyhow::anyhow!("'tx' column family missing"))?;
             let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             let mut scanned = 0u64;
             for item in iter {
                 let (_k, v) = item?;
-                if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&v) {
-                    let _ = wallet.scan_spend_for_me(&sp);
+                if let Ok(tx) = canonical::decode_tx(&v) {
+                    let _ = wallet.scan_tx_for_me(&tx);
                     scanned += 1;
                 }
             }
-            println!("✅ Rescanned {} spends for this wallet", scanned);
+            let _ = wallet.sync_shielded_notes();
+            println!("✅ Rescanned {} transactions for this wallet", scanned);
             return Ok(());
         }
         Some(Cmd::Node {
@@ -2166,7 +1144,6 @@ async fn main() -> anyhow::Result<()> {
         | Some(Cmd::Node {
             cmd: NodeCmd::TrustApprove { .. },
         })
-        | Some(Cmd::PeerId)
         | Some(Cmd::Wallet {
             cmd: WalletCmd::Receive(_),
         })
@@ -2175,10 +1152,7 @@ async fn main() -> anyhow::Result<()> {
         })
         | Some(Cmd::Wallet {
             cmd: WalletCmd::History(_),
-        })
-        | Some(Cmd::Address(_))
-        | Some(Cmd::Balance(_))
-        | Some(Cmd::History(_)) => {
+        }) => {
             unreachable!("handled before network startup")
         }
         None => return Ok(()),

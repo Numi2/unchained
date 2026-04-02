@@ -350,28 +350,6 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     )
     .await;
 
-    let mut proof_rx = net_c.proof_subscribe();
-    net_c.request_coin_proof(coin.id).await;
-    let response = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match proof_rx.recv().await {
-                Ok(response) if response.coin.id == coin.id => return response,
-                Ok(_) => continue,
-                Err(_) => continue,
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for coin proof");
-
-    assert_eq!(response.anchor.hash, anchor2.hash);
-    assert_eq!(response.coin.id, coin.id);
-    assert!(MerkleTree::verify_proof(
-        &Coin::id_to_leaf_hash(&response.coin.id),
-        &response.proof,
-        &response.anchor.merkle_root,
-    ));
-
     net_a.shutdown().await;
     net_b.shutdown().await;
     net_c.shutdown().await;

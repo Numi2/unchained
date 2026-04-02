@@ -4,13 +4,12 @@ use crate::{
     coin::{Coin, CoinCandidate},
     crypto::{
         Address, KemAlgorithm, SignatureAlgorithm, TaggedKemPublicKey, TaggedSigningPublicKey,
-        ML_DSA_65_PK_BYTES, ML_KEM_768_CT_BYTES, ML_KEM_768_PK_BYTES, OTP_PK_BYTES,
+        ML_DSA_65_PK_BYTES, ML_KEM_768_PK_BYTES,
     },
     epoch::Anchor,
     network::{
-        CoinProofRequest, CoinProofResponse, CompactEpoch, EpochByHash, EpochCandidatesResponse,
-        EpochGetTxn, EpochHeadersBatch, EpochHeadersRange, EpochLeavesBundle, EpochTxn,
-        RateLimitedMessage, SelectedIdsBundle,
+        CompactEpoch, EpochByHash, EpochCandidatesResponse, EpochGetTxn, EpochHeadersBatch,
+        EpochHeadersRange, EpochLeavesBundle, EpochTxn, RateLimitedMessage, SelectedIdsBundle,
     },
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
@@ -21,9 +20,8 @@ use crate::{
         NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof,
         NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
-    transaction::Tx,
-    transfer::{Spend, StealthOutput},
-    wallet::{HtlcPlanCoin, HtlcPlanDoc, KeyDocV2, OfferDocV2},
+    transaction::{ShieldedInput, ShieldedOutput, ShieldedOutputPlaintext, Tx},
+    wallet::KeyDocV2,
 };
 
 pub struct CanonicalWriter {
@@ -252,37 +250,6 @@ fn read_option_fixed32(reader: &mut CanonicalReader<'_>) -> Result<Option<[u8; 3
     }
 }
 
-fn write_option_u64(writer: &mut CanonicalWriter, value: Option<u64>) {
-    writer.write_bool(value.is_some());
-    if let Some(value) = value {
-        writer.write_u64(value);
-    }
-}
-
-fn read_option_u64(reader: &mut CanonicalReader<'_>) -> Result<Option<u64>> {
-    if reader.read_bool()? {
-        Ok(Some(reader.read_u64()?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn write_option_string(writer: &mut CanonicalWriter, value: &Option<String>) -> Result<()> {
-    writer.write_bool(value.is_some());
-    if let Some(value) = value {
-        writer.write_string(value)?;
-    }
-    Ok(())
-}
-
-fn read_option_string(reader: &mut CanonicalReader<'_>) -> Result<Option<String>> {
-    if reader.read_bool()? {
-        Ok(Some(reader.read_string()?))
-    } else {
-        Ok(None)
-    }
-}
-
 fn write_option_bytes(writer: &mut CanonicalWriter, value: &Option<Vec<u8>>) -> Result<()> {
     writer.write_bool(value.is_some());
     if let Some(value) = value {
@@ -427,90 +394,100 @@ pub fn decode_coin_candidate(bytes: &[u8]) -> Result<CoinCandidate> {
     Ok(coin)
 }
 
-pub fn write_stealth_output(writer: &mut CanonicalWriter, output: &StealthOutput) {
-    writer.write_fixed(&output.one_time_pk);
-    writer.write_fixed(&output.kem_ct);
-    writer.write_u64(output.amount_le);
-    writer.write_bool(output.view_tag.is_some());
-    if let Some(value) = output.view_tag {
-        writer.write_u8(value);
-    }
-}
-
-pub fn read_stealth_output(reader: &mut CanonicalReader<'_>) -> Result<StealthOutput> {
-    let one_time_pk = reader.read_fixed::<OTP_PK_BYTES>()?;
-    let kem_ct = reader.read_fixed::<ML_KEM_768_CT_BYTES>()?;
-    let amount_le = reader.read_u64()?;
-    let view_tag = if reader.read_bool()? {
-        Some(reader.read_u8()?)
-    } else {
-        None
-    };
-    Ok(StealthOutput {
-        one_time_pk,
-        kem_ct,
-        amount_le,
-        view_tag,
-    })
-}
-
-pub fn write_spend(writer: &mut CanonicalWriter, spend: &Spend) -> Result<()> {
-    writer.write_fixed(&spend.coin_id);
-    writer.write_fixed(&spend.root);
-    write_merkle_proof(writer, &spend.proof)?;
-    writer.write_fixed(&spend.commitment);
-    writer.write_fixed(&spend.nullifier);
-    write_stealth_output(writer, &spend.to);
-    write_option_fixed32(writer, &spend.unlock_preimage);
-    write_option_fixed32(writer, &spend.next_lock_hash);
-    write_option_u64(writer, spend.htlc_timeout_epoch);
-    write_option_fixed32(writer, &spend.htlc_ch_claim);
-    write_option_fixed32(writer, &spend.htlc_ch_refund);
+fn write_shielded_input(writer: &mut CanonicalWriter, input: &ShieldedInput) -> Result<()> {
+    writer.write_bytes(&encode_shielded_note(&input.note)?)?;
+    writer.write_fixed(&input.note_key);
+    writer.write_bytes(&encode_note_membership_proof(&input.membership_proof)?)?;
+    writer.write_bytes(&encode_historical_unspent_checkpoint(
+        &input.historical_checkpoint,
+    )?)?;
+    writer.write_bytes(&encode_historical_unspent_extension(
+        &input.historical_extension,
+    )?)?;
+    writer.write_fixed(&input.current_nullifier);
+    writer.write_bytes(&input.authorization_sig)?;
     Ok(())
 }
 
-pub fn read_spend(reader: &mut CanonicalReader<'_>) -> Result<Spend> {
-    Ok(Spend {
-        coin_id: reader.read_fixed()?,
-        root: reader.read_fixed()?,
-        proof: read_merkle_proof(reader)?,
-        commitment: reader.read_fixed()?,
-        nullifier: reader.read_fixed()?,
-        to: read_stealth_output(reader)?,
-        unlock_preimage: read_option_fixed32(reader)?,
-        next_lock_hash: read_option_fixed32(reader)?,
-        htlc_timeout_epoch: read_option_u64(reader)?,
-        htlc_ch_claim: read_option_fixed32(reader)?,
-        htlc_ch_refund: read_option_fixed32(reader)?,
+fn read_shielded_input(reader: &mut CanonicalReader<'_>) -> Result<ShieldedInput> {
+    Ok(ShieldedInput {
+        note: decode_shielded_note(&reader.read_bytes()?)?,
+        note_key: reader.read_fixed()?,
+        membership_proof: decode_note_membership_proof(&reader.read_bytes()?)?,
+        historical_checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
+        historical_extension: decode_historical_unspent_extension(&reader.read_bytes()?)?,
+        current_nullifier: reader.read_fixed()?,
+        authorization_sig: reader.read_bytes()?,
     })
 }
 
-pub fn encode_spend(spend: &Spend) -> Result<Vec<u8>> {
+pub fn encode_shielded_output(output: &ShieldedOutput) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    write_spend(&mut writer, spend)?;
+    writer.write_bytes(&encode_shielded_note(&output.note)?)?;
+    writer.write_fixed(&output.kem_ct);
+    writer.write_fixed(&output.nonce);
+    writer.write_u8(output.view_tag);
+    writer.write_bytes(&output.ciphertext)?;
     Ok(writer.into_vec())
 }
 
-pub fn decode_spend(bytes: &[u8]) -> Result<Spend> {
+pub fn decode_shielded_output(bytes: &[u8]) -> Result<ShieldedOutput> {
     let mut reader = CanonicalReader::new(bytes);
-    let spend = read_spend(&mut reader)?;
+    let output = ShieldedOutput {
+        note: decode_shielded_note(&reader.read_bytes()?)?,
+        kem_ct: reader.read_fixed()?,
+        nonce: reader.read_fixed()?,
+        view_tag: reader.read_u8()?,
+        ciphertext: reader.read_bytes()?,
+    };
     reader.finish()?;
-    Ok(spend)
+    Ok(output)
+}
+
+pub fn encode_shielded_output_plaintext(plaintext: &ShieldedOutputPlaintext) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(&plaintext.note_commitment);
+    writer.write_fixed(&plaintext.note_key);
+    writer.write_bytes(&encode_historical_unspent_checkpoint(
+        &plaintext.checkpoint,
+    )?)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_shielded_output_plaintext(bytes: &[u8]) -> Result<ShieldedOutputPlaintext> {
+    let mut reader = CanonicalReader::new(bytes);
+    let plaintext = ShieldedOutputPlaintext {
+        note_commitment: reader.read_fixed()?,
+        note_key: reader.read_fixed()?,
+        checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
+    };
+    reader.finish()?;
+    Ok(plaintext)
 }
 
 pub fn encode_tx(tx: &Tx) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_u8(tx.version);
-    writer.write_vec(&tx.spends, |writer, spend| write_spend(writer, spend))?;
+    writer.write_bytes(b"unchained.shielded_tx.v1")?;
+    writer.write_vec(&tx.inputs, |writer, input| {
+        write_shielded_input(writer, input)
+    })?;
+    writer.write_vec(&tx.outputs, |writer, output| {
+        writer.write_bytes(&encode_shielded_output(output)?)?;
+        Ok(())
+    })?;
     Ok(writer.into_vec())
 }
 
 pub fn decode_tx(bytes: &[u8]) -> Result<Tx> {
     let mut reader = CanonicalReader::new(bytes);
-    let version = reader.read_u8()?;
-    let spends = reader.read_vec(read_spend)?;
+    let domain = reader.read_bytes()?;
+    if domain.as_slice() != b"unchained.shielded_tx.v1" {
+        bail!("unsupported transaction encoding");
+    }
+    let inputs = reader.read_vec(read_shielded_input)?;
+    let outputs = reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?;
     reader.finish()?;
-    Ok(Tx { version, spends })
+    Ok(Tx { inputs, outputs })
 }
 
 pub fn encode_key_doc_signable(
@@ -550,86 +527,6 @@ pub fn decode_key_doc(bytes: &[u8]) -> Result<KeyDocV2> {
     Ok(doc)
 }
 
-fn write_htlc_plan_coin(writer: &mut CanonicalWriter, coin: &HtlcPlanCoin) {
-    writer.write_fixed(&coin.coin_id);
-    writer.write_u64(coin.value);
-}
-
-fn read_htlc_plan_coin(reader: &mut CanonicalReader<'_>) -> Result<HtlcPlanCoin> {
-    Ok(HtlcPlanCoin {
-        coin_id: reader.read_fixed()?,
-        value: reader.read_u64()?,
-    })
-}
-
-pub fn write_htlc_plan_doc(writer: &mut CanonicalWriter, doc: &HtlcPlanDoc) -> Result<()> {
-    writer.write_fixed(&doc.chain_id);
-    writer.write_u64(doc.timeout_epoch);
-    writer.write_u64(doc.amount);
-    writer.write_string(&doc.paycode)?;
-    writer.write_vec(&doc.coins, |writer, coin| {
-        write_htlc_plan_coin(writer, coin);
-        Ok(())
-    })?;
-    Ok(())
-}
-
-pub fn read_htlc_plan_doc(reader: &mut CanonicalReader<'_>) -> Result<HtlcPlanDoc> {
-    Ok(HtlcPlanDoc {
-        chain_id: reader.read_fixed()?,
-        timeout_epoch: reader.read_u64()?,
-        amount: reader.read_u64()?,
-        paycode: reader.read_string()?,
-        coins: reader.read_vec(read_htlc_plan_coin)?,
-    })
-}
-
-pub fn encode_offer_doc_signable(doc: &OfferDocV2) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_u8(doc.version);
-    write_address(&mut writer, &doc.maker_address);
-    write_tagged_signing_public_key(&mut writer, &doc.maker_signing_pk);
-    write_htlc_plan_doc(&mut writer, &doc.plan)?;
-    writer.write_bool(doc.price_bps.is_some());
-    if let Some(value) = doc.price_bps {
-        writer.write_u64(value);
-    }
-    write_option_string(&mut writer, &doc.note)?;
-    Ok(writer.into_vec())
-}
-
-pub fn encode_offer_doc(doc: &OfferDocV2) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    let signable = encode_offer_doc_signable(doc)?;
-    writer.write_bytes(&signable)?;
-    writer.write_bytes(&doc.sig)?;
-    Ok(writer.into_vec())
-}
-
-pub fn decode_offer_doc(bytes: &[u8]) -> Result<OfferDocV2> {
-    let mut reader = CanonicalReader::new(bytes);
-    let signable_bytes = reader.read_bytes()?;
-    let sig = reader.read_bytes()?;
-    reader.finish()?;
-
-    let mut signable = CanonicalReader::new(&signable_bytes);
-    let doc = OfferDocV2 {
-        version: signable.read_u8()?,
-        maker_address: read_address(&mut signable)?,
-        maker_signing_pk: read_tagged_signing_public_key(&mut signable)?,
-        plan: read_htlc_plan_doc(&mut signable)?,
-        price_bps: if signable.read_bool()? {
-            Some(signable.read_u64()?)
-        } else {
-            None
-        },
-        note: read_option_string(&mut signable)?,
-        sig,
-    };
-    signable.finish()?;
-    Ok(doc)
-}
-
 pub fn encode_rate_limited_message(message: &RateLimitedMessage) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_string(&message.content)?;
@@ -643,40 +540,6 @@ pub fn decode_rate_limited_message(bytes: &[u8]) -> Result<RateLimitedMessage> {
     };
     reader.finish()?;
     Ok(message)
-}
-
-pub fn encode_coin_proof_request(request: &CoinProofRequest) -> Vec<u8> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&request.coin_id);
-    writer.into_vec()
-}
-
-pub fn decode_coin_proof_request(bytes: &[u8]) -> Result<CoinProofRequest> {
-    let mut reader = CanonicalReader::new(bytes);
-    let request = CoinProofRequest {
-        coin_id: reader.read_fixed()?,
-    };
-    reader.finish()?;
-    Ok(request)
-}
-
-pub fn encode_coin_proof_response(response: &CoinProofResponse) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    write_coin(&mut writer, &response.coin)?;
-    write_anchor(&mut writer, &response.anchor)?;
-    write_merkle_proof(&mut writer, &response.proof)?;
-    Ok(writer.into_vec())
-}
-
-pub fn decode_coin_proof_response(bytes: &[u8]) -> Result<CoinProofResponse> {
-    let mut reader = CanonicalReader::new(bytes);
-    let response = CoinProofResponse {
-        coin: read_coin(&mut reader)?,
-        anchor: read_anchor(&mut reader)?,
-        proof: read_merkle_proof(&mut reader)?,
-    };
-    reader.finish()?;
-    Ok(response)
 }
 
 pub fn encode_epoch_leaves_bundle(bundle: &EpochLeavesBundle) -> Result<Vec<u8>> {

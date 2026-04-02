@@ -26,32 +26,33 @@ The live protocol model is:
 
 - epoch anchors commit mined coins
 - `coin_epoch` binds each coin to the epoch that committed it
-- a spend proves inclusion against that committing epoch
-- the latest spend stored under `coin_id` defines current ownership
+- each committed coin is deterministically lifted into a genesis shielded note
+- shielded note commitments are appended to the global note tree
+- current ownership is represented by unspent notes plus evolving-nullifier history
 - `Tx` is the canonical persistence, validation, and gossip unit
 
-The current system is therefore a private spend chain over stable coin identities. It is not yet a global note commitment tree with append-only note creation.
+The current system is therefore a shielded note runtime rooted in an append-only note commitment tree rather than a `coin_id -> latest spend` chain.
 
 ## Privacy Model
 
-Wallet privacy comes from private recipient addresses, ML-KEM-derived one-time outputs, and hashlock-based ownership transfer.
+Wallet privacy comes from private recipient documents, ML-KEM-derived one-time outputs, and evolving nullifiers over shielded notes.
 
 Important consequence:
 
 - deterministic nullifiers remain in the transaction data for domain-separated spend identity
-- the node does not persist a global nullifier set as canonical state
-- replay prevention comes from the current lock state on the coin plus the latest confirmed spend record
+- the node does not persist a global historic nullifier set as canonical validator state
+- replay prevention comes from the active nullifier epoch plus historical unspent checkpoint validation
 
 This removes flat nullifier-set growth from the live path. In the current model, persisting every historic nullifier is redundant state.
 
 ## Validation Model
 
-Spend validation is commit-epoch aware:
+Shielded validation is epoch-aware:
 
-- each coin is bound to the epoch that committed it
-- spends validate inclusion against that epoch's Merkle root
-- wallets and validators share the same Merkle proof model
-- when local proof material is missing, clients can request a proof from peers and verify it against the stored committing anchor
+- each input note proves membership in the global note commitment tree
+- each input carries a historical-unspent checkpoint plus extension up to the prior nullifier epoch
+- validators enforce uniqueness in the current active nullifier epoch
+- validators can prune historic nullifier contents once the archived epoch commitments are fixed on chain
 
 ## Service Boundary
 
@@ -60,8 +61,8 @@ The product boundary is PQ-only by construction:
 - node-to-node communication runs over the signed PQ mesh
 - the mesh trust root is an offline ML-DSA node root that signs time-bounded runtime node records
 - the online runtime presents only its delegated ML-DSA auth key plus installed signed node record
-- wallet, offer, and message workflows are driven through the CLI and protocol messages
-- no bridge, x402, or separate offers HTTP perimeter exists in the default product
+- wallet and message workflows are driven through the CLI and protocol messages
+- no bridge, x402, offer market, or separate HTTP perimeter exists in the product
 - the metrics/log stream is loopback-only and not part of the remote protocol surface
 
 ## Product Surface
@@ -71,9 +72,8 @@ The public CLI is intentionally phrased in product terms:
 - `node init-root`, `node auth-prepare`, `node auth-sign`, and `node auth-install` implement the offline-root provisioning flow
 - `node start` is the explicit runtime entrypoint
 - `wallet receive`, `wallet send`, `wallet balance`, and `wallet history` are the primary wallet journeys
-- `offers` and `message` are mesh-native product commands
+- `message` is the mesh-native user command
 - `advanced` contains protocol and maintenance tooling
-- older flat command names remain only as compatibility aliases
 
 ## If Re-Architecting Further
 

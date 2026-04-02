@@ -12,7 +12,6 @@ use crate::node_identity::{
 use crate::protocol::CURRENT as PROTOCOL;
 use crate::storage::Store;
 use crate::sync::SyncState;
-use crate::wallet::Wallet;
 use crate::{
     coin::{Coin, CoinCandidate},
     config, crypto,
@@ -76,18 +75,6 @@ pub type NetHandle = Arc<Network>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitedMessage {
     pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoinProofRequest {
-    pub coin_id: [u8; 32],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoinProofResponse {
-    pub coin: Coin,
-    pub anchor: Anchor,
-    pub proof: Vec<([u8; 32], bool)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,19 +148,16 @@ enum WireTopic {
     Tx,
     CompactEpoch,
     RateLimited,
-    Offer,
     EpochLeaves,
     EpochSelectedResponse,
     EpochCandidatesResponse,
     EpochHeadersResponse,
     EpochByHashResponse,
-    CoinProofResponse,
     RequestEpoch,
     RequestEpochHeadersRange,
     RequestEpochByHash,
     RequestCoin,
     RequestLatestEpoch,
-    RequestCoinProof,
     RequestEpochTxn,
     EpochTxn,
     RequestEpochSelected,
@@ -201,24 +185,21 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::Tx => 4,
         WireTopic::CompactEpoch => 5,
         WireTopic::RateLimited => 6,
-        WireTopic::Offer => 7,
-        WireTopic::EpochLeaves => 8,
-        WireTopic::EpochSelectedResponse => 9,
-        WireTopic::EpochCandidatesResponse => 10,
-        WireTopic::EpochHeadersResponse => 11,
-        WireTopic::EpochByHashResponse => 12,
-        WireTopic::CoinProofResponse => 13,
-        WireTopic::RequestEpoch => 14,
-        WireTopic::RequestEpochHeadersRange => 15,
-        WireTopic::RequestEpochByHash => 16,
-        WireTopic::RequestCoin => 17,
-        WireTopic::RequestLatestEpoch => 18,
-        WireTopic::RequestCoinProof => 19,
-        WireTopic::RequestEpochTxn => 20,
-        WireTopic::EpochTxn => 21,
-        WireTopic::RequestEpochSelected => 22,
-        WireTopic::RequestEpochLeaves => 23,
-        WireTopic::RequestEpochCandidates => 24,
+        WireTopic::EpochLeaves => 7,
+        WireTopic::EpochSelectedResponse => 8,
+        WireTopic::EpochCandidatesResponse => 9,
+        WireTopic::EpochHeadersResponse => 10,
+        WireTopic::EpochByHashResponse => 11,
+        WireTopic::RequestEpoch => 12,
+        WireTopic::RequestEpochHeadersRange => 13,
+        WireTopic::RequestEpochByHash => 14,
+        WireTopic::RequestCoin => 15,
+        WireTopic::RequestLatestEpoch => 16,
+        WireTopic::RequestEpochTxn => 17,
+        WireTopic::EpochTxn => 18,
+        WireTopic::RequestEpochSelected => 19,
+        WireTopic::RequestEpochLeaves => 20,
+        WireTopic::RequestEpochCandidates => 21,
     }
 }
 
@@ -230,24 +211,21 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         4 => WireTopic::Tx,
         5 => WireTopic::CompactEpoch,
         6 => WireTopic::RateLimited,
-        7 => WireTopic::Offer,
-        8 => WireTopic::EpochLeaves,
-        9 => WireTopic::EpochSelectedResponse,
-        10 => WireTopic::EpochCandidatesResponse,
-        11 => WireTopic::EpochHeadersResponse,
-        12 => WireTopic::EpochByHashResponse,
-        13 => WireTopic::CoinProofResponse,
-        14 => WireTopic::RequestEpoch,
-        15 => WireTopic::RequestEpochHeadersRange,
-        16 => WireTopic::RequestEpochByHash,
-        17 => WireTopic::RequestCoin,
-        18 => WireTopic::RequestLatestEpoch,
-        19 => WireTopic::RequestCoinProof,
-        20 => WireTopic::RequestEpochTxn,
-        21 => WireTopic::EpochTxn,
-        22 => WireTopic::RequestEpochSelected,
-        23 => WireTopic::RequestEpochLeaves,
-        24 => WireTopic::RequestEpochCandidates,
+        7 => WireTopic::EpochLeaves,
+        8 => WireTopic::EpochSelectedResponse,
+        9 => WireTopic::EpochCandidatesResponse,
+        10 => WireTopic::EpochHeadersResponse,
+        11 => WireTopic::EpochByHashResponse,
+        12 => WireTopic::RequestEpoch,
+        13 => WireTopic::RequestEpochHeadersRange,
+        14 => WireTopic::RequestEpochByHash,
+        15 => WireTopic::RequestCoin,
+        16 => WireTopic::RequestLatestEpoch,
+        17 => WireTopic::RequestEpochTxn,
+        18 => WireTopic::EpochTxn,
+        19 => WireTopic::RequestEpochSelected,
+        20 => WireTopic::RequestEpochLeaves,
+        21 => WireTopic::RequestEpochCandidates,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -384,24 +362,19 @@ struct RuntimeState {
     peers: Arc<RwLock<HashMap<[u8; 32], Connection>>>,
     connected_peers: Arc<Mutex<HashSet<[u8; 32]>>>,
     pending_anchors: Arc<AsyncMutex<HashMap<u64, Vec<PendingAnchor>>>>,
-    pending_txs_by_coin: Arc<AsyncMutex<HashMap<[u8; 32], Vec<crate::transaction::Tx>>>>,
     seen_messages: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
     anchor_tx: broadcast::Sender<Anchor>,
-    proof_tx: broadcast::Sender<CoinProofResponse>,
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
     rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
-    offers_tx: broadcast::Sender<crate::wallet::OfferDocV2>,
 }
 
 #[derive(Clone)]
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
-    proof_tx: broadcast::Sender<CoinProofResponse>,
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
     rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
-    offers_tx: broadcast::Sender<crate::wallet::OfferDocV2>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     connected_peers: Arc<Mutex<HashSet<[u8; 32]>>>,
     shutdown: CancellationToken,
@@ -416,13 +389,11 @@ enum NetworkCommand {
     GossipTx(crate::transaction::Tx),
     GossipCompactEpoch(CompactEpoch),
     GossipRateLimited(RateLimitedMessage),
-    GossipOffer(crate::wallet::OfferDocV2),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
     RequestCoin([u8; 32]),
     RequestLatestEpoch,
-    RequestCoinProof([u8; 32]),
     RequestEpochTxn(EpochGetTxn),
     RequestEpochSelected(u64),
     RequestEpochLeaves(u64),
@@ -436,18 +407,14 @@ enum NetworkCommand {
 pub fn testing_stub_handle() -> NetHandle {
     let (tx_tx, _) = broadcast::channel(1);
     let (anchor_tx, _) = broadcast::channel(1);
-    let (proof_tx, _) = broadcast::channel(1);
-    let (offers_tx, _) = broadcast::channel::<crate::wallet::OfferDocV2>(1);
     let (rate_limited_tx, _) = broadcast::channel(1);
     let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
     let (command_tx, _) = mpsc::unbounded_channel();
     Arc::new(Network {
         anchor_tx,
-        proof_tx,
         tx_tx,
         rate_limited_tx,
         headers_tx,
-        offers_tx,
         command_tx,
         connected_peers: Arc::new(Mutex::new(HashSet::new())),
         shutdown: CancellationToken::new(),
@@ -964,7 +931,6 @@ impl RuntimeState {
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("anchor", &coin.epoch_hash) {
                     let _ = self.db.put_coin_epoch(&coin.id, anchor.num);
                 }
-                self.retry_pending_txs_for_coin(coin.id).await?;
             }
             WireTopic::Tx => {
                 let tx = canonical::decode_tx(&frame.body)?;
@@ -973,9 +939,7 @@ impl RuntimeState {
                         tx.apply(&self.db)?;
                         let _ = self.tx_tx.send(tx);
                     }
-                    Err(_) => {
-                        self.queue_tx_if_waiting_on_coin(tx).await?;
-                    }
+                    Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
                 }
             }
             WireTopic::CompactEpoch => {
@@ -986,13 +950,6 @@ impl RuntimeState {
             WireTopic::RateLimited => {
                 let msg = canonical::decode_rate_limited_message(&frame.body)?;
                 let _ = self.rate_limited_tx.send(msg);
-            }
-            WireTopic::Offer => {
-                let offer = canonical::decode_offer_doc(&frame.body)?;
-                Wallet::verify_offer_doc(&offer)?;
-                metrics::OFFERS_RECEIVED.inc();
-                store_offer(&self.db, &frame.body)?;
-                let _ = self.offers_tx.send(offer);
             }
             WireTopic::EpochLeaves => {
                 let bundle = canonical::decode_epoch_leaves_bundle(&frame.body)?;
@@ -1023,10 +980,6 @@ impl RuntimeState {
                     }
                 }
                 let _ = self.headers_tx.send(batch);
-            }
-            WireTopic::CoinProofResponse => {
-                let response = canonical::decode_coin_proof_response(&frame.body)?;
-                let _ = self.proof_tx.send(response);
             }
             WireTopic::RequestEpoch => {
                 let epoch = decode_u64_body(&frame.body)?;
@@ -1105,19 +1058,6 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::RequestCoinProof => {
-                let req = canonical::decode_coin_proof_request(&frame.body)?;
-                if let Ok(Some(response)) = build_coin_proof_response(&self.db, req.coin_id) {
-                    let _ = self
-                        .sign_and_send_to_peer_related(
-                            record.node_id,
-                            WireTopic::CoinProofResponse,
-                            canonical::encode_coin_proof_response(&response)?,
-                            Some(request_message_id),
-                        )
-                        .await?;
-                }
-            }
             WireTopic::RequestEpochTxn => {
                 let req = canonical::decode_epoch_get_txn(&frame.body)?;
                 let txn = self.lookup_epoch_txn(&req)?;
@@ -1139,10 +1079,7 @@ impl RuntimeState {
                     .get::<Anchor>("anchor", &txn.epoch_hash)?
                     .map(|anchor| anchor.num)
                     .ok_or_else(|| anyhow!("epoch txn references unknown anchor"))?;
-                let recovered = self.store_epoch_txn(txn)?;
-                for coin_id in recovered {
-                    let _ = self.retry_pending_txs_for_coin(coin_id).await;
-                }
+                self.store_epoch_txn(txn)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
             WireTopic::RequestEpochSelected => {
@@ -1241,48 +1178,6 @@ impl RuntimeState {
             indexes,
             coins,
         })
-    }
-
-    async fn queue_tx_if_waiting_on_coin(&self, tx: crate::transaction::Tx) -> Result<()> {
-        let missing = tx
-            .spends
-            .iter()
-            .filter_map(|spend| match self.db.get::<Coin>("coin", &spend.coin_id) {
-                Ok(Some(_)) => None,
-                _ => Some(spend.coin_id),
-            })
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            metrics::VALIDATION_FAIL_TRANSFER.inc();
-            return Ok(());
-        }
-        let mut pending = self.pending_txs_by_coin.lock().await;
-        for coin_id in missing {
-            let entry = pending.entry(coin_id).or_default();
-            if !entry.contains(&tx) {
-                entry.push(tx.clone());
-            }
-        }
-        Ok(())
-    }
-
-    async fn retry_pending_txs_for_coin(&self, coin_id: [u8; 32]) -> Result<()> {
-        let queued = self.pending_txs_by_coin.lock().await.remove(&coin_id);
-        let Some(queued) = queued else {
-            return Ok(());
-        };
-        for tx in queued {
-            match validate_tx(&tx, &self.db) {
-                Ok(()) => {
-                    tx.apply(&self.db)?;
-                    let _ = self.tx_tx.send(tx);
-                }
-                Err(_) => {
-                    let _ = self.queue_tx_if_waiting_on_coin(tx).await;
-                }
-            }
-        }
-        Ok(())
     }
 
     fn store_epoch_leaves_bundle(&self, bundle: EpochLeavesBundle) -> Result<()> {
@@ -1619,11 +1514,9 @@ pub async fn spawn(
 
     let persisted_records = load_persisted_records(&db, &banned_node_ids)?;
     let (anchor_tx, _) = broadcast::channel(256);
-    let (proof_tx, _) = broadcast::channel(256);
     let (tx_tx, _) = broadcast::channel(256);
     let (rate_limited_tx, _) = broadcast::channel(64);
     let (headers_tx, _) = broadcast::channel(256);
-    let (offers_tx, _) = broadcast::channel(256);
     let connected_peers = Arc::new(Mutex::new(HashSet::new()));
     let shutdown = CancellationToken::new();
     let tasks = TaskTracker::new();
@@ -1647,14 +1540,11 @@ pub async fn spawn(
         peers: Arc::new(RwLock::new(HashMap::new())),
         connected_peers: connected_peers.clone(),
         pending_anchors: Arc::new(AsyncMutex::new(HashMap::new())),
-        pending_txs_by_coin: Arc::new(AsyncMutex::new(HashMap::new())),
         seen_messages: Arc::new(AsyncMutex::new(HashMap::new())),
         anchor_tx: anchor_tx.clone(),
-        proof_tx: proof_tx.clone(),
         tx_tx: tx_tx.clone(),
         rate_limited_tx: rate_limited_tx.clone(),
         headers_tx: headers_tx.clone(),
-        offers_tx: offers_tx.clone(),
     };
 
     {
@@ -1672,11 +1562,9 @@ pub async fn spawn(
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let net = Arc::new(Network {
         anchor_tx,
-        proof_tx,
         tx_tx,
         rate_limited_tx,
         headers_tx,
-        offers_tx,
         command_tx: command_tx.clone(),
         connected_peers,
         shutdown,
@@ -1832,11 +1720,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::GossipOffer(offer) => {
-            state
-                .sign_and_broadcast(WireTopic::Offer, canonical::encode_offer_doc(&offer)?)
-                .await?;
-        }
         NetworkCommand::RequestEpoch(epoch) => {
             let _ = state
                 .sign_and_send_to_targets(
@@ -1888,15 +1771,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                     WireTopic::RequestLatestEpoch,
                     encode_empty_body(),
                     REQUEST_FANOUT_TIP,
-                )
-                .await?;
-        }
-        NetworkCommand::RequestCoinProof(coin_id) => {
-            let _ = state
-                .sign_and_send_to_targets(
-                    WireTopic::RequestCoinProof,
-                    canonical::encode_coin_proof_request(&CoinProofRequest { coin_id }),
-                    REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
@@ -1985,20 +1859,12 @@ impl Network {
         self.anchor_tx.subscribe()
     }
 
-    pub fn proof_subscribe(&self) -> broadcast::Receiver<CoinProofResponse> {
-        self.proof_tx.subscribe()
-    }
-
     pub fn tx_subscribe(&self) -> broadcast::Receiver<crate::transaction::Tx> {
         self.tx_tx.subscribe()
     }
 
     pub fn headers_subscribe(&self) -> broadcast::Receiver<EpochHeadersBatch> {
         self.headers_tx.subscribe()
-    }
-
-    pub fn offers_subscribe(&self) -> broadcast::Receiver<crate::wallet::OfferDocV2> {
-        self.offers_tx.subscribe()
     }
 
     pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> {
@@ -2067,12 +1933,6 @@ impl Network {
         let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch);
     }
 
-    pub async fn request_coin_proof(&self, coin_id: [u8; 32]) {
-        let _ = self
-            .command_tx
-            .send(NetworkCommand::RequestCoinProof(coin_id));
-    }
-
     pub async fn request_epoch_selected(&self, epoch_num: u64) {
         let _ = self
             .command_tx
@@ -2104,12 +1964,6 @@ impl Network {
         let _ = self
             .command_tx
             .send(NetworkCommand::GossipEpochLeaves(bundle));
-    }
-
-    pub async fn gossip_offer(&self, offer: &crate::wallet::OfferDocV2) {
-        let _ = self
-            .command_tx
-            .send(NetworkCommand::GossipOffer(offer.clone()));
     }
 
     pub fn peer_count(&self) -> usize {
@@ -2255,7 +2109,6 @@ fn should_relay_topic(topic: WireTopic) -> bool {
             | WireTopic::Tx
             | WireTopic::CompactEpoch
             | WireTopic::RateLimited
-            | WireTopic::Offer
     )
 }
 
@@ -2387,31 +2240,6 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     Ok(())
 }
 
-fn build_coin_proof_response(db: &Store, coin_id: [u8; 32]) -> Result<Option<CoinProofResponse>> {
-    let Some(coin) = db.get::<Coin>("coin", &coin_id)? else {
-        return Ok(None);
-    };
-    let Some(commit_epoch) = db.get_epoch_for_coin(&coin.id)? else {
-        return Ok(None);
-    };
-    let Some(anchor) = db.get::<Anchor>("epoch", &commit_epoch.to_le_bytes())? else {
-        return Ok(None);
-    };
-    let leaf = Coin::id_to_leaf_hash(&coin.id);
-    let proof = if let Some(levels) = db.get_epoch_levels(anchor.num)? {
-        MerkleTree::build_proof_from_levels(&levels, &leaf)
-    } else if let Some(leaves) = db.get_epoch_leaves(anchor.num)? {
-        MerkleTree::build_proof_from_leaves(&leaves, &leaf)
-    } else {
-        None
-    };
-    Ok(proof.map(|proof| CoinProofResponse {
-        coin,
-        anchor,
-        proof,
-    }))
-}
-
 fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
     if anchor.num == 0 {
         return Ok(());
@@ -2483,20 +2311,5 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
     );
     db.write_batch(batch)?;
     metrics::SELECTED_COINS.set(anchor.coin_count as i64);
-    Ok(())
-}
-
-fn store_offer(db: &Store, bytes: &[u8]) -> Result<()> {
-    let Some(cf) = db.db.cf_handle("offers") else {
-        return Ok(());
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u128)
-        .unwrap_or(0);
-    let mut key = Vec::with_capacity(16 + 32);
-    key.extend_from_slice(&ts.to_le_bytes());
-    key.extend_from_slice(blake3::hash(bytes).as_bytes());
-    db.db.put_cf(cf, &key, bytes)?;
     Ok(())
 }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    coin::Coin,
     crypto::{Address, TaggedKemPublicKey, TaggedSigningPublicKey},
     epoch::MerkleTree,
 };
@@ -10,6 +11,7 @@ use crate::{
 pub const SHIELDED_NOTE_VERSION: u8 = 1;
 pub const SHIELDED_CHECKPOINT_VERSION: u8 = 1;
 pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
+pub const SHIELDED_ACTIVE_NULLIFIER_VERSION: u8 = 1;
 
 const NOTE_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-note-key-v1";
 const NOTE_COMMIT_DOMAIN: &str = "unchained-shielded-note-commit-v1";
@@ -19,6 +21,9 @@ const NULLIFIER_LEAF_DOMAIN: &str = "unchained-shielded-nullifier-leaf-v1";
 const CHECKPOINT_BASE_DOMAIN: &str = "unchained-shielded-checkpoint-base-v1";
 const CHECKPOINT_STEP_DOMAIN: &str = "unchained-shielded-checkpoint-step-v1";
 const PRESENTATION_DOMAIN: &str = "unchained-shielded-presentation-v1";
+const GENESIS_NOTE_KEY_DOMAIN: &str = "unchained-shielded-genesis-note-key-v1";
+const GENESIS_NOTE_RHO_DOMAIN: &str = "unchained-shielded-genesis-note-rho-v1";
+const GENESIS_NOTE_RANDOMIZER_DOMAIN: &str = "unchained-shielded-genesis-note-randomizer-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedNote {
@@ -114,6 +119,13 @@ pub struct CheckpointPresentation {
     pub checkpoint: HistoricalUnspentCheckpoint,
     pub blinding: [u8; 32],
     pub presentation_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveNullifierEpoch {
+    pub version: u8,
+    pub epoch: u64,
+    pub nullifiers: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -616,6 +628,52 @@ impl ShieldedSyncServer {
     }
 }
 
+impl ActiveNullifierEpoch {
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            version: SHIELDED_ACTIVE_NULLIFIER_VERSION,
+            epoch,
+            nullifiers: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != SHIELDED_ACTIVE_NULLIFIER_VERSION {
+            bail!(
+                "unsupported active nullifier epoch version {}",
+                self.version
+            );
+        }
+        if self.nullifiers.windows(2).any(|pair| pair[0] >= pair[1]) {
+            bail!("active nullifier set must stay strictly sorted and deduplicated");
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, nullifier: &[u8; 32]) -> bool {
+        self.nullifiers.binary_search(nullifier).is_ok()
+    }
+
+    pub fn insert(&mut self, nullifier: [u8; 32]) -> Result<()> {
+        self.validate()?;
+        match self.nullifiers.binary_search(&nullifier) {
+            Ok(_) => bail!("duplicate current-epoch nullifier"),
+            Err(index) => {
+                self.nullifiers.insert(index, nullifier);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn archive(&self) -> Result<ArchivedNullifierEpoch> {
+        self.validate()?;
+        Ok(ArchivedNullifierEpoch::new(
+            self.epoch,
+            self.nullifiers.iter().copied(),
+        ))
+    }
+}
+
 pub fn note_key_commitment(note_key: &[u8; 32]) -> [u8; 32] {
     *blake3::Hasher::new_derive_key(NOTE_KEY_COMMIT_DOMAIN)
         .update(note_key)
@@ -721,4 +779,53 @@ fn hash_optional_membership(
             hasher.update(&[0]);
         }
     }
+}
+
+pub fn deterministic_genesis_note_key(coin: &Coin, chain_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_KEY_DOMAIN);
+    hasher.update(chain_id);
+    hasher.update(&coin.id);
+    hasher.update(&coin.epoch_hash);
+    hasher.update(&coin.creator_pk.bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn deterministic_genesis_rho(coin: &Coin, birth_epoch: u64, chain_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_RHO_DOMAIN);
+    hasher.update(chain_id);
+    hasher.update(&coin.id);
+    hasher.update(&birth_epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn deterministic_genesis_randomizer(
+    coin: &Coin,
+    birth_epoch: u64,
+    chain_id: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_RANDOMIZER_DOMAIN);
+    hasher.update(chain_id);
+    hasher.update(&coin.id);
+    hasher.update(&coin.creator_pk.bytes);
+    hasher.update(&birth_epoch.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn deterministic_genesis_note(
+    coin: &Coin,
+    birth_epoch: u64,
+    chain_id: &[u8; 32],
+) -> (ShieldedNote, [u8; 32], HistoricalUnspentCheckpoint) {
+    let note_key = deterministic_genesis_note_key(coin, chain_id);
+    let note = ShieldedNote::new(
+        coin.value,
+        birth_epoch,
+        coin.creator_pk.clone(),
+        TaggedKemPublicKey::zero_ml_kem_768(),
+        note_key,
+        deterministic_genesis_rho(coin, birth_epoch, chain_id),
+        deterministic_genesis_randomizer(coin, birth_epoch, chain_id),
+    );
+    let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch);
+    (note, note_key, checkpoint)
 }

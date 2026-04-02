@@ -14,8 +14,6 @@ pub struct Config {
     pub metrics: Metrics,
     #[serde(default)]
     pub compact: Compact,
-    #[serde(default)]
-    pub offers: Offers,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -150,41 +148,6 @@ impl Default for Compact {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Offers {
-    /// TTL for offers durability window (seconds)
-    #[serde(default = "default_offers_ttl_secs")]
-    pub ttl_secs: u64,
-    /// Maximum number of offers retained in the store
-    #[serde(default = "default_offers_max_entries")]
-    pub max_entries: u64,
-    /// Maximum allowed size for offer payloads (bytes)
-    #[serde(default = "default_offers_max_size_bytes")]
-    pub max_size_bytes: u64,
-    /// Per-peer daily cap on accepted offers (count)
-    #[serde(default = "default_offers_per_peer_daily")]
-    pub per_peer_daily: u64,
-    /// Minimum allowed amount in offers (coins)
-    #[serde(default = "default_offers_min_amount")]
-    pub min_amount: u64,
-    /// Default fee basis points to expect/advertise if not present
-    #[serde(default = "default_offers_fee_bps_default")]
-    pub fee_bps_default: u64,
-}
-
-impl Default for Offers {
-    fn default() -> Self {
-        Self {
-            ttl_secs: default_offers_ttl_secs(),
-            max_entries: default_offers_max_entries(),
-            max_size_bytes: default_offers_max_size_bytes(),
-            per_peer_daily: default_offers_per_peer_daily(),
-            min_amount: default_offers_min_amount(),
-            fee_bps_default: default_offers_fee_bps_default(),
-        }
-    }
-}
-
 fn default_mem() -> u32 {
     65_536
 } // 64 MiB
@@ -287,26 +250,6 @@ fn default_compact_max_missing_pct() -> u8 {
     20
 }
 
-// Offers defaults
-fn default_offers_ttl_secs() -> u64 {
-    60 * 60
-} // 1 hour
-fn default_offers_max_entries() -> u64 {
-    50_000
-}
-fn default_offers_max_size_bytes() -> u64 {
-    512 * 1024
-} // 512 KiB
-fn default_offers_per_peer_daily() -> u64 {
-    10_000
-}
-fn default_offers_min_amount() -> u64 {
-    1
-}
-fn default_offers_fee_bps_default() -> u64 {
-    0
-}
-
 /// Read the TOML file at `p` and deserialize into `Config`.
 /// *Adds context* so user errors print a friendlier message.
 ///
@@ -356,7 +299,7 @@ fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
     let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact", "offers",
+        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact",
     ]
     .into_iter()
     .collect();
@@ -428,17 +371,6 @@ fn warn_unknown_keys(val: &TomlValue) {
                 ("compact", TomlValue::Table(t)) => warn_unknown_keys_in(
                     t,
                     &["enable", "prefill_count", "short_id_len", "max_missing_pct"],
-                ),
-                ("offers", TomlValue::Table(t)) => warn_unknown_keys_in(
-                    t,
-                    &[
-                        "ttl_secs",
-                        "max_entries",
-                        "max_size_bytes",
-                        "per_peer_daily",
-                        "min_amount",
-                        "fee_bps_default",
-                    ],
                 ),
                 _ => {}
             }

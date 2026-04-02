@@ -75,14 +75,6 @@ name = "wallet_cf"
 path = "src/bin/wallet_cf.rs"
 
 [[bin]]
-name = "fix_fork"
-path = "src/bin/fix_fork.rs"
-
-[[bin]]
-name = "resync_after_rollback"
-path = "src/bin/resync_after_rollback.rs"
-
-[[bin]]
 name = "list_epochs"
 path = "src/bin/list_epochs.rs"
 

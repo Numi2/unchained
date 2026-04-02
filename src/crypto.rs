@@ -553,9 +553,7 @@ pub fn ml_kem_768_decapsulate(
     let shared_secret = sk
         .decapsulate(&ciphertext)
         .map_err(|_| anyhow!("ML-KEM-768 decapsulation failed"))?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(shared_secret.as_slice());
-    Ok(out)
+    Ok(derive_kem_shared_key32(shared_secret.as_slice()))
 }
 
 /// Derive the genesis lock secret deterministically from a dedicated wallet lock seed.

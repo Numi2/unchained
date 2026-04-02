@@ -17,13 +17,13 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 ## Protocol Posture
 
 - Consensus rules are protocol-locked in [`src/protocol.rs`](/Users/home/unchgit/unchained/src/protocol.rs).
-- Coins are committed by epoch anchors.
-- Spends validate inclusion against the epoch that committed the coin.
-- Ownership is serialized by `coin_id -> latest spend`, not by an append-only note pool.
-- Each spend still carries a deterministic nullifier on the wire, but the node does not persist a global nullifier set for replay prevention in the current spend-chain model.
+- Epoch anchors commit mined coins.
+- Mined coins are deterministically materialized into genesis shielded notes.
+- Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
 - Canonical transaction propagation happens on `unchained/tx/v1`.
+- Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
 
-This is a private transfer system, but it is not yet a full global shielded-note tree with zero-knowledge spend proofs. The public CLI therefore leads with wallet user journeys such as `wallet receive` and `wallet send`, while retaining older flat aliases for compatibility.
+The runtime is shielded-state-native, but it is not yet a full zero-knowledge spend system. Current transactions still reveal note openings to validators while the protocol waits for transparent recursive PQ proof replacement.
 
 ## Architecture
 
@@ -31,7 +31,7 @@ This is a private transfer system, but it is not yet a full global shielded-note
 - `wallet / privacy client`
 - `pq mesh runtime`
 
-The product is now a single PQ-only runtime. Remote interaction happens over the signed PQ mesh, while wallet, offers, and messaging flows are expressed through the CLI and the node-to-node protocol rather than separate HTTP perimeter services.
+The product is now a single PQ-only runtime. Remote interaction happens over the signed PQ mesh, while wallet and messaging flows are expressed through the CLI and the node-to-node protocol rather than separate HTTP perimeter services.
 
 The only remaining HTTP surface is the metrics/log stream, and it is loopback-only for local observability.
 
@@ -76,13 +76,12 @@ The primary user journeys are:
 - `wallet send`
 - `wallet balance`
 - `wallet history`
-- `offers watch`
 - `message send`
 - `message listen`
+- `advanced replay-transactions`
+- `advanced rescan-wallet`
 
 Operational and protocol-maintenance workflows live under `advanced`.
-
-Compatibility aliases are retained for older workflows, including `mine`, `peer-id`, `address`, `send`, `balance`, `history`, `stealth-address`, `offer-watch`, and message aliases.
 
 ## Docs
 

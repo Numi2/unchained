@@ -16,7 +16,6 @@ pub mod shielded;
 pub mod storage;
 pub mod sync;
 pub mod transaction;
-pub mod transfer;
 pub mod wallet;
 
 pub use coin::Coin;
@@ -26,4 +25,3 @@ pub use storage::Store;
 pub use wallet::Wallet;
 
 pub use transaction::Tx;
-pub use transfer::Spend;

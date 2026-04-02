@@ -254,7 +254,7 @@ pub fn spawn(
                 }
 
                 _ = backfill_timer.tick() => {
-                    // Background spend backfill to ensure offline receivers catch up
+                    // Background epoch-state repair to ensure offline nodes catch up cleanly
                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
                         let window: u64 = 16; // scan recent epochs
                         let start = latest.num.saturating_sub(window);
@@ -295,20 +295,6 @@ pub fn spawn(
                                             // Partial or empty reconstruction: ask peers
                                             net.request_epoch_selected(n).await;
                                             net.request_epoch_leaves(n).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Additionally, heal orphaned spends (spend present without its coin)
-                        if let Some(sp_cf) = db.db.cf_handle("spend") {
-                            let iter = db.db.iterator_cf(sp_cf, rocksdb::IteratorMode::Start);
-                            for item in iter {
-                                if let Ok((_k, v)) = item {
-                                    if let Ok(sp) = db.decode_spend_bytes(&v) {
-                                        if db.get::<crate::coin::Coin>("coin", &sp.coin_id).unwrap_or(None).is_none() {
-                                            net.request_coin(sp.coin_id).await;
                                         }
                                     }
                                 }

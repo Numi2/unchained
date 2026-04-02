@@ -53,14 +53,6 @@ impl RetargetCacheMem {
 // Global counter to ensure unique database paths
 static DB_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Encrypted OTP secret key record (version 1)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OtpSkRecordV1 {
-    pub salt: [u8; 16],
-    pub nonce: [u8; 24],
-    pub ct: Vec<u8>,
-}
-
 impl Store {
     pub fn base_path(&self) -> &str {
         &self.path
@@ -146,22 +138,17 @@ impl Store {
             "wallet",
             "anchor",
             "tx",
-            "spend",
-            "nullifier", // legacy CF; no longer canonical in the spend-chain model
-            "commitment_used",
-            "otp_sk",
-            "otp_index",
             "peers",
-            "wallet_scan_pending", // FIXED: pending wallet scans waiting for coin synchronization
-            "meta",                // miscellaneous metadata (e.g., cursors)
-            // Offer discovery CFs
-            "offers",       // id -> OfferStored
-            "offers_quota", // day||peer_hash -> u64 count
+            "meta", // miscellaneous metadata (e.g., cursors)
             // Shielded pool state
             "shielded_note_tree", // singleton canonical note commitment tree
             "shielded_nullifier_epoch", // epoch -> ArchivedNullifierEpoch
             "shielded_root_ledger", // singleton historical nullifier root ledger
             "shielded_checkpoint", // note_commitment -> HistoricalUnspentCheckpoint
+            "shielded_output",    // tx_id||output_index -> ShieldedOutput
+            "shielded_owned_note", // note_commitment -> wallet-owned note plaintext
+            "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
+            "shielded_spent_note", // note_commitment -> spent marker
         ];
 
         // Configure column family options with sane production defaults
@@ -371,36 +358,6 @@ impl Store {
         }
     }
 
-    pub fn get_spend(&self, key: &[u8]) -> Result<Option<crate::transfer::Spend>> {
-        let handle = self
-            .db
-            .cf_handle("spend")
-            .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", "spend"))?;
-
-        match self.db.get_cf(handle, key)? {
-            Some(value) => {
-                if let Ok(decompressed) = zstd::decode_all(&value[..]) {
-                    if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
-                        return Ok(Some(sp));
-                    }
-                }
-                Ok(Some(bincode::deserialize::<crate::transfer::Spend>(
-                    &value[..],
-                )?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub fn decode_spend_bytes(&self, bytes: &[u8]) -> Result<crate::transfer::Spend> {
-        if let Ok(decompressed) = zstd::decode_all(bytes) {
-            if let Ok(sp) = bincode::deserialize::<crate::transfer::Spend>(&decompressed) {
-                return Ok(sp);
-            }
-        }
-        Ok(bincode::deserialize::<crate::transfer::Spend>(bytes)?)
-    }
-
     /// Fetch raw bytes without attempting to deserialize
     pub fn get_raw_bytes(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let handle = self
@@ -539,25 +496,6 @@ impl Store {
         }
 
         Ok(coins)
-    }
-
-    /// Gets all unspent coins owned by a specific address
-    pub fn get_unspent_coins_by_owner(
-        &self,
-        owner_address: &[u8; 32],
-    ) -> Result<Vec<crate::coin::Coin>> {
-        let coins = self.get_coins_by_owner(owner_address)?;
-        let mut unspent_coins = Vec::new();
-
-        for coin in coins {
-            // Check if coin is spent (V3 chain)
-            let recorded_spend: Option<crate::transfer::Spend> = self.get_spend(&coin.id)?;
-            if recorded_spend.is_none() {
-                unspent_coins.push(coin);
-            }
-        }
-
-        Ok(unspent_coins)
     }
 
     /// Iterates over all coins in the database
@@ -760,107 +698,6 @@ impl Store {
 
     // (moved to module scope below)
 
-    /// Store a one-time secret key under pk_hash if absent. Returns Ok(()) even if already present.
-    pub fn put_otp_sk_if_absent(&self, pk_hash: &[u8; 32], sk_bytes: &[u8]) -> Result<()> {
-        use argon2::{Argon2, Params};
-        use chacha20poly1305::{
-            aead::{Aead, NewAead},
-            Key, XChaCha20Poly1305, XNonce,
-        };
-        use rand::rngs::OsRng;
-        use rand::RngCore;
-
-        let cf = self
-            .db
-            .cf_handle("otp_sk")
-            .ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
-        if self.db.get_cf(cf, pk_hash)?.is_some() {
-            return Ok(());
-        }
-
-        // Derive encryption key for OTP SKs from unified passphrase
-        let pass =
-            crate::crypto::unified_passphrase(Some("Enter pass-phrase to protect OTP keys:"))?;
-        let mut salt = [0u8; 16];
-        OsRng.fill_bytes(&mut salt);
-        let params = Params::new(256 * 1024, 3, 1, None)
-            .map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?; // 256 MiB, 3 iters, lanes=1
-        let mut key_bytes = [0u8; 32];
-        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(pass.as_bytes(), &salt, &mut key_bytes)
-            .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
-
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let mut nonce = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let ct = cipher
-            .encrypt(XNonce::from_slice(&nonce), sk_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt OTP SK: {}", e))?;
-        key_bytes.iter_mut().for_each(|b| *b = 0);
-
-        let rec = OtpSkRecordV1 { salt, nonce, ct };
-        let ser = bincode::serialize(&rec)?;
-        self.db.put_cf(cf, pk_hash, &ser)?;
-        Ok(())
-    }
-
-    /// Retrieve and decrypt a one-time secret key by pk_hash
-    pub fn get_otp_sk(&self, pk_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        use argon2::{Argon2, Params};
-        use chacha20poly1305::{
-            aead::{Aead, NewAead},
-            Key, XChaCha20Poly1305, XNonce,
-        };
-
-        let cf = self
-            .db
-            .cf_handle("otp_sk")
-            .ok_or_else(|| anyhow::anyhow!("'otp_sk' column family missing"))?;
-        let Some(v) = self.db.get_cf(cf, pk_hash)? else {
-            return Ok(None);
-        };
-        let rec: OtpSkRecordV1 = bincode::deserialize(&v)?;
-        let pass =
-            crate::crypto::unified_passphrase(Some("Enter pass-phrase to unlock OTP keys:"))?;
-        let params = Params::new(256 * 1024, 3, 1, None)
-            .map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?;
-        let mut key_bytes = [0u8; 32];
-        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(pass.as_bytes(), &rec.salt, &mut key_bytes)
-            .map_err(|e| anyhow::anyhow!("Argon2id key derivation failed: {}", e))?;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let pt = cipher
-            .decrypt(XNonce::from_slice(&rec.nonce), rec.ct.as_ref())
-            .map_err(|_| anyhow::anyhow!("Failed to decrypt OTP SK (wrong passphrase?)"))?;
-        key_bytes.iter_mut().for_each(|b| *b = 0);
-        Ok(Some(pt))
-    }
-
-    /// Index coin_id -> pk_hash to locate OTP SK for spends later
-    pub fn put_otp_index(&self, coin_id: &[u8; 32], pk_hash: &[u8; 32]) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("otp_index")
-            .ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
-        self.db.put_cf(cf, coin_id, pk_hash)?;
-        Ok(())
-    }
-
-    pub fn get_otp_pk_hash_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<[u8; 32]>> {
-        let cf = self
-            .db
-            .cf_handle("otp_index")
-            .ok_or_else(|| anyhow::anyhow!("'otp_index' column family missing"))?;
-        if let Some(v) = self.db.get_cf(cf, coin_id)? {
-            if v.len() == 32 {
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&v);
-                return Ok(Some(h));
-            }
-        }
-        Ok(None)
-    }
-
     /// Persist a signed node record into the peers CF keyed by node_id.
     pub fn store_node_record(&self, node_id: &[u8; 32], record_bytes: &[u8]) -> Result<()> {
         let cf = self
@@ -1022,6 +859,98 @@ impl Store {
             )),
             None => Ok(None),
         }
+    }
+
+    pub fn store_shielded_output(
+        &self,
+        tx_id: &[u8; 32],
+        output_index: u32,
+        output: &crate::transaction::ShieldedOutput,
+    ) -> Result<()> {
+        let mut key = Vec::with_capacity(36);
+        key.extend_from_slice(tx_id);
+        key.extend_from_slice(&output_index.to_le_bytes());
+        self.put("shielded_output", &key, output)
+    }
+
+    pub fn iterate_shielded_outputs(
+        &self,
+    ) -> Result<Vec<([u8; 32], u32, crate::transaction::ShieldedOutput)>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_output")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_output' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut outputs = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if key.len() != 36 {
+                continue;
+            }
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&key[..32]);
+            let mut index_bytes = [0u8; 4];
+            index_bytes.copy_from_slice(&key[32..]);
+            let output = bincode::deserialize::<crate::transaction::ShieldedOutput>(&value)?;
+            outputs.push((tx_id, u32::from_le_bytes(index_bytes), output));
+        }
+        Ok(outputs)
+    }
+
+    pub fn store_shielded_owned_note<T: Serialize>(
+        &self,
+        note_commitment: &[u8; 32],
+        record: &T,
+    ) -> Result<()> {
+        self.put("shielded_owned_note", note_commitment, record)
+    }
+
+    pub fn load_shielded_owned_note<T: DeserializeOwned + 'static>(
+        &self,
+        note_commitment: &[u8; 32],
+    ) -> Result<Option<T>> {
+        self.get("shielded_owned_note", note_commitment)
+    }
+
+    pub fn iterate_shielded_owned_notes<T: DeserializeOwned + 'static>(&self) -> Result<Vec<T>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_owned_note")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_owned_note' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut out = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            out.push(bincode::deserialize::<T>(&value)?);
+        }
+        Ok(out)
+    }
+
+    pub fn store_shielded_active_nullifier_epoch(
+        &self,
+        active: &crate::shielded::ActiveNullifierEpoch,
+    ) -> Result<()> {
+        self.put("shielded_active_nullifier", b"active", active)
+    }
+
+    pub fn load_shielded_active_nullifier_epoch(
+        &self,
+    ) -> Result<Option<crate::shielded::ActiveNullifierEpoch>> {
+        self.get("shielded_active_nullifier", b"active")
+    }
+
+    pub fn mark_shielded_note_spent(
+        &self,
+        note_commitment: &[u8; 32],
+        current_nullifier: &[u8; 32],
+    ) -> Result<()> {
+        self.put("shielded_spent_note", note_commitment, current_nullifier)
+    }
+
+    pub fn is_shielded_note_spent(&self, note_commitment: &[u8; 32]) -> Result<bool> {
+        Ok(self
+            .get_raw_bytes("shielded_spent_note", note_commitment)?
+            .is_some())
     }
 
     /// Gets selected coin IDs for an epoch
@@ -1348,22 +1277,22 @@ impl Store {
     /// Gets statistics about the database
     pub fn get_stats(&self) -> Result<DatabaseStats> {
         let coin_count = self.coin_count()?;
-        let transfer_count = self.spend_count()?;
+        let tx_count = self.tx_count()?;
         let epoch_count = self.epoch_count()?;
 
         Ok(DatabaseStats {
             coin_count,
-            transfer_count,
+            tx_count,
             epoch_count,
         })
     }
 
-    /// Gets the total number of spends in the database
-    pub fn spend_count(&self) -> Result<u64> {
+    /// Gets the total number of canonical transactions in the database.
+    pub fn tx_count(&self) -> Result<u64> {
         let cf = self
             .db
-            .cf_handle("spend")
-            .ok_or_else(|| anyhow::anyhow!("'spend' column family missing"))?;
+            .cf_handle("tx")
+            .ok_or_else(|| anyhow::anyhow!("'tx' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let count = iter.count() as u64;
@@ -1417,7 +1346,7 @@ impl Store {
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
     pub coin_count: u64,
-    pub transfer_count: u64,
+    pub tx_count: u64,
     pub epoch_count: u64,
 }
 
