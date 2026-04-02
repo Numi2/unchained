@@ -67,12 +67,15 @@ pub struct NullifierNonMembershipProof {
 pub struct ArchivedNullifierEpoch {
     pub epoch: u64,
     pub nullifiers: Vec<[u8; 32]>,
+    pub levels: Vec<Vec<[u8; 32]>>,
     pub root: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct NoteCommitmentTree {
     pub commitments: Vec<[u8; 32]>,
+    pub levels: Vec<Vec<[u8; 32]>>,
+    positions: BTreeMap<[u8; 32], u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -125,7 +128,7 @@ pub struct CheckpointPresentation {
 pub struct ActiveNullifierEpoch {
     pub version: u8,
     pub epoch: u64,
-    pub nullifiers: Vec<[u8; 32]>,
+    pub nullifiers: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +143,12 @@ pub struct ShieldedSpendContext {
 pub struct ShieldedSyncServer {
     epochs: BTreeMap<u64, ArchivedNullifierEpoch>,
     ledger: NullifierRootLedger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointExtensionRequest {
+    pub checkpoint: HistoricalUnspentCheckpoint,
+    pub queries: Vec<EvolvingNullifierQuery>,
 }
 
 impl ShieldedNote {
@@ -245,35 +254,65 @@ impl NoteCommitmentTree {
     pub fn new() -> Self {
         Self {
             commitments: Vec::new(),
+            levels: Vec::new(),
+            positions: BTreeMap::new(),
         }
     }
 
-    pub fn append(&mut self, commitment: [u8; 32]) {
+    pub fn from_parts(commitments: Vec<[u8; 32]>, levels: Vec<Vec<[u8; 32]>>) -> Result<Self> {
+        validate_leaf_levels(
+            &commitments
+                .iter()
+                .map(note_leaf_hash)
+                .collect::<Vec<[u8; 32]>>(),
+            &levels,
+        )?;
+        let mut positions = BTreeMap::new();
+        for (index, commitment) in commitments.iter().enumerate() {
+            if positions
+                .insert(*commitment, u32::try_from(index).unwrap_or(u32::MAX))
+                .is_some()
+            {
+                bail!("duplicate note commitment inside note tree");
+            }
+        }
+        Ok(Self {
+            commitments,
+            levels,
+            positions,
+        })
+    }
+
+    pub fn append(&mut self, commitment: [u8; 32]) -> Result<()> {
+        if self.positions.contains_key(&commitment) {
+            bail!("duplicate note commitment");
+        }
+        let index =
+            u32::try_from(self.commitments.len()).map_err(|_| anyhow!("note tree too large"))?;
         self.commitments.push(commitment);
+        self.positions.insert(commitment, index);
+        push_merkle_leaf(&mut self.levels, note_leaf_hash(&commitment));
+        Ok(())
     }
 
     pub fn root(&self) -> [u8; 32] {
-        let leaves = self.note_leaves();
-        MerkleTree::compute_root_from_sorted_leaves(&leaves)
+        merkle_root_from_levels(&self.levels)
     }
 
-    pub fn note_leaves(&self) -> Vec<[u8; 32]> {
-        let mut leaves = self
-            .commitments
-            .iter()
-            .map(note_leaf_hash)
-            .collect::<Vec<[u8; 32]>>();
-        leaves.sort();
-        leaves
+    pub fn len(&self) -> usize {
+        self.commitments.len()
+    }
+
+    pub fn contains_commitment(&self, note_commitment: &[u8; 32]) -> bool {
+        self.positions.contains_key(note_commitment)
     }
 
     pub fn prove_membership(&self, note_commitment: &[u8; 32]) -> Option<NoteMembershipProof> {
-        let leaves = self.note_leaves();
-        let leaf = note_leaf_hash(note_commitment);
-        let proof = MerkleTree::build_proof_from_leaves(&leaves, &leaf)?;
+        let index = usize::try_from(*self.positions.get(note_commitment)?).ok()?;
+        let proof = merkle_proof_from_levels(&self.levels, index)?;
         Some(NoteMembershipProof {
             note_commitment: *note_commitment,
-            root: self.root(),
+            root: merkle_root_from_levels(&self.levels),
             proof,
         })
     }
@@ -291,15 +330,51 @@ impl NoteMembershipProof {
 
 impl ArchivedNullifierEpoch {
     pub fn new(epoch: u64, nullifiers: impl IntoIterator<Item = [u8; 32]>) -> Self {
-        let mut unique = nullifiers.into_iter().collect::<BTreeSet<[u8; 32]>>();
-        let nullifiers = unique.iter().copied().collect::<Vec<_>>();
-        let root = compute_nullifier_root(&nullifiers);
-        unique.clear();
+        let nullifiers = nullifiers
+            .into_iter()
+            .collect::<BTreeSet<[u8; 32]>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let levels = build_merkle_levels(
+            &nullifiers
+                .iter()
+                .map(nullifier_leaf_hash)
+                .collect::<Vec<[u8; 32]>>(),
+        );
+        let root = merkle_root_from_levels(&levels);
         Self {
             epoch,
             nullifiers,
+            levels,
             root,
         }
+    }
+
+    pub fn from_parts(
+        epoch: u64,
+        nullifiers: Vec<[u8; 32]>,
+        levels: Vec<Vec<[u8; 32]>>,
+        root: [u8; 32],
+    ) -> Result<Self> {
+        if nullifiers.windows(2).any(|pair| pair[0] >= pair[1]) {
+            bail!("archived nullifier epoch must stay strictly sorted and deduplicated");
+        }
+        validate_leaf_levels(
+            &nullifiers
+                .iter()
+                .map(nullifier_leaf_hash)
+                .collect::<Vec<[u8; 32]>>(),
+            &levels,
+        )?;
+        if merkle_root_from_levels(&levels) != root {
+            bail!("archived nullifier epoch root mismatch");
+        }
+        Ok(Self {
+            epoch,
+            nullifiers,
+            levels,
+            root,
+        })
     }
 
     pub fn contains(&self, queried_nullifier: &[u8; 32]) -> bool {
@@ -334,21 +409,12 @@ impl ArchivedNullifierEpoch {
 
     fn membership_witness(&self, index: usize) -> Option<NullifierMembershipWitness> {
         let nullifier = *self.nullifiers.get(index)?;
-        let leaves = self.nullifier_leaves();
-        let leaf = nullifier_leaf_hash(&nullifier);
-        let proof = MerkleTree::build_proof_from_leaves(&leaves, &leaf)?;
+        let proof = merkle_proof_from_levels(&self.levels, index)?;
         Some(NullifierMembershipWitness {
             nullifier,
             root: self.root,
             proof,
         })
-    }
-
-    fn nullifier_leaves(&self) -> Vec<[u8; 32]> {
-        self.nullifiers
-            .iter()
-            .map(nullifier_leaf_hash)
-            .collect::<Vec<_>>()
     }
 }
 
@@ -545,23 +611,26 @@ impl ShieldedSyncServer {
         Self::default()
     }
 
+    pub fn insert_archived_epoch(&mut self, archived: ArchivedNullifierEpoch) -> Result<()> {
+        if self.epochs.contains_key(&archived.epoch) {
+            bail!("nullifier epoch {} already archived", archived.epoch);
+        }
+        if let Some((&last_epoch, _)) = self.epochs.last_key_value() {
+            if archived.epoch <= last_epoch {
+                bail!("nullifier epochs must be archived in increasing order");
+            }
+        }
+        self.ledger.remember_epoch(&archived);
+        self.epochs.insert(archived.epoch, archived);
+        Ok(())
+    }
+
     pub fn archive_epoch(
         &mut self,
         epoch: u64,
         nullifiers: impl IntoIterator<Item = [u8; 32]>,
     ) -> Result<()> {
-        if self.epochs.contains_key(&epoch) {
-            bail!("nullifier epoch {} already archived", epoch);
-        }
-        if let Some((&last_epoch, _)) = self.epochs.last_key_value() {
-            if epoch <= last_epoch {
-                bail!("nullifier epochs must be archived in increasing order");
-            }
-        }
-        let archived = ArchivedNullifierEpoch::new(epoch, nullifiers);
-        self.ledger.remember_epoch(&archived);
-        self.epochs.insert(epoch, archived);
-        Ok(())
+        self.insert_archived_epoch(ArchivedNullifierEpoch::new(epoch, nullifiers))
     }
 
     pub fn root_ledger(&self) -> &NullifierRootLedger {
@@ -577,54 +646,95 @@ impl ShieldedSyncServer {
         checkpoint: &HistoricalUnspentCheckpoint,
         queries: &[EvolvingNullifierQuery],
     ) -> Result<HistoricalUnspentExtension> {
-        let expected_from = checkpoint.covered_through_epoch.saturating_add(1);
-        if queries.is_empty() {
-            return Ok(HistoricalUnspentExtension {
-                version: SHIELDED_EXTENSION_VERSION,
-                note_commitment: checkpoint.note_commitment,
+        let mut extensions = self.extend_checkpoints_batch(&[CheckpointExtensionRequest {
+            checkpoint: checkpoint.clone(),
+            queries: queries.to_vec(),
+        }])?;
+        extensions
+            .pop()
+            .ok_or_else(|| anyhow!("missing checkpoint extension result"))
+    }
+
+    pub fn extend_checkpoints_batch(
+        &self,
+        requests: &[CheckpointExtensionRequest],
+    ) -> Result<Vec<HistoricalUnspentExtension>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        struct PendingExtension {
+            note_commitment: [u8; 32],
+            from_epoch: u64,
+            through_epoch: u64,
+            prior_transcript_root: [u8; 32],
+            transcript_root: [u8; 32],
+            records: Vec<HistoricalAbsenceRecord>,
+        }
+
+        let mut pending = Vec::with_capacity(requests.len());
+        let mut epoch_queries: BTreeMap<u64, Vec<(usize, [u8; 32])>> = BTreeMap::new();
+
+        for (request_index, request) in requests.iter().enumerate() {
+            let expected_from = request.checkpoint.covered_through_epoch.saturating_add(1);
+            let mut expected_epoch = expected_from;
+            for query in &request.queries {
+                if query.epoch != expected_epoch {
+                    bail!("queries must form a contiguous epoch range");
+                }
+                epoch_queries
+                    .entry(query.epoch)
+                    .or_default()
+                    .push((request_index, query.nullifier));
+                expected_epoch = expected_epoch.saturating_add(1);
+            }
+            pending.push(PendingExtension {
+                note_commitment: request.checkpoint.note_commitment,
                 from_epoch: expected_from,
-                through_epoch: checkpoint.covered_through_epoch,
-                prior_transcript_root: checkpoint.transcript_root,
-                new_transcript_root: checkpoint.transcript_root,
-                records: Vec::new(),
+                through_epoch: request.checkpoint.covered_through_epoch,
+                prior_transcript_root: request.checkpoint.transcript_root,
+                transcript_root: request.checkpoint.transcript_root,
+                records: Vec::with_capacity(request.queries.len()),
             });
         }
 
-        let mut records = Vec::with_capacity(queries.len());
-        let mut transcript_root = checkpoint.transcript_root;
-        let mut expected_epoch = expected_from;
-        for query in queries {
-            if query.epoch != expected_epoch {
-                bail!("queries must form a contiguous epoch range");
-            }
+        for (epoch, entries) in epoch_queries {
             let archived = self
                 .epochs
-                .get(&query.epoch)
-                .ok_or_else(|| anyhow!("missing nullifier archive for epoch {}", query.epoch))?;
-            let proof = archived.prove_absence(query.nullifier)?;
-            transcript_root = checkpoint_step_root(
-                &transcript_root,
-                query.epoch,
-                &query.nullifier,
-                &proof.digest(),
-            );
-            records.push(HistoricalAbsenceRecord {
-                epoch: query.epoch,
-                nullifier: query.nullifier,
-                proof,
-            });
-            expected_epoch = expected_epoch.saturating_add(1);
+                .get(&epoch)
+                .ok_or_else(|| anyhow!("missing nullifier archive for epoch {}", epoch))?;
+            let mut ordered_entries = entries;
+            ordered_entries.sort_by_key(|(_, nullifier)| *nullifier);
+            for (request_index, nullifier) in ordered_entries {
+                let proof = archived.prove_absence(nullifier)?;
+                let pending_extension = &mut pending[request_index];
+                pending_extension.transcript_root = checkpoint_step_root(
+                    &pending_extension.transcript_root,
+                    epoch,
+                    &nullifier,
+                    &proof.digest(),
+                );
+                pending_extension.records.push(HistoricalAbsenceRecord {
+                    epoch,
+                    nullifier,
+                    proof,
+                });
+                pending_extension.through_epoch = epoch;
+            }
         }
 
-        Ok(HistoricalUnspentExtension {
-            version: SHIELDED_EXTENSION_VERSION,
-            note_commitment: checkpoint.note_commitment,
-            from_epoch: expected_from,
-            through_epoch: expected_epoch.saturating_sub(1),
-            prior_transcript_root: checkpoint.transcript_root,
-            new_transcript_root: transcript_root,
-            records,
-        })
+        Ok(pending
+            .into_iter()
+            .map(|pending_extension| HistoricalUnspentExtension {
+                version: SHIELDED_EXTENSION_VERSION,
+                note_commitment: pending_extension.note_commitment,
+                from_epoch: pending_extension.from_epoch,
+                through_epoch: pending_extension.through_epoch,
+                prior_transcript_root: pending_extension.prior_transcript_root,
+                new_transcript_root: pending_extension.transcript_root,
+                records: pending_extension.records,
+            })
+            .collect())
     }
 }
 
@@ -633,7 +743,7 @@ impl ActiveNullifierEpoch {
         Self {
             version: SHIELDED_ACTIVE_NULLIFIER_VERSION,
             epoch,
-            nullifiers: Vec::new(),
+            nullifiers: BTreeSet::new(),
         }
     }
 
@@ -644,25 +754,19 @@ impl ActiveNullifierEpoch {
                 self.version
             );
         }
-        if self.nullifiers.windows(2).any(|pair| pair[0] >= pair[1]) {
-            bail!("active nullifier set must stay strictly sorted and deduplicated");
-        }
         Ok(())
     }
 
     pub fn contains(&self, nullifier: &[u8; 32]) -> bool {
-        self.nullifiers.binary_search(nullifier).is_ok()
+        self.nullifiers.contains(nullifier)
     }
 
     pub fn insert(&mut self, nullifier: [u8; 32]) -> Result<()> {
         self.validate()?;
-        match self.nullifiers.binary_search(&nullifier) {
-            Ok(_) => bail!("duplicate current-epoch nullifier"),
-            Err(index) => {
-                self.nullifiers.insert(index, nullifier);
-                Ok(())
-            }
+        if !self.nullifiers.insert(nullifier) {
+            bail!("duplicate current-epoch nullifier");
         }
+        Ok(())
     }
 
     pub fn archive(&self) -> Result<ArchivedNullifierEpoch> {
@@ -731,14 +835,6 @@ fn compute_note_commitment(
     *hasher.finalize().as_bytes()
 }
 
-fn compute_nullifier_root(nullifiers: &[[u8; 32]]) -> [u8; 32] {
-    let leaves = nullifiers
-        .iter()
-        .map(nullifier_leaf_hash)
-        .collect::<Vec<[u8; 32]>>();
-    MerkleTree::compute_root_from_sorted_leaves(&leaves)
-}
-
 fn checkpoint_base_root(note_commitment: &[u8; 32], birth_epoch: u64) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_BASE_DOMAIN);
     hasher.update(note_commitment);
@@ -779,6 +875,126 @@ fn hash_optional_membership(
             hasher.update(&[0]);
         }
     }
+}
+
+fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
+}
+
+fn build_merkle_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+    let mut levels = vec![leaves.to_vec()];
+    while levels.last().map(|level| level.len()).unwrap_or(0) > 1 {
+        let current = levels.last().cloned().unwrap_or_default();
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
+        for pair in current.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            next.push(hash_pair(&pair[0], right));
+        }
+        levels.push(next);
+    }
+    levels
+}
+
+fn push_merkle_leaf(levels: &mut Vec<Vec<[u8; 32]>>, leaf: [u8; 32]) {
+    if levels.is_empty() {
+        levels.push(Vec::new());
+    }
+    levels[0].push(leaf);
+
+    let mut level_index = 0usize;
+    let mut node_index = levels[0].len() - 1;
+    loop {
+        if levels.len() <= level_index + 1 {
+            levels.push(Vec::new());
+        }
+        let parent_index = node_index / 2;
+        let left_index = node_index & !1;
+        let left = levels[level_index][left_index];
+        let right = levels[level_index]
+            .get(left_index + 1)
+            .copied()
+            .unwrap_or(left);
+        let parent = hash_pair(&left, &right);
+        if levels[level_index + 1].len() == parent_index {
+            levels[level_index + 1].push(parent);
+        } else {
+            levels[level_index + 1][parent_index] = parent;
+        }
+        level_index += 1;
+        node_index = parent_index;
+        if node_index == 0 && levels[level_index].len() == 1 {
+            break;
+        }
+    }
+}
+
+fn merkle_root_from_levels(levels: &[Vec<[u8; 32]>]) -> [u8; 32] {
+    levels
+        .last()
+        .and_then(|level| level.first())
+        .copied()
+        .unwrap_or([0u8; 32])
+}
+
+fn merkle_proof_from_levels(
+    levels: &[Vec<[u8; 32]>],
+    mut index: usize,
+) -> Option<Vec<([u8; 32], bool)>> {
+    let leaf_count = levels.first().map(|level| level.len()).unwrap_or(0);
+    if leaf_count == 0 || index >= leaf_count {
+        return None;
+    }
+    let mut proof = Vec::with_capacity(levels.len().saturating_sub(1));
+    for level in levels.iter().take(levels.len().saturating_sub(1)) {
+        let sibling_index = if index % 2 == 0 {
+            (index + 1).min(level.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        let sibling_is_left = sibling_index < index;
+        proof.push((level[sibling_index], sibling_is_left));
+        index /= 2;
+    }
+    Some(proof)
+}
+
+fn validate_leaf_levels(leaves: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> Result<()> {
+    if leaves.is_empty() {
+        if !levels.is_empty() {
+            bail!("empty merkle state cannot contain levels");
+        }
+        return Ok(());
+    }
+    if levels.is_empty() {
+        bail!("non-empty merkle state requires levels");
+    }
+    if levels[0] != leaves {
+        bail!("leaf level does not match the expected leaves");
+    }
+    for level_index in 0..levels.len().saturating_sub(1) {
+        let current = &levels[level_index];
+        let next = &levels[level_index + 1];
+        if next.len() != current.len().div_ceil(2) {
+            bail!("invalid merkle level width");
+        }
+        for (parent_index, pair) in current.chunks(2).enumerate() {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let expected = hash_pair(&pair[0], right);
+            if next[parent_index] != expected {
+                bail!("invalid merkle parent hash");
+            }
+        }
+    }
+    if levels.last().map(|level| level.len()).unwrap_or(0) != 1 {
+        bail!("top merkle level must contain exactly one node");
+    }
+    Ok(())
 }
 
 pub fn deterministic_genesis_note_key(coin: &Coin, chain_id: &[u8; 32]) -> [u8; 32] {

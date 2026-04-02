@@ -64,6 +64,8 @@ The proof-carrying contract is split deliberately:
 
 This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
 
+On the client side, checkpoint refresh is now batched across notes and epoch-grouped before witness construction. The wallet also pads per-epoch sync batches with cover requests, so archive sync no longer has to look exactly like “the notes being spent right now”.
+
 ## Service Boundary
 
 The product boundary is PQ-only by construction:

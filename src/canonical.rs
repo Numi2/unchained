@@ -870,14 +870,21 @@ pub fn encode_note_commitment_tree(tree: &NoteCommitmentTree) -> Result<Vec<u8>>
         writer.write_fixed(commitment);
         Ok(())
     })?;
+    writer.write_vec(&tree.levels, |writer, level| {
+        writer.write_vec(level, |writer, node| {
+            writer.write_fixed(node);
+            Ok(())
+        })
+    })?;
     Ok(writer.into_vec())
 }
 
 pub fn decode_note_commitment_tree(bytes: &[u8]) -> Result<NoteCommitmentTree> {
     let mut reader = CanonicalReader::new(bytes);
     let commitments = reader.read_vec(|reader| reader.read_fixed())?;
+    let levels = reader.read_vec(|reader| reader.read_vec(|reader| reader.read_fixed()))?;
     reader.finish()?;
-    Ok(NoteCommitmentTree { commitments })
+    NoteCommitmentTree::from_parts(commitments, levels)
 }
 
 pub fn encode_note_membership_proof(proof: &NoteMembershipProof) -> Result<Vec<u8>> {
@@ -974,19 +981,24 @@ pub fn encode_archived_nullifier_epoch(epoch: &ArchivedNullifierEpoch) -> Result
         writer.write_fixed(nullifier);
         Ok(())
     })?;
+    writer.write_vec(&epoch.levels, |writer, level| {
+        writer.write_vec(level, |writer, node| {
+            writer.write_fixed(node);
+            Ok(())
+        })
+    })?;
     writer.write_fixed(&epoch.root);
     Ok(writer.into_vec())
 }
 
 pub fn decode_archived_nullifier_epoch(bytes: &[u8]) -> Result<ArchivedNullifierEpoch> {
     let mut reader = CanonicalReader::new(bytes);
-    let epoch = ArchivedNullifierEpoch {
-        epoch: reader.read_u64()?,
-        nullifiers: reader.read_vec(|reader| reader.read_fixed())?,
-        root: reader.read_fixed()?,
-    };
+    let epoch_num = reader.read_u64()?;
+    let nullifiers = reader.read_vec(|reader| reader.read_fixed())?;
+    let levels = reader.read_vec(|reader| reader.read_vec(|reader| reader.read_fixed()))?;
+    let root = reader.read_fixed()?;
     reader.finish()?;
-    Ok(epoch)
+    ArchivedNullifierEpoch::from_parts(epoch_num, nullifiers, levels, root)
 }
 
 pub fn encode_nullifier_root_ledger(ledger: &NullifierRootLedger) -> Result<Vec<u8>> {

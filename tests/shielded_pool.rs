@@ -56,7 +56,7 @@ fn note_commitment_tree_membership_proof_verifies() -> Result<()> {
     ];
     let mut tree = NoteCommitmentTree::new();
     for note in &notes {
-        tree.append(note.commitment);
+        tree.append(note.commitment)?;
     }
 
     let proof = tree
@@ -132,6 +132,65 @@ fn checkpoint_extensions_are_portable_across_providers() -> Result<()> {
 }
 
 #[test]
+fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
+    let chain_id = [77u8; 32];
+    let note_a_key = [17u8; 32];
+    let note_b_key = [27u8; 32];
+    let note_a = fixed_note(5, note_a_key, [18u8; 32], [19u8; 32]);
+    let note_b = fixed_note(6, note_b_key, [28u8; 32], [29u8; 32]);
+
+    let mut provider = ShieldedSyncServer::new();
+    for (epoch, set) in [
+        (5u64, vec![[90u8; 32], [91u8; 32]]),
+        (6u64, vec![[92u8; 32], [93u8; 32]]),
+        (7u64, vec![[94u8; 32], [95u8; 32]]),
+    ] {
+        provider.archive_epoch(epoch, set)?;
+    }
+
+    let checkpoint_a = HistoricalUnspentCheckpoint::genesis(note_a.commitment, note_a.birth_epoch);
+    let checkpoint_b = HistoricalUnspentCheckpoint::genesis(note_b.commitment, note_b.birth_epoch);
+    let batch = provider.extend_checkpoints_batch(&[
+        unchained::shielded::CheckpointExtensionRequest {
+            checkpoint: checkpoint_a.clone(),
+            queries: vec![
+                unchained::shielded::EvolvingNullifierQuery {
+                    epoch: 5,
+                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 5)?,
+                },
+                unchained::shielded::EvolvingNullifierQuery {
+                    epoch: 6,
+                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 6)?,
+                },
+                unchained::shielded::EvolvingNullifierQuery {
+                    epoch: 7,
+                    nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 7)?,
+                },
+            ],
+        },
+        unchained::shielded::CheckpointExtensionRequest {
+            checkpoint: checkpoint_b.clone(),
+            queries: vec![
+                unchained::shielded::EvolvingNullifierQuery {
+                    epoch: 6,
+                    nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 6)?,
+                },
+                unchained::shielded::EvolvingNullifierQuery {
+                    epoch: 7,
+                    nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 7)?,
+                },
+            ],
+        },
+    ])?;
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].through_epoch, 7);
+    assert_eq!(batch[1].through_epoch, 7);
+    assert_eq!(batch[0].records.len(), 3);
+    assert_eq!(batch[1].records.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn checkpoint_presentations_are_blinded() -> Result<()> {
     let note = fixed_note(3, [21u8; 32], [22u8; 32], [23u8; 32]);
     let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
@@ -154,7 +213,7 @@ fn storage_roundtrip_persists_shielded_state() -> Result<()> {
 
     let note = fixed_note(8, [31u8; 32], [32u8; 32], [33u8; 32]);
     let mut tree = NoteCommitmentTree::new();
-    tree.append(note.commitment);
+    tree.append(note.commitment)?;
     let epoch = ArchivedNullifierEpoch::new(8, vec![[41u8; 32], [42u8; 32]]);
     let mut provider = ShieldedSyncServer::new();
     provider.archive_epoch(epoch.epoch, epoch.nullifiers.clone())?;

@@ -11,8 +11,8 @@ use crate::{
     protocol::CURRENT as PROTOCOL,
     shielded::{
         deterministic_genesis_note, ActiveNullifierEpoch, ArchivedNullifierEpoch,
-        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, NoteCommitmentTree,
-        NullifierRootLedger, ShieldedNote,
+        CheckpointExtensionRequest, EvolvingNullifierQuery, HistoricalUnspentCheckpoint,
+        HistoricalUnspentExtension, NoteCommitmentTree, NullifierRootLedger, ShieldedNote,
     },
     storage::Store,
 };
@@ -106,7 +106,6 @@ impl Tx {
             bail!("shielded receipt output count mismatch");
         }
 
-        let existing_commitments = tree.commitments.iter().copied().collect::<HashSet<_>>();
         let mut seen_nullifiers = HashSet::new();
         for (index, binding) in journal.inputs.iter().enumerate() {
             if binding.current_nullifier != self.nullifiers[index] {
@@ -139,7 +138,7 @@ impl Tx {
             if binding != &proof::output_binding(output) {
                 bail!("shielded receipt output binding mismatch");
             }
-            if existing_commitments.contains(&output.note_commitment)
+            if tree.contains_commitment(&output.note_commitment)
                 || !new_commitments.insert(output.note_commitment)
             {
                 bail!("duplicate shielded output note commitment");
@@ -171,7 +170,7 @@ impl Tx {
         }
 
         for (index, output) in self.outputs.iter().enumerate() {
-            tree.append(output.note_commitment);
+            tree.append(output.note_commitment)?;
             let mut output_key = Vec::with_capacity(36);
             output_key.extend_from_slice(&tx_id);
             output_key.extend_from_slice(&(index as u32).to_le_bytes());
@@ -242,46 +241,65 @@ pub fn build_local_historical_extension(
     checkpoint: &HistoricalUnspentCheckpoint,
     through_epoch: Option<u64>,
 ) -> Result<HistoricalUnspentExtension> {
+    let requests = vec![build_local_extension_request(
+        db,
+        note,
+        note_key,
+        checkpoint,
+        through_epoch,
+    )?];
+    let mut extensions = build_local_historical_extensions(db, &requests)?;
+    extensions
+        .pop()
+        .ok_or_else(|| anyhow!("missing local historical extension"))
+}
+
+pub fn build_local_historical_extensions(
+    db: &Store,
+    requests: &[CheckpointExtensionRequest],
+) -> Result<Vec<HistoricalUnspentExtension>> {
     ensure_shielded_runtime_state(db)?;
-    let expected_from = checkpoint.covered_through_epoch.saturating_add(1);
-    let Some(through_epoch) = through_epoch else {
-        let server = crate::shielded::ShieldedSyncServer::new();
-        return server.extend_checkpoint(checkpoint, &[]);
-    };
-    if through_epoch < expected_from {
-        let server = crate::shielded::ShieldedSyncServer::new();
-        return server.extend_checkpoint(checkpoint, &[]);
+    if requests.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let chain_id = db.get_chain_id()?;
     let mut server = crate::shielded::ShieldedSyncServer::new();
-    let mut queries = Vec::new();
-    for epoch in expected_from..=through_epoch {
+    let mut needed_epochs = std::collections::BTreeSet::new();
+    for request in requests {
+        for query in &request.queries {
+            needed_epochs.insert(query.epoch);
+        }
+    }
+    for epoch in needed_epochs {
         let archived = db
             .load_shielded_nullifier_epoch(epoch)?
             .unwrap_or_else(|| ArchivedNullifierEpoch::new(epoch, std::iter::empty()));
-        server.archive_epoch(epoch, archived.nullifiers.clone())?;
-        queries.push(crate::shielded::EvolvingNullifierQuery {
-            epoch,
-            nullifier: note.derive_evolving_nullifier(note_key, &chain_id, epoch)?,
-        });
+        server.insert_archived_epoch(archived)?;
     }
-    server.extend_checkpoint(checkpoint, &queries)
+    server.extend_checkpoints_batch(requests)
 }
 
 pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
     let chain_id = db.get_chain_id()?;
-    let coins = db.iterate_coins()?;
+    let mut coins = db
+        .iterate_coins()?
+        .into_iter()
+        .map(|coin| {
+            let birth_epoch = db.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
+            Ok((birth_epoch, coin))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    coins.sort_by(|(epoch_a, coin_a), (epoch_b, coin_b)| {
+        epoch_a.cmp(epoch_b).then(coin_a.id.cmp(&coin_b.id))
+    });
     let mut tree = db
         .load_shielded_note_tree()?
         .unwrap_or_else(NoteCommitmentTree::new);
     let mut changed = false;
-    let mut known = tree.commitments.iter().copied().collect::<HashSet<_>>();
-    for coin in coins {
-        let birth_epoch = db.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
+    for (birth_epoch, coin) in coins {
         let (note, _, _) = deterministic_genesis_note(&coin, birth_epoch, &chain_id);
-        if known.insert(note.commitment) {
-            tree.append(note.commitment);
+        if !tree.contains_commitment(&note.commitment) {
+            tree.append(note.commitment)?;
             changed = true;
         }
     }
@@ -289,6 +307,41 @@ pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
         db.store_shielded_note_tree(&tree)?;
     }
     Ok(())
+}
+
+fn build_local_extension_request(
+    db: &Store,
+    note: &ShieldedNote,
+    note_key: &[u8; 32],
+    checkpoint: &HistoricalUnspentCheckpoint,
+    through_epoch: Option<u64>,
+) -> Result<CheckpointExtensionRequest> {
+    let expected_from = checkpoint.covered_through_epoch.saturating_add(1);
+    let Some(through_epoch) = through_epoch else {
+        return Ok(CheckpointExtensionRequest {
+            checkpoint: checkpoint.clone(),
+            queries: Vec::new(),
+        });
+    };
+    if through_epoch < expected_from {
+        return Ok(CheckpointExtensionRequest {
+            checkpoint: checkpoint.clone(),
+            queries: Vec::new(),
+        });
+    }
+
+    let chain_id = db.get_chain_id()?;
+    let mut queries = Vec::new();
+    for epoch in expected_from..=through_epoch {
+        queries.push(EvolvingNullifierQuery {
+            epoch,
+            nullifier: note.derive_evolving_nullifier(note_key, &chain_id, epoch)?,
+        });
+    }
+    Ok(CheckpointExtensionRequest {
+        checkpoint: checkpoint.clone(),
+        queries,
+    })
 }
 
 fn rollover_active_nullifier_epoch(db: &Store) -> Result<()> {

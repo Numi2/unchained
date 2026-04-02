@@ -82,6 +82,12 @@ validator hot path without weakening safety.
 `ShieldedSyncServer::extend_checkpoint()` extends that checkpoint over a
 contiguous range of epochs by producing authenticated absence records.
 
+The live wallet no longer uses this in a one-note-at-a-time pattern. It builds
+batched checkpoint-extension requests across many owned notes, groups them by
+epoch, and pads each epoch batch with cover requests up to a power-of-two
+bucket. That improves both scale and query-shape privacy without changing
+consensus semantics.
+
 `HistoricalUnspentCheckpoint::apply_extension()` verifies those records against
 the `NullifierRootLedger` and advances the checkpoint without requiring the
 client to download the full historical nullifier database.
@@ -148,7 +154,7 @@ The remaining frontier is sync/privacy efficiency, not shielded spend
 correctness:
 
 1. batched checkpoint extension across many notes
-2. stronger provider-oblivious synchronization
+2. stronger provider-oblivious synchronization beyond padded batching
 3. content-addressed archival distribution for historical nullifier epochs
 4. proof-system-level rerandomization and accumulation schemes where they
    improve privacy or amortized proving cost without weakening PQ safety
