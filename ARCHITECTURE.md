@@ -49,10 +49,20 @@ This removes flat nullifier-set growth from the live path. In the current model,
 
 Shielded validation is epoch-aware:
 
-- each input note proves membership in the global note commitment tree
-- each input carries a historical-unspent checkpoint plus extension up to the prior nullifier epoch
+- each input note proves membership in the global note commitment tree inside a private witness
+- each input carries a historical-unspent checkpoint plus extension up to the prior nullifier epoch inside that same private witness
 - validators enforce uniqueness in the current active nullifier epoch
+- validators verify a succinct STARK receipt and only consume its public journal bindings
 - validators can prune historic nullifier contents once the archived epoch commitments are fixed on chain
+
+The proof-carrying contract is split deliberately:
+
+- [`proof-core`](/Users/home/unchgit/unchained/proof-core/src/lib.rs) defines the canonical witness and public journal semantics
+- [`methods/guest`](/Users/home/unchgit/unchained/methods/guest/src/main.rs) validates the witness inside the zkVM
+- [`src/proof.rs`](/Users/home/unchgit/unchained/src/proof.rs) produces and verifies succinct receipts
+- [`src/transaction.rs`](/Users/home/unchgit/unchained/src/transaction.rs) binds those public journal fields to live chain state before applying updates
+
+This means historical absence records, note membership paths, and note plaintexts are no longer transaction fields. They are witness material hidden behind the receipt.
 
 ## Service Boundary
 
@@ -65,6 +75,8 @@ The product boundary is PQ-only by construction:
 - no bridge, x402, offer market, or separate HTTP perimeter exists in the product
 - the metrics/log stream is loopback-only and not part of the remote protocol surface
 
+On Apple Silicon/macOS, the proving path is intentionally CPU-first. Metal kernels are not part of the correctness boundary and are not required for a working node or test run.
+
 ## Product Surface
 
 The public CLI is intentionally phrased in product terms:
@@ -75,14 +87,14 @@ The public CLI is intentionally phrased in product terms:
 - `message` is the mesh-native user command
 - `advanced` contains protocol and maintenance tooling
 
-## If Re-Architecting Further
+## Privacy Frontier
 
-The shielded-pool successor is now being defined in [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md) and implemented in [src/shielded.rs](/Users/home/unchgit/unchained/src/shielded.rs).
+The live runtime already proves shielded spends with succinct STARK receipts and avoids validator nullifier bloat. The next research-grade frontier is not “make spends private” anymore; it is making archive synchronization more oblivious and more batched without weakening the PQ story.
 
-The target remains:
+That future work should improve:
 
-- one global note commitment tree
-- one compact spent-set commitment or accumulator
-- zero-knowledge spend proofs that prove note inclusion and spent-set non-membership
+- provider privacy under repeated checkpoint extension queries
+- batch proof amortization across many notes
+- long-horizon data-availability for archived nullifier epochs
 
-That future design should not reintroduce an unbounded RocksDB nullifier column as the canonical state root. A real note-pool architecture needs a committed spent-set design, not flat storage growth.
+It should not reintroduce an unbounded RocksDB nullifier column as canonical state.

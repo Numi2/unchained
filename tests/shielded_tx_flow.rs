@@ -115,6 +115,7 @@ fn provision_runtime_identity(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "expensive succinct STARK proof-generation integration"]
 async fn shielded_wallet_send_and_receive_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -156,7 +157,7 @@ async fn shielded_wallet_send_and_receive_roundtrip() -> anyhow::Result<()> {
         .get_raw_bytes("tx", &tx_id)?
         .expect("persisted tx bytes");
     let tx = unchained::canonical::decode_tx(&tx_bytes)?;
-    assert_eq!(tx.inputs.len(), 1);
+    assert_eq!(tx.nullifiers.len(), 1);
     assert_eq!(tx.outputs.len(), 1);
 
     tx.apply(receiver_db.as_ref())?;

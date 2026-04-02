@@ -20,7 +20,7 @@ use crate::{
         NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof,
         NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
-    transaction::{ShieldedInput, ShieldedOutput, ShieldedOutputPlaintext, Tx},
+    transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
     wallet::KeyDocV2,
 };
 
@@ -394,36 +394,9 @@ pub fn decode_coin_candidate(bytes: &[u8]) -> Result<CoinCandidate> {
     Ok(coin)
 }
 
-fn write_shielded_input(writer: &mut CanonicalWriter, input: &ShieldedInput) -> Result<()> {
-    writer.write_bytes(&encode_shielded_note(&input.note)?)?;
-    writer.write_fixed(&input.note_key);
-    writer.write_bytes(&encode_note_membership_proof(&input.membership_proof)?)?;
-    writer.write_bytes(&encode_historical_unspent_checkpoint(
-        &input.historical_checkpoint,
-    )?)?;
-    writer.write_bytes(&encode_historical_unspent_extension(
-        &input.historical_extension,
-    )?)?;
-    writer.write_fixed(&input.current_nullifier);
-    writer.write_bytes(&input.authorization_sig)?;
-    Ok(())
-}
-
-fn read_shielded_input(reader: &mut CanonicalReader<'_>) -> Result<ShieldedInput> {
-    Ok(ShieldedInput {
-        note: decode_shielded_note(&reader.read_bytes()?)?,
-        note_key: reader.read_fixed()?,
-        membership_proof: decode_note_membership_proof(&reader.read_bytes()?)?,
-        historical_checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
-        historical_extension: decode_historical_unspent_extension(&reader.read_bytes()?)?,
-        current_nullifier: reader.read_fixed()?,
-        authorization_sig: reader.read_bytes()?,
-    })
-}
-
 pub fn encode_shielded_output(output: &ShieldedOutput) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(&encode_shielded_note(&output.note)?)?;
+    writer.write_fixed(&output.note_commitment);
     writer.write_fixed(&output.kem_ct);
     writer.write_fixed(&output.nonce);
     writer.write_u8(output.view_tag);
@@ -434,7 +407,7 @@ pub fn encode_shielded_output(output: &ShieldedOutput) -> Result<Vec<u8>> {
 pub fn decode_shielded_output(bytes: &[u8]) -> Result<ShieldedOutput> {
     let mut reader = CanonicalReader::new(bytes);
     let output = ShieldedOutput {
-        note: decode_shielded_note(&reader.read_bytes()?)?,
+        note_commitment: reader.read_fixed()?,
         kem_ct: reader.read_fixed()?,
         nonce: reader.read_fixed()?,
         view_tag: reader.read_u8()?,
@@ -446,7 +419,7 @@ pub fn decode_shielded_output(bytes: &[u8]) -> Result<ShieldedOutput> {
 
 pub fn encode_shielded_output_plaintext(plaintext: &ShieldedOutputPlaintext) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&plaintext.note_commitment);
+    writer.write_bytes(&encode_shielded_note(&plaintext.note)?)?;
     writer.write_fixed(&plaintext.note_key);
     writer.write_bytes(&encode_historical_unspent_checkpoint(
         &plaintext.checkpoint,
@@ -457,7 +430,7 @@ pub fn encode_shielded_output_plaintext(plaintext: &ShieldedOutputPlaintext) -> 
 pub fn decode_shielded_output_plaintext(bytes: &[u8]) -> Result<ShieldedOutputPlaintext> {
     let mut reader = CanonicalReader::new(bytes);
     let plaintext = ShieldedOutputPlaintext {
-        note_commitment: reader.read_fixed()?,
+        note: decode_shielded_note(&reader.read_bytes()?)?,
         note_key: reader.read_fixed()?,
         checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
     };
@@ -467,27 +440,34 @@ pub fn decode_shielded_output_plaintext(bytes: &[u8]) -> Result<ShieldedOutputPl
 
 pub fn encode_tx(tx: &Tx) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(b"unchained.shielded_tx.v1")?;
-    writer.write_vec(&tx.inputs, |writer, input| {
-        write_shielded_input(writer, input)
+    writer.write_bytes(b"unchained.shielded_tx.v2")?;
+    writer.write_vec(&tx.nullifiers, |writer, nullifier| {
+        writer.write_fixed(nullifier);
+        Ok(())
     })?;
     writer.write_vec(&tx.outputs, |writer, output| {
         writer.write_bytes(&encode_shielded_output(output)?)?;
         Ok(())
     })?;
+    writer.write_bytes(&tx.proof)?;
     Ok(writer.into_vec())
 }
 
 pub fn decode_tx(bytes: &[u8]) -> Result<Tx> {
     let mut reader = CanonicalReader::new(bytes);
     let domain = reader.read_bytes()?;
-    if domain.as_slice() != b"unchained.shielded_tx.v1" {
+    if domain.as_slice() != b"unchained.shielded_tx.v2" {
         bail!("unsupported transaction encoding");
     }
-    let inputs = reader.read_vec(read_shielded_input)?;
+    let nullifiers = reader.read_vec(|reader| reader.read_fixed())?;
     let outputs = reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?;
+    let proof = reader.read_bytes()?;
     reader.finish()?;
-    Ok(Tx { inputs, outputs })
+    Ok(Tx {
+        nullifiers,
+        outputs,
+        proof,
+    })
 }
 
 pub fn encode_key_doc_signable(

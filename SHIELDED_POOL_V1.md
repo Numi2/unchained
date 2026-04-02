@@ -1,7 +1,7 @@
-# Shielded Pool V1
+# Shielded Pool
 
-This document defines the shielded-pool architecture being introduced as the
-successor to the current coin/spend-chain model.
+This document describes the live shielded-pool architecture now implemented as
+the canonical state model for Unchained.
 
 It is designed around four constraints:
 
@@ -94,10 +94,9 @@ can be continued by another, as long as both agree on the same root ledger.
 `CheckpointPresentation` is a client-side blinded presentation handle over a
 checkpoint transcript root.
 
-This is intentionally not yet a rerandomizable recursive ZK proof. It is a
-presentation-layer binding that lets the client separate the provider-issued
-checkpoint from the client-issued presentation identifier. The next proof-system
-cutover should replace this with true rerandomization at the proof layer.
+The checkpoint layer is no longer a public transaction field. It is private
+witness material carried into the succinct spend proof, so validators consume
+only the resulting public journal bindings rather than raw absence records.
 
 ## Storage
 
@@ -110,35 +109,46 @@ cutover should replace this with true rerandomization at the proof layer.
 
 These are persisted via canonical encodings in `src/canonical.rs`.
 
-## Current Status
+## Proof-Carrying Spend Path
 
-Implemented now:
+The live spend path is proof-carrying:
 
-- canonical shielded note representation
-- note commitment tree and membership proofs
-- evolving nullifier derivation
-- per-epoch historical nullifier archives
-- authenticated non-membership proofs
-- provider-portable checkpoint extension
-- checkpoint persistence in RocksDB
+- `proof-core` defines the private witness and public journal contract
+- `methods/guest` validates that witness inside the zkVM
+- `src/proof.rs` produces and verifies succinct STARK receipts
+- `src/transaction.rs` accepts only transactions whose receipt journal matches
+  the live note tree root, chain id, current nullifier epoch, and output
+  bindings
+- `src/wallet.rs` now constructs witness data locally, proves it, and only
+  broadcasts the proof-carrying transaction object
 
-Not yet cut over:
+What stays private inside the witness:
 
-- replacement of the live transaction runtime with shielded spends
-- recursive compression of historical absence proofs
-- transparent PQ proof verification inside block validation
-- wallet note management and note scanning on top of the new pool
+- input note plaintexts
+- note membership paths
+- historical checkpoint state
+- historical absence extension records
+- recipient note plaintexts and note keys
 
-## Next Cutover
+What remains public:
 
-The next protocol tranche should:
+- current-epoch nullifiers
+- encrypted output envelopes
+- the succinct receipt
+- the receipt journal bindings needed for state transition
 
-1. define a new shielded transaction object that carries:
-   - note membership proof
-   - current evolving nullifier
-   - historical checkpoint root
-   - output note commitments
-2. replace `coin_id -> latest spend` ownership with the note tree plus current
-   epoch nullifier uniqueness
-3. move historical-unspent verification into a transparent PQ proof system
-4. delete the old spend-chain path after the shielded runtime is live
+## Operational Notes
+
+The proving backend is CPU-first on Apple Silicon/macOS. Metal proving is not
+part of the correctness contract for this repository.
+
+## Next Frontier
+
+The remaining frontier is sync/privacy efficiency, not shielded spend
+correctness:
+
+1. batched checkpoint extension across many notes
+2. stronger provider-oblivious synchronization
+3. content-addressed archival distribution for historical nullifier epochs
+4. proof-system-level rerandomization and accumulation schemes where they
+   improve privacy or amortized proving cost without weakening PQ safety

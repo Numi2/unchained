@@ -4,14 +4,15 @@ use serde_big_array::BigArray;
 use std::collections::HashSet;
 
 use crate::{
-    canonical::{self, CanonicalWriter},
-    crypto::{self, ML_KEM_768_CT_BYTES},
+    canonical,
+    crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
+    proof,
     protocol::CURRENT as PROTOCOL,
     shielded::{
-        deterministic_genesis_note, note_key_commitment, ActiveNullifierEpoch,
-        ArchivedNullifierEpoch, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
-        NoteCommitmentTree, NoteMembershipProof, NullifierRootLedger, ShieldedNote,
+        deterministic_genesis_note, ActiveNullifierEpoch, ArchivedNullifierEpoch,
+        HistoricalUnspentCheckpoint, HistoricalUnspentExtension, NoteCommitmentTree,
+        NullifierRootLedger, ShieldedNote,
     },
     storage::Store,
 };
@@ -19,19 +20,8 @@ use crate::{
 const SHIELDED_OUTPUT_NONCE_LEN: usize = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShieldedInput {
-    pub note: ShieldedNote,
-    pub note_key: [u8; 32],
-    pub membership_proof: NoteMembershipProof,
-    pub historical_checkpoint: HistoricalUnspentCheckpoint,
-    pub historical_extension: HistoricalUnspentExtension,
-    pub current_nullifier: [u8; 32],
-    pub authorization_sig: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedOutput {
-    pub note: ShieldedNote,
+    pub note_commitment: [u8; 32],
     #[serde(with = "BigArray")]
     pub kem_ct: [u8; ML_KEM_768_CT_BYTES],
     #[serde(with = "BigArray")]
@@ -42,60 +32,30 @@ pub struct ShieldedOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedOutputPlaintext {
-    pub note_commitment: [u8; 32],
+    pub note: ShieldedNote,
     pub note_key: [u8; 32],
     pub checkpoint: HistoricalUnspentCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tx {
-    pub inputs: Vec<ShieldedInput>,
+    pub nullifiers: Vec<[u8; 32]>,
     pub outputs: Vec<ShieldedOutput>,
+    pub proof: Vec<u8>,
 }
 
 impl Tx {
-    pub fn new(inputs: Vec<ShieldedInput>, outputs: Vec<ShieldedOutput>) -> Self {
-        Self { inputs, outputs }
+    pub fn new(nullifiers: Vec<[u8; 32]>, outputs: Vec<ShieldedOutput>, proof: Vec<u8>) -> Self {
+        Self {
+            nullifiers,
+            outputs,
+            proof,
+        }
     }
 
     pub fn id(&self) -> Result<[u8; 32]> {
         let bytes = canonical::encode_tx(self).context("serialize tx")?;
-        Ok(crypto::blake3_hash(&bytes))
-    }
-
-    pub fn signing_digest(&self) -> Result<[u8; 32]> {
-        let mut writer = CanonicalWriter::new();
-        writer.write_bytes(b"unchained.shielded_tx.signing.v1")?;
-        writer.write_vec(&self.inputs, |writer, input| {
-            writer.write_fixed(&input.note.commitment);
-            writer.write_fixed(&input.current_nullifier);
-            Ok(())
-        })?;
-        writer.write_vec(&self.outputs, |writer, output| {
-            writer.write_bytes(&canonical::encode_shielded_note(&output.note)?)?;
-            writer.write_fixed(&output.kem_ct);
-            writer.write_fixed(&output.nonce);
-            writer.write_u8(output.view_tag);
-            writer.write_bytes(&output.ciphertext)?;
-            Ok(())
-        })?;
-        Ok(crypto::blake3_hash(&writer.into_vec()))
-    }
-
-    pub fn authorization_message(&self, input_index: usize) -> Result<Vec<u8>> {
-        let digest = self.signing_digest()?;
-        let input = self
-            .inputs
-            .get(input_index)
-            .ok_or_else(|| anyhow!("shielded input index out of range"))?;
-        let mut writer = CanonicalWriter::new();
-        writer.write_fixed(&digest);
-        writer.write_u32(
-            u32::try_from(input_index).map_err(|_| anyhow!("too many shielded inputs"))?,
-        );
-        writer.write_fixed(&input.note.commitment);
-        writer.write_fixed(&input.current_nullifier);
-        Ok(writer.into_vec())
+        Ok(crate::crypto::blake3_hash(&bytes))
     }
 
     pub fn validate(&self, db: &Store) -> Result<()> {
@@ -109,15 +69,15 @@ impl Tx {
     fn validate_shielded(&self, db: &Store) -> Result<()> {
         ensure_shielded_runtime_state(db)?;
 
-        if self.inputs.is_empty() {
-            bail!("shielded tx must contain at least one input");
+        if self.nullifiers.is_empty() {
+            bail!("shielded tx must contain at least one nullifier");
         }
         if self.outputs.is_empty() {
             bail!("shielded tx must contain at least one output");
         }
 
-        let chain_id = db.get_chain_id()?;
         let current_epoch = current_nullifier_epoch(db)?;
+        let chain_id = db.get_chain_id()?;
         let tree = db.load_shielded_note_tree()?.unwrap_or_default();
         let tree_root = tree.root();
         let ledger = db.load_shielded_root_ledger()?.unwrap_or_default();
@@ -129,82 +89,61 @@ impl Tx {
         }
         active.validate()?;
 
-        let mut seen_note_commitments = HashSet::new();
-        let mut seen_nullifiers = HashSet::new();
-        let mut total_in = 0u128;
-        let mut total_out = 0u128;
-
-        for (index, input) in self.inputs.iter().enumerate() {
-            input.note.validate()?;
-            if note_key_commitment(&input.note_key) != input.note.note_key_commitment {
-                bail!("shielded input note key does not match its commitment");
-            }
-            if db.is_shielded_note_spent(&input.note.commitment)? {
-                bail!("shielded note has already been spent");
-            }
-            if !seen_note_commitments.insert(input.note.commitment) {
-                bail!("duplicate shielded note input inside tx");
-            }
-            if !seen_nullifiers.insert(input.current_nullifier) {
-                bail!("duplicate current-epoch nullifier inside tx");
-            }
-            if active.contains(&input.current_nullifier) {
-                bail!("current-epoch nullifier already exists");
-            }
-
-            if input.membership_proof.note_commitment != input.note.commitment {
-                bail!("shielded membership proof does not match the note commitment");
-            }
-            if input.membership_proof.root != tree_root || !input.membership_proof.verify() {
-                bail!("invalid shielded note membership proof");
-            }
-
-            if input.historical_checkpoint.note_commitment != input.note.commitment {
-                bail!("historical checkpoint does not match the note commitment");
-            }
-            let updated_checkpoint = input
-                .historical_checkpoint
-                .apply_extension(&input.historical_extension, &ledger)?;
-            let required_historical_epoch = current_epoch.saturating_sub(1);
-            if updated_checkpoint.covered_through_epoch != required_historical_epoch {
-                bail!("historical checkpoint is stale for the current nullifier epoch");
-            }
-
-            let expected_nullifier =
-                input
-                    .note
-                    .derive_evolving_nullifier(&input.note_key, &chain_id, current_epoch)?;
-            if expected_nullifier != input.current_nullifier {
-                bail!("shielded input current nullifier mismatch");
-            }
-
-            let auth_message = self.authorization_message(index)?;
-            input
-                .note
-                .owner_signing_pk
-                .verify(&auth_message, &input.authorization_sig)
-                .context("invalid shielded input authorization signature")?;
-
-            total_in = total_in.saturating_add(input.note.value as u128);
+        let journal = proof::verify_shielded_receipt_bytes(&self.proof)?;
+        if journal.chain_id != chain_id {
+            bail!("shielded receipt chain id mismatch");
+        }
+        if journal.current_epoch != current_epoch {
+            bail!("shielded receipt epoch mismatch");
+        }
+        if journal.note_tree_root != tree_root {
+            bail!("shielded receipt note tree root mismatch");
+        }
+        if journal.inputs.len() != self.nullifiers.len() {
+            bail!("shielded receipt input count mismatch");
+        }
+        if journal.outputs.len() != self.outputs.len() {
+            bail!("shielded receipt output count mismatch");
         }
 
         let existing_commitments = tree.commitments.iter().copied().collect::<HashSet<_>>();
-        let mut new_commitments = HashSet::new();
-        for output in &self.outputs {
-            output.note.validate()?;
-            if output.note.birth_epoch != current_epoch {
-                bail!("shielded output birth epoch must equal the current nullifier epoch");
+        let mut seen_nullifiers = HashSet::new();
+        for (index, binding) in journal.inputs.iter().enumerate() {
+            if binding.current_nullifier != self.nullifiers[index] {
+                bail!("shielded receipt nullifier mismatch");
             }
-            if existing_commitments.contains(&output.note.commitment)
-                || !new_commitments.insert(output.note.commitment)
+            if !seen_nullifiers.insert(binding.current_nullifier) {
+                bail!("duplicate current nullifier inside tx");
+            }
+            if active.contains(&binding.current_nullifier) {
+                bail!("current nullifier already exists in the active epoch");
+            }
+            if current_epoch > 0 && binding.historical_through_epoch != current_epoch - 1 {
+                bail!("historical range does not end at the prior epoch");
+            }
+            let expected_digest = historical_root_digest_for_range(
+                &ledger,
+                binding.historical_from_epoch,
+                binding.historical_through_epoch,
+            )?;
+            if expected_digest != binding.historical_root_digest {
+                bail!("historical nullifier root digest mismatch");
+            }
+        }
+
+        let mut new_commitments = HashSet::new();
+        for (binding, output) in journal.outputs.iter().zip(&self.outputs) {
+            if binding.note_commitment != output.note_commitment {
+                bail!("shielded receipt output commitment mismatch");
+            }
+            if binding != &proof::output_binding(output) {
+                bail!("shielded receipt output binding mismatch");
+            }
+            if existing_commitments.contains(&output.note_commitment)
+                || !new_commitments.insert(output.note_commitment)
             {
                 bail!("duplicate shielded output note commitment");
             }
-            total_out = total_out.saturating_add(output.note.value as u128);
-        }
-
-        if total_in != total_out {
-            bail!("shielded tx balance mismatch");
         }
 
         Ok(())
@@ -227,19 +166,12 @@ impl Tx {
             .load_shielded_active_nullifier_epoch()?
             .ok_or_else(|| anyhow!("missing active shielded nullifier epoch"))?;
 
-        for input in &self.inputs {
-            batch.put_cf(
-                db.db
-                    .cf_handle("shielded_spent_note")
-                    .ok_or_else(|| anyhow!("'shielded_spent_note' column family missing"))?,
-                &input.note.commitment,
-                &input.current_nullifier,
-            );
-            active.insert(input.current_nullifier)?;
+        for nullifier in &self.nullifiers {
+            active.insert(*nullifier)?;
         }
 
         for (index, output) in self.outputs.iter().enumerate() {
-            tree.append(output.note.commitment);
+            tree.append(output.note_commitment);
             let mut output_key = Vec::with_capacity(36);
             output_key.extend_from_slice(&tx_id);
             output_key.extend_from_slice(&(index as u32).to_le_bytes());
@@ -308,10 +240,14 @@ pub fn build_local_historical_extension(
     note: &ShieldedNote,
     note_key: &[u8; 32],
     checkpoint: &HistoricalUnspentCheckpoint,
-    through_epoch: u64,
+    through_epoch: Option<u64>,
 ) -> Result<HistoricalUnspentExtension> {
     ensure_shielded_runtime_state(db)?;
     let expected_from = checkpoint.covered_through_epoch.saturating_add(1);
+    let Some(through_epoch) = through_epoch else {
+        let server = crate::shielded::ShieldedSyncServer::new();
+        return server.extend_checkpoint(checkpoint, &[]);
+    };
     if through_epoch < expected_from {
         let server = crate::shielded::ShieldedSyncServer::new();
         return server.extend_checkpoint(checkpoint, &[]);
@@ -384,4 +320,19 @@ fn rollover_active_nullifier_epoch(db: &Store) -> Result<()> {
         db.store_shielded_active_nullifier_epoch(&active)?;
     }
     Ok(())
+}
+
+fn historical_root_digest_for_range(
+    ledger: &NullifierRootLedger,
+    from_epoch: u64,
+    through_epoch: u64,
+) -> Result<[u8; 32]> {
+    if from_epoch > through_epoch {
+        return Ok(proof_core::historical_root_digest_from_pairs(&[]));
+    }
+    let mut pairs = Vec::new();
+    for epoch in from_epoch..=through_epoch {
+        pairs.push((epoch, ledger.root_for_epoch(epoch)?));
+    }
+    Ok(proof_core::historical_root_digest_from_pairs(&pairs))
 }

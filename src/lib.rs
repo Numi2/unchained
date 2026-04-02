@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod miner;
 pub mod network;
 pub mod node_identity;
+pub mod proof;
 pub mod protocol;
 pub mod shielded;
 pub mod storage;

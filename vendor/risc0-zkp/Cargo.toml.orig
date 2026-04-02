@@ -1,0 +1,74 @@
+[package]
+name = "risc0-zkp"
+description = "RISC Zero zero-knowledge proof system core crate"
+version = "3.0.4"
+edition = { workspace = true }
+license = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+
+[[bench]]
+name = "hash"
+harness = false
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false }
+blake2 = { version = "0.10.6", default-features = false }
+borsh = { version = "1.5", default-features = false, features = ["derive"] }
+bytemuck = { version = "1.12", features = ["derive"] }
+cfg-if = "1.0"
+cust = { version = "0.3", optional = true }
+digest = { version = "0.10", features = ["oid"] }
+ff = { version = "0.13", features = ["derive", "bits"], optional = true }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+hex-literal = "0.4.1"
+paste = "1.0"
+rand_core = "0.9.3"
+risc0-core = { workspace = true }
+risc0-zkvm-platform = { workspace = true }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+sha2 = { version = "0.10", default-features = false, features = ["compress"] }
+stability = "0.2"
+tracing = { version = "0.1", default-features = false, features = [
+  "attributes",
+] }
+
+[target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]
+metal = { workspace = true }
+
+[target.'cfg(not(target_os = "zkvm"))'.dependencies]
+ndarray = { version = "0.16", features = ["rayon"], optional = true }
+parking_lot = { version = "0.12", optional = true }
+rand = { version = "0.9.1", optional = true }
+rayon = { version = "1.5", optional = true }
+risc0-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+rand = { version = "0.9.1", features = ["small_rng"] }
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+# NOTE: cuda and metal are excluded because their build scripts require external tools.
+features = ["prove", "std"]
+
+[features]
+circuit_debug = []
+cuda = ["dep:cust", "prove", "risc0-sys/cuda"]
+default = []
+metal = ["prove"]
+metal_prefix_products = []
+prove = [
+  "dep:ff",
+  "dep:ndarray",
+  "dep:parking_lot",
+  "dep:rand",
+  "dep:rayon",
+  "dep:risc0-sys",
+  "risc0-core/perf",
+  "std",
+]
+std = ["anyhow/std"]
+unstable = []

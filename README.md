@@ -20,10 +20,8 @@ Unchained is a post-quantum private asset node with a PQ-only default build.
 - Epoch anchors commit mined coins.
 - Mined coins are deterministically materialized into genesis shielded notes.
 - Canonical ownership now lives in the shielded note tree plus the active and archived evolving-nullifier epochs.
-- Canonical transaction propagation happens on `unchained/tx/v1`.
+- Canonical transactions carry a succinct STARK receipt over a private witness, while validators only see the current nullifiers, encrypted outputs, and the proof journal bindings required to update state.
 - Historical unspent state is represented by checkpoint and extension objects rather than a perpetually growing validator nullifier table.
-
-The runtime is shielded-state-native, but it is not yet a full zero-knowledge spend system. Current transactions still reveal note openings to validators while the protocol waits for transparent recursive PQ proof replacement.
 
 ## Architecture
 
@@ -44,6 +42,14 @@ Node identity is provisioned through an offline-root ceremony:
 
 The runtime only requires the installed ML-DSA auth key and signed node record. The root key is not needed online after provisioning.
 
+Proof generation is now part of the live wallet path:
+
+- `proof-core` defines the canonical shielded witness and public journal contract
+- `methods/guest` is the zkVM guest that validates that witness
+- [`src/proof.rs`](/Users/home/unchgit/unchained/src/proof.rs) generates and verifies succinct STARK receipts
+
+On Apple Silicon, the repository treats CPU proving as the stable default. The build does not depend on a functioning Metal proving path.
+
 ## Build
 
 Use a current stable Rust toolchain.
@@ -59,9 +65,12 @@ Useful commands:
 cargo fmt
 cargo check
 cargo test
+cargo test --test shielded_tx_flow -- --ignored --nocapture
 cargo run --release --bin unchained -- node start
 cargo run --release --bin unchained -- wallet receive
 ```
+
+`cargo test` is the fast default suite. The ignored `shielded_tx_flow` integration runs the full end-to-end succinct-proof wallet roundtrip.
 
 ## CLI
 
@@ -87,6 +96,6 @@ Operational and protocol-maintenance workflows live under `advanced`.
 
 - [README.md](/Users/home/unchgit/unchained/README.md): concise project summary
 - [ARCHITECTURE.md](/Users/home/unchgit/unchained/ARCHITECTURE.md): system boundaries and current design
-- [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md): shielded-pool successor design and currently landed core
+- [SHIELDED_POOL_V1.md](/Users/home/unchgit/unchained/SHIELDED_POOL_V1.md): live shielded-pool and proof-carrying state model
 
 Older Markdown files are archival unless rewritten to match the live code.
