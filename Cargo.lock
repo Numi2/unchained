@@ -3414,7 +3414,10 @@ name = "proof-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
+ "chacha20poly1305",
+ "ml-kem",
  "serde",
 ]
 

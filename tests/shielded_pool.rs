@@ -189,9 +189,9 @@ fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
     let batch = provider.serve_checkpoints_batch(
         &manifest,
         &[
-            CheckpointExtensionRequest {
-                checkpoint: checkpoint_a.clone(),
-                queries: vec![
+            CheckpointExtensionRequest::new(
+                checkpoint_a.clone(),
+                vec![
                     EvolvingNullifierQuery {
                         epoch: 5,
                         nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 5)?,
@@ -205,10 +205,11 @@ fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
                         nullifier: note_a.derive_evolving_nullifier(&note_a_key, &chain_id, 7)?,
                     },
                 ],
-            },
-            CheckpointExtensionRequest {
-                checkpoint: checkpoint_b.clone(),
-                queries: vec![
+                [1u8; 32],
+            ),
+            CheckpointExtensionRequest::new(
+                checkpoint_b.clone(),
+                vec![
                     EvolvingNullifierQuery {
                         epoch: 6,
                         nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 6)?,
@@ -218,7 +219,8 @@ fn checkpoint_extensions_can_be_batched_across_notes() -> Result<()> {
                         nullifier: note_b.derive_evolving_nullifier(&note_b_key, &chain_id, 7)?,
                     },
                 ],
-            },
+                [2u8; 32],
+            ),
         ],
     )?;
     assert_eq!(batch.len(), 2);
@@ -250,8 +252,8 @@ fn checkpoint_presentations_are_blinded() -> Result<()> {
     let presentation_a = checkpoint.presentation([1u8; 32]);
     let presentation_b = checkpoint.presentation([2u8; 32]);
 
-    assert!(presentation_a.verify());
-    assert!(presentation_b.verify());
+    assert!(presentation_a.verify_against_checkpoint(&checkpoint));
+    assert!(presentation_b.verify_against_checkpoint(&checkpoint));
     assert_ne!(
         presentation_a.presentation_digest,
         presentation_b.presentation_digest
@@ -282,9 +284,9 @@ fn provider_rotation_changes_query_assignment_across_rounds() -> Result<()> {
     let directory =
         ArchiveDirectory::from_root_ledger_and_providers(provider.root_ledger(), 2, manifests)?;
     let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
-    let request = CheckpointExtensionRequest {
-        checkpoint: checkpoint.clone(),
-        queries: (5u64..=8)
+    let request = CheckpointExtensionRequest::new(
+        checkpoint.clone(),
+        (5u64..=8)
             .map(|epoch| {
                 Ok(EvolvingNullifierQuery {
                     epoch,
@@ -292,7 +294,8 @@ fn provider_rotation_changes_query_assignment_across_rounds() -> Result<()> {
                 })
             })
             .collect::<Result<Vec<_>>>()?,
-    };
+        [3u8; 32],
+    );
     let mut providers = std::collections::BTreeSet::new();
     for round in 0u64..8 {
         let batches =
@@ -361,9 +364,9 @@ fn route_checkpoint_requests_stripes_one_note_across_multiple_providers() -> Res
     let directory =
         ArchiveDirectory::from_root_ledger_and_providers(provider.root_ledger(), 2, manifests)?;
     let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, note.birth_epoch);
-    let request = CheckpointExtensionRequest {
+    let request = CheckpointExtensionRequest::new(
         checkpoint,
-        queries: (5u64..=8)
+        (5u64..=8)
             .map(|epoch| {
                 Ok(EvolvingNullifierQuery {
                     epoch,
@@ -371,7 +374,8 @@ fn route_checkpoint_requests_stripes_one_note_across_multiple_providers() -> Res
                 })
             })
             .collect::<Result<Vec<_>>>()?,
-    };
+        [4u8; 32],
+    );
     let batches = route_checkpoint_requests(&directory, std::slice::from_ref(&request), 11, 2, 8)?;
     let routed_providers = batches
         .iter()

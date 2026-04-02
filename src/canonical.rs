@@ -1390,7 +1390,7 @@ pub fn encode_checkpoint_extension_request(
     request: &CheckpointExtensionRequest,
 ) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(&encode_historical_unspent_checkpoint(&request.checkpoint)?)?;
+    writer.write_bytes(&encode_checkpoint_presentation(&request.presentation)?)?;
     writer.write_vec(&request.queries, |writer, query| {
         write_evolving_nullifier_query(writer, query);
         Ok(())
@@ -1401,7 +1401,8 @@ pub fn encode_checkpoint_extension_request(
 pub fn decode_checkpoint_extension_request(bytes: &[u8]) -> Result<CheckpointExtensionRequest> {
     let mut reader = CanonicalReader::new(bytes);
     let request = CheckpointExtensionRequest {
-        checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
+        checkpoint: None,
+        presentation: decode_checkpoint_presentation(&reader.read_bytes()?)?,
         queries: reader.read_vec(read_evolving_nullifier_query)?,
     };
     reader.finish()?;
@@ -1441,6 +1442,7 @@ fn write_historical_unspent_packet(
     writer.write_vec(&packet.segments, |writer, segment| {
         writer.write_fixed(&segment.provider_id);
         writer.write_fixed(&segment.provider_manifest_digest);
+        writer.write_fixed(&segment.request_binding);
         writer.write_u64(segment.from_epoch);
         writer.write_u64(segment.through_epoch);
         writer.write_fixed(&segment.segment_service_root);
@@ -1468,6 +1470,7 @@ fn read_historical_unspent_packet(
             Ok(HistoricalUnspentSegment {
                 provider_id: reader.read_fixed()?,
                 provider_manifest_digest: reader.read_fixed()?,
+                request_binding: reader.read_fixed()?,
                 from_epoch: reader.read_u64()?,
                 through_epoch: reader.read_u64()?,
                 segment_service_root: reader.read_fixed()?,
@@ -1550,7 +1553,7 @@ pub fn encode_historical_unspent_service_response(
     writer.write_u8(response.version);
     writer.write_fixed(&response.provider_id);
     writer.write_fixed(&response.provider_manifest_digest);
-    writer.write_fixed(&response.note_commitment);
+    writer.write_fixed(&response.request_binding);
     writer.write_u64(response.from_epoch);
     writer.write_u64(response.through_epoch);
     writer.write_fixed(&response.segment_service_root);
@@ -1569,7 +1572,7 @@ pub fn decode_historical_unspent_service_response(
         version: reader.read_u8()?,
         provider_id: reader.read_fixed()?,
         provider_manifest_digest: reader.read_fixed()?,
-        note_commitment: reader.read_fixed()?,
+        request_binding: reader.read_fixed()?,
         from_epoch: reader.read_u64()?,
         through_epoch: reader.read_u64()?,
         segment_service_root: reader.read_fixed()?,
@@ -1628,9 +1631,7 @@ pub fn decode_checkpoint_batch_response(bytes: &[u8]) -> Result<CheckpointBatchR
 
 pub fn encode_checkpoint_presentation(presentation: &CheckpointPresentation) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(&encode_historical_unspent_checkpoint(
-        &presentation.checkpoint,
-    )?)?;
+    writer.write_u64(presentation.covered_through_epoch);
     writer.write_fixed(&presentation.blinding);
     writer.write_fixed(&presentation.presentation_digest);
     Ok(writer.into_vec())
@@ -1639,7 +1640,7 @@ pub fn encode_checkpoint_presentation(presentation: &CheckpointPresentation) -> 
 pub fn decode_checkpoint_presentation(bytes: &[u8]) -> Result<CheckpointPresentation> {
     let mut reader = CanonicalReader::new(bytes);
     let presentation = CheckpointPresentation {
-        checkpoint: decode_historical_unspent_checkpoint(&reader.read_bytes()?)?,
+        covered_through_epoch: reader.read_u64()?,
         blinding: reader.read_fixed()?,
         presentation_digest: reader.read_fixed()?,
     };

@@ -246,22 +246,11 @@ pub fn ensure_shielded_runtime_state(db: &Store) -> Result<()> {
 
 pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
     let chain_id = db.get_chain_id()?;
-    let mut coins = db
-        .iterate_coins()?
-        .into_iter()
-        .map(|coin| {
-            let birth_epoch = db.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
-            Ok((birth_epoch, coin))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    coins.sort_by(|(epoch_a, coin_a), (epoch_b, coin_b)| {
-        epoch_a.cmp(epoch_b).then(coin_a.id.cmp(&coin_b.id))
-    });
     let mut tree = db
         .load_shielded_note_tree()?
         .unwrap_or_else(NoteCommitmentTree::new);
     let mut changed = false;
-    for (birth_epoch, coin) in coins {
+    for (birth_epoch, coin) in db.iterate_committed_coins()? {
         let (note, _, _) = deterministic_genesis_note(&coin, birth_epoch, &chain_id);
         if !tree.contains_commitment(&note.commitment) {
             tree.append(note.commitment)?;

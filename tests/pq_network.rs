@@ -827,15 +827,17 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
         .find_map(|counter| {
             let note_commitment = *blake3::hash(&counter.to_le_bytes()).as_bytes();
             let checkpoint = HistoricalUnspentCheckpoint::genesis(note_commitment, 1);
+            let blinding = *blake3::hash(&counter.to_le_bytes()).as_bytes();
             route_checkpoint_requests(
                 &directory,
-                &[CheckpointExtensionRequest {
-                    checkpoint: checkpoint.clone(),
-                    queries: vec![EvolvingNullifierQuery {
+                &[CheckpointExtensionRequest::new(
+                    checkpoint.clone(),
+                    vec![EvolvingNullifierQuery {
                         epoch: 1,
                         nullifier: [44u8; 32],
                     }],
-                }],
+                    blinding,
+                )],
                 rotation_round,
                 PROTOCOL.oblivious_sync_min_batch as usize,
                 PROTOCOL.max_historical_nullifier_batch as usize,
@@ -849,13 +851,14 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
 
     let extensions = net_b
         .request_historical_extensions(
-            &[CheckpointExtensionRequest {
-                checkpoint: checkpoint.clone(),
-                queries: vec![EvolvingNullifierQuery {
+            &[CheckpointExtensionRequest::new(
+                checkpoint.clone(),
+                vec![EvolvingNullifierQuery {
                     epoch: 1,
                     nullifier: [44u8; 32],
                 }],
-            }],
+                [55u8; 32],
+            )],
             rotation_round,
         )
         .await?;

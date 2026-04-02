@@ -808,27 +808,6 @@ async fn main() -> anyhow::Result<()> {
 
     if node_start_requested {
         println!("Database: {}", cfg.storage.path);
-
-        // Auto-import anchors snapshot if DB is empty (no genesis) and a co-located snapshot file exists
-        if db
-            .get::<epoch::Anchor>("epoch", &0u64.to_le_bytes())?
-            .is_none()
-        {
-            // Try well-known relative filenames next to config or working directory
-            let candidates = ["anchors_snapshot.zst", "anchors_snapshot.bin"];
-            for cand in candidates.iter() {
-                if std::path::Path::new(cand).exists() {
-                    match db.import_anchors_snapshot(cand) {
-                        Ok(n) if n > 0 => {
-                            println!("Imported {} anchors from '{}'", n, cand);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Snapshot import from '{}' failed: {}", cand, e),
-                    }
-                }
-            }
-        }
     }
 
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
@@ -1087,7 +1066,6 @@ async fn main() -> anyhow::Result<()> {
             let msg = RateLimitedMessage { content: message };
             net.gossip_rate_limited(msg).await;
             println!("Message submitted to the shared topic.");
-            println!("Outbound rate limit: 2 messages per 24h.");
             return Ok(());
         }
         Some(Cmd::Message {

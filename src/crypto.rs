@@ -5,7 +5,8 @@ use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
 use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaPublicKey, ML_DSA_65, ML_DSA_65_SIGNING};
 use blake3::Hasher;
 use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::EncapsulateDeterministic;
+use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768, B32};
 use once_cell::sync::OnceCell;
 use rand::rngs::OsRng;
 use rcgen::{CertificateParams, KeyPair, SanType};
@@ -141,6 +142,13 @@ impl TaggedKemPublicKey {
 
     pub fn encapsulate(&self) -> Result<([u8; ML_KEM_768_CT_BYTES], [u8; 32])> {
         kem_encapsulate_to_ml_kem(self)
+    }
+
+    pub fn encapsulate_deterministic(
+        &self,
+        seed: &[u8; 32],
+    ) -> Result<([u8; ML_KEM_768_CT_BYTES], [u8; 32])> {
+        kem_encapsulate_to_ml_kem_deterministic(self, seed)
     }
 }
 
@@ -540,6 +548,20 @@ pub fn kem_encapsulate_to_ml_kem(
     let (ciphertext, shared_secret) = public_key
         .encapsulate(&mut OsRng)
         .map_err(|_| anyhow!("ML-KEM-768 encapsulation failed"))?;
+    let mut kem_ct = [0u8; ML_KEM_768_CT_BYTES];
+    kem_ct.copy_from_slice(ciphertext.as_slice());
+    Ok((kem_ct, derive_kem_shared_key32(shared_secret.as_slice())))
+}
+
+pub fn kem_encapsulate_to_ml_kem_deterministic(
+    pk: &TaggedKemPublicKey,
+    seed: &[u8; 32],
+) -> Result<([u8; ML_KEM_768_CT_BYTES], [u8; 32])> {
+    let public_key = ml_kem_768_public_key_from_tagged(pk);
+    let seed: B32 = (*seed).into();
+    let (ciphertext, shared_secret) = public_key
+        .encapsulate_deterministic(&seed)
+        .map_err(|_| anyhow!("ML-KEM-768 deterministic encapsulation failed"))?;
     let mut kem_ct = [0u8; ML_KEM_768_CT_BYTES];
     kem_ct.copy_from_slice(ciphertext.as_slice());
     Ok((kem_ct, derive_kem_shared_key32(shared_secret.as_slice())))

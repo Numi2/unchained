@@ -21,6 +21,7 @@ use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, 
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
     shielded::{
         HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
         HistoricalUnspentPacket, HistoricalUnspentSegment, HistoricalUnspentStratum,
@@ -214,13 +215,46 @@ pub fn output_plaintext_to_proof(
     }
 }
 
+pub fn output_plaintext_from_proof(
+    plaintext: &ProofShieldedOutputPlaintext,
+) -> Result<ShieldedOutputPlaintext> {
+    let owner_signing_pk =
+        TaggedSigningPublicKey::from_ml_dsa_65_bytes(&plaintext.note.owner_signing_pk)?;
+    let owner_kem_pk = TaggedKemPublicKey::from_ml_kem_768_bytes(&plaintext.note.owner_kem_pk)?;
+    Ok(ShieldedOutputPlaintext {
+        note: ShieldedNote {
+            version: plaintext.note.version,
+            value: plaintext.note.value,
+            birth_epoch: plaintext.note.birth_epoch,
+            owner_address: plaintext.note.owner_address,
+            owner_signing_pk,
+            owner_kem_pk,
+            rho: plaintext.note.rho,
+            note_randomizer: plaintext.note.note_randomizer,
+            note_key_commitment: plaintext.note.note_key_commitment,
+            commitment: plaintext.note.commitment,
+        },
+        note_key: plaintext.note_key,
+        checkpoint: HistoricalUnspentCheckpoint {
+            version: plaintext.checkpoint.version,
+            note_commitment: plaintext.checkpoint.note_commitment,
+            birth_epoch: plaintext.checkpoint.birth_epoch,
+            covered_through_epoch: plaintext.checkpoint.covered_through_epoch,
+            transcript_root: plaintext.checkpoint.transcript_root,
+            verified_epoch_count: plaintext.checkpoint.verified_epoch_count,
+        },
+    })
+}
+
 pub fn output_witness_from_local(
     plaintext: &ShieldedOutputPlaintext,
     output: &ShieldedOutput,
+    encapsulation_seed: &[u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
 ) -> ProofShieldedOutputWitness {
     ProofShieldedOutputWitness {
         plaintext: output_plaintext_to_proof(plaintext),
         public_output: public_output_from_local(output),
+        encapsulation_seed: *encapsulation_seed,
     }
 }
 

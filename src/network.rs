@@ -411,6 +411,44 @@ struct PendingAnchor {
     received_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct P2pPolicy {
+    max_validation_failures_per_peer: u32,
+    peer_ban_duration: Duration,
+    rate_limit_window: Duration,
+    max_messages_per_window: u32,
+}
+
+impl P2pPolicy {
+    fn from_config(cfg: &config::P2p) -> Self {
+        Self {
+            max_validation_failures_per_peer: cfg.max_validation_failures_per_peer.max(1),
+            peer_ban_duration: Duration::from_secs(cfg.peer_ban_duration_secs.max(1)),
+            rate_limit_window: Duration::from_secs(cfg.rate_limit_window_secs.max(1)),
+            max_messages_per_window: cfg.max_messages_per_window.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PeerPolicyState {
+    window_started_at: Instant,
+    messages_in_window: u32,
+    validation_failures: u32,
+    banned_until: Option<Instant>,
+}
+
+impl PeerPolicyState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            messages_in_window: 0,
+            validation_failures: 0,
+            banned_until: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeState {
     db: Arc<Store>,
@@ -427,6 +465,8 @@ struct RuntimeState {
     connection_timeout: Duration,
     published_addresses: Vec<String>,
     banned_node_ids: HashSet<[u8; 32]>,
+    p2p_policy: P2pPolicy,
+    peer_policy: Arc<AsyncMutex<HashMap<[u8; 32], PeerPolicyState>>>,
     known_records: Arc<RwLock<HashMap<[u8; 32], NodeRecordV2>>>,
     peers: Arc<RwLock<HashMap<[u8; 32], Connection>>>,
     connected_peers: Arc<Mutex<HashSet<[u8; 32]>>>,
@@ -552,6 +592,81 @@ impl RuntimeState {
         }
     }
 
+    async fn peer_is_temporarily_banned(&self, node_id: [u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut guard = self.peer_policy.lock().await;
+        if let Some(state) = guard.get_mut(&node_id) {
+            if let Some(until) = state.banned_until {
+                if now < until {
+                    return true;
+                }
+                state.banned_until = None;
+                state.validation_failures = 0;
+                state.messages_in_window = 0;
+                state.window_started_at = now;
+            }
+        }
+        false
+    }
+
+    async fn enforce_peer_allowed(&self, node_id: [u8; 32]) -> Result<()> {
+        if self.banned_node_ids.contains(&node_id) {
+            bail!("peer is banned");
+        }
+        if self.peer_is_temporarily_banned(node_id).await {
+            bail!("peer is temporarily banned");
+        }
+        Ok(())
+    }
+
+    async fn record_inbound_message(&self, node_id: [u8; 32]) -> Result<()> {
+        let now = Instant::now();
+        let mut guard = self.peer_policy.lock().await;
+        let state = guard
+            .entry(node_id)
+            .or_insert_with(|| PeerPolicyState::new(now));
+        if let Some(until) = state.banned_until {
+            if now < until {
+                bail!("peer is temporarily banned");
+            }
+            state.banned_until = None;
+            state.validation_failures = 0;
+            state.messages_in_window = 0;
+            state.window_started_at = now;
+        }
+        if now.duration_since(state.window_started_at) >= self.p2p_policy.rate_limit_window {
+            state.window_started_at = now;
+            state.messages_in_window = 0;
+        }
+        state.messages_in_window = state.messages_in_window.saturating_add(1);
+        if state.messages_in_window > self.p2p_policy.max_messages_per_window {
+            state.banned_until = Some(now + self.p2p_policy.peer_ban_duration);
+            bail!("peer exceeded the configured ingress message budget");
+        }
+        Ok(())
+    }
+
+    async fn record_validation_failure(&self, node_id: [u8; 32]) {
+        let now = Instant::now();
+        let mut guard = self.peer_policy.lock().await;
+        let state = guard
+            .entry(node_id)
+            .or_insert_with(|| PeerPolicyState::new(now));
+        if let Some(until) = state.banned_until {
+            if now < until {
+                return;
+            }
+            state.banned_until = None;
+            state.validation_failures = 0;
+            state.messages_in_window = 0;
+            state.window_started_at = now;
+        }
+        state.validation_failures = state.validation_failures.saturating_add(1);
+        if state.validation_failures >= self.p2p_policy.max_validation_failures_per_peer {
+            state.banned_until = Some(now + self.p2p_policy.peer_ban_duration);
+        }
+    }
+
     async fn refresh_local_identity(&self) -> Result<()> {
         let chain_id = self.local_chain_id();
         let refreshed = {
@@ -569,9 +684,7 @@ impl RuntimeState {
         let now_unix_ms = unix_ms();
         record.validate(now_unix_ms)?;
         self.trust_policy.ensure_record_allowed(&record)?;
-        if self.banned_node_ids.contains(&record.node_id) {
-            bail!("record belongs to a banned node");
-        }
+        self.enforce_peer_allowed(record.node_id).await?;
         let local_node = self.local_node_id().await;
         if record.node_id == local_node {
             return Ok(false);
@@ -1394,9 +1507,7 @@ impl RuntimeState {
         if !chain_compatible(self.local_chain_id(), record.chain_id) {
             bail!("record chain_id is incompatible with the local chain");
         }
-        if self.banned_node_ids.contains(&record.node_id) {
-            bail!("remote node is banned");
-        }
+        self.enforce_peer_allowed(record.node_id).await?;
         if record.node_id == self.local_node_id().await {
             bail!("remote node record matches the local node");
         }
@@ -1410,7 +1521,7 @@ impl RuntimeState {
     }
 
     async fn dial_record(&self, record: NodeRecordV2) -> Result<()> {
-        if self.banned_node_ids.contains(&record.node_id) {
+        if self.enforce_peer_allowed(record.node_id).await.is_err() {
             return Ok(());
         }
         if record.node_id == self.local_node_id().await {
@@ -1498,9 +1609,19 @@ impl RuntimeState {
                             break;
                         }
                     };
+                    if let Err(e) = self.record_inbound_message(record.node_id).await {
+                        net_log!(
+                            "⚠️  Closing {} after ingress policy violation: {}",
+                            hex::encode(record.node_id),
+                            e
+                        );
+                        connection.close(0u32.into(), b"rate-limit");
+                        break;
+                    }
                     let message: WireMessage = match decode_wire_message(&bytes) {
                         Ok(message) => message,
                         Err(e) => {
+                            self.record_validation_failure(record.node_id).await;
                             net_log!(
                                 "⚠️  Invalid wire message from {}: {}",
                                 hex::encode(record.node_id),
@@ -1512,6 +1633,7 @@ impl RuntimeState {
                     };
                     match message {
                         WireMessage::Hello(_) => {
+                            self.record_validation_failure(record.node_id).await;
                             net_log!(
                                 "⚠️  Protocol violation from {}: unexpected post-handshake hello",
                                 hex::encode(record.node_id)
@@ -1521,6 +1643,7 @@ impl RuntimeState {
                         }
                         WireMessage::Envelope(envelope) => {
                             if let Err(e) = self.handle_envelope(record.clone(), envelope).await {
+                                self.record_validation_failure(record.node_id).await;
                                 net_log!(
                                     "⚠️  Dropping envelope from {}: {}",
                                     hex::encode(record.node_id),
@@ -1601,19 +1724,20 @@ impl RuntimeState {
             }
             WireTopic::CoinCandidate => {
                 let candidate = canonical::decode_coin_candidate(&frame.body)?;
-                if validate_coin_candidate(&candidate, &self.db).is_ok() {
-                    let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-                    self.db.put("coin_candidate", &key, &candidate)?;
-                } else {
-                    metrics::VALIDATION_FAIL_COIN.inc();
+                match validate_coin_candidate(&candidate, &self.db) {
+                    Ok(()) => {
+                        let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                        self.db.put("coin_candidate", &key, &candidate)?;
+                    }
+                    Err(err) => {
+                        metrics::VALIDATION_FAIL_COIN.inc();
+                        bail!("rejecting invalid coin candidate: {err}");
+                    }
                 }
             }
             WireTopic::Coin => {
-                let coin = canonical::decode_coin(&frame.body)?;
-                self.db.put("coin", &coin.id, &coin)?;
-                if let Ok(Some(anchor)) = self.db.get::<Anchor>("anchor", &coin.epoch_hash) {
-                    let _ = self.db.put_coin_epoch(&coin.id, anchor.num);
-                }
+                let _ = canonical::decode_coin(&frame.body)?;
+                bail!("unsolicited committed coin frames are not part of the canonical protocol");
             }
             WireTopic::Tx => {
                 let tx = canonical::decode_tx(&frame.body)?;
@@ -1664,9 +1788,15 @@ impl RuntimeState {
             WireTopic::EpochCandidatesResponse => {
                 let response = canonical::decode_epoch_candidates_response(&frame.body)?;
                 for candidate in response.candidates {
-                    if validate_coin_candidate(&candidate, &self.db).is_ok() {
-                        let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-                        let _ = self.db.put("coin_candidate", &key, &candidate);
+                    match validate_coin_candidate(&candidate, &self.db) {
+                        Ok(()) => {
+                            let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                            let _ = self.db.put("coin_candidate", &key, &candidate);
+                        }
+                        Err(err) => {
+                            metrics::VALIDATION_FAIL_COIN.inc();
+                            bail!("rejecting invalid epoch candidate response: {err}");
+                        }
                     }
                 }
             }
@@ -1731,17 +1861,8 @@ impl RuntimeState {
                 }
             }
             WireTopic::RequestCoin => {
-                let coin_id = decode_bytes32_body(&frame.body)?;
-                if let Ok(Some(coin)) = self.db.get::<Coin>("coin", &coin_id) {
-                    let _ = self
-                        .sign_and_send_to_peer_related(
-                            record.node_id,
-                            WireTopic::Coin,
-                            canonical::encode_coin(&coin)?,
-                            Some(message_id),
-                        )
-                        .await?;
-                }
+                let _ = decode_bytes32_body(&frame.body)?;
+                bail!("coin-by-id recovery is unsupported; use epoch transaction recovery only");
             }
             WireTopic::RequestLatestEpoch => {
                 decode_empty_body(&frame.body)?;
@@ -2275,7 +2396,7 @@ impl RuntimeState {
 
 pub async fn spawn(
     net_cfg: config::Net,
-    _p2p_cfg: config::P2p,
+    p2p_cfg: config::P2p,
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
 ) -> Result<NetHandle> {
@@ -2341,6 +2462,8 @@ pub async fn spawn(
         connection_timeout: Duration::from_secs(net_cfg.connection_timeout_secs.max(1)),
         published_addresses,
         banned_node_ids: banned_node_ids.clone(),
+        p2p_policy: P2pPolicy::from_config(&p2p_cfg),
+        peer_policy: Arc::new(AsyncMutex::new(HashMap::new())),
         known_records: Arc::new(RwLock::new(HashMap::new())),
         peers: Arc::new(RwLock::new(HashMap::new())),
         connected_peers: connected_peers.clone(),
@@ -2689,13 +2812,8 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 .await?;
         }
         NetworkCommand::RequestCoin(coin_id) => {
-            let _ = state
-                .sign_and_send_to_targets(
-                    WireTopic::RequestCoin,
-                    encode_bytes32_body(&coin_id),
-                    REQUEST_FANOUT_DEFAULT,
-                )
-                .await?;
+            let _ = coin_id;
+            bail!("coin-by-id recovery is unsupported; use epoch transaction recovery only");
         }
         NetworkCommand::RequestLatestEpoch => {
             let _ = state
@@ -3136,12 +3254,12 @@ impl Network {
             .iter()
             .map(|request| {
                 if request.queries.is_empty() {
-                    Some(request.checkpoint.empty_extension())
+                    Ok(Some(request.local_checkpoint()?.empty_extension()))
                 } else {
-                    None
+                    Ok(None)
                 }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut segment_results = vec![Vec::new(); requests.len()];
         let mut response_rx = self.checkpoint_subscribe();
         let deadline = Instant::now() + self.archive_sync_timeout;
@@ -3313,7 +3431,7 @@ impl Network {
                 .await;
 
             for (routed, response) in batch.requests.iter().zip(checkpoint_response.responses) {
-                response.verify_against_manifest(&manifest, &directory)?;
+                response.verify_against_request(&routed.request, &manifest, &directory)?;
                 if let Some(request_index) = routed.request_index {
                     let mut blinding = [0u8; 32];
                     rand::rngs::OsRng.fill_bytes(&mut blinding);
@@ -3335,7 +3453,7 @@ impl Network {
             let mut aggregate_blinding = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut aggregate_blinding);
             results[request_index] = Some(HistoricalUnspentExtension::aggregate(
-                &request.checkpoint,
+                request.local_checkpoint()?,
                 segments.into_iter().map(|(_, segment)| segment).collect(),
                 aggregate_blinding,
             )?);

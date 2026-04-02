@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hex;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use serde::Deserialize;
@@ -513,6 +513,26 @@ impl Store {
         }
 
         Ok(coins)
+    }
+
+    /// Iterates over canonically committed coins in deterministic epoch/id order.
+    pub fn iterate_committed_coins(&self) -> Result<Vec<(u64, crate::coin::Coin)>> {
+        let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
+            return Ok(Vec::new());
+        };
+        let mut committed = Vec::new();
+        for epoch_num in 0..=latest.num {
+            for coin_id in self.get_coin_ids_for_epoch_committed(epoch_num)? {
+                let coin = self
+                    .get::<crate::coin::Coin>("coin", &coin_id)?
+                    .ok_or_else(|| anyhow!("missing committed coin {}", hex::encode(coin_id)))?;
+                committed.push((epoch_num, coin));
+            }
+        }
+        committed.sort_by(|(epoch_a, coin_a), (epoch_b, coin_b)| {
+            epoch_a.cmp(epoch_b).then(coin_a.id.cmp(&coin_b.id))
+        });
+        Ok(committed)
     }
 
     /// Iterates over all coin candidates in the database
@@ -1440,14 +1460,20 @@ impl Store {
         let snapshot: AnchorsSnapshotV1 = bincode::deserialize(&data)
             .context("Failed to deserialize anchors snapshot (expected AnchorsSnapshotV1)")?;
 
-        // If DB already has a genesis, ensure chain id matches
-        if let Ok(Some(existing_genesis)) =
-            self.get::<crate::epoch::Anchor>("epoch", &0u64.to_le_bytes())
+        if self
+            .get::<crate::epoch::Anchor>("epoch", b"latest")?
+            .is_some()
         {
-            if existing_genesis.hash != snapshot.chain_id {
-                anyhow::bail!("Snapshot chain_id does not match existing database genesis");
-            }
+            bail!("anchor snapshot import requires an empty database");
         }
+
+        if snapshot.anchors.is_empty() {
+            bail!("anchor snapshot is empty");
+        }
+
+        let mut anchors = snapshot.anchors;
+        anchors.sort_by_key(|anchor| anchor.num);
+        validate_anchor_snapshot(&anchors, snapshot.chain_id)?;
 
         let mut inserted: u64 = 0;
         let mut batch = WriteBatch::default();
@@ -1462,7 +1488,7 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("'anchor' column family missing"))?;
 
         let mut highest_num: Option<u64> = None;
-        for a in snapshot.anchors.iter() {
+        for a in anchors.iter() {
             let key = a.num.to_le_bytes();
             let exists = match self.db.get_cf(epoch_cf, &key) {
                 Ok(Some(_)) => true,
@@ -1557,6 +1583,77 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]) -> Result<()> {
+    use crate::consensus::{params_from_anchor, validate_header_params, RETARGET_INTERVAL};
+
+    let Some(genesis) = anchors.first() else {
+        bail!("anchor snapshot is empty");
+    };
+    if genesis.num != 0 {
+        bail!("anchor snapshot must start at genesis");
+    }
+    if genesis.hash != chain_id {
+        bail!("snapshot chain_id does not match the genesis anchor hash");
+    }
+    if genesis.difficulty != crate::protocol::CURRENT.genesis_difficulty as usize
+        || genesis.mem_kib != crate::protocol::CURRENT.genesis_mem_kib
+    {
+        bail!("snapshot genesis parameters do not match protocol rules");
+    }
+    if genesis.cumulative_work
+        != crate::epoch::Anchor::expected_work_for_difficulty(genesis.difficulty)
+    {
+        bail!("snapshot genesis cumulative work mismatch");
+    }
+    let mut genesis_hasher = blake3::Hasher::new();
+    genesis_hasher.update(&genesis.merkle_root);
+    if *genesis_hasher.finalize().as_bytes() != genesis.hash {
+        bail!("snapshot genesis hash mismatch");
+    }
+
+    let mut validated = Vec::with_capacity(anchors.len());
+    validated.push(genesis.clone());
+
+    for anchor in anchors.iter().skip(1) {
+        let prev = validated
+            .last()
+            .ok_or_else(|| anyhow!("validated snapshot unexpectedly missing parent"))?;
+        if anchor.num != prev.num.saturating_add(1) {
+            bail!("snapshot anchors must be contiguous");
+        }
+        if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 {
+            bail!("snapshot anchor merkle root cannot be zero when coins are present");
+        }
+        let window_start = validated.len().saturating_sub(RETARGET_INTERVAL as usize);
+        validate_header_params(
+            Some(prev),
+            anchor.num,
+            &validated[window_start..],
+            params_from_anchor(anchor),
+        )
+        .map_err(|err| {
+            anyhow!(
+                "snapshot consensus parameter mismatch at epoch {}: {err}",
+                anchor.num
+            )
+        })?;
+
+        let expected_work = crate::epoch::Anchor::expected_work_for_difficulty(anchor.difficulty);
+        if anchor.cumulative_work != prev.cumulative_work.saturating_add(expected_work) {
+            bail!("snapshot cumulative work mismatch at epoch {}", anchor.num);
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&anchor.merkle_root);
+        hasher.update(&prev.hash);
+        if *hasher.finalize().as_bytes() != anchor.hash {
+            bail!("snapshot anchor hash mismatch at epoch {}", anchor.num);
+        }
+        validated.push(anchor.clone());
+    }
+
+    Ok(())
 }
 
 /// Database statistics

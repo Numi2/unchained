@@ -1,4 +1,9 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
+use chacha20poly1305::{
+    aead::{Aead, NewAead},
+    Key, XChaCha20Poly1305, XNonce,
+};
+use ml_kem::{EncapsulateDeterministic, Encoded, EncodedSizeUser, KemCore, MlKem768, B32};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -7,6 +12,11 @@ pub const SHIELDED_CHECKPOINT_VERSION: u8 = 1;
 pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
 pub const CHECKPOINT_ACCUMULATOR_VERSION: u8 = 1;
 pub const SHIELDED_OUTPUT_NONCE_LEN: usize = 24;
+pub const SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN: usize = 32;
+
+type MlKem768PublicKey = <MlKem768 as KemCore>::EncapsulationKey;
+type MlKem768Ciphertext = ml_kem::Ciphertext<MlKem768>;
+type MlKem768SharedKey = ml_kem::SharedKey<MlKem768>;
 
 const NOTE_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-note-key-v1";
 const NOTE_COMMIT_DOMAIN: &str = "unchained-shielded-note-commit-v1";
@@ -192,6 +202,7 @@ pub struct ProofShieldedInputWitness {
 pub struct ProofShieldedOutputWitness {
     pub plaintext: ProofShieldedOutputPlaintext,
     pub public_output: ProofShieldedOutput,
+    pub encapsulation_seed: [u8; SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,6 +359,7 @@ pub fn validate_shielded_tx_witness(
         if output.public_output.note_commitment != output.plaintext.note.commitment {
             bail!("public output note commitment mismatch");
         }
+        verify_public_output_encryption(output)?;
         if !seen_output_commitments.insert(output.public_output.note_commitment) {
             bail!("duplicate output note commitment");
         }
@@ -924,6 +936,62 @@ pub fn public_output_digest(output: &ProofShieldedOutput) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn verify_public_output_encryption(output: &ProofShieldedOutputWitness) -> Result<()> {
+    let public_key = ml_kem_768_public_key_from_bytes(&output.plaintext.note.owner_kem_pk)?;
+    let encapsulation_seed: B32 = output.encapsulation_seed.into();
+    let (expected_kem_ct, shared_secret): (MlKem768Ciphertext, MlKem768SharedKey) = public_key
+        .encapsulate_deterministic(&encapsulation_seed)
+        .map_err(|_| anyhow!("ML-KEM-768 deterministic encapsulation failed"))?;
+    if output.public_output.kem_ct != expected_kem_ct.as_slice() {
+        bail!("output KEM ciphertext mismatch");
+    }
+    let aead_key = derive_kem_shared_key32(shared_secret.as_slice());
+    if output.public_output.view_tag != view_tag(&aead_key) {
+        bail!("output view tag mismatch");
+    }
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&aead_key));
+    let decrypted = cipher
+        .decrypt(
+            XNonce::from_slice(&output.public_output.nonce),
+            output.public_output.ciphertext.as_ref(),
+        )
+        .map_err(|_| anyhow!("failed to decrypt the public shielded output"))?;
+    let expected_plaintext = bincode::serialize(&output.plaintext)
+        .map_err(|err| anyhow!("serialize output plaintext: {err}"))?;
+    if decrypted != expected_plaintext {
+        bail!("shielded output ciphertext does not match the proven plaintext");
+    }
+    Ok(())
+}
+
+fn ml_kem_768_public_key_from_bytes(bytes: &[u8]) -> Result<MlKem768PublicKey> {
+    let encoded = Encoded::<MlKem768PublicKey>::try_from(bytes)
+        .map_err(|_| anyhow!("invalid ML-KEM-768 public key length"))?;
+    Ok(MlKem768PublicKey::from_bytes(&encoded))
+}
+
+fn derive_kem_shared_key32(shared_secret: &[u8]) -> [u8; 32] {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ml-kem.shared-key.v1");
+    hasher.update(&lp(shared_secret.len()));
+    hasher.update(shared_secret);
+    *hasher.finalize().as_bytes()
+}
+
+fn view_tag(shared_secret: &[u8]) -> u8 {
+    fn lp(len: usize) -> [u8; 4] {
+        (len as u32).to_le_bytes()
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vt");
+    hasher.update(&lp(shared_secret.len()));
+    hasher.update(shared_secret);
+    hasher.finalize().as_bytes()[0]
+}
+
 pub fn historical_root_digest(records: &[HistoricalAbsenceRecord]) -> [u8; 32] {
     let pairs = records
         .iter()
@@ -1303,11 +1371,14 @@ mod tests {
 
     fn sample_note(seed: u8, value: u64, birth_epoch: u64) -> (ProofShieldedNote, [u8; 32]) {
         let owner_signing_pk = vec![seed; 32];
-        let owner_kem_pk = vec![seed.wrapping_add(1); 32];
+        let kem_d: B32 = [seed.wrapping_add(1); 32].into();
+        let kem_z: B32 = [seed.wrapping_add(2); 32].into();
+        let (_, owner_kem_pk) = MlKem768::generate_deterministic(&kem_d, &kem_z);
+        let owner_kem_pk = owner_kem_pk.as_bytes().to_vec();
         let owner_address = address_from_bytes(&owner_signing_pk);
-        let note_key = [seed.wrapping_add(2); 32];
-        let rho = [seed.wrapping_add(3); 32];
-        let note_randomizer = [seed.wrapping_add(4); 32];
+        let note_key = [seed.wrapping_add(3); 32];
+        let rho = [seed.wrapping_add(4); 32];
+        let note_randomizer = [seed.wrapping_add(5); 32];
         let note_key_commitment = note_key_commitment(&note_key);
         let commitment = compute_note_commitment(
             SHIELDED_NOTE_VERSION,
@@ -1477,19 +1548,34 @@ mod tests {
 
     fn sample_output_witness(seed: u8, value: u64, birth_epoch: u64) -> ProofShieldedOutputWitness {
         let (note, note_key) = sample_note(seed, value, birth_epoch);
+        let plaintext = ProofShieldedOutputPlaintext {
+            checkpoint: HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch),
+            note: note.clone(),
+            note_key,
+        };
+        let encapsulation_seed = [seed.wrapping_add(6); SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN];
+        let kem_pk =
+            ml_kem_768_public_key_from_bytes(&note.owner_kem_pk).expect("valid ML-KEM public key");
+        let (kem_ct, shared_key) = kem_pk
+            .encapsulate_deterministic(&B32::from(encapsulation_seed))
+            .expect("deterministic encapsulation");
+        let nonce = [seed; SHIELDED_OUTPUT_NONCE_LEN];
+        let plaintext_bytes =
+            bincode::serialize(&plaintext).expect("serialize shielded output plaintext");
+        let aead_key = derive_kem_shared_key32(shared_key.as_slice());
+        let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&aead_key))
+            .encrypt(XNonce::from_slice(&nonce), plaintext_bytes.as_ref())
+            .expect("encrypt shielded output");
         ProofShieldedOutputWitness {
-            plaintext: ProofShieldedOutputPlaintext {
-                checkpoint: HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch),
-                note: note.clone(),
-                note_key,
-            },
+            plaintext,
             public_output: ProofShieldedOutput {
                 note_commitment: note.commitment,
-                kem_ct: vec![seed; 64],
-                nonce: [seed; SHIELDED_OUTPUT_NONCE_LEN],
-                view_tag: seed,
-                ciphertext: vec![seed.wrapping_add(9); 48],
+                kem_ct: kem_ct.as_slice().to_vec(),
+                nonce,
+                view_tag: view_tag(&aead_key),
+                ciphertext,
             },
+            encapsulation_seed,
         }
     }
 

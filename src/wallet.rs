@@ -349,11 +349,10 @@ impl Wallet {
             .ok_or_else(|| anyhow!("Database connection dropped"))?;
         transaction::ensure_shielded_runtime_state(store.as_ref())?;
         let chain_id = store.get_chain_id()?;
-        for coin in store.iterate_coins()? {
+        for (birth_epoch, coin) in store.iterate_committed_coins()? {
             if coin.creator_address != self.address {
                 continue;
             }
-            let birth_epoch = store.get_epoch_for_coin(&coin.id)?.unwrap_or(0);
             let (note, note_key, checkpoint) =
                 shielded::deterministic_genesis_note(&coin, birth_epoch, &chain_id);
             if store
@@ -390,7 +389,10 @@ impl Wallet {
                 output.ciphertext.as_ref(),
             )
             .map_err(|_| anyhow!("failed to decrypt shielded output payload"))?;
-        let decoded = canonical::decode_shielded_output_plaintext(&plaintext)?;
+        let decoded = proof::output_plaintext_from_proof(
+            &bincode::deserialize::<proof_core::ProofShieldedOutputPlaintext>(&plaintext)
+                .map_err(|err| anyhow!("failed to decode shielded output payload: {err}"))?,
+        )?;
         if decoded.note.commitment != output.note_commitment {
             bail!("shielded output plaintext commitment mismatch");
         }
@@ -494,26 +496,19 @@ impl Wallet {
             .await
     }
 
-    async fn refresh_owned_shielded_checkpoints_with_round(
+    fn prepare_owned_checkpoint_requests(
         &self,
-        notes: &mut [OwnedShieldedNote],
-        network: &crate::network::NetHandle,
-        rotation_round: u64,
-    ) -> Result<()> {
-        let store = self
-            ._db
-            .upgrade()
-            .ok_or_else(|| anyhow!("Database connection dropped"))?;
-        transaction::ensure_shielded_runtime_state(store.as_ref())?;
-        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
-        let Some(through_epoch) = current_epoch.checked_sub(1) else {
-            return Ok(());
-        };
-        let chain_id = store.get_chain_id()?;
-
-        let mut requests = Vec::new();
-        let mut request_note_indexes = Vec::new();
-        let mut request_checkpoints = Vec::new();
+        notes: &[OwnedShieldedNote],
+        through_epoch: u64,
+        chain_id: [u8; 32],
+    ) -> Result<
+        Vec<(
+            usize,
+            shielded::HistoricalUnspentCheckpoint,
+            shielded::CheckpointExtensionRequest,
+        )>,
+    > {
+        let mut prepared = Vec::new();
         for (note_index, owned) in notes.iter().enumerate() {
             let request_checkpoint = owned.checkpoint_accumulator.as_ref().map_or_else(
                 || {
@@ -536,13 +531,41 @@ impl Wallet {
                         .derive_evolving_nullifier(&owned.note_key, &chain_id, epoch)?;
                 queries.push(shielded::EvolvingNullifierQuery { epoch, nullifier });
             }
-            request_note_indexes.push(note_index);
-            request_checkpoints.push(request_checkpoint.clone());
-            requests.push(shielded::CheckpointExtensionRequest {
-                checkpoint: request_checkpoint,
-                queries,
-            });
+            prepared.push((
+                note_index,
+                request_checkpoint.clone(),
+                shielded::CheckpointExtensionRequest::with_random_blinding(
+                    request_checkpoint,
+                    queries,
+                ),
+            ));
         }
+        Ok(prepared)
+    }
+
+    async fn refresh_owned_shielded_checkpoints_with_round(
+        &self,
+        notes: &mut [OwnedShieldedNote],
+        network: &crate::network::NetHandle,
+        rotation_round: u64,
+    ) -> Result<()> {
+        let store = self
+            ._db
+            .upgrade()
+            .ok_or_else(|| anyhow!("Database connection dropped"))?;
+        transaction::ensure_shielded_runtime_state(store.as_ref())?;
+        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
+        let Some(through_epoch) = current_epoch.checked_sub(1) else {
+            return Ok(());
+        };
+        let chain_id = store.get_chain_id()?;
+
+        let prepared_requests =
+            self.prepare_owned_checkpoint_requests(notes, through_epoch, chain_id)?;
+        let requests = prepared_requests
+            .iter()
+            .map(|(_, _, request)| request.clone())
+            .collect::<Vec<_>>();
 
         if requests.is_empty() {
             return Ok(());
@@ -555,15 +578,17 @@ impl Wallet {
             .load_shielded_root_ledger()?
             .ok_or_else(|| anyhow!("missing shielded root ledger"))?;
 
-        for (request_index, note_index) in request_note_indexes.into_iter().enumerate() {
+        for (request_index, (note_index, request_checkpoint, _)) in
+            prepared_requests.into_iter().enumerate()
+        {
             if !extensions[request_index].strata.is_empty() {
                 let accumulator = proof::prove_checkpoint_accumulator(
-                    &request_checkpoints[request_index],
+                    &request_checkpoint,
                     &extensions[request_index],
                     notes[note_index].checkpoint_accumulator.as_ref(),
                 )?;
-                notes[note_index].checkpoint = request_checkpoints[request_index]
-                    .apply_accumulator(&accumulator.journal, &ledger)?;
+                notes[note_index].checkpoint =
+                    request_checkpoint.apply_accumulator(&accumulator.journal, &ledger)?;
                 notes[note_index].checkpoint_accumulator = Some(accumulator);
             }
             store.store_shielded_owned_note(
@@ -599,6 +624,7 @@ impl Wallet {
         &self,
         current_epoch: u64,
         rotation_round: u64,
+        span_templates: &[usize],
         count: usize,
     ) -> Vec<shielded::CheckpointExtensionRequest> {
         let Some(through_epoch) = current_epoch.checked_sub(1) else {
@@ -614,15 +640,36 @@ impl Wallet {
             .saturating_sub(earliest_epoch)
             .saturating_add(1)
             .max(1);
+        let max_cover_len = epoch_span
+            .min(crate::protocol::CURRENT.max_historical_nullifier_batch as u64)
+            .max(1);
         let mut requests = Vec::with_capacity(count);
         for index in 0..count {
+            let desired_cover_len = if span_templates.is_empty() {
+                let mut span_hasher =
+                    blake3::Hasher::new_derive_key(SHIELDED_REFRESH_OFFSET_DOMAIN);
+                span_hasher.update(b"cover-span");
+                span_hasher.update(&self.address);
+                span_hasher.update(&rotation_round.to_le_bytes());
+                span_hasher.update(&(index as u64).to_le_bytes());
+                let mut span_bytes = [0u8; 8];
+                span_bytes.copy_from_slice(&span_hasher.finalize().as_bytes()[..8]);
+                1usize + (u64::from_le_bytes(span_bytes) % max_cover_len) as usize
+            } else {
+                span_templates[index % span_templates.len()].max(1)
+            };
+            let cover_len = desired_cover_len.min(max_cover_len as usize).max(1);
+            let start_slots = epoch_span
+                .saturating_sub(cover_len as u64)
+                .saturating_add(1);
             let mut epoch_hasher = blake3::Hasher::new_derive_key(SHIELDED_REFRESH_OFFSET_DOMAIN);
+            epoch_hasher.update(b"cover-start");
             epoch_hasher.update(&self.address);
             epoch_hasher.update(&rotation_round.to_le_bytes());
             epoch_hasher.update(&(index as u64).to_le_bytes());
             let mut epoch_bytes = [0u8; 8];
             epoch_bytes.copy_from_slice(&epoch_hasher.finalize().as_bytes()[..8]);
-            let cover_epoch = earliest_epoch + (u64::from_le_bytes(epoch_bytes) % epoch_span);
+            let cover_epoch = earliest_epoch + (u64::from_le_bytes(epoch_bytes) % start_slots);
 
             let mut commitment_hasher =
                 blake3::Hasher::new_derive_key(SHIELDED_COVER_COMMIT_DOMAIN);
@@ -630,26 +677,38 @@ impl Wallet {
             commitment_hasher.update(&rotation_round.to_le_bytes());
             commitment_hasher.update(&(index as u64).to_le_bytes());
             commitment_hasher.update(&cover_epoch.to_le_bytes());
+            commitment_hasher.update(&(cover_len as u64).to_le_bytes());
             let cover_commitment = *commitment_hasher.finalize().as_bytes();
 
-            let mut nullifier_hasher =
-                blake3::Hasher::new_derive_key(SHIELDED_COVER_NULLIFIER_DOMAIN);
-            nullifier_hasher.update(&self.address);
-            nullifier_hasher.update(&rotation_round.to_le_bytes());
-            nullifier_hasher.update(&(index as u64).to_le_bytes());
-            nullifier_hasher.update(&cover_epoch.to_le_bytes());
-            let cover_nullifier = *nullifier_hasher.finalize().as_bytes();
-
-            requests.push(shielded::CheckpointExtensionRequest {
-                checkpoint: shielded::HistoricalUnspentCheckpoint::genesis(
-                    cover_commitment,
-                    cover_epoch,
-                ),
-                queries: vec![shielded::EvolvingNullifierQuery {
-                    epoch: cover_epoch,
-                    nullifier: cover_nullifier,
-                }],
-            });
+            let queries = (0..cover_len)
+                .map(|offset| {
+                    let epoch = cover_epoch.saturating_add(offset as u64);
+                    let mut nullifier_hasher =
+                        blake3::Hasher::new_derive_key(SHIELDED_COVER_NULLIFIER_DOMAIN);
+                    nullifier_hasher.update(&self.address);
+                    nullifier_hasher.update(&rotation_round.to_le_bytes());
+                    nullifier_hasher.update(&(index as u64).to_le_bytes());
+                    nullifier_hasher.update(&epoch.to_le_bytes());
+                    nullifier_hasher.update(&(offset as u64).to_le_bytes());
+                    shielded::EvolvingNullifierQuery {
+                        epoch,
+                        nullifier: *nullifier_hasher.finalize().as_bytes(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut presentation_hasher =
+                blake3::Hasher::new_derive_key(SHIELDED_COVER_COMMIT_DOMAIN);
+            presentation_hasher.update(b"presentation");
+            presentation_hasher.update(&self.address);
+            presentation_hasher.update(&rotation_round.to_le_bytes());
+            presentation_hasher.update(&(index as u64).to_le_bytes());
+            presentation_hasher.update(&cover_epoch.to_le_bytes());
+            presentation_hasher.update(&(cover_len as u64).to_le_bytes());
+            requests.push(shielded::CheckpointExtensionRequest::new(
+                shielded::HistoricalUnspentCheckpoint::genesis(cover_commitment, cover_epoch),
+                queries,
+                *presentation_hasher.finalize().as_bytes(),
+            ));
         }
         requests
     }
@@ -667,6 +726,19 @@ impl Wallet {
         let mut notes = self.load_owned_shielded_notes(false, true)?;
         let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
         let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
+        let cover_span_templates = current_epoch
+            .checked_sub(1)
+            .map(|through_epoch| {
+                self.prepare_owned_checkpoint_requests(&notes, through_epoch, store.get_chain_id()?)
+                    .map(|prepared| {
+                        prepared
+                            .into_iter()
+                            .map(|(_, _, request)| request.queries.len())
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
         if !notes.is_empty() {
             self.refresh_owned_shielded_checkpoints_with_round(&mut notes, network, rotation_round)
                 .await?;
@@ -674,6 +746,7 @@ impl Wallet {
         let cover_requests = self.build_cover_checkpoint_requests(
             current_epoch,
             rotation_round,
+            &cover_span_templates,
             crate::protocol::CURRENT.oblivious_sync_cover_queries as usize,
         );
         if !cover_requests.is_empty() {
@@ -690,7 +763,11 @@ impl Wallet {
         owner_kem_pk: TaggedKemPublicKey,
         value: u64,
         birth_epoch: u64,
-    ) -> Result<(ShieldedOutput, ShieldedOutputPlaintext)> {
+    ) -> Result<(
+        ShieldedOutput,
+        ShieldedOutputPlaintext,
+        [u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
+    )> {
         let mut note_key = [0u8; 32];
         let mut rho = [0u8; 32];
         let mut note_randomizer = [0u8; 32];
@@ -714,8 +791,11 @@ impl Wallet {
             note_key,
             checkpoint,
         };
-        let payload_bytes = canonical::encode_shielded_output_plaintext(&payload)?;
-        let (kem_ct, shared) = owner_kem_pk.encapsulate()?;
+        let payload_bytes = bincode::serialize(&proof::output_plaintext_to_proof(&payload))
+            .map_err(|err| anyhow!("failed to encode shielded output payload: {err}"))?;
+        let mut encapsulation_seed = [0u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN];
+        OsRng.fill_bytes(&mut encapsulation_seed);
+        let (kem_ct, shared) = owner_kem_pk.encapsulate_deterministic(&encapsulation_seed)?;
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&shared));
@@ -731,6 +811,7 @@ impl Wallet {
                 ciphertext,
             },
             payload,
+            encapsulation_seed,
         ))
     }
 
@@ -891,29 +972,28 @@ impl Wallet {
 
         let mut outputs = Vec::new();
         let mut output_witnesses = Vec::new();
-        let (recipient_output, recipient_plaintext) = self.build_shielded_output(
-            recipient_signing_pk,
-            receiver_kem_pk,
-            amount,
-            current_epoch,
-        )?;
+        let (recipient_output, recipient_plaintext, recipient_encapsulation_seed) = self
+            .build_shielded_output(recipient_signing_pk, receiver_kem_pk, amount, current_epoch)?;
         output_witnesses.push(proof::output_witness_from_local(
             &recipient_plaintext,
             &recipient_output,
+            &recipient_encapsulation_seed,
         ));
         outputs.push(recipient_output);
 
         let change = total_selected.saturating_sub(amount);
         if change > 0 {
-            let (change_output, change_plaintext) = self.build_shielded_output(
-                self.signing_pk.clone(),
-                self.kem_pk.clone(),
-                change,
-                current_epoch,
-            )?;
+            let (change_output, change_plaintext, change_encapsulation_seed) = self
+                .build_shielded_output(
+                    self.signing_pk.clone(),
+                    self.kem_pk.clone(),
+                    change,
+                    current_epoch,
+                )?;
             output_witnesses.push(proof::output_witness_from_local(
                 &change_plaintext,
                 &change_output,
+                &change_encapsulation_seed,
             ));
             outputs.push(change_output);
         }

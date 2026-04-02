@@ -132,7 +132,7 @@ pub struct HistoricalUnspentServiceResponse {
     pub version: u8,
     pub provider_id: [u8; 32],
     pub provider_manifest_digest: [u8; 32],
-    pub note_commitment: [u8; 32],
+    pub request_binding: [u8; 32],
     pub from_epoch: u64,
     pub through_epoch: u64,
     pub segment_service_root: [u8; 32],
@@ -144,6 +144,7 @@ pub struct HistoricalUnspentServiceResponse {
 pub struct HistoricalUnspentSegment {
     pub provider_id: [u8; 32],
     pub provider_manifest_digest: [u8; 32],
+    pub request_binding: [u8; 32],
     pub from_epoch: u64,
     pub through_epoch: u64,
     pub segment_service_root: [u8; 32],
@@ -298,7 +299,7 @@ pub struct ArchiveRetrievalReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointPresentation {
-    pub checkpoint: HistoricalUnspentCheckpoint,
+    pub covered_through_epoch: u64,
     pub blinding: [u8; 32],
     pub presentation_digest: [u8; 32],
 }
@@ -366,7 +367,8 @@ pub struct ShieldedSyncServer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointExtensionRequest {
-    pub checkpoint: HistoricalUnspentCheckpoint,
+    pub checkpoint: Option<HistoricalUnspentCheckpoint>,
+    pub presentation: CheckpointPresentation,
     pub queries: Vec<EvolvingNullifierQuery>,
 }
 
@@ -767,14 +769,7 @@ impl HistoricalUnspentCheckpoint {
     }
 
     pub fn presentation(&self, blinding: [u8; 32]) -> CheckpointPresentation {
-        let mut hasher = blake3::Hasher::new_derive_key(PRESENTATION_DOMAIN);
-        hasher.update(&self.transcript_root);
-        hasher.update(&blinding);
-        CheckpointPresentation {
-            checkpoint: self.clone(),
-            blinding,
-            presentation_digest: *hasher.finalize().as_bytes(),
-        }
+        CheckpointPresentation::for_checkpoint(self, blinding)
     }
 
     pub fn empty_extension(&self) -> HistoricalUnspentExtension {
@@ -966,11 +961,85 @@ impl HistoricalUnspentCheckpoint {
     }
 }
 
+impl CheckpointExtensionRequest {
+    pub fn new(
+        checkpoint: HistoricalUnspentCheckpoint,
+        queries: Vec<EvolvingNullifierQuery>,
+        blinding: [u8; 32],
+    ) -> Self {
+        let presentation = checkpoint.presentation(blinding);
+        Self {
+            checkpoint: Some(checkpoint),
+            presentation,
+            queries,
+        }
+    }
+
+    pub fn with_random_blinding(
+        checkpoint: HistoricalUnspentCheckpoint,
+        queries: Vec<EvolvingNullifierQuery>,
+    ) -> Self {
+        let mut blinding = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut blinding);
+        Self::new(checkpoint, queries, blinding)
+    }
+
+    pub fn wire_only(
+        presentation: CheckpointPresentation,
+        queries: Vec<EvolvingNullifierQuery>,
+    ) -> Self {
+        Self {
+            checkpoint: None,
+            presentation,
+            queries,
+        }
+    }
+
+    pub fn local_checkpoint(&self) -> Result<&HistoricalUnspentCheckpoint> {
+        self.checkpoint
+            .as_ref()
+            .ok_or_else(|| anyhow!("checkpoint request is missing local checkpoint context"))
+    }
+
+    pub fn from_epoch(&self) -> u64 {
+        self.presentation.covered_through_epoch.saturating_add(1)
+    }
+
+    pub fn request_binding(&self) -> [u8; 32] {
+        self.presentation.presentation_digest
+    }
+
+    pub fn derive_segment_request(
+        &self,
+        segment_queries: Vec<EvolvingNullifierQuery>,
+        segment_index: u32,
+    ) -> Result<Self> {
+        let from_epoch = segment_queries
+            .first()
+            .map(|query| query.epoch)
+            .ok_or_else(|| anyhow!("segment request cannot be empty"))?;
+        let through_epoch = segment_queries
+            .last()
+            .map(|query| query.epoch)
+            .ok_or_else(|| anyhow!("segment request cannot be empty"))?;
+        Ok(Self::wire_only(
+            self.presentation.derive_segment(
+                from_epoch.saturating_sub(1),
+                from_epoch,
+                through_epoch,
+                segment_index,
+            ),
+            segment_queries,
+        ))
+    }
+}
+
 impl HistoricalUnspentServiceResponse {
     pub fn rerandomize(&self, blinding: [u8; 32]) -> HistoricalUnspentSegment {
         HistoricalUnspentSegment {
             provider_id: self.provider_id,
             provider_manifest_digest: self.provider_manifest_digest,
+            request_binding: self.request_binding,
             from_epoch: self.from_epoch,
             through_epoch: self.through_epoch,
             segment_service_root: self.segment_service_root,
@@ -1016,16 +1085,43 @@ impl HistoricalUnspentServiceResponse {
             bail!("service response historical root digest mismatch");
         }
         let expected_service_root =
-            checkpoint_segment_service_root(&self.note_commitment, self.from_epoch, &self.records)?;
+            checkpoint_segment_service_root(&self.request_binding, self.from_epoch, &self.records)?;
         if self.segment_service_root != expected_service_root {
             bail!("service response segment transcript root mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn verify_against_request(
+        &self,
+        request: &CheckpointExtensionRequest,
+        manifest: &ArchiveProviderManifest,
+        directory: &ArchiveDirectory,
+    ) -> Result<()> {
+        self.verify_against_manifest(manifest, directory)?;
+        if self.request_binding != request.request_binding() {
+            bail!("service response request binding mismatch");
+        }
+        if self.from_epoch != request.from_epoch() {
+            bail!("service response starts at the wrong epoch");
+        }
+        if self.records.len() != request.queries.len() {
+            bail!("service response length does not match the request");
+        }
+        let expected_through_epoch = request
+            .queries
+            .last()
+            .map(|query| query.epoch)
+            .ok_or_else(|| anyhow!("checkpoint request is missing the terminal epoch"))?;
+        if self.through_epoch != expected_through_epoch {
+            bail!("service response ends at the wrong epoch");
         }
         Ok(())
     }
 }
 
 impl HistoricalUnspentSegment {
-    pub fn verify_against_note(&self, note_commitment: &[u8; 32]) -> Result<()> {
+    pub fn verify(&self) -> Result<()> {
         if self.records.is_empty() {
             bail!("historical segment cannot be empty");
         }
@@ -1033,7 +1129,7 @@ impl HistoricalUnspentSegment {
             bail!("historical segment through_epoch does not match the final record");
         }
         let expected_service_root =
-            checkpoint_segment_service_root(note_commitment, self.from_epoch, &self.records)?;
+            checkpoint_segment_service_root(&self.request_binding, self.from_epoch, &self.records)?;
         if self.segment_service_root != expected_service_root {
             bail!("historical segment service root mismatch");
         }
@@ -1081,7 +1177,7 @@ impl HistoricalUnspentPacket {
             if segment.from_epoch != expected_epoch {
                 bail!("historical packet segments must stay contiguous");
             }
-            segment.verify_against_note(note_commitment)?;
+            segment.verify()?;
             for record in &segment.records {
                 if record.epoch != expected_epoch {
                     bail!("historical packet records must remain contiguous");
@@ -1128,7 +1224,7 @@ impl HistoricalUnspentPacket {
             if segment.from_epoch != expected_epoch {
                 bail!("historical packet segments must stay contiguous");
             }
-            segment.verify_against_note(note_commitment)?;
+            segment.verify()?;
             for record in &segment.records {
                 if record.epoch != expected_epoch {
                     bail!("historical packet records must remain contiguous");
@@ -1309,7 +1405,7 @@ impl HistoricalUnspentExtension {
             if segment.records.is_empty() {
                 bail!("historical segments cannot be empty");
             }
-            segment.verify_against_note(&checkpoint.note_commitment)?;
+            segment.verify()?;
             for record in &segment.records {
                 if record.epoch != expected_epoch {
                     bail!("historical segment records must remain contiguous");
@@ -1408,7 +1504,7 @@ impl CheckpointBatchRequest {
             if request.queries.is_empty() {
                 continue;
             }
-            let expected_from = request.checkpoint.covered_through_epoch.saturating_add(1);
+            let expected_from = request.from_epoch();
             let through_epoch = request
                 .queries
                 .last()
@@ -1448,11 +1544,54 @@ impl CheckpointBatchResponse {
 }
 
 impl CheckpointPresentation {
-    pub fn verify(&self) -> bool {
+    pub fn for_checkpoint(checkpoint: &HistoricalUnspentCheckpoint, blinding: [u8; 32]) -> Self {
         let mut hasher = blake3::Hasher::new_derive_key(PRESENTATION_DOMAIN);
-        hasher.update(&self.checkpoint.transcript_root);
-        hasher.update(&self.blinding);
-        *hasher.finalize().as_bytes() == self.presentation_digest
+        hasher.update(&[checkpoint.version]);
+        hasher.update(&checkpoint.birth_epoch.to_le_bytes());
+        hasher.update(&checkpoint.covered_through_epoch.to_le_bytes());
+        hasher.update(&checkpoint.transcript_root);
+        hasher.update(&checkpoint.verified_epoch_count.to_le_bytes());
+        hasher.update(&blinding);
+        Self {
+            covered_through_epoch: checkpoint.covered_through_epoch,
+            blinding,
+            presentation_digest: *hasher.finalize().as_bytes(),
+        }
+    }
+
+    pub fn derive_segment(
+        &self,
+        covered_through_epoch: u64,
+        from_epoch: u64,
+        through_epoch: u64,
+        segment_index: u32,
+    ) -> Self {
+        let mut blinding_hasher = blake3::Hasher::new_derive_key(PRESENTATION_DOMAIN);
+        blinding_hasher.update(b"segment-blinding");
+        blinding_hasher.update(&self.presentation_digest);
+        blinding_hasher.update(&covered_through_epoch.to_le_bytes());
+        blinding_hasher.update(&from_epoch.to_le_bytes());
+        blinding_hasher.update(&through_epoch.to_le_bytes());
+        blinding_hasher.update(&segment_index.to_le_bytes());
+        let blinding = *blinding_hasher.finalize().as_bytes();
+
+        let mut digest_hasher = blake3::Hasher::new_derive_key(PRESENTATION_DOMAIN);
+        digest_hasher.update(b"segment");
+        digest_hasher.update(&self.presentation_digest);
+        digest_hasher.update(&covered_through_epoch.to_le_bytes());
+        digest_hasher.update(&from_epoch.to_le_bytes());
+        digest_hasher.update(&through_epoch.to_le_bytes());
+        digest_hasher.update(&segment_index.to_le_bytes());
+        digest_hasher.update(&blinding);
+        Self {
+            covered_through_epoch,
+            blinding,
+            presentation_digest: *digest_hasher.finalize().as_bytes(),
+        }
+    }
+
+    pub fn verify_against_checkpoint(&self, checkpoint: &HistoricalUnspentCheckpoint) -> bool {
+        *self == Self::for_checkpoint(checkpoint, self.blinding)
     }
 }
 
@@ -1932,7 +2071,7 @@ impl ArchiveDirectory {
                 provider_selection_score(
                     &provider.provider_id,
                     &provider.schedule_seed,
-                    &checkpoint.note_commitment,
+                    &checkpoint.transcript_root,
                     from_epoch,
                     through_epoch,
                     rotation_round,
@@ -2203,7 +2342,7 @@ impl ArchiveDirectory {
 
     pub fn pick_provider_for_segment(
         &self,
-        note_commitment: &[u8; 32],
+        request_binding: &[u8; 32],
         from_epoch: u64,
         through_epoch: u64,
         rotation_round: u64,
@@ -2273,7 +2412,7 @@ impl ArchiveDirectory {
                 provider_selection_score(
                     &provider.provider_id,
                     &provider.schedule_seed,
-                    note_commitment,
+                    request_binding,
                     from_epoch,
                     through_epoch,
                     rotation_round ^ (segment_index as u64),
@@ -2557,7 +2696,7 @@ pub fn route_checkpoint_requests(
     let max_batch_size = max_batch_size.max(1);
     let min_batch_size = min_batch_size.max(1).min(max_batch_size);
     let mut routed = Vec::new();
-    let mut counts_by_provider_shard = BTreeMap::<([u8; 32], u64), usize>::new();
+    let mut segment_lengths_by_provider_shard = BTreeMap::<([u8; 32], u64), Vec<usize>>::new();
     let mut provider_loads = BTreeMap::<[u8; 32], usize>::new();
 
     for (request_index, request) in requests.iter().enumerate() {
@@ -2586,16 +2725,10 @@ pub fn route_checkpoint_requests(
                 .last()
                 .map(|query| query.epoch)
                 .ok_or_else(|| anyhow!("checkpoint segment is missing terminal epoch"))?;
-            let segment_checkpoint = HistoricalUnspentCheckpoint {
-                version: request.checkpoint.version,
-                note_commitment: request.checkpoint.note_commitment,
-                birth_epoch: request.checkpoint.birth_epoch,
-                covered_through_epoch: segment_queries[0].epoch.saturating_sub(1),
-                transcript_root: request.checkpoint.transcript_root,
-                verified_epoch_count: request.checkpoint.verified_epoch_count,
-            };
+            let segment_request =
+                request.derive_segment_request(segment_queries.clone(), segment_index)?;
             let provider = directory.pick_provider_for_segment(
-                &request.checkpoint.note_commitment,
+                &segment_request.request_binding(),
                 segment_queries[0].epoch,
                 through_epoch,
                 rotation_round,
@@ -2604,50 +2737,77 @@ pub fn route_checkpoint_requests(
                 &provider_loads,
             )?;
             used_providers.insert(provider.provider_id);
-            *counts_by_provider_shard
+            segment_lengths_by_provider_shard
                 .entry((provider.provider_id, segment_shard_id))
-                .or_default() += 1;
+                .or_default()
+                .push(segment_request.queries.len());
             *provider_loads.entry(provider.provider_id).or_default() += 1;
             routed.push(RoutedCheckpointRequest {
                 provider_id: provider.provider_id,
                 request_index: Some(request_index),
                 segment_index,
                 shard_id: segment_shard_id,
-                request: CheckpointExtensionRequest {
-                    checkpoint: segment_checkpoint,
-                    queries: segment_queries,
-                },
+                request: segment_request,
             });
             segment_index = segment_index.saturating_add(1);
             segment_start = segment_end;
         }
     }
 
-    for ((provider_id, shard_id), real_count) in counts_by_provider_shard {
+    for ((provider_id, shard_id), segment_lengths) in segment_lengths_by_provider_shard {
         let shard = directory
             .shard(shard_id)
             .ok_or_else(|| anyhow!("missing archive shard {}", shard_id))?;
+        let real_count = segment_lengths.len();
         let mut target_count = real_count.max(min_batch_size).next_power_of_two();
         target_count = target_count.min(max_batch_size.max(real_count));
         for cover_index in real_count..target_count {
-            let cover_epoch = shard.first_epoch.saturating_add(
-                (cover_index as u64)
-                    % shard
-                        .last_epoch
-                        .saturating_sub(shard.first_epoch)
-                        .saturating_add(1),
+            let available_span = shard
+                .last_epoch
+                .saturating_sub(shard.first_epoch)
+                .saturating_add(1);
+            let template_len = segment_lengths[cover_index % segment_lengths.len()].max(1);
+            let cover_len = template_len.min(available_span as usize).max(1);
+            let start_slots = available_span
+                .saturating_sub(cover_len as u64)
+                .saturating_add(1);
+            let start_seed = synthetic_cover_digest(
+                b"start",
+                &provider_id,
+                rotation_round ^ shard_id,
+                shard.first_epoch,
+                cover_index as u64,
             );
+            let mut start_bytes = [0u8; 8];
+            start_bytes.copy_from_slice(&start_seed[..8]);
+            let cover_epoch =
+                shard.first_epoch + (u64::from_le_bytes(start_bytes) % start_slots.max(1));
+            let cover_queries = (0..cover_len)
+                .map(|offset| {
+                    let epoch = cover_epoch.saturating_add(offset as u64);
+                    EvolvingNullifierQuery {
+                        epoch,
+                        nullifier: synthetic_cover_digest(
+                            b"nullifier",
+                            &provider_id,
+                            rotation_round ^ shard_id,
+                            epoch,
+                            ((cover_index as u64) << 32) | (offset as u64),
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
             let fake_commitment = synthetic_cover_digest(
                 b"commitment",
                 &provider_id,
-                rotation_round,
+                rotation_round ^ shard_id,
                 cover_epoch,
                 cover_index as u64,
             );
-            let fake_nullifier = synthetic_cover_digest(
-                b"nullifier",
+            let presentation_blinding = synthetic_cover_digest(
+                b"presentation",
                 &provider_id,
-                rotation_round,
+                rotation_round ^ shard_id,
                 cover_epoch,
                 cover_index as u64,
             );
@@ -2656,13 +2816,11 @@ pub fn route_checkpoint_requests(
                 request_index: None,
                 segment_index: u32::MAX,
                 shard_id,
-                request: CheckpointExtensionRequest {
-                    checkpoint: HistoricalUnspentCheckpoint::genesis(fake_commitment, cover_epoch),
-                    queries: vec![EvolvingNullifierQuery {
-                        epoch: cover_epoch,
-                        nullifier: fake_nullifier,
-                    }],
-                },
+                request: CheckpointExtensionRequest::new(
+                    HistoricalUnspentCheckpoint::genesis(fake_commitment, cover_epoch),
+                    cover_queries,
+                    presentation_blinding,
+                ),
             });
         }
     }
@@ -2732,10 +2890,11 @@ impl ShieldedSyncServer {
     ) -> Result<HistoricalUnspentServiceResponse> {
         let mut responses = self.serve_checkpoints_batch(
             manifest,
-            &[CheckpointExtensionRequest {
-                checkpoint: checkpoint.clone(),
-                queries: queries.to_vec(),
-            }],
+            &[CheckpointExtensionRequest::new(
+                checkpoint.clone(),
+                queries.to_vec(),
+                [0u8; 32],
+            )],
         )?;
         responses
             .pop()
@@ -2752,7 +2911,7 @@ impl ShieldedSyncServer {
         }
 
         struct PendingResponse {
-            note_commitment: [u8; 32],
+            request_binding: [u8; 32],
             from_epoch: u64,
             through_epoch: u64,
             historical_roots: Vec<(u64, [u8; 32])>,
@@ -2763,7 +2922,7 @@ impl ShieldedSyncServer {
         let mut epoch_queries: BTreeMap<u64, Vec<(usize, [u8; 32])>> = BTreeMap::new();
 
         for (request_index, request) in requests.iter().enumerate() {
-            let expected_from = request.checkpoint.covered_through_epoch.saturating_add(1);
+            let expected_from = request.from_epoch();
             let mut expected_epoch = expected_from;
             for query in &request.queries {
                 if query.epoch != expected_epoch {
@@ -2776,9 +2935,9 @@ impl ShieldedSyncServer {
                 expected_epoch = expected_epoch.saturating_add(1);
             }
             pending.push(PendingResponse {
-                note_commitment: request.checkpoint.note_commitment,
+                request_binding: request.request_binding(),
                 from_epoch: expected_from,
-                through_epoch: request.checkpoint.covered_through_epoch,
+                through_epoch: request.presentation.covered_through_epoch,
                 historical_roots: Vec::with_capacity(request.queries.len()),
                 records: Vec::with_capacity(request.queries.len()),
             });
@@ -2811,11 +2970,11 @@ impl ShieldedSyncServer {
                     version: SHIELDED_EXTENSION_VERSION,
                     provider_id: manifest.provider_id,
                     provider_manifest_digest: manifest.manifest_digest,
-                    note_commitment: pending_response.note_commitment,
+                    request_binding: pending_response.request_binding,
                     from_epoch: pending_response.from_epoch,
                     through_epoch: pending_response.through_epoch,
                     segment_service_root: checkpoint_segment_service_root(
-                        &pending_response.note_commitment,
+                        &pending_response.request_binding,
                         pending_response.from_epoch,
                         &pending_response.records,
                     )?,
@@ -3314,8 +3473,14 @@ fn checkpoint_batch_order_key(
         }
     }
     hasher.update(&request.shard_id.to_le_bytes());
-    hasher.update(&request.request.checkpoint.note_commitment);
-    hasher.update(&request.request.checkpoint.transcript_root);
+    hasher.update(&request.request.request_binding());
+    hasher.update(
+        &request
+            .request
+            .presentation
+            .covered_through_epoch
+            .to_le_bytes(),
+    );
     if let Some(first) = request.request.queries.first() {
         hasher.update(&first.epoch.to_le_bytes());
         hasher.update(&first.nullifier);
@@ -3346,7 +3511,7 @@ fn archive_provider_schedule_seed(
 fn provider_selection_score(
     provider_id: &[u8; 32],
     schedule_seed: &[u8; 32],
-    note_commitment: &[u8; 32],
+    request_binding: &[u8; 32],
     from_epoch: u64,
     through_epoch: u64,
     rotation_round: u64,
@@ -3354,7 +3519,7 @@ fn provider_selection_score(
     let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_PROVIDER_SELECT_DOMAIN);
     hasher.update(provider_id);
     hasher.update(schedule_seed);
-    hasher.update(note_commitment);
+    hasher.update(request_binding);
     hasher.update(&from_epoch.to_le_bytes());
     hasher.update(&through_epoch.to_le_bytes());
     hasher.update(&rotation_round.to_le_bytes());

@@ -40,7 +40,7 @@ bincode = "1.3"
 zstd = "0.13"
 hex = "0.4"
 serde-big-array = "0.5"
-ml-kem = "0.2.1"
+ml-kem = { version = "0.2.1", features = ["deterministic"] }
 # Finalized NIST ML-KEM for wallet and asset-layer key encapsulation
 # AEAD for encrypting one-time secret keys in stealth outputs
 aes-gcm-siv = "0.11"
