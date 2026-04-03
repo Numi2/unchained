@@ -49,7 +49,7 @@ struct NodeCli {
     author,
     version,
     about = "Unchained wallet runtime",
-    long_about = "Operate the Unchained shielded wallet service, export addresses, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
+    long_about = "Operate the Unchained shielded wallet service, mint single-use receive handles, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
     after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <KEYDOC_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
@@ -153,7 +153,7 @@ struct ReceiveArgs {
 
 #[derive(Args, Clone)]
 struct SendArgs {
-    #[arg(long = "to", alias = "paycode")]
+    #[arg(long = "to")]
     to: Option<String>,
     #[arg(long)]
     amount: Option<u64>,
@@ -536,7 +536,7 @@ async fn run_send_flow(
     }
     let to_raw = match &args.to {
         Some(to) => to.clone(),
-        None => prompt_line("Recipient document: ")?,
+        None => prompt_line("Single-use receive handle: ")?,
     };
     let to = load_receiver_code(&to_raw)?;
     if to.is_empty() {
@@ -602,8 +602,8 @@ async fn run_send_flow(
     Ok(())
 }
 
-fn print_receive_output(state: &wallet::WalletObservedState, args: &ReceiveArgs) -> Result<()> {
-    let address = state.receive_handle.clone();
+fn print_receive_output(handle: &str, args: &ReceiveArgs) -> Result<()> {
+    let address = handle.to_string();
     let copied = if args.copy {
         copy_to_clipboard(&address).is_ok()
     } else {
@@ -650,14 +650,13 @@ fn print_receive_output(state: &wallet::WalletObservedState, args: &ReceiveArgs)
 fn print_balance_output(state: &wallet::WalletObservedState, args: &BalanceArgs) -> Result<()> {
     let balance = state.balance;
     let outputs = state.spendable_outputs;
-    let address = state.receive_handle.clone();
     if args.json {
         println!(
             "{}",
             serde_json::json!({
                 "balance": balance,
                 "spendable_outputs": outputs,
-                "address": address,
+                "address": hex::encode(state.address),
             })
         );
         return Ok(());
@@ -873,8 +872,8 @@ pub async fn run_wallet_cli() -> Result<()> {
         }
         WalletCmd::Receive(args) => {
             let client = open_wallet_control_client(&cfg).await?;
-            let state = client.state().await?;
-            print_receive_output(&state.state, &args)?;
+            let handle = client.mint_receive_handle().await?;
+            print_receive_output(&handle, &args)?;
             Ok(())
         }
         WalletCmd::Balance(args) => {

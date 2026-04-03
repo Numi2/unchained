@@ -26,7 +26,7 @@ use crate::{
         NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
-    wallet::KeyDocV2,
+    wallet::RecipientHandle,
 };
 
 pub struct CanonicalWriter {
@@ -475,57 +475,45 @@ pub fn decode_tx(bytes: &[u8]) -> Result<Tx> {
     })
 }
 
-pub fn encode_key_doc_signable(
-    version: u8,
+pub fn encode_recipient_handle_signable(
     chain_id: &[u8; 32],
     signing_pk: &TaggedSigningPublicKey,
-    kem_pk: &TaggedKemPublicKey,
-) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_u8(version);
-    writer.write_fixed(chain_id);
-    write_tagged_signing_public_key(&mut writer, signing_pk);
-    write_tagged_kem_public_key(&mut writer, kem_pk);
-    Ok(writer.into_vec())
-}
-
-pub fn encode_key_doc_v3_signable(
-    version: u8,
-    chain_id: &[u8; 32],
-    signing_pk: &TaggedSigningPublicKey,
-    kem_pk: &TaggedKemPublicKey,
     receive_key_id: &[u8; 32],
+    kem_pk: &TaggedKemPublicKey,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
 ) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_u8(version);
     writer.write_fixed(chain_id);
     write_tagged_signing_public_key(&mut writer, signing_pk);
-    write_tagged_kem_public_key(&mut writer, kem_pk);
     writer.write_fixed(receive_key_id);
+    write_tagged_kem_public_key(&mut writer, kem_pk);
     writer.write_u64(issued_unix_ms);
     writer.write_u64(expires_unix_ms);
     Ok(writer.into_vec())
 }
 
-pub fn encode_key_doc(doc: &KeyDocV2) -> Result<Vec<u8>> {
+pub fn encode_recipient_handle(doc: &RecipientHandle) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_u8(doc.version);
     writer.write_fixed(&doc.chain_id);
     write_tagged_signing_public_key(&mut writer, &doc.signing_pk);
+    writer.write_fixed(&doc.receive_key_id);
     write_tagged_kem_public_key(&mut writer, &doc.kem_pk);
+    writer.write_u64(doc.issued_unix_ms);
+    writer.write_u64(doc.expires_unix_ms);
     writer.write_bytes(&doc.sig)?;
     Ok(writer.into_vec())
 }
 
-pub fn decode_key_doc(bytes: &[u8]) -> Result<KeyDocV2> {
+pub fn decode_recipient_handle(bytes: &[u8]) -> Result<RecipientHandle> {
     let mut reader = CanonicalReader::new(bytes);
-    let doc = KeyDocV2 {
-        version: reader.read_u8()?,
+    let doc = RecipientHandle {
         chain_id: reader.read_fixed()?,
         signing_pk: read_tagged_signing_public_key(&mut reader)?,
+        receive_key_id: reader.read_fixed()?,
         kem_pk: read_tagged_kem_public_key(&mut reader)?,
+        issued_unix_ms: reader.read_u64()?,
+        expires_unix_ms: reader.read_u64()?,
         sig: reader.read_bytes()?,
     };
     reader.finish()?;

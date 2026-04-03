@@ -2413,9 +2413,7 @@ pub async fn spawn(
 
     let bootstrap_records = load_bootstrap_records(&net_cfg.bootstrap)?;
     if net_cfg.strict_trust && bootstrap_records.is_empty() {
-        bail!(
-            "strict trust is enabled, but no bootstrap node records were configured"
-        );
+        bail!("strict trust is enabled, but no bootstrap node records were configured");
     }
     let trust_policy = TrustPolicy::load(&bootstrap_records, &net_cfg.trust_updates)?
         .with_strict_root_pinning(net_cfg.strict_trust);

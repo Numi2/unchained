@@ -25,6 +25,7 @@ pub enum WalletControlRequest {
     Ping,
     SubscribeState,
     ForceSync,
+    MintReceiveHandle,
     DeriveGenesisLockSecret {
         coin_id: [u8; 32],
         chain_id: [u8; 32],
@@ -39,6 +40,7 @@ pub enum WalletControlRequest {
 pub enum WalletControlResponse {
     Pong,
     Synced,
+    ReceiveHandle { handle: String },
     GenesisLockSecret { secret: [u8; 32] },
     Sent { outcome: SendOutcome },
     Error { message: String },
@@ -167,6 +169,13 @@ impl WalletControlClient {
         match self.call(WalletControlRequest::ForceSync).await? {
             WalletControlResponse::Synced => Ok(()),
             other => bail!("unexpected wallet control sync response: {other:?}"),
+        }
+    }
+
+    pub async fn mint_receive_handle(&self) -> Result<String> {
+        match self.call(WalletControlRequest::MintReceiveHandle).await? {
+            WalletControlResponse::ReceiveHandle { handle } => Ok(handle),
+            other => bail!("unexpected wallet control receive-handle response: {other:?}"),
         }
     }
 
@@ -359,10 +368,15 @@ impl WalletControlService {
         Ok(())
     }
 
+    async fn mint_receive_handle(&self) -> Result<String> {
+        let _guard = self.op_lock.lock().await;
+        self.wallet.export_address()
+    }
+
     async fn send(&self, recipient_handle: String, amount: u64) -> Result<SendOutcome> {
         let _guard = self.op_lock.lock().await;
         self.wallet
-            .send_with_paycode_and_note(&recipient_handle, amount)
+            .send_to_recipient_handle(&recipient_handle, amount)
             .await
     }
 }
@@ -586,6 +600,9 @@ async fn handle_request(
                 let _ = state_refresh_tx.send(());
                 Ok(WalletControlResponse::Synced)
             }
+            WalletControlRequest::MintReceiveHandle => Ok(WalletControlResponse::ReceiveHandle {
+                handle: service.mint_receive_handle().await?,
+            }),
             WalletControlRequest::DeriveGenesisLockSecret { coin_id, chain_id } => {
                 Ok(WalletControlResponse::GenesisLockSecret {
                     secret: service

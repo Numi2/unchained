@@ -1,8 +1,8 @@
 use crate::{
     canonical,
     crypto::{
-        self, Address, MlKem768SecretKey, TaggedKemPublicKey, TaggedSigningPublicKey,
-        ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES,
+        self, Address, TaggedKemPublicKey, TaggedSigningPublicKey, ML_KEM_768_PK_BYTES,
+        ML_KEM_768_SK_BYTES,
     },
     node_control::{NodeControlClient, NodeControlStateEnvelope, ShieldedRuntimeSnapshot},
     proof, shielded,
@@ -14,31 +14,15 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyDocV2 {
-    pub version: u8,
+pub struct RecipientHandle {
     pub chain_id: [u8; 32],
     pub signing_pk: TaggedSigningPublicKey,
-    pub kem_pk: TaggedKemPublicKey,
-    pub sig: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyDocV3 {
-    pub version: u8,
-    pub chain_id: [u8; 32],
-    pub signing_pk: TaggedSigningPublicKey,
-    pub kem_pk: TaggedKemPublicKey,
     #[serde(with = "BigArray")]
     pub receive_key_id: [u8; 32],
+    pub kem_pk: TaggedKemPublicKey,
     pub issued_unix_ms: u64,
     pub expires_unix_ms: u64,
     pub sig: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-enum ParsedKeyDoc {
-    V2(KeyDocV2),
-    V3(KeyDocV3),
 }
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Argon2, Params};
@@ -54,12 +38,10 @@ use rand::RngCore;
 use rpassword;
 
 const WALLET_SECRET_KEY: &[u8] = b"default_keypair";
-const WALLET_FORMAT_MAGIC: &[u8; 4] = b"UCW3";
+const WALLET_FORMAT_MAGIC: &[u8; 4] = b"UCW4";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
-const WALLET_VERSION_STANDARDIZED: u8 = 3;
-const KEY_DOC_VERSION_V2: u8 = 2;
-const KEY_DOC_VERSION_V3: u8 = 3;
+const WALLET_FORMAT_VERSION: u8 = 1;
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
@@ -72,18 +54,12 @@ const SHIELDED_STORE_VERSION: u8 = 1;
 const SHIELDED_STORE_DOMAIN: &str = "unchained-wallet-shielded-store-v1";
 const SHIELDED_SEND_SEED_DOMAIN: &str = "unchained-wallet-shielded-send-seed-v1";
 const SHIELDED_OUTPUT_ENTROPY_DOMAIN: &str = "unchained-wallet-shielded-output-entropy-v1";
-const RECEIVE_KEY_RECORD_VERSION: u8 = 1;
-const RECEIVE_KEY_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-const RECEIVE_KEY_ACTIVE_META_PREFIX: &[u8] = b"receive_key_active_v1:";
+const RECEIVE_KEY_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const RECEIVE_KEY_ID_DOMAIN: &str = "unchained-wallet-receive-key-id-v1";
 
 #[derive(Serialize, Deserialize)]
-struct WalletSecretsV3 {
+struct WalletSecrets {
     signing_key_pkcs8: Vec<u8>,
-    #[serde(with = "BigArray")]
-    kem_sk: [u8; ML_KEM_768_SK_BYTES],
-    #[serde(with = "BigArray")]
-    kem_pk: [u8; ML_KEM_768_PK_BYTES],
     #[serde(with = "BigArray")]
     lock_seed: [u8; 32],
 }
@@ -112,8 +88,7 @@ struct SentShieldedTxRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct WalletReceiveKeyRecordV1 {
-    pub version: u8,
+struct ReceiveKeyRecord {
     #[serde(with = "BigArray")]
     pub key_id: [u8; 32],
     #[serde(with = "BigArray")]
@@ -128,7 +103,7 @@ struct WalletReceiveKeyRecordV1 {
 
 #[derive(Debug, Clone)]
 struct WalletReceiveKeyMaterial {
-    key_id: Option<[u8; 32]>,
+    key_id: [u8; 32],
     kem_pk: TaggedKemPublicKey,
     #[allow(dead_code)]
     issued_unix_ms: u64,
@@ -142,8 +117,6 @@ pub struct Wallet {
     node_client: Option<NodeControlClient>,
     signing_pk: TaggedSigningPublicKey,
     signing_key: PqdsaKeyPair,
-    kem_pk: TaggedKemPublicKey,
-    kem_sk: MlKem768SecretKey,
     lock_seed: [u8; 32],
     address: Address,
 }
@@ -215,18 +188,9 @@ impl Wallet {
         *hasher.finalize().as_bytes()
     }
 
-    fn active_receive_key_meta_key(chain_id: &[u8; 32]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(RECEIVE_KEY_ACTIVE_META_PREFIX.len() + chain_id.len());
-        key.extend_from_slice(RECEIVE_KEY_ACTIVE_META_PREFIX);
-        key.extend_from_slice(chain_id);
-        key
-    }
-
-    fn receive_key_record_to_material(
-        record: &WalletReceiveKeyRecordV1,
-    ) -> WalletReceiveKeyMaterial {
+    fn receive_key_record_to_material(record: &ReceiveKeyRecord) -> WalletReceiveKeyMaterial {
         WalletReceiveKeyMaterial {
-            key_id: Some(record.key_id),
+            key_id: record.key_id,
             kem_pk: TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk),
             issued_unix_ms: record.issued_unix_ms,
             expires_unix_ms: record.expires_unix_ms,
@@ -234,11 +198,12 @@ impl Wallet {
         }
     }
 
+    #[cfg(test)]
     fn load_receive_key_record(
         &self,
         store: &WalletStore,
         key_id: &[u8; 32],
-    ) -> Result<Option<WalletReceiveKeyRecordV1>> {
+    ) -> Result<Option<ReceiveKeyRecord>> {
         let cf = store
             .db
             .cf_handle("wallet_receive_key")
@@ -252,10 +217,7 @@ impl Wallet {
         }
     }
 
-    fn iterate_receive_key_records(
-        &self,
-        store: &WalletStore,
-    ) -> Result<Vec<WalletReceiveKeyRecordV1>> {
+    fn iterate_receive_key_records(&self, store: &WalletStore) -> Result<Vec<ReceiveKeyRecord>> {
         let cf = store
             .db
             .cf_handle("wallet_receive_key")
@@ -270,10 +232,19 @@ impl Wallet {
         Ok(keys)
     }
 
+    fn delete_receive_key_record(&self, store: &WalletStore, key_id: &[u8; 32]) -> Result<()> {
+        let cf = store
+            .db
+            .cf_handle("wallet_receive_key")
+            .ok_or_else(|| anyhow!("'wallet_receive_key' column family missing"))?;
+        store.db.delete_cf(cf, key_id)?;
+        Ok(())
+    }
+
     fn store_receive_key_record(
         &self,
         store: &WalletStore,
-        record: &WalletReceiveKeyRecordV1,
+        record: &ReceiveKeyRecord,
     ) -> Result<()> {
         let cf = store
             .db
@@ -285,42 +256,15 @@ impl Wallet {
         Ok(())
     }
 
-    fn active_receive_key_record(
-        &self,
-        store: &WalletStore,
-        chain_id: &[u8; 32],
-    ) -> Result<Option<WalletReceiveKeyRecordV1>> {
-        let meta_key = Self::active_receive_key_meta_key(chain_id);
-        let Some(key_id) = store.get_raw_bytes("meta", &meta_key)? else {
-            return Ok(None);
-        };
-        if key_id.len() != 32 {
-            bail!("active receive key id has invalid length");
-        }
-        let mut key_id_buf = [0u8; 32];
-        key_id_buf.copy_from_slice(&key_id);
-        self.load_receive_key_record(store, &key_id_buf)
-    }
-
-    fn set_active_receive_key_id(
-        &self,
-        store: &WalletStore,
-        chain_id: &[u8; 32],
-        key_id: &[u8; 32],
-    ) -> Result<()> {
-        store.put_raw_bytes("meta", &Self::active_receive_key_meta_key(chain_id), key_id)
-    }
-
     fn generate_receive_key_record(
         &self,
         chain_id: [u8; 32],
-    ) -> WalletReceiveKeyRecordV1 {
-        let issued_unix_ms = Self::now_unix_ms();
-        let expires_unix_ms = issued_unix_ms.saturating_add(RECEIVE_KEY_LIFETIME_MS);
+        issued_unix_ms: u64,
+        expires_unix_ms: u64,
+    ) -> ReceiveKeyRecord {
         let (kem_sk, kem_pk) = crypto::ml_kem_768_generate();
         let key_id = Self::derive_receive_key_id(&chain_id, &kem_pk, issued_unix_ms);
-        WalletReceiveKeyRecordV1 {
-            version: RECEIVE_KEY_RECORD_VERSION,
+        ReceiveKeyRecord {
             key_id,
             chain_id,
             kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&kem_sk),
@@ -330,59 +274,91 @@ impl Wallet {
         }
     }
 
-    fn ensure_active_receive_key_record(
+    fn build_recipient_handle(
+        &self,
+        chain_id: [u8; 32],
+        record: &ReceiveKeyRecord,
+    ) -> Result<RecipientHandle> {
+        let kem_pk = TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk);
+        let msg = canonical::encode_recipient_handle_signable(
+            &chain_id,
+            &self.signing_pk,
+            &record.key_id,
+            &kem_pk,
+            record.issued_unix_ms,
+            record.expires_unix_ms,
+        )?;
+        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &msg)?;
+        Ok(RecipientHandle {
+            chain_id,
+            signing_pk: self.signing_pk.clone(),
+            receive_key_id: record.key_id,
+            kem_pk,
+            issued_unix_ms: record.issued_unix_ms,
+            expires_unix_ms: record.expires_unix_ms,
+            sig,
+        })
+    }
+
+    fn prune_expired_receive_key_records(&self, store: &WalletStore) -> Result<()> {
+        let now_unix_ms = Self::now_unix_ms();
+        let expired = self
+            .iterate_receive_key_records(store)?
+            .into_iter()
+            .filter(|record| now_unix_ms >= record.expires_unix_ms)
+            .map(|record| record.key_id)
+            .collect::<Vec<_>>();
+        for key_id in expired {
+            self.delete_receive_key_record(store, &key_id)?;
+        }
+        Ok(())
+    }
+
+    fn mint_receive_key_record(
         &self,
         store: &WalletStore,
         chain_id: [u8; 32],
-    ) -> Result<WalletReceiveKeyRecordV1> {
-        let now_unix_ms = Self::now_unix_ms();
-        if let Some(record) = self.active_receive_key_record(store, &chain_id)? {
-            if record.version == RECEIVE_KEY_RECORD_VERSION
-                && record.chain_id == chain_id
-                && now_unix_ms < record.expires_unix_ms
-            {
-                return Ok(record);
-            }
-        }
-        let record = self.generate_receive_key_record(chain_id);
+    ) -> Result<ReceiveKeyRecord> {
+        self.prune_expired_receive_key_records(store)?;
+        let issued_unix_ms = Self::now_unix_ms();
+        let expires_unix_ms = issued_unix_ms.saturating_add(RECEIVE_KEY_LIFETIME_MS);
+        let record = self.generate_receive_key_record(chain_id, issued_unix_ms, expires_unix_ms);
         self.store_receive_key_record(store, &record)?;
-        self.set_active_receive_key_id(store, &chain_id, &record.key_id)?;
         Ok(record)
     }
 
-    fn receive_key_materials(&self, store: &WalletStore) -> Result<Vec<WalletReceiveKeyMaterial>> {
-        let mut materials = Vec::new();
-        if let Ok(chain_id) = self.effective_chain_id() {
-            if let Some(active) = self.active_receive_key_record(store, &chain_id)? {
-                materials.push(Self::receive_key_record_to_material(&active));
-            }
-        }
-        for record in self.iterate_receive_key_records(store)? {
-            if materials
-                .iter()
-                .any(|existing| existing.key_id == Some(record.key_id))
-            {
-                continue;
-            }
-            materials.push(Self::receive_key_record_to_material(&record));
-        }
-        materials.push(WalletReceiveKeyMaterial {
-            key_id: None,
-            kem_pk: self.kem_pk.clone(),
-            issued_unix_ms: 0,
-            expires_unix_ms: u64::MAX,
-            kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&self.kem_sk),
-        });
-        Ok(materials)
-    }
-
-    fn current_receive_kem_public_key_for_chain(
+    fn mint_internal_receive_kem_public_key_for_chain(
         &self,
         chain_id: [u8; 32],
     ) -> Result<TaggedKemPublicKey> {
         let wallet_store = self.wallet_store()?;
-        let record = self.ensure_active_receive_key_record(wallet_store.as_ref(), chain_id)?;
+        let record = self.mint_receive_key_record(wallet_store.as_ref(), chain_id)?;
         Ok(TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk))
+    }
+
+    fn mint_recipient_handle_for_chain(&self, chain_id: [u8; 32]) -> Result<String> {
+        let wallet_store = self.wallet_store()?;
+        let record = self.mint_receive_key_record(wallet_store.as_ref(), chain_id)?;
+        serde_json::to_string(&self.build_recipient_handle(chain_id, &record)?)
+            .context("serialize recipient handle")
+    }
+
+    fn receive_key_materials(&self, store: &WalletStore) -> Result<Vec<WalletReceiveKeyMaterial>> {
+        self.prune_expired_receive_key_records(store)?;
+        let now_unix_ms = Self::now_unix_ms();
+        let mut materials = self
+            .iterate_receive_key_records(store)?
+            .into_iter()
+            .filter(|record| now_unix_ms < record.expires_unix_ms)
+            .map(|record| Self::receive_key_record_to_material(&record))
+            .collect::<Vec<_>>();
+        materials.sort_by(|left, right| {
+            right
+                .issued_unix_ms
+                .cmp(&left.issued_unix_ms)
+                .then(right.key_id.cmp(&left.key_id))
+        });
+        Ok(materials)
     }
 
     fn require_node_client(&self) -> Result<&NodeControlClient> {
@@ -455,10 +431,10 @@ impl Wallet {
                 bail!("Unsupported wallet encoding");
             }
             if &encoded[..WALLET_FORMAT_MAGIC.len()] != WALLET_FORMAT_MAGIC {
-                bail!("Unsupported wallet format; remove the old wallet and create a fresh ML-DSA/ML-KEM wallet");
+                bail!("Unsupported wallet format; create a fresh wallet for the unified receive-handle architecture");
             }
             let version = encoded[WALLET_FORMAT_MAGIC.len()];
-            if version != WALLET_VERSION_STANDARDIZED {
+            if version != WALLET_FORMAT_VERSION {
                 bail!("Unsupported wallet version: {}", version);
             }
 
@@ -483,12 +459,10 @@ impl Wallet {
                 .decrypt(XNonce::from_slice(nonce), ciphertext)
                 .map_err(|_| anyhow!("Invalid pass-phrase"))?;
 
-            let secrets: WalletSecretsV3 = bincode::deserialize(&decrypted)
+            let secrets: WalletSecrets = bincode::deserialize(&decrypted)
                 .map_err(|_| anyhow!("Corrupted wallet payload"))?;
             let signing_key = crypto::ml_dsa_65_keypair_from_pkcs8(&secrets.signing_key_pkcs8)?;
             let signing_pk = crypto::ml_dsa_65_public_key(&signing_key);
-            let kem_sk = crypto::ml_kem_768_secret_key_from_bytes(&secrets.kem_sk);
-            let kem_pk = TaggedKemPublicKey::from_ml_kem_768_array(secrets.kem_pk);
             let mut key_zero = key;
             key_zero.iter_mut().for_each(|b| *b = 0);
 
@@ -497,8 +471,6 @@ impl Wallet {
                 node_client: None,
                 signing_pk: signing_pk.clone(),
                 signing_key,
-                kem_pk,
-                kem_sk,
                 lock_seed: secrets.lock_seed,
                 address: crypto::address_from_pk(&signing_pk),
             });
@@ -510,7 +482,6 @@ impl Wallet {
         OsRng.fill_bytes(&mut salt);
         let signing_key = crypto::ml_dsa_65_generate()?;
         let signing_pk = crypto::ml_dsa_65_public_key(&signing_key);
-        let (kem_sk, kem_pk) = crypto::ml_kem_768_generate();
         let address = crypto::address_from_pk(&signing_pk);
         let mut lock_seed = [0u8; 32];
         OsRng.fill_bytes(&mut lock_seed);
@@ -525,10 +496,8 @@ impl Wallet {
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        let secrets = WalletSecretsV3 {
+        let secrets = WalletSecrets {
             signing_key_pkcs8: crypto::ml_dsa_65_keypair_to_pkcs8(&signing_key)?,
-            kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&kem_sk),
-            kem_pk: kem_pk.bytes,
             lock_seed,
         };
         let plaintext = bincode::serialize(&secrets)?;
@@ -541,7 +510,7 @@ impl Wallet {
             WALLET_FORMAT_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ciphertext.len(),
         );
         encoded.extend_from_slice(WALLET_FORMAT_MAGIC);
-        encoded.push(WALLET_VERSION_STANDARDIZED);
+        encoded.push(WALLET_FORMAT_VERSION);
         encoded.extend_from_slice(&salt);
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
@@ -553,8 +522,6 @@ impl Wallet {
             node_client: None,
             signing_pk,
             signing_key,
-            kem_pk,
-            kem_sk,
             lock_seed,
             address,
         })
@@ -573,12 +540,6 @@ impl Wallet {
     /// Gets the public key
     pub fn public_key(&self) -> &TaggedSigningPublicKey {
         &self.signing_pk
-    }
-    pub fn kem_public_key(&self) -> &TaggedKemPublicKey {
-        &self.kem_pk
-    }
-    pub fn kem_secret_key(&self) -> &MlKem768SecretKey {
-        &self.kem_sk
     }
 
     /// INTERNAL: compute genesis lock secret deterministically for a coin we created.
@@ -708,38 +669,14 @@ impl Wallet {
     }
 
     // ---------------------------------------------------------------------
-    // Address export/import: authenticated ML-KEM key distribution
+    // Single-use receive handles
     // ---------------------------------------------------------------------
-    // Recipient handles are signed KeyDoc JSON documents. Unsigned address blobs are no longer accepted.
     pub fn export_address(&self) -> Result<String> {
         self.export_address_for_chain(self.effective_chain_id()?)
     }
 
     fn export_address_for_chain(&self, chain_id: [u8; 32]) -> Result<String> {
-        let wallet_store = self.wallet_store()?;
-        let receive_key = self.ensure_active_receive_key_record(wallet_store.as_ref(), chain_id)?;
-        let kem_pk = TaggedKemPublicKey::from_ml_kem_768_array(receive_key.kem_pk);
-        let msg = canonical::encode_key_doc_v3_signable(
-            KEY_DOC_VERSION_V3,
-            &chain_id,
-            &self.signing_pk,
-            &kem_pk,
-            &receive_key.key_id,
-            receive_key.issued_unix_ms,
-            receive_key.expires_unix_ms,
-        )?;
-        let sig = crypto::ml_dsa_65_sign(&self.signing_key, &msg)?;
-        let doc = KeyDocV3 {
-            version: KEY_DOC_VERSION_V3,
-            chain_id,
-            signing_pk: self.signing_pk.clone(),
-            kem_pk,
-            receive_key_id: receive_key.key_id,
-            issued_unix_ms: receive_key.issued_unix_ms,
-            expires_unix_ms: receive_key.expires_unix_ms,
-            sig,
-        };
-        serde_json::to_string(&doc).context("serialize recipient KeyDoc")
+        self.mint_recipient_handle_for_chain(chain_id)
     }
 
     pub fn export_stealth_address(&self) -> Result<String> {
@@ -749,18 +686,12 @@ impl Wallet {
     pub fn parse_address(
         addr_str: &str,
     ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
-        match Self::parse_key_doc(addr_str)? {
-            ParsedKeyDoc::V2(doc) => Ok((
-                crate::crypto::address_from_pk(&doc.signing_pk),
-                doc.signing_pk,
-                doc.kem_pk,
-            )),
-            ParsedKeyDoc::V3(doc) => Ok((
-                crate::crypto::address_from_pk(&doc.signing_pk),
-                doc.signing_pk,
-                doc.kem_pk,
-            )),
-        }
+        let handle = Self::parse_recipient_handle_document(addr_str)?;
+        Ok((
+            crate::crypto::address_from_pk(&handle.signing_pk),
+            handle.signing_pk,
+            handle.kem_pk,
+        ))
     }
 
     pub fn parse_stealth_address(
@@ -769,15 +700,15 @@ impl Wallet {
         Self::parse_address(addr_str)
     }
 
-    // Recipient documents are the only supported addressing surface.
-
-    /// Accepts a recipient handle that can be either:
-    /// - A KeyDoc JSON string with algorithm-tagged ML-DSA/ML-KEM bindings.
-    /// Returns (recipient_addr, recipient_signing_pk, receiver_kem_pk) after full verification.
     fn parse_recipient_handle(
         &self,
         handle: &str,
-    ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
+    ) -> Result<(
+        Address,
+        TaggedSigningPublicKey,
+        TaggedKemPublicKey,
+        [u8; 32],
+    )> {
         let chain_id = self.effective_chain_id()?;
         self.parse_recipient_handle_for_chain(handle, chain_id)
     }
@@ -786,78 +717,51 @@ impl Wallet {
         &self,
         handle: &str,
         chain_id: [u8; 32],
-    ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
-        if let Ok((addr, signing_pk, kem_pk)) = Self::parse_address(handle) {
-            let doc = Self::parse_key_doc(handle)?;
-            let doc_chain_id = match &doc {
-                ParsedKeyDoc::V2(doc) => doc.chain_id,
-                ParsedKeyDoc::V3(doc) => doc.chain_id,
-            };
-            if doc_chain_id != chain_id {
-                anyhow::bail!("KeyDoc chain_id mismatch");
-            }
-            return Ok((addr, signing_pk, kem_pk));
+    ) -> Result<(
+        Address,
+        TaggedSigningPublicKey,
+        TaggedKemPublicKey,
+        [u8; 32],
+    )> {
+        let handle = Self::parse_recipient_handle_document(handle)?;
+        if handle.chain_id != chain_id {
+            bail!("recipient handle chain_id mismatch");
         }
-
-        // Friendly hint for future paycode inputs without cached binding
-        let s = handle.trim();
-        if s.starts_with("ucsp1") {
-            anyhow::bail!("Paycode detected but no cached binding. Paste the signed KeyDoc JSON.");
-        }
-
-        anyhow::bail!("Invalid recipient handle")
+        Ok((
+            crate::crypto::address_from_pk(&handle.signing_pk),
+            handle.signing_pk,
+            handle.kem_pk,
+            handle.receive_key_id,
+        ))
     }
 
     pub fn validate_recipient_handle(&self, handle: &str) -> Result<()> {
         self.parse_recipient_handle(handle).map(|_| ())
     }
 
-    fn parse_key_doc(addr_str: &str) -> Result<ParsedKeyDoc> {
-        let s = addr_str.trim();
-        if !(s.starts_with('{') && s.ends_with('}')) {
-            bail!("Recipient handle must be a signed KeyDoc JSON document");
+    fn parse_recipient_handle_document(handle_str: &str) -> Result<RecipientHandle> {
+        let trimmed = handle_str.trim();
+        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            bail!("recipient handle must be a signed JSON document");
         }
-        let value: serde_json::Value = serde_json::from_str(s).context("Invalid KeyDoc JSON")?;
-        let version = value
-            .get("version")
-            .and_then(|version| version.as_u64())
-            .ok_or_else(|| anyhow!("KeyDoc version is missing"))? as u8;
-        match version {
-            KEY_DOC_VERSION_V2 => {
-                let doc: KeyDocV2 =
-                    serde_json::from_value(value).context("Invalid V2 KeyDoc JSON")?;
-                let msg = canonical::encode_key_doc_signable(
-                    doc.version,
-                    &doc.chain_id,
-                    &doc.signing_pk,
-                    &doc.kem_pk,
-                )?;
-                doc.signing_pk.verify(&msg, &doc.sig)?;
-                Ok(ParsedKeyDoc::V2(doc))
-            }
-            KEY_DOC_VERSION_V3 => {
-                let doc: KeyDocV3 =
-                    serde_json::from_value(value).context("Invalid V3 KeyDoc JSON")?;
-                if doc.expires_unix_ms <= doc.issued_unix_ms {
-                    bail!("KeyDoc expiration must be after issuance");
-                }
-                if Self::now_unix_ms() >= doc.expires_unix_ms {
-                    bail!("KeyDoc has expired");
-                }
-                let msg = canonical::encode_key_doc_v3_signable(
-                    doc.version,
-                    &doc.chain_id,
-                    &doc.signing_pk,
-                    &doc.kem_pk,
-                    &doc.receive_key_id,
-                    doc.issued_unix_ms,
-                    doc.expires_unix_ms,
-                )?;
-                doc.signing_pk.verify(&msg, &doc.sig)?;
-                Ok(ParsedKeyDoc::V3(doc))
-            }
-            other => bail!("Unsupported KeyDoc version: {}", other),
+        let handle: RecipientHandle =
+            serde_json::from_str(trimmed).context("invalid recipient handle JSON")?;
+        if handle.expires_unix_ms <= handle.issued_unix_ms {
+            bail!("recipient handle expiration must be after issuance");
         }
+        if Self::now_unix_ms() >= handle.expires_unix_ms {
+            bail!("recipient handle has expired");
+        }
+        let msg = canonical::encode_recipient_handle_signable(
+            &handle.chain_id,
+            &handle.signing_pk,
+            &handle.receive_key_id,
+            &handle.kem_pk,
+            handle.issued_unix_ms,
+            handle.expires_unix_ms,
+        )?;
+        handle.signing_pk.verify(&msg, &handle.sig)?;
+        Ok(handle)
     }
 
     fn materialize_owned_genesis_notes(&self, snapshot: &ShieldedRuntimeSnapshot) -> Result<()> {
@@ -889,7 +793,7 @@ impl Wallet {
     fn decrypt_shielded_output(
         &self,
         output: &ShieldedOutput,
-    ) -> Result<Option<ShieldedOutputPlaintext>> {
+    ) -> Result<Option<(ShieldedOutputPlaintext, [u8; 32])>> {
         let wallet_store = self.wallet_store()?;
         for material in self.receive_key_materials(wallet_store.as_ref())? {
             let shared = crypto::ml_kem_768_decapsulate(
@@ -924,7 +828,7 @@ impl Wallet {
             {
                 bail!("shielded output note key does not match the commitment");
             }
-            return Ok(Some(decoded));
+            return Ok(Some((decoded, material.key_id)));
         }
         Ok(None)
     }
@@ -932,7 +836,7 @@ impl Wallet {
     fn rescan_shielded_outputs(&self, snapshot: &ShieldedRuntimeSnapshot) -> Result<()> {
         let wallet_store = self.wallet_store()?;
         for (tx_id, output_index, output) in &snapshot.shielded_outputs {
-            let Some(plaintext) = self.decrypt_shielded_output(&output)? else {
+            let Some((plaintext, _receive_key_id)) = self.decrypt_shielded_output(&output)? else {
                 continue;
             };
             if self
@@ -1426,7 +1330,7 @@ impl Wallet {
         let wallet_store = self.wallet_store()?;
         let tx_id = tx.id()?;
         for (output_index, output) in tx.outputs.iter().enumerate() {
-            let Some(plaintext) = self.decrypt_shielded_output(output)? else {
+            let Some((plaintext, _receive_key_id)) = self.decrypt_shielded_output(output)? else {
                 continue;
             };
             if self
@@ -1462,13 +1366,13 @@ impl Wallet {
     /// Prepares a canonical shielded transaction and witness without proving it.
     pub async fn prepare_shielded_send(
         &self,
-        receiver_paycode: &str,
+        recipient_handle: &str,
         amount: u64,
     ) -> Result<PreparedShieldedTx> {
         let node_state = self.current_node_state()?;
         let snapshot = node_state.state.shielded_runtime;
-        let (_recipient_addr, recipient_signing_pk, receiver_kem_pk) = self
-            .parse_recipient_handle_for_chain(receiver_paycode, snapshot.chain_id)
+        let (_recipient_addr, recipient_signing_pk, receiver_kem_pk, _receive_key_id) = self
+            .parse_recipient_handle_for_chain(recipient_handle, snapshot.chain_id)
             .context("Invalid receiver handle")?;
         let recipient_address = recipient_signing_pk.address();
         let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
@@ -1556,7 +1460,7 @@ impl Wallet {
         if change > 0 {
             let change_entropy = self.derive_output_entropy(&send_seed, 1);
             let change_receive_kem_pk =
-                self.current_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+                self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
             let (change_output, change_plaintext, change_encapsulation_seed) = self
                 .build_shielded_output(
                     self.signing_pk.clone(),
@@ -1632,21 +1536,21 @@ impl Wallet {
         })
     }
 
-    /// Sends a canonical shielded transaction to a verified recipient document.
-    pub async fn send_with_paycode_and_note(
+    /// Sends a canonical shielded transaction to a verified recipient handle.
+    pub async fn send_to_recipient_handle(
         &self,
-        receiver_paycode: &str,
+        recipient_handle: &str,
         amount: u64,
     ) -> Result<SendOutcome> {
-        let prepared = self.prepare_shielded_send(receiver_paycode, amount).await?;
+        let prepared = self.prepare_shielded_send(recipient_handle, amount).await?;
         let (receipt, _journal) = proof::prove_shielded_tx(prepared.witness())?;
         self.submit_prepared_shielded_send(prepared, proof::receipt_to_bytes(&receipt)?)
             .await
     }
 
-    /// Simple wrapper: pay using a recipient handle (address or KeyDoc JSON) with empty note.
+    /// Simple wrapper: pay using a recipient handle.
     pub async fn pay(&self, to: &str, amount: u64) -> Result<SendOutcome> {
-        self.send_with_paycode_and_note(to, amount).await
+        self.send_to_recipient_handle(to, amount).await
     }
 
     /// Gets the transaction history for this wallet
@@ -1703,7 +1607,6 @@ impl Wallet {
         let notes = self.load_owned_shielded_notes_for_snapshot(snapshot, true)?;
         let history = self.transaction_history_from_local(wallet_store.as_ref())?;
         Ok(WalletObservedState {
-            receive_handle: self.export_address_for_chain(snapshot.chain_id)?,
             address: self.address,
             chain_id: snapshot.chain_id,
             current_nullifier_epoch: snapshot.current_nullifier_epoch,
@@ -1737,7 +1640,6 @@ pub struct SendOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletObservedState {
-    pub receive_handle: String,
     pub address: Address,
     pub chain_id: [u8; 32],
     pub current_nullifier_epoch: u64,
@@ -1780,12 +1682,13 @@ mod tests {
         let tempdir = TempDir::new()?;
         let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
         let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
+        let (_unused_sk, note_kem_pk) = crypto::ml_kem_768_generate();
 
         let note = shielded::ShieldedNote::new(
             7,
             3,
             wallet.public_key().clone(),
-            wallet.kem_public_key().clone(),
+            note_kem_pk,
             [1u8; 32],
             [2u8; 32],
             [3u8; 32],
@@ -1839,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn exported_receive_handle_uses_stable_rotating_receive_key() -> Result<()> {
+    fn exported_receive_handles_are_single_use_and_signed() -> Result<()> {
         let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
         let tempdir = TempDir::new()?;
         let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
@@ -1848,30 +1751,50 @@ mod tests {
 
         let handle_a = wallet.export_address_for_chain(chain_id)?;
         let handle_b = wallet.export_address_for_chain(chain_id)?;
-        let ParsedKeyDoc::V3(doc_a) = Wallet::parse_key_doc(&handle_a)? else {
-            bail!("expected V3 KeyDoc");
-        };
-        let ParsedKeyDoc::V3(doc_b) = Wallet::parse_key_doc(&handle_b)? else {
-            bail!("expected V3 KeyDoc");
-        };
+        let doc_a = Wallet::parse_recipient_handle_document(&handle_a)?;
+        let doc_b = Wallet::parse_recipient_handle_document(&handle_b)?;
+
         assert_eq!(doc_a.chain_id, chain_id);
         assert_eq!(doc_a.chain_id, doc_b.chain_id);
         assert_eq!(doc_a.signing_pk, doc_b.signing_pk);
-        assert_eq!(doc_a.kem_pk, doc_b.kem_pk);
-        assert_eq!(doc_a.receive_key_id, doc_b.receive_key_id);
-        assert_eq!(doc_a.issued_unix_ms, doc_b.issued_unix_ms);
-        assert_eq!(doc_a.expires_unix_ms, doc_b.expires_unix_ms);
-        assert_ne!(doc_a.kem_pk, wallet.kem_public_key().clone());
+        assert_ne!(doc_a.receive_key_id, doc_b.receive_key_id);
+        assert_ne!(doc_a.kem_pk, doc_b.kem_pk);
         assert!(doc_a.expires_unix_ms > doc_a.issued_unix_ms);
+        assert!(doc_b.expires_unix_ms > doc_b.issued_unix_ms);
+        assert!(wallet
+            .load_receive_key_record(wallet_store.as_ref(), &doc_a.receive_key_id)?
+            .is_some());
+        assert!(wallet
+            .load_receive_key_record(wallet_store.as_ref(), &doc_b.receive_key_id)?
+            .is_some());
+        Ok(())
+    }
 
-        let active_record = wallet
-            .active_receive_key_record(wallet_store.as_ref(), &chain_id)?
-            .ok_or_else(|| anyhow!("missing active receive key record"))?;
-        assert_eq!(doc_a.receive_key_id, active_record.key_id);
-        assert_eq!(
-            doc_a.kem_pk,
-            TaggedKemPublicKey::from_ml_kem_768_array(active_record.kem_pk)
-        );
+    #[test]
+    fn expired_receive_keys_are_pruned_before_new_handles_are_minted() -> Result<()> {
+        let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
+        let tempdir = TempDir::new()?;
+        let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+        let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
+        let chain_id = [9u8; 32];
+
+        let original_handle = wallet.export_address_for_chain(chain_id)?;
+        let original_doc = Wallet::parse_recipient_handle_document(&original_handle)?;
+        let mut expired = wallet
+            .load_receive_key_record(wallet_store.as_ref(), &original_doc.receive_key_id)?
+            .ok_or_else(|| anyhow!("missing receive key record"))?;
+        expired.expires_unix_ms = 0;
+        wallet.store_receive_key_record(wallet_store.as_ref(), &expired)?;
+
+        let rotated_handle = wallet.export_address_for_chain(chain_id)?;
+        let rotated_doc = Wallet::parse_recipient_handle_document(&rotated_handle)?;
+        assert_ne!(original_doc.receive_key_id, rotated_doc.receive_key_id);
+        assert!(wallet
+            .load_receive_key_record(wallet_store.as_ref(), &original_doc.receive_key_id)?
+            .is_none());
+        assert!(wallet
+            .load_receive_key_record(wallet_store.as_ref(), &rotated_doc.receive_key_id)?
+            .is_some());
         Ok(())
     }
 }

@@ -187,10 +187,15 @@ async fn wallet_control_serves_state_and_mining_identity() -> Result<()> {
     let state = client.state().await?;
     assert_eq!(state.state.balance, 1);
     assert_eq!(state.state.spendable_outputs, 1);
-    assert!(!state.state.receive_handle.is_empty());
     assert_eq!(state.state.chain_id, genesis.hash);
     assert_eq!(state.identity.address, wallet.address());
     assert_eq!(state.identity.signing_pk, wallet.public_key().clone());
+
+    let receive_handle = client.mint_receive_handle().await?;
+    let (receive_address, receive_signing_pk, _receive_kem_pk) =
+        Wallet::parse_address(&receive_handle)?;
+    assert_eq!(receive_address, wallet.address());
+    assert_eq!(receive_signing_pk, wallet.public_key().clone());
 
     let coin_id = [3u8; 32];
     let chain_id = [7u8; 32];
