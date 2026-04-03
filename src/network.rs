@@ -1,9 +1,10 @@
 use crate::canonical::{self, CanonicalReader, CanonicalWriter};
 use crate::consensus::{
-    OrderingPath, QuorumCertificate, ValidatorId, ValidatorVote, DAG_BFT_TIMEOUT_MS,
-    FAST_PATH_TIMEOUT_MS,
+    ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorId, ValidatorVote,
+    DAG_BFT_TIMEOUT_MS, FAST_PATH_TIMEOUT_MS,
 };
 use crate::epoch::{Anchor, AnchorProposal, MerkleTree};
+use crate::evidence;
 use crate::metrics;
 use crate::node_identity::{
     build_client_config, build_server_config, load_local_node_id, tls_peer_spki,
@@ -15,9 +16,9 @@ use crate::staking::{
     expected_validator_set_for_epoch, load_or_compute_active_validator_set,
     register_genesis_local_validator_pool,
 };
-use crate::storage::Store;
+use crate::storage::{protocol_chain_id, Store};
 use crate::sync::SyncState;
-use crate::transaction::{SharedStateBatch, SharedStateDagBatch};
+use crate::transaction::{FastPathBatch, SharedStateBatch, SharedStateDagBatch};
 use crate::{
     coin::{Coin, CoinCandidate},
     config,
@@ -173,6 +174,7 @@ enum WireTopic {
     Anchor,
     AnchorProposal,
     ValidatorVote,
+    FastPathBatch,
     SharedStateDagBatch,
     CoinCandidate,
     Coin,
@@ -202,6 +204,7 @@ enum WireTopic {
     CheckpointBatch,
     ArchiveCustodyCommitment,
     ArchiveRetrievalReceipt,
+    RequestFastPathBatch,
     RequestSharedStateDagBatch,
 }
 
@@ -222,36 +225,38 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::Anchor => 1,
         WireTopic::AnchorProposal => 2,
         WireTopic::ValidatorVote => 3,
-        WireTopic::SharedStateDagBatch => 4,
-        WireTopic::CoinCandidate => 5,
-        WireTopic::Coin => 6,
-        WireTopic::Tx => 7,
-        WireTopic::CompactEpoch => 8,
-        WireTopic::EpochLeaves => 9,
-        WireTopic::EpochSelectedResponse => 10,
-        WireTopic::EpochCandidatesResponse => 11,
-        WireTopic::EpochHeadersResponse => 12,
-        WireTopic::EpochByHashResponse => 13,
-        WireTopic::RequestEpoch => 14,
-        WireTopic::RequestEpochHeadersRange => 15,
-        WireTopic::RequestEpochByHash => 16,
-        WireTopic::RequestCoin => 17,
-        WireTopic::RequestLatestEpoch => 18,
-        WireTopic::RequestEpochTxn => 19,
-        WireTopic::EpochTxn => 20,
-        WireTopic::RequestEpochSelected => 21,
-        WireTopic::RequestEpochLeaves => 22,
-        WireTopic::RequestEpochCandidates => 23,
-        WireTopic::NodeRecord => 24,
-        WireTopic::ArchiveManifest => 25,
-        WireTopic::ArchiveReplica => 26,
-        WireTopic::RequestArchiveShard => 27,
-        WireTopic::ArchiveShard => 28,
-        WireTopic::RequestCheckpointBatch => 29,
-        WireTopic::CheckpointBatch => 30,
-        WireTopic::ArchiveCustodyCommitment => 31,
-        WireTopic::ArchiveRetrievalReceipt => 32,
-        WireTopic::RequestSharedStateDagBatch => 33,
+        WireTopic::FastPathBatch => 4,
+        WireTopic::SharedStateDagBatch => 5,
+        WireTopic::CoinCandidate => 6,
+        WireTopic::Coin => 7,
+        WireTopic::Tx => 8,
+        WireTopic::CompactEpoch => 9,
+        WireTopic::EpochLeaves => 10,
+        WireTopic::EpochSelectedResponse => 11,
+        WireTopic::EpochCandidatesResponse => 12,
+        WireTopic::EpochHeadersResponse => 13,
+        WireTopic::EpochByHashResponse => 14,
+        WireTopic::RequestEpoch => 15,
+        WireTopic::RequestEpochHeadersRange => 16,
+        WireTopic::RequestEpochByHash => 17,
+        WireTopic::RequestCoin => 18,
+        WireTopic::RequestLatestEpoch => 19,
+        WireTopic::RequestEpochTxn => 20,
+        WireTopic::EpochTxn => 21,
+        WireTopic::RequestEpochSelected => 22,
+        WireTopic::RequestEpochLeaves => 23,
+        WireTopic::RequestEpochCandidates => 24,
+        WireTopic::NodeRecord => 25,
+        WireTopic::ArchiveManifest => 26,
+        WireTopic::ArchiveReplica => 27,
+        WireTopic::RequestArchiveShard => 28,
+        WireTopic::ArchiveShard => 29,
+        WireTopic::RequestCheckpointBatch => 30,
+        WireTopic::CheckpointBatch => 31,
+        WireTopic::ArchiveCustodyCommitment => 32,
+        WireTopic::ArchiveRetrievalReceipt => 33,
+        WireTopic::RequestFastPathBatch => 34,
+        WireTopic::RequestSharedStateDagBatch => 35,
     }
 }
 
@@ -260,36 +265,38 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         1 => WireTopic::Anchor,
         2 => WireTopic::AnchorProposal,
         3 => WireTopic::ValidatorVote,
-        4 => WireTopic::SharedStateDagBatch,
-        5 => WireTopic::CoinCandidate,
-        6 => WireTopic::Coin,
-        7 => WireTopic::Tx,
-        8 => WireTopic::CompactEpoch,
-        9 => WireTopic::EpochLeaves,
-        10 => WireTopic::EpochSelectedResponse,
-        11 => WireTopic::EpochCandidatesResponse,
-        12 => WireTopic::EpochHeadersResponse,
-        13 => WireTopic::EpochByHashResponse,
-        14 => WireTopic::RequestEpoch,
-        15 => WireTopic::RequestEpochHeadersRange,
-        16 => WireTopic::RequestEpochByHash,
-        17 => WireTopic::RequestCoin,
-        18 => WireTopic::RequestLatestEpoch,
-        19 => WireTopic::RequestEpochTxn,
-        20 => WireTopic::EpochTxn,
-        21 => WireTopic::RequestEpochSelected,
-        22 => WireTopic::RequestEpochLeaves,
-        23 => WireTopic::RequestEpochCandidates,
-        24 => WireTopic::NodeRecord,
-        25 => WireTopic::ArchiveManifest,
-        26 => WireTopic::ArchiveReplica,
-        27 => WireTopic::RequestArchiveShard,
-        28 => WireTopic::ArchiveShard,
-        29 => WireTopic::RequestCheckpointBatch,
-        30 => WireTopic::CheckpointBatch,
-        31 => WireTopic::ArchiveCustodyCommitment,
-        32 => WireTopic::ArchiveRetrievalReceipt,
-        33 => WireTopic::RequestSharedStateDagBatch,
+        4 => WireTopic::FastPathBatch,
+        5 => WireTopic::SharedStateDagBatch,
+        6 => WireTopic::CoinCandidate,
+        7 => WireTopic::Coin,
+        8 => WireTopic::Tx,
+        9 => WireTopic::CompactEpoch,
+        10 => WireTopic::EpochLeaves,
+        11 => WireTopic::EpochSelectedResponse,
+        12 => WireTopic::EpochCandidatesResponse,
+        13 => WireTopic::EpochHeadersResponse,
+        14 => WireTopic::EpochByHashResponse,
+        15 => WireTopic::RequestEpoch,
+        16 => WireTopic::RequestEpochHeadersRange,
+        17 => WireTopic::RequestEpochByHash,
+        18 => WireTopic::RequestCoin,
+        19 => WireTopic::RequestLatestEpoch,
+        20 => WireTopic::RequestEpochTxn,
+        21 => WireTopic::EpochTxn,
+        22 => WireTopic::RequestEpochSelected,
+        23 => WireTopic::RequestEpochLeaves,
+        24 => WireTopic::RequestEpochCandidates,
+        25 => WireTopic::NodeRecord,
+        26 => WireTopic::ArchiveManifest,
+        27 => WireTopic::ArchiveReplica,
+        28 => WireTopic::RequestArchiveShard,
+        29 => WireTopic::ArchiveShard,
+        30 => WireTopic::RequestCheckpointBatch,
+        31 => WireTopic::CheckpointBatch,
+        32 => WireTopic::ArchiveCustodyCommitment,
+        33 => WireTopic::ArchiveRetrievalReceipt,
+        34 => WireTopic::RequestFastPathBatch,
+        35 => WireTopic::RequestSharedStateDagBatch,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -433,6 +440,15 @@ struct PendingAnchorCertification {
 
 struct PendingSharedStateProposal {
     proposer_record: NodeRecordV2,
+    proposal_envelope: SignedEnvelope,
+    proposal_message_id: [u8; 32],
+    proposal: AnchorProposal,
+    received_at: Instant,
+}
+
+struct PendingFastPathProposal {
+    proposer_record: NodeRecordV2,
+    proposal_envelope: SignedEnvelope,
     proposal_message_id: [u8; 32],
     proposal: AnchorProposal,
     received_at: Instant,
@@ -512,8 +528,9 @@ struct RuntimeState {
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     pending_anchor_certifications: Arc<AsyncMutex<HashMap<[u8; 32], PendingAnchorCertification>>>,
+    pending_fast_path_proposals: Arc<AsyncMutex<Vec<PendingFastPathProposal>>>,
     pending_shared_state_proposals: Arc<AsyncMutex<Vec<PendingSharedStateProposal>>>,
-    cast_anchor_votes: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
+    cast_anchor_votes: Arc<AsyncMutex<HashMap<(u64, u32), Instant>>>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
     archive_replicas: Arc<RwLock<HashMap<([u8; 32], u64), ArchiveReplicaAttestation>>>,
     peer_exchange: bool,
@@ -543,6 +560,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipTx(crate::transaction::Tx),
+    GossipFastPathBatch(FastPathBatch),
     GossipSharedStateDagBatch(SharedStateDagBatch),
     GossipCompactEpoch(CompactEpoch),
     ProposeAnchor {
@@ -1534,12 +1552,65 @@ impl RuntimeState {
         guard.insert(message_id, now).is_none()
     }
 
-    async fn mark_anchor_vote_cast(&self, proposal_hash: [u8; 32]) -> bool {
+    async fn mark_anchor_vote_cast(&self, position: ConsensusPosition) -> bool {
         let now = Instant::now();
         let mut guard = self.cast_anchor_votes.lock().await;
         guard
             .retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(PENDING_ANCHOR_TTL_SECS));
-        guard.insert(proposal_hash, now).is_none()
+        guard.insert((position.epoch, position.slot), now).is_none()
+    }
+
+    fn observe_anchor_proposal(
+        &self,
+        proposer_record: &NodeRecordV2,
+        proposal: &AnchorProposal,
+        envelope: &SignedEnvelope,
+    ) -> Result<()> {
+        let proposer = ValidatorId::from_hot_key(&proposer_record.auth_spki);
+        if let Some(record) =
+            evidence::observe_anchor_proposal(self.db.as_ref(), proposer, proposal, envelope)?
+        {
+            bail!(
+                "recorded proposal equivocation evidence {} for validator {} at epoch {} slot {}",
+                hex::encode(record.evidence_id),
+                hex::encode(proposer.0),
+                proposal.position.epoch,
+                proposal.position.slot
+            );
+        }
+        Ok(())
+    }
+
+    fn observe_validator_vote(&self, vote: &ValidatorVote) -> Result<()> {
+        if let Some(record) = evidence::observe_validator_vote(self.db.as_ref(), vote)? {
+            bail!(
+                "recorded vote equivocation evidence {} for validator {} at epoch {} slot {}",
+                hex::encode(record.evidence_id),
+                hex::encode(vote.voter.0),
+                vote.target.position.epoch,
+                vote.target.position.slot
+            );
+        }
+        Ok(())
+    }
+
+    fn observe_shared_state_dag_batch(
+        &self,
+        batch: &SharedStateDagBatch,
+        envelope: &SignedEnvelope,
+    ) -> Result<()> {
+        if let Some(record) =
+            evidence::observe_shared_state_dag_batch(self.db.as_ref(), batch, envelope)?
+        {
+            bail!(
+                "recorded DAG batch equivocation evidence {} for validator {} at epoch {} round {}",
+                hex::encode(record.evidence_id),
+                hex::encode(batch.author.0),
+                batch.epoch,
+                batch.round
+            );
+        }
+        Ok(())
     }
 
     fn pending_anchor_vote_power(
@@ -1629,7 +1700,7 @@ impl RuntimeState {
         proposal: AnchorProposal,
         reply: oneshot::Sender<Result<QuorumCertificate>>,
     ) -> Result<()> {
-        let start_result: Result<(SignedEnvelope, ValidatorVote)> = async {
+        let start_result: Result<(NodeRecordV2, SignedEnvelope, ValidatorVote)> = async {
             let identity = self.identity.read().await;
             let local_validator_id = ValidatorId::from_hot_key(&identity.record().auth_spki);
             let local_validator = proposal
@@ -1651,6 +1722,7 @@ impl RuntimeState {
                 target: target.clone(),
                 signature: identity.sign_consensus_message(&target.signing_bytes())?,
             };
+            let proposer_record = identity.record().clone();
             drop(identity);
             let envelope = self
                 .sign_topic_envelope(
@@ -1658,17 +1730,20 @@ impl RuntimeState {
                     canonical::encode_anchor_proposal(&proposal)?,
                 )
                 .await?;
-            Ok((envelope, local_vote))
+            Ok((proposer_record, envelope, local_vote))
         }
         .await;
 
-        let (envelope, local_vote) = match start_result {
+        let (proposer_record, envelope, local_vote) = match start_result {
             Ok(values) => values,
             Err(err) => {
                 let _ = reply.send(Err(anyhow!(err.to_string())));
                 return Ok(());
             }
         };
+
+        self.observe_anchor_proposal(&proposer_record, &proposal, &envelope)?;
+        self.observe_validator_vote(&local_vote)?;
 
         let proposal_message_id = envelope.message_id;
         self.register_pending_anchor_proposal(
@@ -1688,6 +1763,7 @@ impl RuntimeState {
     async fn cast_anchor_proposal_vote(
         &self,
         proposer_record: &NodeRecordV2,
+        proposal_envelope: &SignedEnvelope,
         proposal_message_id: [u8; 32],
         proposal: AnchorProposal,
     ) -> Result<()> {
@@ -1707,26 +1783,62 @@ impl RuntimeState {
         validate_anchor_proposal_against_store(&proposal, parent.as_ref(), self.db.as_ref())
             .map_err(|err| anyhow!(err))?;
         validate_anchor_proposal_author(&proposal, proposer_record)?;
-        if proposal.ordering_path == OrderingPath::DagBftSharedState {
-            if let Some(missing_batch_id) =
-                first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
-            {
-                self.queue_shared_state_proposal(
-                    proposer_record.clone(),
-                    proposal_message_id,
-                    proposal.clone(),
-                )
-                .await;
-                self.request_shared_state_dag_batch_from(proposer_record.clone(), missing_batch_id)
+        self.observe_anchor_proposal(proposer_record, &proposal, proposal_envelope)?;
+        match proposal.ordering_path {
+            OrderingPath::FastPathPrivateTransfer => {
+                if self
+                    .db
+                    .load_fast_path_batch(&proposal.merkle_root)?
+                    .is_none()
+                {
+                    self.queue_fast_path_proposal(
+                        proposer_record.clone(),
+                        proposal_envelope.clone(),
+                        proposal_message_id,
+                        proposal.clone(),
+                    )
+                    .await;
+                    self.request_fast_path_batch_from(
+                        proposer_record.clone(),
+                        proposal.merkle_root,
+                    )
                     .await?;
-                return Ok(());
+                    return Ok(());
+                }
+                let batch = self
+                    .db
+                    .load_fast_path_batch(&proposal.merkle_root)?
+                    .ok_or_else(|| {
+                        anyhow!("fast-path batch disappeared during proposal validation")
+                    })?;
+                validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
+                    .map_err(|err| anyhow!(err))?;
             }
-            validate_shared_state_dag_plan_for_proposal(
-                &proposal,
-                parent.as_ref(),
-                self.db.as_ref(),
-            )
-            .map_err(|err| anyhow!(err))?;
+            OrderingPath::DagBftSharedState => {
+                if let Some(missing_batch_id) =
+                    first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
+                {
+                    self.queue_shared_state_proposal(
+                        proposer_record.clone(),
+                        proposal_envelope.clone(),
+                        proposal_message_id,
+                        proposal.clone(),
+                    )
+                    .await;
+                    self.request_shared_state_dag_batch_from(
+                        proposer_record.clone(),
+                        missing_batch_id,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                validate_shared_state_dag_plan_for_proposal(
+                    &proposal,
+                    parent.as_ref(),
+                    self.db.as_ref(),
+                )
+                .map_err(|err| anyhow!(err))?;
+            }
         }
 
         let local_validator_id = {
@@ -1740,10 +1852,10 @@ impl RuntimeState {
         else {
             return Ok(());
         };
-        if !self.mark_anchor_vote_cast(proposal.hash).await {
+        let target = proposal.vote_target();
+        if !self.mark_anchor_vote_cast(target.position).await {
             return Ok(());
         }
-        let target = proposal.vote_target();
         let signature = {
             let identity = self.identity.read().await;
             identity.sign_consensus_message(&target.signing_bytes())?
@@ -1753,6 +1865,7 @@ impl RuntimeState {
             target: target.clone(),
             signature,
         };
+        self.observe_validator_vote(&vote)?;
 
         let _ = self
             .sign_and_send_to_record_related(
@@ -1785,6 +1898,7 @@ impl RuntimeState {
                 bail!("validator vote correlation does not match the pending proposal");
             }
             validate_anchor_vote(&pending.proposal, voter_record, &vote)?;
+            self.observe_validator_vote(&vote)?;
             pending.votes.insert(vote.voter, vote);
             if let Some(qc) = Self::pending_anchor_qc(pending)? {
                 completion = Some((pending.reply.take(), qc));
@@ -1802,6 +1916,7 @@ impl RuntimeState {
     async fn queue_shared_state_proposal(
         &self,
         proposer_record: NodeRecordV2,
+        proposal_envelope: SignedEnvelope,
         proposal_message_id: [u8; 32],
         proposal: AnchorProposal,
     ) {
@@ -1811,10 +1926,93 @@ impl RuntimeState {
         });
         guard.push(PendingSharedStateProposal {
             proposer_record,
+            proposal_envelope,
             proposal_message_id,
             proposal,
             received_at: Instant::now(),
         });
+    }
+
+    async fn queue_fast_path_proposal(
+        &self,
+        proposer_record: NodeRecordV2,
+        proposal_envelope: SignedEnvelope,
+        proposal_message_id: [u8; 32],
+        proposal: AnchorProposal,
+    ) {
+        let mut guard = self.pending_fast_path_proposals.lock().await;
+        guard.retain(|pending| {
+            pending.received_at.elapsed() < Duration::from_secs(PENDING_ANCHOR_TTL_SECS)
+        });
+        guard.push(PendingFastPathProposal {
+            proposer_record,
+            proposal_envelope,
+            proposal_message_id,
+            proposal,
+            received_at: Instant::now(),
+        });
+    }
+
+    async fn request_fast_path_batch(&self, ordered_tx_root: [u8; 32]) -> Result<()> {
+        let _ = self
+            .sign_and_send_to_targets(
+                WireTopic::RequestFastPathBatch,
+                encode_bytes32_body(&ordered_tx_root),
+                REQUEST_FANOUT_DEFAULT,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn request_fast_path_batch_from(
+        &self,
+        record: NodeRecordV2,
+        ordered_tx_root: [u8; 32],
+    ) -> Result<()> {
+        let _ = self
+            .sign_and_send_to_record_related(
+                record,
+                WireTopic::RequestFastPathBatch,
+                encode_bytes32_body(&ordered_tx_root),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn ingest_fast_path_batch(&self, batch: FastPathBatch) -> Result<()> {
+        if self
+            .db
+            .load_fast_path_batch(&batch.ordered_tx_root)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        batch.validate_against_store(self.db.as_ref())?;
+        self.db.store_fast_path_batch(&batch)?;
+
+        let pending = {
+            let mut guard = self.pending_fast_path_proposals.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for pending in pending {
+            let _ = self
+                .cast_anchor_proposal_vote(
+                    &pending.proposer_record,
+                    &pending.proposal_envelope,
+                    pending.proposal_message_id,
+                    pending.proposal,
+                )
+                .await;
+        }
+
+        let next_height = self
+            .db
+            .get::<Anchor>("epoch", b"latest")?
+            .map(|anchor| anchor.num.saturating_add(1))
+            .unwrap_or(0);
+        self.process_pending_anchors(next_height).await?;
+        Ok(())
     }
 
     async fn request_shared_state_dag_batch(&self, batch_id: [u8; 32]) -> Result<()> {
@@ -1844,7 +2042,12 @@ impl RuntimeState {
         Ok(())
     }
 
-    async fn ingest_shared_state_dag_batch(&self, batch: SharedStateDagBatch) -> Result<()> {
+    async fn ingest_shared_state_dag_batch(
+        &self,
+        author_record: &NodeRecordV2,
+        batch: SharedStateDagBatch,
+        envelope: &SignedEnvelope,
+    ) -> Result<()> {
         if self
             .db
             .load_shared_state_dag_batch(&batch.batch_id)?
@@ -1858,22 +2061,17 @@ impl RuntimeState {
         if validator_set.validator(&batch.author).is_none() {
             bail!("shared-state DAG batch author is not part of the active validator set");
         }
-        if self
-            .db
-            .has_shared_state_dag_batch_author(batch.epoch, batch.round, &batch.author)?
-        {
-            let existing = self
-                .db
-                .load_shared_state_dag_round(batch.epoch, batch.round)?;
-            if existing.iter().any(|existing| {
-                existing.author == batch.author && existing.batch_id != batch.batch_id
-            }) {
-                bail!(
-                    "validator already authored a different shared-state DAG batch for this round"
-                );
-            }
-        }
+        validate_shared_state_dag_batch_author(&batch, author_record)?;
+        self.observe_shared_state_dag_batch(&batch, envelope)?;
         self.db.store_shared_state_dag_batch(&batch)?;
+        let observation = crate::evidence::StoredSharedStateDagObservation {
+            batch_id: batch.batch_id,
+            envelope: envelope.clone(),
+        };
+        self.db.store_shared_state_dag_observation(
+            &Store::shared_state_dag_observation_key(batch.epoch, batch.round, batch.author),
+            &observation,
+        )?;
 
         let pending = {
             let mut guard = self.pending_shared_state_proposals.lock().await;
@@ -1883,6 +2081,7 @@ impl RuntimeState {
             let _ = self
                 .cast_anchor_proposal_vote(
                     &pending.proposer_record,
+                    &pending.proposal_envelope,
                     pending.proposal_message_id,
                     pending.proposal,
                 )
@@ -2081,7 +2280,6 @@ impl RuntimeState {
         envelope: SignedEnvelope,
     ) -> Result<()> {
         let connection_node_id = connection_record.node_id;
-        let response_to_message_id = envelope.response_to_message_id;
         let author_record = if envelope.node_id == connection_record.node_id {
             connection_record
         } else {
@@ -2106,22 +2304,17 @@ impl RuntimeState {
             self.broadcast_envelope(envelope.clone(), Some(connection_node_id))
                 .await?;
         }
-        self.handle_topic(
-            author_record,
-            envelope.message_id,
-            response_to_message_id,
-            frame,
-        )
-        .await
+        self.handle_topic(author_record, envelope, frame).await
     }
 
     async fn handle_topic(
         &self,
         record: NodeRecordV2,
-        message_id: [u8; 32],
-        response_to_message_id: Option<[u8; 32]>,
+        envelope: SignedEnvelope,
         frame: TopicFrame,
     ) -> Result<()> {
+        let message_id = envelope.message_id;
+        let response_to_message_id = envelope.response_to_message_id;
         match frame.topic {
             WireTopic::Anchor | WireTopic::EpochByHashResponse => {
                 let anchor = canonical::decode_anchor(&frame.body)?;
@@ -2129,7 +2322,7 @@ impl RuntimeState {
             }
             WireTopic::AnchorProposal => {
                 let proposal = canonical::decode_anchor_proposal(&frame.body)?;
-                self.cast_anchor_proposal_vote(&record, message_id, proposal)
+                self.cast_anchor_proposal_vote(&record, &envelope, message_id, proposal)
                     .await?;
             }
             WireTopic::ValidatorVote => {
@@ -2137,9 +2330,14 @@ impl RuntimeState {
                 self.record_anchor_vote(&record, response_to_message_id, vote)
                     .await?;
             }
+            WireTopic::FastPathBatch => {
+                let batch = canonical::decode_fast_path_batch(&frame.body)?;
+                self.ingest_fast_path_batch(batch).await?;
+            }
             WireTopic::SharedStateDagBatch => {
                 let batch = canonical::decode_shared_state_dag_batch(&frame.body)?;
-                self.ingest_shared_state_dag_batch(batch).await?;
+                self.ingest_shared_state_dag_batch(&record, batch, &envelope)
+                    .await?;
             }
             WireTopic::CoinCandidate => {
                 let candidate = canonical::decode_coin_candidate(&frame.body)?;
@@ -2175,14 +2373,30 @@ impl RuntimeState {
                         Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
                     }
                 } else {
+                    if self.db.load_fast_path_pending_tx(&tx_id)?.is_some() {
+                        return Ok(());
+                    }
                     match validate_tx(&tx, &self.db) {
                         Ok(()) => {
-                            tx.apply(&self.db)?;
+                            self.db.store_fast_path_pending_tx(&tx_id, &tx)?;
                         }
                         Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
                     }
                 }
                 let _ = self.tx_tx.send(tx);
+            }
+            WireTopic::RequestFastPathBatch => {
+                let ordered_tx_root = decode_bytes32_body(&frame.body)?;
+                if let Some(batch) = self.db.load_fast_path_batch(&ordered_tx_root)? {
+                    let _ = self
+                        .sign_and_send_to_peer_related(
+                            record.node_id,
+                            WireTopic::FastPathBatch,
+                            canonical::encode_fast_path_batch(&batch)?,
+                            Some(message_id),
+                        )
+                        .await?;
+                }
             }
             WireTopic::RequestSharedStateDagBatch => {
                 let batch_id = decode_bytes32_body(&frame.body)?;
@@ -2778,7 +2992,34 @@ impl RuntimeState {
                 return Ok(());
             }
         }
-        if anchor.ordering_path == OrderingPath::DagBftSharedState {
+        let proposal = AnchorProposal {
+            num: anchor.num,
+            hash: anchor.hash,
+            parent_hash: anchor.parent_hash,
+            position: anchor.position,
+            ordering_path: anchor.ordering_path,
+            merkle_root: anchor.merkle_root,
+            coin_count: anchor.coin_count,
+            dag_round: anchor.dag_round,
+            dag_frontier: anchor.dag_frontier.clone(),
+            ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+            ordered_tx_root: anchor.ordered_tx_root,
+            ordered_tx_count: anchor.ordered_tx_count,
+            validator_set: anchor.validator_set.clone(),
+        };
+        if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
+            if self.db.load_fast_path_batch(&anchor.merkle_root)?.is_none() {
+                let _ = self.request_fast_path_batch(anchor.merkle_root).await;
+                self.buffer_anchor(anchor).await;
+                return Ok(());
+            }
+            let batch = self
+                .db
+                .load_fast_path_batch(&anchor.merkle_root)?
+                .ok_or_else(|| anyhow!("fast-path batch disappeared during anchor handling"))?;
+            validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
+                .map_err(anyhow::Error::msg)?;
+        } else if anchor.ordering_path == OrderingPath::DagBftSharedState {
             let proposal = AnchorProposal {
                 num: anchor.num,
                 hash: anchor.hash,
@@ -2851,7 +3092,14 @@ impl RuntimeState {
             self.db
                 .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
         };
-        let shared_state_batch = if anchor.ordering_path == OrderingPath::DagBftSharedState {
+        let finalized_batch = if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
+            Some(
+                self.db
+                    .load_fast_path_batch(&anchor.merkle_root)?
+                    .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is unavailable"))?
+                    .txs,
+            )
+        } else if anchor.ordering_path == OrderingPath::DagBftSharedState {
             Some(
                 reconstruct_shared_state_dag_plan(
                     self.db.as_ref(),
@@ -2864,12 +3112,15 @@ impl RuntimeState {
                 })?
                 .aggregate_batch,
             )
+            .map(|batch| batch.txs)
         } else {
             None
         };
         persist_finalized_anchor(self.db.as_ref(), &anchor)?;
         metrics::EPOCH_HEIGHT.set(anchor.num as i64);
-        if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
+        if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
+            let _ = ();
+        } else if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
             net_log!(
                 "⚠️  Unable to reconstruct selected coins for epoch {}: {}",
                 anchor.num,
@@ -2877,8 +3128,8 @@ impl RuntimeState {
             );
             let _ = self.repair_epoch_state(anchor.num).await;
         }
-        if let Some(batch) = shared_state_batch {
-            for tx in batch.txs {
+        if let Some(txs) = finalized_batch {
+            for tx in txs {
                 let _ = self.tx_tx.send(tx);
             }
         }
@@ -2970,6 +3221,7 @@ pub async fn spawn(
         headers_tx: headers_tx.clone(),
         checkpoint_tx: checkpoint_tx.clone(),
         pending_anchor_certifications: Arc::new(AsyncMutex::new(HashMap::new())),
+        pending_fast_path_proposals: Arc::new(AsyncMutex::new(Vec::new())),
         pending_shared_state_proposals: Arc::new(AsyncMutex::new(Vec::new())),
         cast_anchor_votes: Arc::new(AsyncMutex::new(HashMap::new())),
         archive_manifests: Arc::new(RwLock::new(
@@ -3257,6 +3509,14 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 .sign_and_broadcast(WireTopic::Tx, canonical::encode_tx(&tx)?)
                 .await?;
         }
+        NetworkCommand::GossipFastPathBatch(batch) => {
+            state
+                .sign_and_broadcast(
+                    WireTopic::FastPathBatch,
+                    canonical::encode_fast_path_batch(&batch)?,
+                )
+                .await?;
+        }
         NetworkCommand::GossipSharedStateDagBatch(batch) => {
             state
                 .sign_and_broadcast(
@@ -3412,6 +3672,10 @@ impl Network {
         select_pending_shared_state_batch(self.db.as_ref())
     }
 
+    pub fn select_pending_fast_path_batch(&self) -> Result<Option<FastPathBatch>> {
+        select_pending_fast_path_batch(self.db.as_ref())
+    }
+
     pub async fn submit_tx(&self, tx: &crate::transaction::Tx) -> Result<[u8; 32]> {
         let tx_id = tx.id()?;
         if self.db.get_raw_bytes("tx", &tx_id)?.is_some() {
@@ -3419,9 +3683,23 @@ impl Network {
         }
         match tx {
             crate::transaction::Tx::OrdinaryPrivateTransfer(_) => {
-                tx.apply(&self.db)?;
+                if self.db.load_fast_path_pending_tx(&tx_id)?.is_none() {
+                    tx.validate(&self.db)?;
+                    self.db.store_fast_path_pending_tx(&tx_id, tx)?;
+                }
                 let _ = self.tx_tx.send(tx.clone());
                 let _ = self.command_tx.send(NetworkCommand::GossipTx(tx.clone()));
+                let _ = self.finalize_available_fast_path_anchor().await;
+                if let Ok(Some(batch)) = self.select_pending_shared_state_batch() {
+                    if batch
+                        .txs
+                        .iter()
+                        .any(|candidate| candidate.id().ok() == Some(tx_id))
+                    {
+                        let _ = self.author_local_shared_state_batch(&batch).await;
+                        let _ = self.finalize_available_shared_state_anchor().await;
+                    }
+                }
             }
             crate::transaction::Tx::SharedState(_) => {
                 if self.db.load_shared_state_pending_tx(&tx_id)?.is_none() {
@@ -3450,6 +3728,12 @@ impl Network {
     pub async fn gossip_tx(&self, tx: &crate::transaction::Tx) {
         let _ = self.tx_tx.send(tx.clone());
         let _ = self.command_tx.send(NetworkCommand::GossipTx(tx.clone()));
+    }
+
+    pub async fn gossip_fast_path_batch(&self, batch: &FastPathBatch) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipFastPathBatch(batch.clone()));
     }
 
     pub async fn gossip_shared_state_dag_batch(&self, batch: &SharedStateDagBatch) {
@@ -3594,6 +3878,80 @@ impl Network {
         let anchor = proposal.finalize(qc)?;
         anchor.validate_against_parent(parent)?;
         Ok(anchor)
+    }
+
+    pub async fn publish_fast_path_batch(&self, batch: &FastPathBatch) -> Result<()> {
+        batch.validate_against_store(self.db.as_ref())?;
+        if self
+            .db
+            .load_fast_path_batch(&batch.ordered_tx_root)?
+            .is_none()
+        {
+            self.db.store_fast_path_batch(batch)?;
+        }
+        self.gossip_fast_path_batch(batch).await;
+        Ok(())
+    }
+
+    pub async fn finalize_available_fast_path_anchor(&self) -> Result<Option<Anchor>> {
+        let parent = self.db.get::<Anchor>("epoch", b"latest")?;
+        let next_num = parent
+            .as_ref()
+            .map(|anchor| anchor.num.saturating_add(1))
+            .unwrap_or(0);
+        let position = Anchor::position_for_num(next_num);
+        let validator_set = match parent.as_ref() {
+            Some(parent) if parent.position.epoch == position.epoch => parent.validator_set.clone(),
+            Some(_) => load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?,
+            None => {
+                let identity = self
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                    .clone();
+                let identity = identity.read().await;
+                register_genesis_local_validator_pool(self.db.as_ref(), identity.record())?;
+                load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?
+            }
+        };
+        let local_validator_id = {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                .read()
+                .await;
+            ValidatorId::from_hot_key(&identity.record().auth_spki)
+        };
+        if validator_set.leader_for(position) != local_validator_id {
+            return Ok(None);
+        }
+
+        let Some(batch) = self.select_pending_fast_path_batch()? else {
+            return Ok(None);
+        };
+        self.publish_fast_path_batch(&batch).await?;
+        let anchor = self
+            .certify_local_anchor(
+                next_num,
+                parent.as_ref(),
+                batch.ordered_tx_root,
+                batch.ordered_tx_count()?,
+                0,
+                Vec::new(),
+                Vec::new(),
+                [0u8; 32],
+                0,
+                OrderingPath::FastPathPrivateTransfer,
+            )
+            .await?;
+        persist_finalized_anchor(self.db.as_ref(), &anchor)?;
+        let _ = self.anchor_tx.send(anchor.clone());
+        for tx in &batch.txs {
+            let _ = self.tx_tx.send(tx.clone());
+        }
+        self.gossip_anchor(&anchor).await;
+        Ok(Some(anchor))
     }
 
     pub async fn author_local_shared_state_batch(
@@ -4390,6 +4748,7 @@ fn should_relay_topic(topic: WireTopic) -> bool {
         topic,
         WireTopic::Anchor
             | WireTopic::AnchorProposal
+            | WireTopic::FastPathBatch
             | WireTopic::SharedStateDagBatch
             | WireTopic::CoinCandidate
             | WireTopic::Tx
@@ -4399,10 +4758,31 @@ fn should_relay_topic(topic: WireTopic) -> bool {
 }
 
 fn chain_compatible(local_chain_id: Option<[u8; 32]>, remote_chain_id: Option<[u8; 32]>) -> bool {
-    matches!(
-        (local_chain_id, remote_chain_id),
-        (Some(local_chain_id), Some(remote_chain_id)) if local_chain_id == remote_chain_id
-    )
+    match (local_chain_id, remote_chain_id) {
+        (Some(local_chain_id), Some(remote_chain_id)) => {
+            local_chain_id == remote_chain_id
+                || local_chain_id == protocol_chain_id()
+                || remote_chain_id == protocol_chain_id()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chain_compatible;
+    use crate::storage::protocol_chain_id;
+
+    #[test]
+    fn protocol_chain_id_remains_compatible_during_genesis_rebind() {
+        let provisional = protocol_chain_id();
+        let canonical = [7u8; 32];
+        assert!(chain_compatible(Some(canonical), Some(canonical)));
+        assert!(chain_compatible(Some(canonical), Some(provisional)));
+        assert!(chain_compatible(Some(provisional), Some(canonical)));
+        assert!(!chain_compatible(Some(canonical), Some([8u8; 32])));
+        assert!(!chain_compatible(None, Some(canonical)));
+    }
 }
 
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
@@ -4520,6 +4900,17 @@ fn validate_anchor_vote(
     Ok(())
 }
 
+fn validate_shared_state_dag_batch_author(
+    batch: &SharedStateDagBatch,
+    author_record: &NodeRecordV2,
+) -> Result<()> {
+    let expected_author = ValidatorId::from_hot_key(&author_record.auth_spki);
+    if batch.author != expected_author {
+        bail!("shared-state DAG batch author does not match the envelope signer");
+    }
+    Ok(())
+}
+
 fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     let parent = if anchor.num == 0 {
         None
@@ -4549,30 +4940,128 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         parent.as_ref(),
         db,
     )?;
-    if anchor.ordering_path == OrderingPath::DagBftSharedState {
-        validate_shared_state_dag_plan_for_proposal(
-            &AnchorProposal {
-                num: anchor.num,
-                hash: anchor.hash,
-                parent_hash: anchor.parent_hash,
-                position: anchor.position,
-                ordering_path: anchor.ordering_path,
-                merkle_root: anchor.merkle_root,
-                coin_count: anchor.coin_count,
-                dag_round: anchor.dag_round,
-                dag_frontier: anchor.dag_frontier.clone(),
-                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
-                ordered_tx_root: anchor.ordered_tx_root,
-                ordered_tx_count: anchor.ordered_tx_count,
-                validator_set: anchor.validator_set.clone(),
-            },
-            parent.as_ref(),
-            db,
-        )?;
+    let proposal = AnchorProposal {
+        num: anchor.num,
+        hash: anchor.hash,
+        parent_hash: anchor.parent_hash,
+        position: anchor.position,
+        ordering_path: anchor.ordering_path,
+        merkle_root: anchor.merkle_root,
+        coin_count: anchor.coin_count,
+        dag_round: anchor.dag_round,
+        dag_frontier: anchor.dag_frontier.clone(),
+        ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+        ordered_tx_root: anchor.ordered_tx_root,
+        ordered_tx_count: anchor.ordered_tx_count,
+        validator_set: anchor.validator_set.clone(),
+    };
+    match anchor.ordering_path {
+        OrderingPath::FastPathPrivateTransfer => {
+            let batch = db
+                .load_fast_path_batch(&anchor.merkle_root)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "fast-path batch for finalized anchor is unavailable".to_string())?;
+            validate_fast_path_batch_for_proposal(&proposal, &batch, db)?;
+        }
+        OrderingPath::DagBftSharedState => {
+            validate_shared_state_dag_plan_for_proposal(&proposal, parent.as_ref(), db)?;
+        }
     }
     anchor
         .validate_against_parent(parent.as_ref())
         .map_err(|e| e.to_string())
+}
+
+fn validate_fast_path_batch_for_proposal(
+    proposal: &AnchorProposal,
+    batch: &FastPathBatch,
+    db: &Store,
+) -> Result<(), String> {
+    if proposal.ordering_path != OrderingPath::FastPathPrivateTransfer {
+        return Err("fast-path batch cannot be attached to a full-order proposal".to_string());
+    }
+    batch
+        .validate_against_store(db)
+        .map_err(|e| e.to_string())?;
+    let batch_count = batch.ordered_tx_count().map_err(|e| e.to_string())?;
+    if proposal.merkle_root != batch.ordered_tx_root {
+        return Err("fast-path batch root does not match the proposal commitment".to_string());
+    }
+    if proposal.coin_count != batch_count {
+        return Err("fast-path batch count does not match the proposal commitment".to_string());
+    }
+    Ok(())
+}
+
+fn fast_path_nullifier_counts(db: &Store) -> Result<HashMap<[u8; 32], usize>> {
+    let mut counts = HashMap::<[u8; 32], usize>::new();
+    for (tx_id, tx) in db.load_fast_path_pending_txs()? {
+        if !matches!(tx, crate::transaction::Tx::OrdinaryPrivateTransfer(_)) {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if db.get_raw_bytes("tx", &tx_id)?.is_some() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if tx.validate(db).is_err() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        for nullifier in tx.nullifiers() {
+            *counts.entry(*nullifier).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn select_pending_fast_path_batch(db: &Store) -> Result<Option<FastPathBatch>> {
+    let mut pending = db.load_fast_path_pending_txs()?;
+    pending.sort_by_key(|(tx_id, _)| *tx_id);
+    let nullifier_counts = fast_path_nullifier_counts(db)?;
+
+    let mut selected = Vec::new();
+    let mut seen_nullifiers = HashSet::new();
+    for (tx_id, tx) in pending {
+        if !matches!(tx, crate::transaction::Tx::OrdinaryPrivateTransfer(_)) {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if db.get_raw_bytes("tx", &tx_id)?.is_some() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if tx.validate(db).is_err() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if tx
+            .nullifiers()
+            .iter()
+            .any(|nullifier| nullifier_counts.get(nullifier).copied().unwrap_or(0) > 1)
+        {
+            continue;
+        }
+        if tx
+            .nullifiers()
+            .iter()
+            .any(|nullifier| seen_nullifiers.contains(nullifier))
+        {
+            continue;
+        }
+        for nullifier in tx.nullifiers() {
+            seen_nullifiers.insert(*nullifier);
+        }
+        selected.push(tx);
+        if selected.len() >= PROTOCOL.max_coins_per_epoch as usize {
+            break;
+        }
+    }
+
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(FastPathBatch::new(selected)?))
 }
 
 fn shared_state_parent_round(parent: Option<&Anchor>, epoch: u64) -> u64 {
@@ -4790,22 +5279,49 @@ fn validate_shared_state_dag_plan_for_proposal(
 
 fn select_pending_shared_state_batch(db: &Store) -> Result<Option<SharedStateBatch>> {
     let mut pending = db.load_shared_state_pending_txs()?;
+    let nullifier_counts = fast_path_nullifier_counts(db)?;
+    for (tx_id, tx) in db.load_fast_path_pending_txs()? {
+        if !matches!(tx, crate::transaction::Tx::OrdinaryPrivateTransfer(_)) {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if db.get_raw_bytes("tx", &tx_id)?.is_some() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if tx.validate(db).is_err() {
+            let _ = db.delete_fast_path_pending_tx(&tx_id);
+            continue;
+        }
+        if tx
+            .nullifiers()
+            .iter()
+            .any(|nullifier| nullifier_counts.get(nullifier).copied().unwrap_or(0) > 1)
+        {
+            pending.push((tx_id, tx));
+        }
+    }
     pending.sort_by_key(|(tx_id, _)| *tx_id);
 
     let mut selected = Vec::new();
     let mut seen_nullifiers = HashSet::new();
     let mut seen_conflicts = HashSet::new();
     for (tx_id, tx) in pending {
-        if !matches!(tx, crate::transaction::Tx::SharedState(_)) {
-            let _ = db.delete_shared_state_pending_tx(&tx_id);
-            continue;
-        }
+        let is_shared_state = matches!(tx, crate::transaction::Tx::SharedState(_));
         if db.get_raw_bytes("tx", &tx_id)?.is_some() {
-            let _ = db.delete_shared_state_pending_tx(&tx_id);
+            if is_shared_state {
+                let _ = db.delete_shared_state_pending_tx(&tx_id);
+            } else {
+                let _ = db.delete_fast_path_pending_tx(&tx_id);
+            }
             continue;
         }
         if tx.validate(db).is_err() {
-            let _ = db.delete_shared_state_pending_tx(&tx_id);
+            if is_shared_state {
+                let _ = db.delete_shared_state_pending_tx(&tx_id);
+            } else {
+                let _ = db.delete_fast_path_pending_tx(&tx_id);
+            }
             continue;
         }
         let conflict_keys = tx.shared_state_conflict_keys()?;
@@ -4836,45 +5352,52 @@ fn select_pending_shared_state_batch(db: &Store) -> Result<Option<SharedStateBat
 }
 
 fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
-    if anchor.ordering_path == OrderingPath::DagBftSharedState {
-        let parent = if anchor.num == 0 {
-            None
-        } else {
-            db.get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
-        };
-        validate_shared_state_dag_plan_for_proposal(
-            &AnchorProposal {
-                num: anchor.num,
-                hash: anchor.hash,
-                parent_hash: anchor.parent_hash,
-                position: anchor.position,
-                ordering_path: anchor.ordering_path,
-                merkle_root: anchor.merkle_root,
-                coin_count: anchor.coin_count,
-                dag_round: anchor.dag_round,
-                dag_frontier: anchor.dag_frontier.clone(),
-                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
-                ordered_tx_root: anchor.ordered_tx_root,
-                ordered_tx_count: anchor.ordered_tx_count,
-                validator_set: anchor.validator_set.clone(),
-            },
-            parent.as_ref(),
-            db,
-        )
-        .map_err(|err| anyhow!(err))?;
-        let dag_batches = anchor
-            .ordered_batch_ids
-            .iter()
-            .map(|batch_id| {
-                db.load_shared_state_dag_batch(batch_id)?.ok_or_else(|| {
-                    anyhow!("shared-state DAG batch for finalized anchor is missing")
+    let proposal = AnchorProposal {
+        num: anchor.num,
+        hash: anchor.hash,
+        parent_hash: anchor.parent_hash,
+        position: anchor.position,
+        ordering_path: anchor.ordering_path,
+        merkle_root: anchor.merkle_root,
+        coin_count: anchor.coin_count,
+        dag_round: anchor.dag_round,
+        dag_frontier: anchor.dag_frontier.clone(),
+        ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+        ordered_tx_root: anchor.ordered_tx_root,
+        ordered_tx_count: anchor.ordered_tx_count,
+        validator_set: anchor.validator_set.clone(),
+    };
+    match anchor.ordering_path {
+        OrderingPath::FastPathPrivateTransfer => {
+            let batch = db
+                .load_fast_path_batch(&anchor.merkle_root)?
+                .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is missing"))?;
+            validate_fast_path_batch_for_proposal(&proposal, &batch, db)
+                .map_err(anyhow::Error::msg)?;
+            batch.apply_finalized(db)?;
+        }
+        OrderingPath::DagBftSharedState => {
+            let parent = if anchor.num == 0 {
+                None
+            } else {
+                db.get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
+            };
+            validate_shared_state_dag_plan_for_proposal(&proposal, parent.as_ref(), db)
+                .map_err(|err| anyhow!(err))?;
+            let dag_batches = anchor
+                .ordered_batch_ids
+                .iter()
+                .map(|batch_id| {
+                    db.load_shared_state_dag_batch(batch_id)?.ok_or_else(|| {
+                        anyhow!("shared-state DAG batch for finalized anchor is missing")
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let batch = SharedStateBatch::from_dag_batches(&dag_batches)?;
-        batch.apply_finalized(db)?;
-        for batch_id in &anchor.ordered_batch_ids {
-            db.mark_shared_state_dag_batch_finalized(batch_id, anchor.num)?;
+                .collect::<Result<Vec<_>>>()?;
+            let batch = SharedStateBatch::from_dag_batches(&dag_batches)?;
+            batch.apply_finalized(db)?;
+            for batch_id in &anchor.ordered_batch_ids {
+                db.mark_shared_state_dag_batch_finalized(batch_id, anchor.num)?;
+            }
         }
     }
     db.store_validator_committee(&anchor.validator_set)?;

@@ -277,6 +277,10 @@ impl Store {
             "validator_pool",
             "validator_committee",
             "tx",
+            "consensus_evidence",
+            "anchor_proposal_observation",
+            "validator_vote_observation",
+            "shared_state_dag_observation",
             "shared_state_pending_tx",
             "shared_state_batch",
             "meta",
@@ -332,10 +336,16 @@ impl Store {
             "validator_pool",      // validator_id -> ValidatorPool
             "validator_committee", // epoch -> ValidatorSet
             "tx",
-            "shared_state_pending_tx", // tx_id -> pending shared-state Tx
-            "shared_state_batch",      // ordered_tx_root -> SharedStateBatch
-            "shared_state_dag_batch",  // batch_id -> SharedStateDagBatch
-            "shared_state_dag_round",  // epoch||round||author -> batch_id
+            "consensus_evidence", // evidence_id -> ConsensusEvidenceRecord
+            "anchor_proposal_observation", // proposer||epoch||slot -> StoredAnchorProposalObservation
+            "validator_vote_observation",  // voter||epoch||slot -> StoredValidatorVoteObservation
+            "shared_state_dag_observation", // epoch||round||author -> StoredSharedStateDagObservation
+            "fast_path_pending_tx",         // tx_id -> pending ordinary fast-path Tx
+            "fast_path_batch",              // ordered_tx_root -> FastPathBatch
+            "shared_state_pending_tx",      // tx_id -> pending shared-state Tx
+            "shared_state_batch",           // ordered_tx_root -> SharedStateBatch
+            "shared_state_dag_batch",       // batch_id -> SharedStateDagBatch
+            "shared_state_dag_round",       // epoch||round||author -> batch_id
             "shared_state_finalized_batch", // batch_id -> anchor_num
             "peers",
             "meta", // miscellaneous metadata (e.g., cursors)
@@ -865,6 +875,59 @@ impl Store {
         Ok(())
     }
 
+    pub fn store_fast_path_pending_tx(
+        &self,
+        tx_id: &[u8; 32],
+        tx: &crate::transaction::Tx,
+    ) -> Result<()> {
+        self.put("fast_path_pending_tx", tx_id, tx)
+    }
+
+    pub fn load_fast_path_pending_tx(
+        &self,
+        tx_id: &[u8; 32],
+    ) -> Result<Option<crate::transaction::Tx>> {
+        self.get("fast_path_pending_tx", tx_id)
+    }
+
+    pub fn load_fast_path_pending_txs(&self) -> Result<Vec<([u8; 32], crate::transaction::Tx)>> {
+        let cf = self
+            .db
+            .cf_handle("fast_path_pending_tx")
+            .ok_or_else(|| anyhow::anyhow!("'fast_path_pending_tx' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut txs = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            let key: [u8; 32] = key
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("invalid fast-path pending tx key length"))?;
+            txs.push((key, bincode::deserialize(&value)?));
+        }
+        Ok(txs)
+    }
+
+    pub fn delete_fast_path_pending_tx(&self, tx_id: &[u8; 32]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("fast_path_pending_tx")
+            .ok_or_else(|| anyhow::anyhow!("'fast_path_pending_tx' column family missing"))?;
+        self.db.delete_cf(cf, tx_id)?;
+        Ok(())
+    }
+
+    pub fn store_fast_path_batch(&self, batch: &crate::transaction::FastPathBatch) -> Result<()> {
+        self.put("fast_path_batch", &batch.ordered_tx_root, batch)
+    }
+
+    pub fn load_fast_path_batch(
+        &self,
+        ordered_tx_root: &[u8; 32],
+    ) -> Result<Option<crate::transaction::FastPathBatch>> {
+        self.get("fast_path_batch", ordered_tx_root)
+    }
+
     pub fn store_shared_state_batch(
         &self,
         batch: &crate::transaction::SharedStateBatch,
@@ -877,6 +940,119 @@ impl Store {
         ordered_tx_root: &[u8; 32],
     ) -> Result<Option<crate::transaction::SharedStateBatch>> {
         self.get("shared_state_batch", ordered_tx_root)
+    }
+
+    pub fn anchor_proposal_observation_key(
+        proposer: crate::consensus::ValidatorId,
+        position: crate::consensus::ConsensusPosition,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32 + 8 + 4);
+        key.extend_from_slice(&proposer.0);
+        key.extend_from_slice(&position.epoch.to_le_bytes());
+        key.extend_from_slice(&position.slot.to_le_bytes());
+        key
+    }
+
+    pub fn validator_vote_observation_key(
+        voter: crate::consensus::ValidatorId,
+        position: crate::consensus::ConsensusPosition,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32 + 8 + 4);
+        key.extend_from_slice(&voter.0);
+        key.extend_from_slice(&position.epoch.to_le_bytes());
+        key.extend_from_slice(&position.slot.to_le_bytes());
+        key
+    }
+
+    pub fn shared_state_dag_observation_key(
+        epoch: u64,
+        round: u64,
+        author: crate::consensus::ValidatorId,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + 8 + 32);
+        key.extend_from_slice(&epoch.to_le_bytes());
+        key.extend_from_slice(&round.to_le_bytes());
+        key.extend_from_slice(&author.0);
+        key
+    }
+
+    pub fn store_anchor_proposal_observation(
+        &self,
+        key: &[u8],
+        observation: &crate::evidence::StoredAnchorProposalObservation,
+    ) -> Result<()> {
+        self.put("anchor_proposal_observation", key, observation)
+    }
+
+    pub fn load_anchor_proposal_observation(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<crate::evidence::StoredAnchorProposalObservation>> {
+        self.get("anchor_proposal_observation", key)
+    }
+
+    pub fn store_validator_vote_observation(
+        &self,
+        key: &[u8],
+        observation: &crate::evidence::StoredValidatorVoteObservation,
+    ) -> Result<()> {
+        self.put("validator_vote_observation", key, observation)
+    }
+
+    pub fn load_validator_vote_observation(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<crate::evidence::StoredValidatorVoteObservation>> {
+        self.get("validator_vote_observation", key)
+    }
+
+    pub fn store_shared_state_dag_observation(
+        &self,
+        key: &[u8],
+        observation: &crate::evidence::StoredSharedStateDagObservation,
+    ) -> Result<()> {
+        self.put("shared_state_dag_observation", key, observation)
+    }
+
+    pub fn load_shared_state_dag_observation(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<crate::evidence::StoredSharedStateDagObservation>> {
+        self.get("shared_state_dag_observation", key)
+    }
+
+    pub fn store_consensus_evidence(
+        &self,
+        record: &crate::evidence::ConsensusEvidenceRecord,
+    ) -> Result<()> {
+        let existing = self.get_raw_bytes("consensus_evidence", &record.evidence_id)?;
+        if existing.is_none() {
+            self.put("consensus_evidence", &record.evidence_id, record)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_consensus_evidence(&self) -> Result<Vec<crate::evidence::ConsensusEvidenceRecord>> {
+        let cf = self
+            .db
+            .cf_handle("consensus_evidence")
+            .ok_or_else(|| anyhow::anyhow!("'consensus_evidence' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut records: Vec<crate::evidence::ConsensusEvidenceRecord> = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            records.push(
+                bincode::deserialize(&value)
+                    .context("deserialize consensus evidence from storage")?,
+            );
+        }
+        records.sort_by(|left, right| {
+            right
+                .recorded_unix_ms
+                .cmp(&left.recorded_unix_ms)
+                .then(left.evidence_id.cmp(&right.evidence_id))
+        });
+        Ok(records)
     }
 
     fn shared_state_dag_round_key(epoch: u64, round: u64, author: &[u8; 32]) -> Vec<u8> {

@@ -2,21 +2,12 @@ use crate::consensus::{
     ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorSet, VoteTarget,
     DEFAULT_SLOTS_PER_EPOCH, MAX_COINS_PER_CHECKPOINT,
 };
-use crate::protocol::CURRENT as PROTOCOL;
 use crate::sync::SyncState;
-use crate::{
-    coin::{Coin, CoinCandidate},
-    network::NetHandle,
-    storage::Store,
-};
+use crate::{coin::Coin, network::NetHandle, storage::Store};
 use anyhow::{bail, Result as AnyResult};
-use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
-use tokio::{
-    sync::{broadcast, mpsc},
-    time,
-};
+use tokio::{sync::broadcast, time};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct AnchorProposal {
@@ -663,10 +654,8 @@ pub struct Manager {
     net_cfg: crate::config::Net,
     net: NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
-    coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     shutdown_rx: broadcast::Receiver<()>,
     sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
-    compact_cfg: crate::config::Compact,
 }
 impl Manager {
     pub fn new(
@@ -674,10 +663,8 @@ impl Manager {
         cfg: crate::config::Epoch,
         net_cfg: crate::config::Net,
         net: NetHandle,
-        coin_rx: mpsc::UnboundedReceiver<[u8; 32]>,
         shutdown_rx: broadcast::Receiver<()>,
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
-        compact_cfg: crate::config::Compact,
     ) -> Self {
         let anchor_tx = net.anchor_sender();
         Self {
@@ -686,10 +673,8 @@ impl Manager {
             net_cfg,
             net,
             anchor_tx,
-            coin_rx,
             shutdown_rx,
             sync_state,
-            compact_cfg,
         }
     }
 
@@ -731,7 +716,6 @@ impl Manager {
                 }
             }
 
-            let mut buffer: HashSet<[u8; 32]> = HashSet::new();
             // Tick immediately on startup for all cases; no restart grace period
             let mut ticker = time::interval_at(
                 time::Instant::now(),
@@ -739,9 +723,6 @@ impl Manager {
             );
             // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Periodic candidate pull during the entire epoch interval
-            let mut candidate_pull_ticker = time::interval(time::Duration::from_millis(500));
-            candidate_pull_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -750,11 +731,13 @@ impl Manager {
                         println!("🛑 Epoch manager received shutdown signal");
                         break;
                     }
-                    Some(id) = self.coin_rx.recv() => {
-                        buffer.insert(id);
-                        crate::metrics::CANDIDATE_COINS.set(buffer.len() as i64);
-                    },
                     _ = ticker.tick() => {
+                        if let Ok(Some(latest_anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
+                            if latest_anchor.num >= current_epoch {
+                                current_epoch = latest_anchor.num.saturating_add(1);
+                            }
+                        }
+
                         // When bootstrap peers are configured, strictly avoid producing epochs until fully synced with peers.
                         if !self.net_cfg.bootstrap.is_empty() {
                             let (synced, highest_seen, peer_confirmed) = self
@@ -783,7 +766,7 @@ impl Manager {
                         }
 
 
-                        if current_epoch == 0 && buffer.is_empty() {
+                        if current_epoch == 0 {
                             if self.net_cfg.bootstrap.is_empty() {
                                 println!("🌱 No existing epochs found. Creating genesis anchor (no bootstrap configured)...");
                             } else {
@@ -793,9 +776,6 @@ impl Manager {
                             }
                         }
 
-
-                        // Determine previous anchor (for epoch linkage and candidate filtering)
-                        let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
 
                         match self.net.select_pending_shared_state_batch() {
                             Ok(Some(shared_state_batch)) => {
@@ -810,6 +790,30 @@ impl Manager {
                             Ok(None) => {}
                             Err(err) => {
                                 eprintln!("⚠️ Failed selecting shared-state batch: {}", err);
+                            }
+                        }
+
+                        match self.net.finalize_available_fast_path_anchor().await {
+                            Ok(Some(anchor)) => {
+                                crate::metrics::EPOCH_HEIGHT.set(anchor.num as i64);
+                                crate::metrics::SELECTED_COINS.set(anchor.coin_count as i64);
+                                if let Err(e) = self.anchor_tx.send(anchor.clone()) {
+                                    eprintln!("⚠️  Failed to broadcast fast-path anchor: {}", e);
+                                }
+                                current_epoch = anchor.num.saturating_add(1);
+                                ticker = time::interval_at(
+                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
+                                    time::Duration::from_secs(self.cfg.seconds)
+                                );
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "⏳ Local fast-path checkpoint {} not certified: {}",
+                                    current_epoch, err
+                                );
                             }
                         }
 
@@ -834,209 +838,6 @@ impl Manager {
                                     current_epoch, err
                                 );
                             }
-                        }
-
-                        // Use canonical fair selection that ensures diversity across creators
-                        let mut selected: Vec<CoinCandidate> = Vec::new();
-                        if let Some(prev) = &prev_anchor {
-                            let cap = PROTOCOL.max_coins_per_epoch as usize;
-                            let (list, _total) = crate::epoch::select_candidates_for_epoch(&self.db, prev, cap, Some(&buffer));
-                            selected = list;
-                        }
-                        if let Some(last) = selected.last() {
-                            // approximate selection threshold: interpret first 8 bytes of admission digest as u64
-                            let mut eight = [0u8;8];
-                            eight.copy_from_slice(&last.admission_digest[..8]);
-                            crate::metrics::SELECTION_THRESHOLD_U64.set(u64::from_le_bytes(eight) as i64);
-                        }
-
-                        // Build Merkle root from selected coin IDs and persist sorted leaves for fast proofs
-                        let selected_ids: HashSet<[u8; 32]> = selected.iter().map(|c| c.id).collect();
-                        let mut leaves: Vec<[u8;32]> = selected_ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
-                        leaves.sort();
-                        // Avoid emitting empty epochs on existing chains. This prevents height from
-                        // advancing without any economic activity and reduces potential fork surface.
-                        if prev_anchor.is_some() && selected_ids.is_empty() {
-                            continue;
-                        }
-                        let levels = MerkleTree::build_levels_from_sorted_leaves(&leaves);
-                        let merkle_root = if levels.is_empty() { [0u8;32] } else { *levels.last().unwrap().first().unwrap() };
-                        let anchor = match self
-                            .net
-                            .certify_local_anchor(
-                                current_epoch,
-                                prev_anchor.as_ref(),
-                                merkle_root,
-                                selected_ids.len() as u32,
-                                0,
-                                Vec::new(),
-                                Vec::new(),
-                                [0u8; 32],
-                                0,
-                                OrderingPath::FastPathPrivateTransfer,
-                            )
-                            .await
-                        {
-                            Ok(anchor) => anchor,
-                            Err(err) => {
-                                eprintln!(
-                                    "⏳ Local checkpoint {} not certified: {}",
-                                    current_epoch, err
-                                );
-                                continue;
-                            }
-                        };
-
-                        let mut batch = WriteBatch::default();
-                        let serialized_anchor = match bincode::serialize(&anchor) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                eprintln!("🔥 Failed to serialize anchor: {}", e);
-                                continue;
-                            }
-                        };
-
-                        let epoch_cf = match self.db.db.cf_handle("epoch") {
-                            Some(cf) => cf,
-                            None => {
-                                eprintln!("🔥 'epoch' column family missing");
-                                continue;
-                            }
-                        };
-
-                        batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
-                        batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
-                        if let Some(committee_cf) = self.db.db.cf_handle("validator_committee") {
-                            if let Ok(bytes) = bincode::serialize(&anchor.validator_set) {
-                                batch.put_cf(
-                                    committee_cf,
-                                    &anchor.validator_set.epoch.to_le_bytes(),
-                                    bytes,
-                                );
-                            }
-                        }
-
-                        // Persist selected coins into confirmed coin CF and index selected IDs per-epoch
-                        if let (Some(coin_cf), Some(coin_epoch_cf)) = (self.db.db.cf_handle("coin"), self.db.db.cf_handle("coin_epoch")) {
-                            let rev_cf_opt = self.db.db.cf_handle("coin_epoch_by_epoch");
-                            // Pre-serialize and reuse buffer for coin bodies
-                            let mut coin_buf: Vec<u8> = Vec::with_capacity(256);
-                            for cand in &selected {
-                                let coin = cand.clone().into_confirmed();
-                                coin_buf.clear();
-                                if bincode::serialize_into(&mut coin_buf, &coin).is_ok() {
-                                    batch.put_cf(coin_cf, &coin.id, &coin_buf);
-                                } else if let Ok(bytes) = bincode::serialize(&coin) {
-                                    batch.put_cf(coin_cf, &coin.id, &bytes);
-                                }
-                                // Record the epoch number that committed this coin
-                                batch.put_cf(coin_epoch_cf, &coin.id, &current_epoch.to_le_bytes());
-                                // Reverse index: epoch_num||coin_id -> 1 for range scans
-                                if let Some(rev_cf) = rev_cf_opt {
-                                    let mut key = Vec::with_capacity(8 + 32);
-                                    key.extend_from_slice(&current_epoch.to_le_bytes());
-                                    key.extend_from_slice(&coin.id);
-                                    batch.put_cf(rev_cf, &key, &[]);
-                                }
-                            }
-                        } else if let Some(coin_cf) = self.db.db.cf_handle("coin") {
-                            // Fallback: write coins even if coin_epoch CF is missing (should not happen)
-                            let mut coin_buf: Vec<u8> = Vec::with_capacity(256);
-                            for cand in &selected {
-                                let coin = cand.clone().into_confirmed();
-                                coin_buf.clear();
-                                if bincode::serialize_into(&mut coin_buf, &coin).is_ok() {
-                                    batch.put_cf(coin_cf, &coin.id, &coin_buf);
-                                } else if let Ok(bytes) = bincode::serialize(&coin) {
-                                    batch.put_cf(coin_cf, &coin.id, &bytes);
-                                }
-                            }
-                        }
-                        if let Some(sel_cf) = self.db.db.cf_handle("epoch_selected") {
-                            // Key: epoch number (little endian) || coin_id
-                            for coin in &selected_ids {
-                                let mut key = Vec::with_capacity(8 + 32);
-                                key.extend_from_slice(&current_epoch.to_le_bytes());
-                                key.extend_from_slice(coin);
-                                batch.put_cf(sel_cf, &key, &[]);
-                            }
-                        }
-                        if let Err(e) = self.db.store_epoch_leaves(current_epoch, &leaves) { eprintln!("⚠️ Failed to store epoch leaves: {}", e); }
-                        if let Err(e) = self.db.store_epoch_levels(current_epoch, &levels) { eprintln!("⚠️ Failed to store epoch levels: {}", e); }
-
-                        if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
-                            batch.put_cf(anchor_cf, &anchor.hash, &serialized_anchor);
-                        }
-
-                        if let Err(e) = self.db.write_batch(batch) {
-                            eprintln!("🔥 Failed to write new epoch to DB: {e}");
-                            continue;
-                        } else {
-                            crate::metrics::EPOCH_HEIGHT.set(current_epoch as i64);
-                            crate::metrics::SELECTED_COINS.set(selected_ids.len() as i64);
-                            // Gossip the canonical anchor.
-                            self.net.gossip_anchor(&anchor).await;
-                            // Also gossip compact epoch if enabled
-                            if self.compact_cfg.enable {
-                                // Build a compact message opportunistically: prefill first entries
-                                let prefill_n = self.compact_cfg.prefill_count.min(selected.len() as u32);
-                                let mut prefilled: Vec<(u32, crate::coin::Coin)> = Vec::new();
-                                for (i, cand) in selected.iter().take(prefill_n as usize).enumerate() {
-                                    prefilled.push((i as u32, cand.clone().into_confirmed()));
-                                }
-                                // Short IDs: first 8 bytes of BLAKE3(coin_id). Low collision rate in practice.
-                                let mut short_ids: Vec<[u8;8]> = Vec::with_capacity(selected.len());
-                                for cand in &selected {
-                                    let mut hasher = blake3::Hasher::new();
-                                    hasher.update(&cand.id);
-                                    let full = *hasher.finalize().as_bytes();
-                                    let mut short = [0u8;8];
-                                    short.copy_from_slice(&full[..8]);
-                                    short_ids.push(short);
-                                }
-                                let compact = crate::network::CompactEpoch { anchor: anchor.clone(), short_ids, prefilled };
-                                self.net.gossip_compact_epoch(compact).await;
-                                crate::metrics::COMPACT_EPOCHS_SENT.inc();
-                            }
-                            // Also gossip sorted leaves to help peers serve proofs deterministically
-                            let bundle = crate::network::EpochLeavesBundle { epoch_num: current_epoch, merkle_root, leaves: leaves.clone() };
-                            self.net.gossip_epoch_leaves(bundle).await;
-                            if let Err(e) = self.anchor_tx.send(anchor.clone()) {
-                                eprintln!("⚠️  Failed to broadcast anchor: {}", e);
-                            }
-                            // Prune candidates but keep a safety window of recent epoch hashes to support reorgs
-                            if let Some(latest) = self.db.get::<Anchor>("epoch", b"latest").ok().flatten() {
-                                let mut keep: Vec<[u8;32]> = Vec::new();
-                                // Keep the new parent (current hash) and recent window of parents
-                                keep.push(anchor.hash);
-                                // Walk back up to 127 previous anchors (total ~128 hashes kept)
-                                let mut n = latest.num;
-                                let mut walked: u64 = 0;
-                                while walked < 127 {
-                                    if n == 0 { break; }
-                                    if let Ok(Some(a)) = self.db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                        keep.push(a.hash);
-                                    } else { break; }
-                                    if n == 0 { break; }
-                                    n = n.saturating_sub(1);
-                                    walked += 1;
-                                }
-                                let _ = self.db.prune_candidates_keep_hashes(&keep.iter().collect::<Vec<_>>().iter().map(|h| **h).collect::<Vec<[u8;32]>>());
-                            }
-                            buffer.clear();
-                            current_epoch += 1;
-                            // Align next tick to now + epoch.seconds
-                            ticker = time::interval_at(
-                                time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                time::Duration::from_secs(self.cfg.seconds)
-                            );
-                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        }
-                    }
-                    _ = candidate_pull_ticker.tick() => {
-                        // Continuously pull candidates for the upcoming epoch's parent hash
-                        if let Some(prev) = &self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default() {
-                            self.net.request_epoch_candidates(prev.hash).await;
                         }
                     }
                 }

@@ -444,7 +444,6 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
 async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     let db = open_store(cfg)?;
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
-    let (_coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let net = network::spawn(
         cfg.net.clone(),
@@ -473,10 +472,8 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
         cfg.epoch.clone(),
         cfg.net.clone(),
         net.clone(),
-        coin_rx,
         shutdown_tx.subscribe(),
         sync_state.clone(),
-        cfg.compact.clone(),
     );
     epoch_mgr.spawn_loop();
     Ok(NetworkRuntime {

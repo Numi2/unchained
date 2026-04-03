@@ -84,6 +84,12 @@ pub struct SharedStateBatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FastPathBatch {
+    pub ordered_tx_root: [u8; 32],
+    pub txs: Vec<Tx>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedStateDagBatch {
     pub epoch: u64,
     pub round: u64,
@@ -126,15 +132,7 @@ impl SharedStateBatch {
     }
 
     pub fn new(txs: Vec<Tx>) -> Result<Self> {
-        let tx_ids = txs
-            .iter()
-            .map(|tx| {
-                if !matches!(tx, Tx::SharedState(_)) {
-                    bail!("shared-state batches may only carry shared-state transactions");
-                }
-                tx.id()
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let tx_ids = txs.iter().map(|tx| tx.id()).collect::<Result<Vec<_>>>()?;
         let ordered_tx_root = Self::ordered_tx_root_for_ids(&tx_ids);
         Ok(Self {
             ordered_tx_root,
@@ -157,10 +155,7 @@ impl SharedStateBatch {
     pub fn validate(&self) -> Result<()> {
         let tx_ids = self.tx_ids()?;
         let mut seen_tx_ids = HashSet::new();
-        for (tx, tx_id) in self.txs.iter().zip(tx_ids.iter()) {
-            if !matches!(tx, Tx::SharedState(_)) {
-                bail!("shared-state batches may only carry shared-state transactions");
-            }
+        for (_tx, tx_id) in self.txs.iter().zip(tx_ids.iter()) {
             if !seen_tx_ids.insert(*tx_id) {
                 bail!("shared-state batch contains duplicate transaction ids");
             }
@@ -260,8 +255,20 @@ impl SharedStateBatch {
             write_batch.put_cf(tx_cf, &tx_id, &tx_bytes);
             write_batch.delete_cf(pending_cf, &tx_id);
             match tx {
-                Tx::OrdinaryPrivateTransfer(_) => {
-                    bail!("ordinary transactions are not valid inside a shared-state batch");
+                Tx::OrdinaryPrivateTransfer(transfer) => {
+                    append_shielded_transfer_to_overlay(
+                        db,
+                        &mut write_batch,
+                        &tx_id,
+                        transfer,
+                        &mut note_tree,
+                        &mut active,
+                    )?;
+                    let fast_path_pending_cf = db
+                        .db
+                        .cf_handle("fast_path_pending_tx")
+                        .ok_or_else(|| anyhow!("'fast_path_pending_tx' column family missing"))?;
+                    write_batch.delete_cf(fast_path_pending_cf, &tx_id);
                 }
                 Tx::SharedState(shared) => match &shared.action {
                     SharedStateAction::RegisterValidator(registration) => {
@@ -359,6 +366,134 @@ impl SharedStateBatch {
         }
         db.write_batch(write_batch)
             .context("write finalized shared-state batch to the database")?;
+        Ok(finalized_tx_ids)
+    }
+}
+
+impl FastPathBatch {
+    pub fn ordered_tx_root_for_ids(tx_ids: &[[u8; 32]]) -> [u8; 32] {
+        SharedStateBatch::ordered_tx_root_for_ids(tx_ids)
+    }
+
+    pub fn new(txs: Vec<Tx>) -> Result<Self> {
+        let tx_ids = txs
+            .iter()
+            .map(|tx| {
+                if !matches!(tx, Tx::OrdinaryPrivateTransfer(_)) {
+                    bail!("fast-path batches may only carry ordinary private transfers");
+                }
+                tx.id()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            ordered_tx_root: Self::ordered_tx_root_for_ids(&tx_ids),
+            txs,
+        })
+    }
+
+    pub fn tx_ids(&self) -> Result<Vec<[u8; 32]>> {
+        self.txs.iter().map(Tx::id).collect()
+    }
+
+    pub fn ordered_tx_count(&self) -> Result<u32> {
+        u32::try_from(self.txs.len()).context("fast-path batch size exceeds u32")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let tx_ids = self.tx_ids()?;
+        let mut seen_tx_ids = HashSet::new();
+        let mut seen_nullifiers = HashSet::new();
+        for (tx, tx_id) in self.txs.iter().zip(tx_ids.iter()) {
+            let Tx::OrdinaryPrivateTransfer(_) = tx else {
+                bail!("fast-path batches may only carry ordinary private transfers");
+            };
+            if !seen_tx_ids.insert(*tx_id) {
+                bail!("fast-path batch contains duplicate transaction ids");
+            }
+            for nullifier in tx.nullifiers() {
+                if !seen_nullifiers.insert(*nullifier) {
+                    bail!("fast-path batch contains duplicate nullifiers");
+                }
+            }
+        }
+        let expected_root = Self::ordered_tx_root_for_ids(&tx_ids);
+        if self.ordered_tx_root != expected_root {
+            bail!("fast-path batch ordered tx root mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_store(&self, db: &Store) -> Result<()> {
+        self.validate()?;
+        for tx in &self.txs {
+            let tx_id = tx.id()?;
+            if db.get_raw_bytes("tx", &tx_id)?.is_some() {
+                bail!("fast-path batch contains an already finalized transaction");
+            }
+            match tx {
+                Tx::OrdinaryPrivateTransfer(transfer) => {
+                    tx.validate(db)?;
+                    let journal = proof::verify_shielded_receipt_bytes(&transfer.proof)?;
+                    if journal.inputs.len() != transfer.nullifiers.len() {
+                        bail!("fast-path transaction proof input count mismatch");
+                    }
+                    if journal.outputs.len() != transfer.outputs.len() {
+                        bail!("fast-path transaction proof output count mismatch");
+                    }
+                }
+                Tx::SharedState(_) => {
+                    bail!("fast-path batches cannot carry shared-state transactions")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_finalized(&self, db: &Store) -> Result<Vec<[u8; 32]>> {
+        self.validate_against_store(db)?;
+        ensure_shielded_runtime_state(db)?;
+
+        let mut note_tree = db.load_shielded_note_tree()?.unwrap_or_default();
+        let mut active = db
+            .load_shielded_active_nullifier_epoch()?
+            .ok_or_else(|| anyhow!("missing active shielded nullifier epoch"))?;
+        let tx_cf = db
+            .db
+            .cf_handle("tx")
+            .ok_or_else(|| anyhow!("tx CF missing"))?;
+        let pending_cf = db
+            .db
+            .cf_handle("fast_path_pending_tx")
+            .ok_or_else(|| anyhow!("'fast_path_pending_tx' column family missing"))?;
+
+        let mut write_batch = rocksdb::WriteBatch::default();
+        let mut finalized_tx_ids = Vec::with_capacity(self.txs.len());
+        for tx in &self.txs {
+            let tx_id = tx.id()?;
+            finalized_tx_ids.push(tx_id);
+            let tx_bytes = canonical::encode_tx(tx).context("serialize finalized fast-path tx")?;
+            write_batch.put_cf(tx_cf, &tx_id, &tx_bytes);
+            write_batch.delete_cf(pending_cf, &tx_id);
+            let Tx::OrdinaryPrivateTransfer(transfer) = tx else {
+                bail!("fast-path batch contains a non-ordinary transaction");
+            };
+            append_shielded_transfer_to_overlay(
+                db,
+                &mut write_batch,
+                &tx_id,
+                transfer,
+                &mut note_tree,
+                &mut active,
+            )?;
+        }
+
+        persist_shielded_runtime_overlay(db, &mut write_batch, &note_tree, &active)?;
+        db.write_batch(write_batch)
+            .context("write finalized fast-path batch to the database")?;
         Ok(finalized_tx_ids)
     }
 }
@@ -1260,6 +1395,24 @@ mod tests {
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool })
     }
 
+    fn shielded_output(seed: u8) -> ShieldedOutput {
+        ShieldedOutput {
+            note_commitment: [seed; 32],
+            kem_ct: [seed.wrapping_add(1); crate::crypto::ML_KEM_768_CT_BYTES],
+            nonce: [seed.wrapping_add(2); SHIELDED_OUTPUT_NONCE_LEN],
+            view_tag: seed.wrapping_add(3),
+            ciphertext: vec![seed.wrapping_add(4), seed.wrapping_add(5)],
+        }
+    }
+
+    fn ordinary_tx(nullifier_seed: u8, output_seed: u8, proof_seed: u8) -> Tx {
+        Tx::new(
+            vec![[nullifier_seed; 32]],
+            vec![shielded_output(output_seed)],
+            vec![proof_seed],
+        )
+    }
+
     #[test]
     fn ordinary_private_transfers_default_to_fast_path_class() {
         let tx = Tx::new(vec![[1u8; 32]], Vec::new(), vec![7u8; 4]);
@@ -1316,5 +1469,61 @@ mod tests {
         assert_eq!(tx.proof(), Some(transfer.proof.as_slice()));
         assert_eq!(tx.input_count(), 1);
         assert_eq!(tx.output_count(), 1);
+    }
+
+    #[test]
+    fn fast_path_batch_rejects_shared_state_transactions() {
+        let err = FastPathBatch::new(vec![Tx::new_shared_state(
+            registration_action(),
+            vec![9u8; 4],
+        )])
+        .expect_err("shared-state tx must not be accepted into fast path");
+        assert!(err
+            .to_string()
+            .contains("fast-path batches may only carry ordinary private transfers"));
+    }
+
+    #[test]
+    fn fast_path_batch_rejects_duplicate_nullifiers() {
+        let tx_a = ordinary_tx(3, 7, 11);
+        let tx_b = ordinary_tx(3, 8, 12);
+        let batch = FastPathBatch::new(vec![tx_a, tx_b]).expect("construct fast-path batch");
+        let err = batch
+            .validate()
+            .expect_err("duplicate nullifiers must not survive fast-path selection");
+        assert!(err
+            .to_string()
+            .contains("fast-path batch contains duplicate nullifiers"));
+    }
+
+    #[test]
+    fn shared_state_dag_aggregation_filters_contended_ordinary_transfers() {
+        let ordinary_a = ordinary_tx(4, 20, 30);
+        let ordinary_b = ordinary_tx(4, 21, 31);
+        let shared = Tx::new_shared_state(registration_action(), vec![12u8; 4]);
+
+        let dag_a = SharedStateDagBatch::new(
+            0,
+            1,
+            ValidatorId([1u8; 32]),
+            Vec::new(),
+            SharedStateBatch::new(vec![ordinary_a.clone()]).expect("dag batch A"),
+        )
+        .expect("round-1 DAG batch A");
+        let dag_b = SharedStateDagBatch::new(
+            0,
+            1,
+            ValidatorId([2u8; 32]),
+            Vec::new(),
+            SharedStateBatch::new(vec![ordinary_b, shared.clone()]).expect("dag batch B"),
+        )
+        .expect("round-1 DAG batch B");
+
+        let aggregate =
+            SharedStateBatch::from_dag_batches(&[dag_a, dag_b]).expect("aggregate DAG batches");
+        let aggregate_ids = aggregate.tx_ids().expect("aggregate tx ids");
+        assert_eq!(aggregate_ids.len(), 2);
+        assert_eq!(aggregate_ids[0], ordinary_a.id().expect("ordinary tx id"));
+        assert_eq!(aggregate_ids[1], shared.id().expect("shared-state tx id"));
     }
 }

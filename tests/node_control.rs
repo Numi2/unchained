@@ -8,8 +8,9 @@ use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 use unchained::{
     config::{Net, P2p},
+    consensus::{ConsensusPosition, OrderingPath, ValidatorVote, VoteTarget},
     epoch::Anchor,
-    network, node_control, node_identity,
+    evidence, network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
     storage::{Store, WalletStore},
     sync::SyncState,
@@ -165,6 +166,8 @@ async fn node_control_serves_consensus_status() -> Result<()> {
         Some(genesis.position.epoch)
     );
     assert_eq!(status.registered_validator_pools.len(), 1);
+    assert_eq!(status.consensus_evidence_count, 0);
+    assert!(status.recent_consensus_evidence.is_empty());
     assert_eq!(
         status
             .latest_finalized_anchor
@@ -205,6 +208,74 @@ async fn node_control_serves_consensus_status() -> Result<()> {
 
     std::fs::write(&capability_path, [0u8; 32])?;
     assert!(client.ping().is_err());
+
+    let _ = shutdown_tx.send(());
+    server_task.await??;
+    net.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_control_surfaces_recent_consensus_evidence() -> Result<()> {
+    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "node-control-evidence-passphrase");
+    network::set_quiet_logging(true);
+
+    let tempdir = TempDir::new()?;
+    let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
+    let _wallet_db = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
+    let validator = committee
+        .validator_set_for_epoch(genesis.position.epoch)
+        .validators[0]
+        .clone();
+    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
+
+    let first_vote = ValidatorVote {
+        voter: validator.id,
+        target: VoteTarget {
+            position: ConsensusPosition {
+                epoch: genesis.position.epoch,
+                slot: genesis.position.slot.saturating_add(1),
+            },
+            ordering_path: OrderingPath::FastPathPrivateTransfer,
+            block_digest: [1u8; 32],
+        },
+        signature: vec![1u8; 16],
+    };
+    let second_vote = ValidatorVote {
+        voter: validator.id,
+        target: VoteTarget {
+            block_digest: [2u8; 32],
+            ..first_vote.target.clone()
+        },
+        signature: vec![2u8; 16],
+    };
+    assert!(evidence::observe_validator_vote(db.as_ref(), &first_vote)?.is_none());
+    let evidence_record = evidence::observe_validator_vote(db.as_ref(), &second_vote)?
+        .expect("store vote equivocation evidence");
+
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = node_control::NodeControlServer::bind(
+        &tempdir.path().to_string_lossy(),
+        db.clone(),
+        net.clone(),
+        sync_state,
+        false,
+    )
+    .await?;
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let client = node_control::NodeControlClient::new(&tempdir.path().to_string_lossy());
+    client.ping()?;
+    let status = client.consensus_status()?;
+    assert_eq!(status.consensus_evidence_count, 1);
+    assert_eq!(status.recent_consensus_evidence.len(), 1);
+    assert_eq!(
+        status.recent_consensus_evidence[0].evidence_id,
+        evidence_record.evidence_id
+    );
 
     let _ = shutdown_tx.send(());
     server_task.await??;

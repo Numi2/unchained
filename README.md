@@ -208,6 +208,8 @@ The current foundation slice now includes:
   selection at epoch boundaries
 - leader-proposed checkpoint certification with explicit validator vote
   collection over the network
+- persisted consensus-accountability evidence for conflicting anchor proposals,
+  conflicting validator votes, and conflicting validator-authored DAG batches
 - content-addressed shared-state batch dissemination and batch retrieval for
   validator-ordered actions
 - finalized checkpoint objects that commit parent linkage, ordering path,
@@ -235,9 +237,16 @@ Checkpoint certification now requires a deterministic slot leader to propose an
 `AnchorProposal`, gather validator votes, and assemble a quorum certificate
 before a finalized checkpoint is produced. Shared-state ordering now has a real
 round/parent/frontier structure with availability-driven leader proposals over
-quorum DAG rounds. The remaining consensus gap is narrower: ordinary-payment
-fast-path certificates, deterministic fallback between fast-path and full BFT
-ordering, richer multi-round DAG scheduling, and governed slash/evidence flows.
+quorum DAG rounds. Ordinary private payments now also take a real canonical
+fast path: nodes stage ordinary shielded transfers into explicit fast-path
+batches, leaders finalize only those batch commitments, and duplicate-nullifier
+contention deterministically diverts the contended transfer set into the full
+ordered DAG/BFT path instead of letting it race the fast path.
+
+The remaining consensus gap is narrower: richer multi-round DAG scheduling,
+stronger end-to-end coverage for proof-heavy fast-path/fallback flows across
+multiple validators, and governed liveness/slashing execution on top of the now
+persisted equivocation evidence path.
 
 Validator activation is now pulled from persisted validator-pool state rather
 than inherited indefinitely from the parent checkpoint. The staking lifecycle

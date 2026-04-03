@@ -67,7 +67,7 @@ struct NodeRecordSignableV2 {
     expires_unix_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedEnvelope {
     pub version: u8,
     pub protocol_version: u32,
@@ -773,8 +773,20 @@ impl NodeIdentity {
             .map_err(|_| anyhow!("failed to DER-encode node auth public key"))?
             .as_ref()
             .to_vec();
-        let record = load_persisted_record(&dir)?;
-        record.validate(now_unix_ms())?;
+        let now = now_unix_ms();
+        let mut record = load_persisted_record(&dir)?;
+        record.validate(now)?;
+        if record.auth_spki != auth_spki {
+            bail!("runtime auth key does not match the installed signed node record");
+        }
+        let needs_refresh = record.protocol_version != protocol_version
+            || record.chain_id != chain_id
+            || record.addresses != addresses
+            || record.expires_unix_ms.saturating_sub(now) <= NODE_RECORD_RENEW_BEFORE_MS;
+        if needs_refresh {
+            record =
+                refresh_runtime_record(&dir, &auth_spki, protocol_version, chain_id, &addresses)?;
+        }
         if record.protocol_version != protocol_version {
             bail!(
                 "installed node record protocol version {} does not match runtime {}",
@@ -787,9 +799,6 @@ impl NodeIdentity {
         }
         if record.addresses != addresses {
             bail!("installed node record addresses differ from configured published addresses");
-        }
-        if record.auth_spki != auth_spki {
-            bail!("runtime auth key does not match the installed signed node record");
         }
         let node_id = derive_node_id(&record.root_spki);
         if node_id != record.node_id {
@@ -1165,6 +1174,38 @@ fn identity_dir(base: &Path) -> PathBuf {
 fn load_persisted_record(dir: &Path) -> Result<NodeRecordV2> {
     let bytes = fs::read(dir.join(NODE_RECORD_PATH))?;
     canonical::decode_node_record(&bytes)
+}
+
+fn refresh_runtime_record(
+    dir: &Path,
+    auth_spki: &[u8],
+    protocol_version: u32,
+    chain_id: Option<[u8; 32]>,
+    addresses: &[String],
+) -> Result<NodeRecordV2> {
+    let root_path = dir.join(NODE_ROOT_KEY_PATH);
+    if !root_path.exists() {
+        bail!(
+            "installed node record is stale for the local chain/config and the node root key is unavailable for automatic refresh"
+        );
+    }
+    let root = load_key(&root_path)?;
+    let root_info = root_info_from_key(&root)?;
+    persist_root_info(dir, &root_info)?;
+    let now = now_unix_ms();
+    let record = sign_node_record(
+        &root,
+        protocol_version,
+        chain_id,
+        root_info.node_id,
+        root_info.root_spki,
+        auth_spki.to_vec(),
+        addresses.to_vec(),
+        now,
+        now.saturating_add(NODE_RECORD_LIFETIME_MS),
+    )?;
+    persist_record(dir, &record)?;
+    Ok(record)
 }
 
 fn persist_record(dir: &Path, record: &NodeRecordV2) -> Result<()> {

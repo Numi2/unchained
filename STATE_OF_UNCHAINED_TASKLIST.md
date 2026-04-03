@@ -64,12 +64,21 @@ transitional and should be removed rather than preserved.
   Batch parents, round/frontier reconstruction, quorum-round checkpoint
   proposals, and multi-validator DAG-order tests now exist. Richer
   multi-round scheduling and fallback behavior are still open.
-- `[ ]` Implement a fast path for ordinary owned-note transfers
-- `[ ]` Define automatic fallback from fast path to full BFT ordering for
+- `[~]` Implement a fast path for ordinary owned-note transfers
+  Ordinary transfers now stage into explicit fast-path batches and finalize
+  only through leader-certified fast-path checkpoints; broader multi-validator
+  proof-heavy coverage is still open.
+- `[~]` Define automatic fallback from fast path to full BFT ordering for
   shared-state or contended transactions
+  Duplicate-nullifier contention now deterministically routes ordinary
+  transfers into the ordered DAG/BFT path, but end-to-end contention tests
+  with real shielded proofs are still missing.
 - `[~]` Define finality, fork-choice, and replay rules for deterministic BFT
   history
-- `[ ]` Define validator liveness, equivocation, and slashing evidence rules
+- `[~]` Define validator liveness, equivocation, and slashing evidence rules
+  Conflicting proposals, validator votes, and validator-authored DAG batches
+  now persist canonical equivocation evidence; liveness faults, governed
+  penalties, and slash execution are still open.
 
 ## 4. Shielded Staking
 
@@ -198,8 +207,13 @@ transitional and should be removed rather than preserved.
 - `[x]` Add signed shared-state validator registration/profile-update tests
 - `[x]` Add ordered shared-state batch finalization tests for validator
   lifecycle actions
-- `[ ]` Add tests for ordinary-payment fast-path privacy invariants
-- `[ ]` Add tests for fallback from fast path to full BFT ordering
+- `[~]` Add tests for ordinary-payment fast-path privacy invariants
+  Batch/routing unit coverage exists and the ignored ordinary-payment proving
+  soak now verifies fast-path finalization semantics; richer privacy-invariant
+  coverage is still open.
+- `[~]` Add tests for fallback from fast path to full BFT ordering
+  Deterministic aggregation tests now lock contention filtering, but an
+  end-to-end contended ordinary-payment proof test is still missing.
 - `[~]` Add tests for private delegation and unbonding flows
 - `[ ]` Add tests for ingress role separation and metadata-handling invariants
 - `[ ]` Add tests for compact wallet sync and fuzzy detection

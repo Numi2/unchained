@@ -35,8 +35,9 @@ use crate::{
         ValidatorStatus,
     },
     transaction::{
-        OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization, SharedStateBatch,
-        SharedStateDagBatch, SharedStateTx, ShieldedOutput, ShieldedOutputPlaintext, Tx,
+        FastPathBatch, OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization,
+        SharedStateBatch, SharedStateDagBatch, SharedStateTx, ShieldedOutput,
+        ShieldedOutputPlaintext, Tx,
     },
     wallet::RecipientHandle,
 };
@@ -622,6 +623,25 @@ fn read_shared_state_batch(reader: &mut CanonicalReader<'_>) -> Result<SharedSta
     Ok(batch)
 }
 
+fn write_fast_path_batch(writer: &mut CanonicalWriter, batch: &FastPathBatch) -> Result<()> {
+    writer.write_fixed(&batch.ordered_tx_root);
+    writer.write_vec(&batch.txs, |writer, tx| {
+        writer.write_bytes(&encode_tx(tx)?)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn read_fast_path_batch(reader: &mut CanonicalReader<'_>) -> Result<FastPathBatch> {
+    let ordered_tx_root = reader.read_fixed()?;
+    let txs = reader.read_vec(|reader| decode_tx(&reader.read_bytes()?))?;
+    let batch = FastPathBatch::new(txs)?;
+    if batch.ordered_tx_root != ordered_tx_root {
+        bail!("fast-path batch ordered tx root mismatch");
+    }
+    Ok(batch)
+}
+
 fn write_shared_state_dag_batch(
     writer: &mut CanonicalWriter,
     batch: &SharedStateDagBatch,
@@ -661,6 +681,19 @@ pub fn encode_shared_state_batch(batch: &SharedStateBatch) -> Result<Vec<u8>> {
 pub fn decode_shared_state_batch(bytes: &[u8]) -> Result<SharedStateBatch> {
     let mut reader = CanonicalReader::new(bytes);
     let batch = read_shared_state_batch(&mut reader)?;
+    reader.finish()?;
+    Ok(batch)
+}
+
+pub fn encode_fast_path_batch(batch: &FastPathBatch) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_fast_path_batch(&mut writer, batch)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_fast_path_batch(bytes: &[u8]) -> Result<FastPathBatch> {
+    let mut reader = CanonicalReader::new(bytes);
+    let batch = read_fast_path_batch(&mut reader)?;
     reader.finish()?;
     Ok(batch)
 }

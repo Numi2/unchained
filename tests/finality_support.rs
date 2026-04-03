@@ -8,6 +8,7 @@ use unchained::{
     epoch::Anchor,
     node_identity::{validator_from_record, NodeIdentity},
     staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
+    transaction::{SharedStateBatch, SharedStateDagBatch},
     Store,
 };
 
@@ -194,5 +195,83 @@ impl TestCommittee {
             coin_count,
             OrderingPath::FastPathPrivateTransfer,
         )
+    }
+
+    #[allow(dead_code)]
+    pub fn shared_state_anchor(
+        &self,
+        parent: &Anchor,
+        dag_round: u64,
+        dag_frontier: Vec<[u8; 32]>,
+        ordered_batches: Vec<SharedStateDagBatch>,
+    ) -> Anchor {
+        let num = parent.num.saturating_add(1);
+        let position = Anchor::position_for_num(num);
+        let validator_set = self.validator_set(position.epoch);
+        let aggregate_batch =
+            SharedStateBatch::from_dag_batches(&ordered_batches).expect("aggregate DAG batches");
+        let ordered_batch_ids = ordered_batches
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>();
+        let ordered_tx_count = aggregate_batch
+            .ordered_tx_count()
+            .expect("aggregate ordered tx count");
+        let block_digest = Anchor::compute_hash(
+            num,
+            Some(parent.hash),
+            position,
+            OrderingPath::DagBftSharedState,
+            [0u8; 32],
+            0,
+            dag_round,
+            &dag_frontier,
+            &ordered_batch_ids,
+            aggregate_batch.ordered_tx_root,
+            ordered_tx_count,
+            &validator_set,
+        );
+        let target = VoteTarget {
+            position,
+            ordering_path: OrderingPath::DagBftSharedState,
+            block_digest,
+        };
+        let target_bytes = target.signing_bytes();
+        let votes = self
+            .members
+            .iter()
+            .map(|member| ValidatorVote {
+                voter: member.validator.id,
+                target: target.clone(),
+                signature: match &member.signer {
+                    CommitteeSigner::TestKey(hot_key) => ml_dsa_65_sign(hot_key, &target_bytes)
+                        .expect("sign test shared-state checkpoint"),
+                    CommitteeSigner::Identity(identity) => identity
+                        .sign_consensus_message(&target_bytes)
+                        .expect("sign runtime shared-state checkpoint"),
+                },
+            })
+            .collect();
+        let qc = QuorumCertificate::from_votes(&validator_set, target, votes)
+            .expect("build test shared-state checkpoint QC");
+        let anchor = Anchor::new(
+            num,
+            Some(parent.hash),
+            OrderingPath::DagBftSharedState,
+            [0u8; 32],
+            0,
+            dag_round,
+            dag_frontier,
+            ordered_batch_ids,
+            aggregate_batch.ordered_tx_root,
+            ordered_tx_count,
+            validator_set,
+            qc,
+        )
+        .expect("build test shared-state checkpoint");
+        anchor
+            .validate_against_parent(Some(parent))
+            .expect("validate test shared-state checkpoint");
+        anchor
     }
 }

@@ -365,6 +365,15 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let tx = unchained::canonical::decode_tx(&tx_bytes)?;
     assert_eq!(tx.input_count(), 1);
     assert_eq!(tx.output_count(), 1);
+    assert!(sender_db.load_fast_path_pending_tx(&tx_id)?.is_none());
+    assert!(sender_db.load_shared_state_pending_tx(&tx_id)?.is_none());
+    assert_eq!(
+        sender_db
+            .get::<Anchor>("epoch", b"latest")?
+            .expect("latest finalized anchor")
+            .ordering_path,
+        OrderingPath::FastPathPrivateTransfer
+    );
 
     assert_eq!(sender_wallet.balance()?, 0);
     assert_eq!(receiver_wallet.balance()?, 1);

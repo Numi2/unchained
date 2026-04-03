@@ -2,6 +2,7 @@ use crate::{
     coin::Coin,
     consensus::ValidatorSet,
     epoch::Anchor,
+    evidence::ConsensusEvidenceRecord,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     network::NetHandle,
     shielded::{
@@ -45,6 +46,8 @@ pub struct ConsensusStatus {
     pub latest_finalized_anchor: Option<Anchor>,
     pub active_validator_set: Option<ValidatorSet>,
     pub registered_validator_pools: Vec<ValidatorPool>,
+    pub consensus_evidence_count: usize,
+    pub recent_consensus_evidence: Vec<ConsensusEvidenceRecord>,
     pub local_tip: u64,
     pub highest_seen_epoch: u64,
     pub peer_confirmed_tip: bool,
@@ -94,6 +97,11 @@ fn build_consensus_status(
         .transpose()?
         .flatten();
     let registered_validator_pools = db.load_validator_pools()?;
+    let mut consensus_evidence = db.load_consensus_evidence()?;
+    let consensus_evidence_count = consensus_evidence.len();
+    if consensus_evidence.len() > 16 {
+        consensus_evidence.truncate(16);
+    }
     let local_tip = latest_finalized_anchor
         .as_ref()
         .map(|anchor| anchor.num)
@@ -118,6 +126,8 @@ fn build_consensus_status(
         latest_finalized_anchor,
         active_validator_set,
         registered_validator_pools,
+        consensus_evidence_count,
+        recent_consensus_evidence: consensus_evidence,
         local_tip,
         highest_seen_epoch,
         peer_confirmed_tip,
