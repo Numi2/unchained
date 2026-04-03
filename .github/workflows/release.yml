@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            artifact_suffix: linux-x86_64
+          - name: macOS arm64
+            os: macos-14
+            artifact_suffix: macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+
+      - name: Smoke test primary CLIs
+        run: |
+          ./target/release/unchained_node --version
+          ./target/release/unchained_wallet --version
+          ./target/release/unchained_miner --version
+          test -x ./target/release/inspect_db
+          test -x ./target/release/list_epochs
+
+      - name: Package release archive
+        env:
+          ARCHIVE_SUFFIX: ${{ matrix.artifact_suffix }}
+        run: |
+          ref_name="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            ref_name="manual-${GITHUB_SHA::7}"
+          fi
+
+          archive_root="unchained-${ref_name}-${ARCHIVE_SUFFIX}"
+          dist_root="dist/${archive_root}"
+          mkdir -p "${dist_root}"
+
+          cp target/release/unchained_node "${dist_root}/"
+          cp target/release/unchained_wallet "${dist_root}/"
+          cp target/release/unchained_miner "${dist_root}/"
+          cp target/release/inspect_db "${dist_root}/"
+          cp target/release/list_epochs "${dist_root}/"
+          cp config.toml "${dist_root}/"
+          cp README.md "${dist_root}/"
+
+          tar -C dist -czf "dist/${archive_root}.tar.gz" "${archive_root}"
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.tar.gz

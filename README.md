@@ -1,121 +1,200 @@
 # Unchained
 
-Unchained is a Rust node and CLI wallet for a post-quantum shielded asset system.
-The checked-in runtime path is PQ-only: node identity, peer transport, wallet
-recipient documents, and shielded outputs all use ML-KEM-768 and ML-DSA-65 in
-the live code.
+Unchained is a **private real-time settlement chain** built for **post-quantum
+safety**.
 
-This README is aligned to the current implementation in `src/`, `proof-core/`,
-`methods/`, and `tests/`.
+The canonical design is:
 
-## Verified Runtime Properties
+- shielded delegated proof of stake
+- Mysticeti-class DAG BFT ordering
+- fast-path finality for ordinary private payments
+- private delegation and staking
+- hybrid `X25519MLKEM768` transport
+- `ML-DSA` hot-path validator signatures
+- `SLH-DSA` cold recovery and governance keys
+- transparent STARK-family proofs with a conservative `>= 128-bit` target
 
-- Consensus is epoch-based proof of work with Argon2id work and BLAKE3 hashing
-  (`src/consensus.rs`, `src/epoch.rs`, `src/crypto.rs`).
-- Peer transport is QUIC over TLS 1.3 raw public keys with ML-KEM-768 key
-  exchange and ML-DSA-65 authentication
-  (`src/network.rs`, `src/node_identity.rs`).
-- Wire objects and signed documents use an explicit canonical byte codec rather
-  than relying on Serde or `bincode` layout for protocol compatibility
-  (`src/canonical.rs`, `src/node_identity.rs`).
-- Persistence uses RocksDB with separate chain and wallet-private stores. Chain
-  state lives in the main node database, while wallet secrets, owned notes,
-  sent-transaction history, spent-note markers, checkpoints, and wallet-local
-  metadata live under a dedicated private store rooted at `wallet_private/`
-  with explicit wallet-only column families (`src/storage.rs`, `src/wallet.rs`).
-- Raw coin mirroring to loose files is opt-in only; the checked-in runtime does
-  not mirror canonical coin data unless `COIN_MIRRORING=1` is set explicitly
-  (`src/storage.rs`).
-- Wallet recipient handles are signed KeyDoc JSON documents that bind a chain ID
-  to ML-DSA and ML-KEM public keys (`src/wallet.rs`).
-- Shielded outputs are ML-KEM-768 encrypted and carry opaque ciphertext plus a
-  public note commitment (`src/wallet.rs`, `src/transaction.rs`).
-- `Tx` is the canonical gossip, validation, and persistence unit
-  (`src/transaction.rs`).
+Unchained is **not** a mining chain, **not** a generic smart-contract chain,
+and **not** a public-mempool chain.
 
-## Shielded State Model
+## Why Unchained Exists
 
-- Protocol constants are locked in `src/protocol.rs` and consumed by consensus,
-  nullifier rollover, archive routing, and wallet refresh.
-- Mined coins can be deterministically lifted into genesis shielded notes and
-  appended to the global note commitment tree
-  (`src/transaction.rs`, `src/wallet.rs`, `src/shielded.rs`).
-- Canonical ownership is represented by the note commitment tree plus the active
-  and archived nullifier epochs (`src/transaction.rs`, `src/shielded.rs`).
-- Shielded transactions carry a succinct proof. Validators check the proof
-  journal against live chain state and only persist current nullifiers, outputs,
-  and the transaction itself (`src/proof.rs`, `src/transaction.rs`,
-  `proof-core/src/lib.rs`).
-- Historical unspent state is tracked as checkpoints and checkpoint
-  accumulators, not as an ever-growing validator nullifier table
-  (`src/wallet.rs`, `src/proof.rs`, `src/transaction.rs`).
+The market already has:
 
-## Wallet Refresh And Archive Layer
+- fast public chains
+- privacy-oriented chains
+- post-quantum research chains
 
-- `unchained_wallet serve` owns the wallet-private store and publishes the
-  canonical local wallet state surface. `receive`, `balance`, `history`,
-  `rescan`, and `send` are wallet-control clients of that running service
-  rather than direct wallet-database readers (`src/app.rs`, `src/wallet.rs`,
-  `src/storage.rs`, `src/wallet_control.rs`).
-- Each refresh can issue real checkpoint requests for owned notes and synthetic
-  cover requests even when no spend is pending (`src/wallet.rs`).
-- Checkpoint queries are segmented by archive shard, routed across providers,
-  padded with cover traffic to power-of-two batch sizes, rerandomized, and
-  aggregated into packets and strata before checkpoint accumulator proving
-  (`src/shielded.rs`, `src/network.rs`, `src/proof.rs`).
-- The live runtime persists and exchanges archive provider manifests, replica
-  attestations, service ledgers, custody commitments, retrieval receipts,
-  availability certificates, and operator scorecards
-  (`src/network.rs`, `src/shielded.rs`, `src/storage.rs`).
-- Archive shard repair and replica rebalancing are wired into the network
-  runtime (`src/network.rs`).
+It does **not** already have a strong answer for this product:
 
-## Service Boundary
+**sub-second confidential settlement with deterministic finality and a credible
+post-quantum posture.**
 
-- The checked-in runtime is split into three binaries: `unchained_node`,
-  `unchained_wallet`, and `unchained_miner` (`src/app.rs`,
-  `src/bin/unchained_node.rs`, `src/bin/unchained_wallet.rs`,
-  `src/bin/unchained_miner.rs`).
-- `unchained_wallet serve` owns the wallet-private store and exposes a local
-  Unix-domain control socket plus a per-start capability file for streamed
-  wallet state, send/sync operations, and lock derivation
-  (`src/app.rs`, `src/wallet_control.rs`).
-- `unchained_node start` owns chain state and the live network runtime and now
-  exposes a separate local Unix-domain control socket plus a per-start
-  capability file for streamed canonical node state, checkpoint relay, and tx
-  submission (`src/app.rs`,
-  `src/node_control.rs`).
-- `unchained_node start` also owns epoch management and candidate admission; the
-  miner no longer embeds an epoch manager or opens the chain database
-  (`src/app.rs`, `src/epoch.rs`, `src/node_control.rs`, `src/miner.rs`).
-- Remote interaction happens through signed envelopes on the node-to-node
-  transport (`src/network.rs`, `src/node_identity.rs`).
-- The only HTTP surface in the checked-in runtime is the local metrics/log
-  stream, and the code enforces a loopback bind for it (`src/metrics.rs`).
-- Node identity supports an offline-root ceremony through
-  `unchained_node init-root`, `unchained_node auth-prepare`,
-  `unchained_node auth-sign`, and `unchained_node auth-install`
-  (`src/app.rs`, `src/node_identity.rs`).
-- Runtime operation only needs the installed auth key and signed node record;
-  the offline root is not required by `NodeIdentity::load_runtime_in_dir`
-  (`src/node_identity.rs`).
-- The checked-in CLI no longer falls back to embedded config blobs; operators
-  are expected to run the binaries with an explicit on-disk config
-  (`src/app.rs`, `src/config.rs`, `src/bin/inspect_db.rs`,
-  `src/bin/list_epochs.rs`).
+That gap matters for:
 
-## Proofs
+- stablecoin settlement
+- treasury movement
+- payroll
+- exchange inventory transfers
+- OTC settlement
+- merchant settlement without public counterparty graphs
+- fintech wallets that cannot expose balances and transaction relationships on
+  a public ledger
 
-- `proof-core` defines the canonical shielded witness, checkpoint accumulator
-  journal, and public binding semantics (`proof-core/src/lib.rs`).
-- `methods/guest` validates shielded spend witnesses in the zkVM
-  (`methods/guest/src/main.rs`).
-- `methods/checkpoint-guest` validates checkpoint accumulator steps in the zkVM
-  (`methods/checkpoint-guest/src/main.rs`).
-- `src/proof.rs` generates and verifies succinct receipts, and wallet sends call
-  into that live path (`src/wallet.rs`, `src/proof.rs`).
-- The project code uses `risc0_zkvm::default_prover()`; Unchained does not
-  define a separate project-specific Metal proving path (`src/proof.rs`).
+## Product Definition
+
+Unchained is a specialized settlement rail.
+
+It focuses on:
+
+- private transfer
+- private staking and delegation
+- private asset issuance and redemption
+- governed system actions
+- optional private batch exchange or RFQ settlement
+
+It does not aim to be:
+
+- a general compute platform
+- an EVM clone
+- a public DeFi casino
+- a mining economy
+
+That narrower scope is deliberate. It is what makes the privacy, latency, and
+PQ claims coherent.
+
+## Canonical Design
+
+### Consensus
+
+Consensus is **shielded delegated proof of stake** with a **small active
+validator committee**.
+
+Key properties:
+
+- deterministic finality
+- no heaviest-chain race
+- no probabilistic "wait for more confirmations" model
+- no mining
+- no hashpower market
+
+Unchained uses a **Mysticeti-class DAG ordering core** and a **fast path for
+ordinary owned-note transfers**. Shared-state actions such as staking changes
+or governance actions fall back to the normal BFT path.
+
+The fast path does not weaken payment privacy. Ordinary payments remain fully
+shielded and should reveal only nullifiers, note commitments, ciphertexts, and
+validity proof data.
+
+### State Model
+
+Unchained uses a **shielded note/object ledger**:
+
+- spends consume notes
+- nullifiers mark spent notes
+- outputs create new encrypted notes
+- note commitments are appended to a global authenticated structure
+- there is no transparent balance table for ordinary users
+
+### Staking
+
+Validators are public. Delegators are private.
+
+Delegation is represented by shielded pool-share notes rather than public stake
+accounts. Rewards accrue through pool accounting, and slashing is public at the
+validator-pool level without revealing the ownership graph of delegators.
+
+### Wallet Addressability
+
+Unchained does not expose reusable public payment addresses.
+
+Wallet UX is built around:
+
+1. short public `LocatorID`s
+2. private discovery
+3. one-time `RecipientHandle` negotiation
+4. direct invoice links for merchant-style flows
+
+The sender never needs to see large PQ key material, and the ledger never needs
+to see a reusable outward identity.
+
+### Network Privacy
+
+There is no public mempool.
+
+Wallets submit transactions through ingress relays over hybrid-encrypted
+transport. The relay layer adds source separation and small randomized delay,
+then diffuses transactions into the validator network.
+
+The canonical network-metadata defense is a **two-role ingress path**:
+
+- an `access relay` that sees client network identity but not transaction
+  plaintext
+- a `submission gateway` that sees transaction plaintext but not client network
+  identity
+
+Gateways release transactions on short fixed ticks using constant-size padded
+envelopes and micro-batched validator ingress. That addresses source-timing and
+first-seen leakage without mixnet-scale latency.
+
+Wallet sync is based on compact chain data plus fuzzy note-detection tags and
+local trial decryption, not requester-linked archive queries.
+
+### Cryptography
+
+- transport: `X25519MLKEM768`
+- validator hot signatures: `ML-DSA`
+- cold governance and recovery: `SLH-DSA`
+- transaction proofs: transparent STARK-family proofs
+
+Unchained does not depend on a trusted setup, a pure-PQ-only transport posture,
+or a general-purpose zkVM in the steady-state critical path.
+
+## User Experience Targets
+
+The target experience is simple:
+
+- share a short locator or invoice QR
+- wallet resolves privately or consumes the invoice directly
+- payment finalizes in under a second when the network is healthy
+- the recipient, amount graph, and ownership graph remain shielded by default
+
+The design target is:
+
+- ordinary private payments: `~250-700 ms` finality on a healthy WAN
+- shared-state operations: `~500-1200 ms`
+- sender-perceived completion, including proof generation: typically under `2 s`
+
+The tradeoffs are also deliberate:
+
+- stake exits are delayed
+- validator operation is specialized
+- Unchained is narrower than a general-purpose L1
+
+Those are the right tradeoffs for a private settlement product.
+
+## What Is Out
+
+The following are not part of the road ahead:
+
+- proof of work
+- mining binaries as a product surface
+- epoch-sealed PoW anchors
+- public archive-receipt accounting
+- reusable public payment addresses
+- optional privacy with a transparent default
+- public-order-flow DeFi as the product center
+- generic smart contracts in the base protocol
+
+## Repository Status
+
+The repository is in transition toward this design.
+
+Legacy PoW, miner, epoch, archive-accounting, and implementation-specific
+surfaces may still exist in the codebase, but they are not the target
+architecture and should not be treated as canonical.
+
+`ARCHITECTURE.md` is the source of truth for the road ahead.
 
 ## Build
 
@@ -123,105 +202,12 @@ Use a current stable Rust toolchain.
 
 ```bash
 rustup update
-cargo build --release
-```
-
-Useful commands:
-
-```bash
-cargo fmt
-cargo check
+cargo build
 cargo test
-cargo test --test shielded_tx_flow -- --nocapture
-cargo run --release --bin unchained_node -- start
-cargo run --release --bin unchained_wallet -- serve
-cargo run --release --bin unchained_wallet -- receive
-cargo run --release --bin unchained_miner
 ```
-
-The default test suite includes:
-
-- `tests/shielded_tx_flow.rs`: deterministic prepared-send CI coverage through
-  the node control socket plus an ignored live-proving soak roundtrip
-- `tests/shielded_pool.rs`: shielded note, checkpoint, archive, and
-  rerandomization coverage
-- `tests/pq_network.rs`: PQ bootstrap, anchor recovery, and network
-  archive/proof flows
-- `tests/wallet_control.rs`: local wallet control socket coverage for miner-facing
-  state streaming, miner-facing identity, lock derivation, and capability tamper
-
-Run `cargo test --test shielded_tx_flow -- --ignored --nocapture` when you want
-the full zkVM proving soak on CPU-only proving hosts.
-
-## CLI
-
-Primary binaries:
-
-- `unchained_node`: node runtime, identity ceremony, message topic, anchor import/export, replay
-- `unchained_wallet`: wallet control service, receive, send, balance, history, rescan
-- `unchained_miner`: dedicated mining runtime that consumes node-control mining work and the wallet control socket
-
-`unchained_wallet receive` exports a signed KeyDoc JSON recipient document, and
-`unchained_wallet send` validates that document before constructing a proof-backed
-shielded transaction (`src/wallet.rs`).
-
-Run `unchained_wallet serve` before `unchained_miner`; the miner no longer opens
-the wallet-private database or loads wallet secrets directly (`src/wallet_control.rs`,
-`src/miner.rs`).
-
-Run `unchained_wallet serve` before wallet receive/send/balance/history/rescan;
-those commands are now pure clients of the wallet control service and no longer
-open the wallet-private database directly (`src/wallet_control.rs`,
-`src/wallet.rs`, `src/app.rs`).
-
-Run `unchained_node start` before `unchained_miner`; the miner no longer opens
-the chain database, owns a QUIC endpoint, or runs the epoch manager locally
-(`src/node_control.rs`, `src/miner.rs`, `src/app.rs`).
-
-Run `unchained_node start` before wallet receive/send/balance/history/rescan;
-the wallet role now reads canonical chain and network state through the node
-control socket rather than opening the chain database directly
-(`src/node_control.rs`, `src/wallet.rs`, `src/app.rs`).
-
-Wallet chain-aware actions now require the node control socket; there is no
-direct wallet-to-chain fallback path in the checked-in runtime
-(`src/node_control.rs`, `src/wallet.rs`).
-
-Both local control planes are capability-authenticated; socket filesystem
-permissions are no longer the only authorization boundary
-(`src/local_control.rs`, `src/node_control.rs`, `src/wallet_control.rs`).
-
-The node control plane maintains a long-lived authenticated state stream.
-Wallet and miner clients cache canonical node state from that stream instead of
-repeatedly polling local RPC snapshots for mining readiness or shielded runtime
-state, and the mining side also receives recent finalized-selection summaries
-through that same stream (`src/node_control.rs`, `src/miner.rs`,
-`src/wallet.rs`).
-
-The wallet control plane also maintains a long-lived authenticated wallet-state
-stream. Wallet clients observe receive handles, balances, history, and owned
-shielded-note state through that service instead of reloading wallet-private
-state directly on each command (`src/wallet_control.rs`, `src/wallet.rs`,
-`src/app.rs`).
-
-The miner also binds its creator address and signing key to that streamed
-wallet authority state instead of taking a boot-time wallet identity snapshot.
-If the wallet authority changes underneath a running miner, the miner fails
-closed rather than silently switching identity (`src/miner.rs`,
-`src/wallet_control.rs`).
-
-Wallet refresh, balance, history, and prepared-send flows execute against a
-single coherent node-state envelope per operation, and a prepared shielded send
-is rejected if the canonical shielded state changes before submit
-(`src/wallet.rs`, `src/node_control.rs`).
-
-`unchained_node message send` and `unchained_node message listen` operate on a
-shared text topic rather than a direct wallet-to-wallet transport
-(`src/app.rs`, `src/network.rs`).
 
 ## Docs
 
-- `README.md`: current project summary
-- `ARCHITECTURE.md`: broader design notes for the same runtime
-- `SHIELDED_POOL_V1.md`: shielded pool and archive/checkpoint model with the
-  terminology used by the code
+- [ARCHITECTURE.md](ARCHITECTURE.md): canonical target architecture
+- [README.md](README.md): project overview and product direction
+- [SHIELDED_POOL_V1.md](SHIELDED_POOL_V1.md): legacy shielded-pool notes that should be treated as historical context, not the target architecture

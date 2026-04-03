@@ -50,7 +50,7 @@ struct NodeCli {
     version,
     about = "Unchained wallet runtime",
     long_about = "Operate the Unchained shielded wallet service, mint single-use receive handles, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
-    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <KEYDOC_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
+    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <RECIPIENT_HANDLE_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -179,10 +179,10 @@ struct HistoryArgs {
 enum WalletCmd {
     /// Host the local wallet control socket used by other runtimes
     Serve,
-    /// Show your shareable receiving address
+    /// Mint a single-use receiving handle
     #[command(alias = "address")]
     Receive(ReceiveArgs),
-    /// Send coins to a receiver, or run a guided send flow
+    /// Send coins using a single-use receiving handle, or run a guided send flow
     Send(SendArgs),
     /// Show wallet balance and owned shielded notes
     Balance(BalanceArgs),
