@@ -1,3 +1,5 @@
+mod finality_support;
+
 use once_cell::sync::Lazy;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -7,12 +9,12 @@ use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 use unchained::coin::Coin;
 use unchained::config::{Net, P2p};
-use unchained::consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS};
 use unchained::epoch::Anchor;
 use unchained::network;
 use unchained::node_control;
 use unchained::node_identity;
 use unchained::protocol::CURRENT as PROTOCOL;
+use unchained::shielded::ShieldedNoteKind;
 use unchained::storage::{Store, WalletStore};
 use unchained::sync::SyncState;
 use unchained::wallet::Wallet;
@@ -58,22 +60,12 @@ fn build_p2p() -> P2p {
     }
 }
 
-fn genesis_anchor() -> Anchor {
-    let merkle_root = [0u8; 32];
-    let hash = *blake3::hash(&merkle_root).as_bytes();
-    Anchor {
-        num: 0,
-        hash,
-        merkle_root,
-        difficulty: TARGET_LEADING_ZEROS,
-        coin_count: 0,
-        cumulative_work: Anchor::expected_work_for_difficulty(TARGET_LEADING_ZEROS),
-        mem_kib: DEFAULT_MEM_KIB,
-    }
-}
-
-fn seed_genesis(store: &Store) -> anyhow::Result<Anchor> {
-    let genesis = genesis_anchor();
+fn seed_genesis(
+    store: &Store,
+    committee: &finality_support::TestCommittee,
+) -> anyhow::Result<Anchor> {
+    let genesis = committee.genesis_anchor();
+    committee.seed_validator_state(store, genesis.position.epoch)?;
     store.put("epoch", &0u64.to_le_bytes(), &genesis)?;
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
@@ -146,10 +138,8 @@ async fn spawn_node_control(
 )> {
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let (coin_tx, _coin_rx) = tokio::sync::mpsc::unbounded_channel();
     let server =
-        node_control::NodeControlServer::bind(base_path, db, net, sync_state, coin_tx, false)
-            .await?;
+        node_control::NodeControlServer::bind(base_path, db, net, sync_state, false).await?;
     let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
     Ok((shutdown_tx, task))
 }
@@ -167,7 +157,8 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
     let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
 
-    let genesis = seed_genesis(sender_db.as_ref())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db)?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
@@ -277,7 +268,8 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
     let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
 
-    let genesis = seed_genesis(sender_db.as_ref())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db)?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
@@ -309,12 +301,86 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
         .get_raw_bytes("tx", &tx_id)?
         .expect("persisted tx bytes");
     let tx = unchained::canonical::decode_tx(&tx_bytes)?;
-    assert_eq!(tx.nullifiers.len(), 1);
-    assert_eq!(tx.outputs.len(), 1);
+    assert_eq!(tx.input_count(), 1);
+    assert_eq!(tx.output_count(), 1);
 
     assert_eq!(sender_wallet.balance()?, 0);
     assert_eq!(receiver_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
+
+    net.shutdown().await;
+    let _ = node_control_shutdown.send(());
+    node_control_task.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_delegation_updates_validator_pool_and_wallet_note_state() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+    std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
+
+    let sender_dir = TempDir::new()?;
+    let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
+    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
+
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
+    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db)?;
+    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+
+    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
+    let (node_control_shutdown, node_control_task) = spawn_node_control(
+        &sender_dir.path().to_string_lossy(),
+        sender_db.clone(),
+        net.clone(),
+    )
+    .await?;
+    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
+    node_client.ping()?;
+    let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client));
+
+    let validator_set = sender_db
+        .load_validator_committee(genesis.position.epoch)?
+        .expect("genesis validator committee");
+    let validator_id = validator_set.validators[0].id;
+
+    let prepared = sender_wallet
+        .prepare_private_delegation(validator_id, 1)
+        .await?;
+    let journal = proof_core::validate_private_delegation_witness(prepared.witness())?;
+    assert_eq!(journal.validator_id, validator_id.0);
+    assert_eq!(journal.delegated_value, 1);
+
+    let tx_id = sender_wallet.delegate_to_validator(validator_id, 1).await?;
+    let tx_bytes = sender_db
+        .get_raw_bytes("tx", &tx_id)?
+        .expect("persisted delegation tx bytes");
+    let tx = unchained::canonical::decode_tx(&tx_bytes)?;
+    assert!(!tx.is_fast_path_eligible());
+
+    let updated_pool = sender_db
+        .load_validator_pool(&validator_id)?
+        .expect("updated validator pool");
+    assert_eq!(updated_pool.total_bonded_stake, 2);
+    assert_eq!(updated_pool.total_delegation_shares, 2);
+
+    let owned_notes = sender_wallet.list_owned_shielded_notes()?;
+    assert_eq!(sender_wallet.balance()?, 0);
+    assert_eq!(owned_notes.len(), 1);
+    assert!(matches!(
+        owned_notes[0].note.kind,
+        ShieldedNoteKind::DelegationShare {
+            validator_id: note_validator_id
+        } if note_validator_id == validator_id.0
+    ));
+
+    let delegation_record = sender_db
+        .load_delegation_share(&owned_notes[0].note.commitment)?
+        .expect("delegation share record");
+    assert_eq!(delegation_record.validator_id, validator_id);
+    assert_eq!(delegation_record.delegated_amount, 1);
+    assert_eq!(delegation_record.minted_shares, 1);
 
     net.shutdown().await;
     let _ = node_control_shutdown.send(());

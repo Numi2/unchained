@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use methods::{
-    CHECKPOINT_ACCUMULATOR_METHOD_ELF, CHECKPOINT_ACCUMULATOR_METHOD_ID, SHIELDED_SPEND_METHOD_ELF,
+    CHECKPOINT_ACCUMULATOR_METHOD_ELF, CHECKPOINT_ACCUMULATOR_METHOD_ID,
+    PRIVATE_DELEGATION_METHOD_ELF, PRIVATE_DELEGATION_METHOD_ID, SHIELDED_SPEND_METHOD_ELF,
     SHIELDED_SPEND_METHOD_ID,
 };
 use proof_core::{
@@ -12,8 +13,9 @@ use proof_core::{
     HistoricalUnspentStratum as ProofHistoricalUnspentStratum,
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
-    NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofShieldedInputWitness,
-    ProofShieldedNote, ProofShieldedOutput, ProofShieldedOutputBinding,
+    NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofPrivateDelegationJournal,
+    ProofPrivateDelegationWitness, ProofShieldedInputWitness, ProofShieldedNote,
+    ProofShieldedNoteKind, ProofShieldedOutput, ProofShieldedOutputBinding,
     ProofShieldedOutputPlaintext, ProofShieldedOutputWitness, ProofShieldedTxJournal,
     ProofShieldedTxWitness,
 };
@@ -26,6 +28,7 @@ use crate::{
         HistoricalAbsenceRecord, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
         HistoricalUnspentPacket, HistoricalUnspentSegment, HistoricalUnspentStratum,
         NoteMembershipProof, NullifierMembershipWitness, NullifierNonMembershipProof, ShieldedNote,
+        ShieldedNoteKind,
     },
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
@@ -87,6 +90,61 @@ pub fn verify_shielded_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJour
         .verify(SHIELDED_SPEND_METHOD_ID)
         .context("verify shielded receipt")?;
     decode_shielded_tx_journal(&receipt)
+}
+
+pub fn prove_private_delegation(
+    witness: &ProofPrivateDelegationWitness,
+) -> Result<(Receipt, ProofPrivateDelegationJournal)> {
+    let mut builder = ExecutorEnv::builder();
+    for input in &witness.shielded.inputs {
+        match (
+            input.historical_accumulator.as_ref(),
+            input.historical_accumulator_receipt.as_ref(),
+        ) {
+            (Some(accumulator), Some(bytes)) => {
+                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                if &journal != accumulator {
+                    bail!("historical accumulator witness does not match its receipt");
+                }
+                builder.add_assumption(receipt_from_bytes(bytes)?);
+            }
+            (Some(_), None) => bail!("historical accumulator receipt is missing"),
+            (None, Some(_)) => bail!("unexpected accumulator receipt without a journal"),
+            (None, None) => {}
+        }
+    }
+    let env = builder
+        .write(witness)
+        .context("serialize private delegation witness")?
+        .build()
+        .context("build private delegation executor environment")?;
+    let prove_info = default_prover()
+        .prove_with_opts(env, PRIVATE_DELEGATION_METHOD_ELF, &ProverOpts::succinct())
+        .context("prove private delegation witness")?;
+    let receipt = prove_info.receipt;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("private delegation requires a succinct STARK receipt"),
+    }
+    receipt
+        .verify(PRIVATE_DELEGATION_METHOD_ID)
+        .context("verify locally generated private delegation receipt")?;
+    let journal = decode_private_delegation_journal(&receipt)?;
+    Ok((receipt, journal))
+}
+
+pub fn verify_private_delegation_receipt_bytes(
+    bytes: &[u8],
+) -> Result<ProofPrivateDelegationJournal> {
+    let receipt = receipt_from_bytes(bytes)?;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("only succinct private delegation receipts are accepted"),
+    }
+    receipt
+        .verify(PRIVATE_DELEGATION_METHOD_ID)
+        .context("verify private delegation receipt")?;
+    decode_private_delegation_journal(&receipt)
 }
 
 pub fn receipt_to_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
@@ -224,6 +282,7 @@ pub fn output_plaintext_from_proof(
     Ok(ShieldedOutputPlaintext {
         note: ShieldedNote {
             version: plaintext.note.version,
+            kind: note_kind_from_proof(&plaintext.note.kind),
             value: plaintext.note.value,
             birth_epoch: plaintext.note.birth_epoch,
             owner_address: plaintext.note.owner_address,
@@ -284,6 +343,13 @@ fn decode_shielded_tx_journal(receipt: &Receipt) -> Result<ProofShieldedTxJourna
         .map_err(|err| anyhow!("decode shielded receipt journal: {err}"))
 }
 
+fn decode_private_delegation_journal(receipt: &Receipt) -> Result<ProofPrivateDelegationJournal> {
+    receipt
+        .journal
+        .decode()
+        .map_err(|err| anyhow!("decode private delegation receipt journal: {err}"))
+}
+
 fn decode_checkpoint_accumulator_journal(
     receipt: &Receipt,
 ) -> Result<CheckpointAccumulatorJournal> {
@@ -300,6 +366,7 @@ fn receipt_from_bytes(bytes: &[u8]) -> Result<Receipt> {
 fn note_to_proof(note: &ShieldedNote) -> ProofShieldedNote {
     ProofShieldedNote {
         version: note.version,
+        kind: note_kind_to_proof(&note.kind),
         value: note.value,
         birth_epoch: note.birth_epoch,
         owner_address: note.owner_address,
@@ -309,6 +376,42 @@ fn note_to_proof(note: &ShieldedNote) -> ProofShieldedNote {
         note_randomizer: note.note_randomizer,
         note_key_commitment: note.note_key_commitment,
         commitment: note.commitment,
+    }
+}
+
+fn note_kind_to_proof(kind: &ShieldedNoteKind) -> ProofShieldedNoteKind {
+    match kind {
+        ShieldedNoteKind::Payment => ProofShieldedNoteKind::Payment,
+        ShieldedNoteKind::DelegationShare { validator_id } => {
+            ProofShieldedNoteKind::DelegationShare {
+                validator_id: *validator_id,
+            }
+        }
+        ShieldedNoteKind::UnbondingClaim {
+            validator_id,
+            release_epoch,
+        } => ProofShieldedNoteKind::UnbondingClaim {
+            validator_id: *validator_id,
+            release_epoch: *release_epoch,
+        },
+    }
+}
+
+fn note_kind_from_proof(kind: &ProofShieldedNoteKind) -> ShieldedNoteKind {
+    match kind {
+        ProofShieldedNoteKind::Payment => ShieldedNoteKind::Payment,
+        ProofShieldedNoteKind::DelegationShare { validator_id } => {
+            ShieldedNoteKind::DelegationShare {
+                validator_id: *validator_id,
+            }
+        }
+        ProofShieldedNoteKind::UnbondingClaim {
+            validator_id,
+            release_epoch,
+        } => ShieldedNoteKind::UnbondingClaim {
+            validator_id: *validator_id,
+            release_epoch: *release_epoch,
+        },
     }
 }
 

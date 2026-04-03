@@ -9,8 +9,8 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use crate::{
-    canonical, config, epoch, metrics, miner, network, node_control, node_identity, protocol,
-    storage, sync, wallet, wallet_control,
+    canonical, config, epoch, metrics, network, node_control, node_identity, protocol, storage,
+    sync, wallet, wallet_control,
 };
 use crate::{
     network::NetHandle,
@@ -33,7 +33,7 @@ struct CommonArgs {
     author,
     version,
     about = "Unchained node runtime",
-    long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and miner clients.",
+    long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and validator-facing services.",
     after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node start\n"
 )]
 struct NodeCli {
@@ -58,18 +58,6 @@ struct WalletCli {
 
     #[command(subcommand)]
     cmd: WalletCmd,
-}
-
-#[derive(Parser)]
-#[command(
-    author,
-    version,
-    about = "Unchained miner runtime",
-    long_about = "Run the Unchained dedicated miner and block-production runtime. Requires `unchained_node start` for mining work and `unchained_wallet serve` for local wallet secrets."
-)]
-struct MinerCli {
-    #[command(flatten)]
-    common: CommonArgs,
 }
 
 #[derive(Subcommand)]
@@ -196,7 +184,6 @@ struct NetworkRuntime {
     db: Arc<Store>,
     net: NetHandle,
     sync_state: Arc<Mutex<SyncState>>,
-    coin_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -457,7 +444,7 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
 async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     let db = open_store(cfg)?;
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
-    let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let net = network::spawn(
         cfg.net.clone(),
@@ -496,7 +483,6 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
         db,
         net,
         sync_state,
-        coin_tx,
         shutdown_tx,
     })
 }
@@ -779,7 +765,6 @@ pub async fn run_node_cli() -> Result<()> {
                 runtime.db.clone(),
                 runtime.net.clone(),
                 runtime.sync_state.clone(),
-                runtime.coin_tx.clone(),
                 !cfg.net.bootstrap.is_empty(),
             )
             .await?;
@@ -799,9 +784,9 @@ pub async fn run_node_cli() -> Result<()> {
             if let Some(public_ip) = cfg.net.public_ip.clone() {
                 println!("Public IP: {public_ip}");
             }
-            println!("Epoch length: {} seconds", cfg.epoch.seconds);
-            println!("Mining: external clients only");
-            println!("Epoch manager: enabled");
+            println!("Local checkpoint cadence: {} seconds", cfg.epoch.seconds);
+            println!("Consensus foundation: validator/BFT runtime");
+            println!("Settlement manager: enabled");
             println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);
             let shutdown_result = wait_for_shutdown("Unchained node", runtime).await;
             let node_control_result = node_control_task.await.map_err(|err| anyhow!(err))?;
@@ -897,50 +882,6 @@ pub async fn run_wallet_cli() -> Result<()> {
             let client = open_wallet_control_client(&cfg).await?;
             run_send_flow(&client, &args).await?;
             Ok(())
-        }
-    }
-}
-
-pub async fn run_miner_cli() -> Result<()> {
-    let cli = MinerCli::parse();
-    let mut cfg = load_config(&cli.common.config)?;
-    cfg.mining.enabled = true;
-    apply_quiet_logging(&cli.common, &cfg);
-
-    let node_control = open_node_control_client(&cfg)?;
-    let wallet_control = wallet_control::WalletControlClient::new(&cfg.storage.path);
-    wallet_control.ping().await?;
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-
-    println!("Database: {}", cfg.storage.path);
-    let miner_task = miner::spawn(
-        cfg.mining.clone(),
-        node_control,
-        wallet_control,
-        shutdown_rx,
-    );
-
-    println!();
-    println!("Unchained miner is running.");
-    println!("Node runtime: external");
-    println!("Wallet runtime: external");
-    println!("Epoch length: {} seconds", cfg.epoch.seconds);
-    println!("Mining: enabled");
-    println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);
-    println!("Press Ctrl+C to stop.");
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            println!();
-            println!("Shutdown signal received. Cleaning up Unchained miner...");
-            let _ = shutdown_tx.send(());
-            let _ = miner_task.await;
-            println!("Unchained miner stopped.");
-            Ok(())
-        }
-        Err(err) => {
-            let _ = shutdown_tx.send(());
-            let _ = miner_task.await;
-            Err(err.into())
         }
     }
 }

@@ -190,11 +190,52 @@ The following are not part of the road ahead:
 
 The repository is in transition toward this design.
 
-Legacy PoW, miner, epoch, archive-accounting, and implementation-specific
-surfaces may still exist in the codebase, but they are not the target
-architecture and should not be treated as canonical.
+Legacy archive-accounting and some documentation surfaces still exist, but the
+canonical chain-state path is no longer PoW- or miner-shaped and should be
+read as validator/finality-first.
 
 `ARCHITECTURE.md` is the source of truth for the road ahead.
+
+The current foundation slice now includes:
+
+- canonical validator-set and quorum-certificate objects
+- validator derivation from real node-record hot keys with ML-DSA QC signature
+  verification
+- deterministic epoch/slot consensus state and leader selection
+- public validator-pool objects with commission, metadata, total bonded stake,
+  activation epoch, and status
+- persisted active-committee snapshots plus deterministic top-stake committee
+  selection at epoch boundaries
+- leader-proposed checkpoint certification with explicit validator vote
+  collection over the network
+- finalized checkpoint objects that commit parent linkage, ordering path,
+  committee hash, and quorum evidence
+- finalized-history replay and sync rules based on contiguous checkpoint
+  validation rather than heaviest-chain work
+- deterministic candidate admission digests instead of PoW-based coin
+  admission
+- explicit transaction bodies for ordinary private transfer vs signed
+  shared-state action
+- executable validator-pool shared-state actions for registration and profile
+  updates, authorized by the validator cold governance key
+- removal of the public miner binary and miner-facing local control surface
+
+Shared-state transaction execution now has a real canonical runtime for
+validator-pool registration and profile updates. Those actions mutate the
+public validator-pool state directly, remain off the ordinary transfer fast
+path, and require explicit cold-governance authorization rather than being
+routed through payment logic.
+
+Checkpoint certification now requires a deterministic slot leader to propose an
+`AnchorProposal`, gather validator votes, and assemble a quorum certificate
+before a finalized checkpoint is produced. The remaining consensus gap is not
+basic QC formation; it is DAG dissemination plus full shared-state BFT ordering
+for delegation, undelegation, issuance, redemption, and governed slash flows.
+
+Validator activation is now pulled from persisted validator-pool state rather
+than inherited indefinitely from the parent checkpoint. What still does not
+exist is the canonical source for those stake totals: shielded delegation /
+undelegation notes and their native staking circuits.
 
 ## Build
 

@@ -167,9 +167,6 @@ impl MetricsAggregator {
         counter_delta!("unchained_v3_sends_total", V3_SENDS);
         counter_delta!("unchained_db_write_failures_total", DB_WRITE_FAILS);
         counter_delta!("unchained_pruned_candidates_total", PRUNED_CANDIDATES);
-        counter_delta!("unchained_mining_attempts_total", MINING_ATTEMPTS);
-        counter_delta!("unchained_mining_solutions_total", MINING_FOUND);
-        counter_delta!("unchained_alt_fork_events_total", ALT_FORK_EVENTS);
         counter_delta!("unchained_compact_epochs_sent_total", COMPACT_EPOCHS_SENT);
         counter_delta!(
             "unchained_compact_epochs_received_total",
@@ -418,34 +415,7 @@ pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| {
 pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::new(
         "unchained_selection_threshold_u64",
-        "Threshold (first 8 bytes of pow_hash) for last selected coin",
-    )
-    .unwrap()
-});
-pub static MINING_ATTEMPTS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_mining_attempts_total",
-        "Total mining attempts (nonces tried)",
-    )
-    .unwrap()
-});
-pub static MINING_FOUND: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_mining_solutions_total",
-        "Total found PoW solutions",
-    )
-    .unwrap()
-});
-pub static MINING_HASH_TIME_MS: Lazy<Histogram> = Lazy::new(|| {
-    Histogram::new(
-        "unchained_mining_hash_time_ms",
-        "Argon2 PoW hashing time per attempt (ms)",
-    )
-});
-pub static ALT_FORK_EVENTS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_alt_fork_events_total",
-        "Count of alternate fork anchor events (hash mismatch) observed",
+        "Threshold (first 8 bytes of candidate admission digest) for last selected coin",
     )
     .unwrap()
 });

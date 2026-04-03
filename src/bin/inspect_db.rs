@@ -11,9 +11,24 @@ fn main() -> anyhow::Result<()> {
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {
         println!("📊 Latest Epoch: #{}", latest_epoch.num);
-        println!("   Difficulty: {}", latest_epoch.difficulty);
-        println!("   Memory: {} KiB", latest_epoch.mem_kib);
+        println!(
+            "   Position: epoch {} slot {}",
+            latest_epoch.position.epoch, latest_epoch.position.slot
+        );
+        println!(
+            "   Parent: {}",
+            latest_epoch
+                .parent_hash
+                .map(hex::encode)
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!("   Ordering path: {:?}", latest_epoch.ordering_path);
         println!("   Coins in epoch (selected): {}", latest_epoch.coin_count);
+        println!(
+            "   Validator set hash: {}",
+            hex::encode(latest_epoch.validator_set.committee_hash())
+        );
+        println!("   QC votes: {}", latest_epoch.qc.votes.len());
         println!("   Merkle root: {}", hex::encode(latest_epoch.merkle_root));
         println!("   Hash: {}", hex::encode(latest_epoch.hash));
     } else {
@@ -23,8 +38,14 @@ fn main() -> anyhow::Result<()> {
     // Print genesis anchor for cross-node comparison
     if let Ok(Some(genesis)) = db.get::<Anchor>("epoch", &0u64.to_le_bytes()) {
         println!("\n🌱 Genesis:");
-        println!("   Difficulty: {}", genesis.difficulty);
-        println!("   Memory: {} KiB", genesis.mem_kib);
+        println!(
+            "   Position: epoch {} slot {}",
+            genesis.position.epoch, genesis.position.slot
+        );
+        println!(
+            "   Validator set hash: {}",
+            hex::encode(genesis.validator_set.committee_hash())
+        );
         println!("   Merkle root: {}", hex::encode(genesis.merkle_root));
         println!("   Hash: {}", hex::encode(genesis.hash));
     } else {
@@ -63,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     println!("   Total epochs: {total_epochs}");
     println!("   Total coins (from epoch metadata): {coin_count_from_epochs}");
     println!("   ⚠️  WARNING: This only counts coins recorded in epoch metadata!");
-    println!("   ⚠️  Some coins may be mined but not properly recorded in epochs!");
+    println!("   ⚠️  Some committed coins may not yet be indexed for per-epoch inspection.");
 
     // Show database storage info
     println!("\n🗄️ Database Storage Info:");

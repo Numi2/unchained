@@ -39,22 +39,9 @@ max_messages_per_window = 1000
 path = "../blockchain_data"
 
 [epoch]
-# Duration of each epoch in seconds (timing only; does not affect consensus validation)
+# Local checkpoint cadence in seconds for a standalone validator/runtime.
+# Finalized slot/epoch consensus state is protocol-defined, not operator-tuned.
 seconds = 222
-
-
-[mining]
-# Enable mining by default
-enabled = true
-
-# Heartbeat interval to keep connection fresh
-heartbeat_interval_secs = 30
-
-# Maximum mining attempts per epoch before moving to next epoch
-# (alias for `max_attempts` in code)
-max_mining_attempts = 1000000
-
-
 
 [metrics]
 # Optional local observability endpoint. Must remain loopback-only.

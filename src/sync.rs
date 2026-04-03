@@ -1,4 +1,6 @@
-use crate::{epoch::Anchor, network::NetHandle, storage::Store};
+use crate::{
+    epoch::Anchor, network::NetHandle, staking::expected_validator_set_for_epoch, storage::Store,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -50,6 +52,23 @@ impl Default for SyncState {
             synced: false,
             peer_confirmed_tip: false,
         }
+    }
+}
+
+fn validate_anchor_for_sync(anchor: &Anchor, parent: Option<&Anchor>, db: &Store) -> bool {
+    if anchor.validate_against_parent(parent).is_err() {
+        return false;
+    }
+    let epoch_boundary = parent
+        .map(|parent| parent.position.epoch != anchor.position.epoch)
+        .unwrap_or(true);
+    if !epoch_boundary {
+        return true;
+    }
+    match expected_validator_set_for_epoch(db, anchor.position.epoch) {
+        Ok(Some(expected)) => expected == anchor.validator_set,
+        Ok(None) => anchor.num == 0,
+        Err(_) => false,
     }
 }
 
@@ -305,22 +324,17 @@ pub fn spawn(
 
                 Ok(anchor) = anchor_rx.recv() => {
                     if anchor.num > local_epoch {
-                        if anchor.is_better_chain(&db.get("epoch", b"latest").unwrap_or_default()) {
-                            // Only fast-forward to anchor if it's strictly the next contiguous epoch and parent is present;
-                            // otherwise request the missing range to enforce sequential adoption.
-                            if anchor.num == local_epoch + 1 {
-                                // Verify parent exists and links correctly before trusting this as progress
-                                let mut ok = false;
-                                if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &local_epoch.to_le_bytes()) {
-                                    let mut h = blake3::Hasher::new();
-                                    h.update(&anchor.merkle_root); h.update(&prev.hash);
-                                    ok = *h.finalize().as_bytes() == anchor.hash;
-                                }
-                                if ok { local_epoch = anchor.num; }
-                                else { request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await; }
-                            } else if anchor.num > local_epoch + 1 {
-                                request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await;
+                        // Only fast-forward to a contiguous finalized checkpoint. Anything else
+                        // requires explicit backfill so we never invent a fork-choice rule.
+                        if anchor.num == local_epoch + 1 {
+                            let mut ok = false;
+                            if let Ok(Some(prev)) = db.get::<Anchor>("epoch", &local_epoch.to_le_bytes()) {
+                                ok = validate_anchor_for_sync(&anchor, Some(&prev), db.as_ref());
                             }
+                            if ok { local_epoch = anchor.num; }
+                            else { request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await; }
+                        } else if anchor.num > local_epoch + 1 {
+                            request_missing_epochs(local_epoch, anchor.num, &net, &semaphore, &db).await;
                         }
                     }
                 }
@@ -398,24 +412,18 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
                     let mut ok = true;
                     for (idx, a) in seg.headers.iter().enumerate() {
                         if idx == 0 {
-                            if a.num > 0 {
-                                if let Ok(Some(prev)) = db_headers.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
-                                    let mut h = blake3::Hasher::new();
-                                    h.update(&a.merkle_root); h.update(&prev.hash);
-                                    let recomputed = *h.finalize().as_bytes();
-                                    if recomputed != a.hash { ok = false; break; }
-                                    let expected = Anchor::expected_work_for_difficulty(a.difficulty);
-                                    if a.cumulative_work != prev.cumulative_work.saturating_add(expected) { ok = false; break; }
+                            let parent = if a.num == 0 {
+                                None
+                            } else {
+                                match db_headers.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
+                                    Ok(Some(prev)) => Some(prev),
+                                    _ => { ok = false; break; }
                                 }
-                            }
+                            };
+                            if !validate_anchor_for_sync(a, parent.as_ref(), db_headers.as_ref()) { ok = false; break; }
                         } else {
                             let prev = &seg.headers[idx-1];
-                            if a.num != prev.num + 1 { ok = false; break; }
-                            let mut h = blake3::Hasher::new();
-                            h.update(&a.merkle_root); h.update(&prev.hash);
-                            if *h.finalize().as_bytes() != a.hash { ok = false; break; }
-                            let expected = Anchor::expected_work_for_difficulty(a.difficulty);
-                            if a.cumulative_work != prev.cumulative_work.saturating_add(expected) { ok = false; break; }
+                            if !validate_anchor_for_sync(a, Some(prev), db_headers.as_ref()) { ok = false; break; }
                         }
                     }
                     if !ok { crate::metrics::HEADERS_INVALID.inc(); continue; }
@@ -425,6 +433,7 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
                     if current_best.is_none() {
                         if let Some(first) = seg.headers.first() {
                             if first.num == 0 {
+                                let _ = db_headers.store_validator_committee(&first.validator_set);
                                 let _ = db_headers.put("epoch", &0u64.to_le_bytes(), first);
                                 let _ = db_headers.put("anchor", &first.hash, first);
                                 let _ = db_headers.put("epoch", b"latest", first);
@@ -432,8 +441,11 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
                         }
                     }
                     if let Some(last) = seg.headers.last() {
-                        if last.is_better_chain(&current_best) {
+                        if current_best.as_ref().map(|best| last.num > best.num).unwrap_or(true) {
                             for a in &seg.headers {
+                                if db_headers.store_validator_committee(&a.validator_set).is_err() {
+                                    crate::metrics::DB_WRITE_FAILS.inc();
+                                }
                                 if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 crate::metrics::HEADERS_ANCHORS_STORED.inc();

@@ -1,12 +1,13 @@
+mod finality_support;
+
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use unchained::{
     coin::Coin,
     config::{Net, P2p},
-    consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS},
     epoch::Anchor,
     network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
@@ -72,22 +73,9 @@ fn build_p2p() -> P2p {
     }
 }
 
-fn genesis_anchor() -> Anchor {
-    let merkle_root = [0u8; 32];
-    let hash = *blake3::hash(&merkle_root).as_bytes();
-    Anchor {
-        num: 0,
-        hash,
-        merkle_root,
-        difficulty: TARGET_LEADING_ZEROS,
-        coin_count: 0,
-        cumulative_work: Anchor::expected_work_for_difficulty(TARGET_LEADING_ZEROS),
-        mem_kib: DEFAULT_MEM_KIB,
-    }
-}
-
-fn seed_genesis(store: &Store) -> Result<Anchor> {
-    let genesis = genesis_anchor();
+fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> Result<Anchor> {
+    let genesis = committee.genesis_anchor();
+    committee.seed_validator_state(store, genesis.position.epoch)?;
     store.put("epoch", &0u64.to_le_bytes(), &genesis)?;
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
@@ -144,7 +132,7 @@ async fn spawn_network(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wallet_control_serves_state_and_mining_identity() -> Result<()> {
+async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-test-passphrase");
     network::set_quiet_logging(true);
 
@@ -153,19 +141,18 @@ async fn wallet_control_serves_state_and_mining_identity() -> Result<()> {
     let db = Arc::new(Store::open(&base_path)?);
     let wallet_store = Arc::new(WalletStore::open(&base_path)?);
     let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
-    let genesis = seed_genesis(db.as_ref())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
     let _coin = seed_sender_coin(db.as_ref(), &wallet, &genesis)?;
 
     let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let (coin_tx, _coin_rx) = mpsc::unbounded_channel();
     let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel::<()>(1);
     let node_server = node_control::NodeControlServer::bind(
         &base_path,
         db.clone(),
         net.clone(),
         sync_state,
-        coin_tx,
         false,
     )
     .await?;

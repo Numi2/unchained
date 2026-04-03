@@ -1,3 +1,5 @@
+mod finality_support;
+
 use once_cell::sync::Lazy;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::Endpoint;
@@ -10,18 +12,18 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
 use unchained::coin::Coin;
 use unchained::config::{Net, P2p};
-use unchained::consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS};
+use unchained::consensus::OrderingPath;
 use unchained::crypto::TaggedSigningPublicKey;
 use unchained::epoch::{Anchor, MerkleTree};
 use unchained::network::{self, NetHandle};
-use unchained::node_identity;
+use unchained::node_identity::{self, validator_from_record, NodeIdentity};
 use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::shielded::{
     local_archive_provider_manifest, local_archive_replica_attestations, route_checkpoint_requests,
     ArchiveDirectory, ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
     HistoricalUnspentCheckpoint, NullifierRootLedger,
 };
-use unchained::storage::Store;
+use unchained::storage::{protocol_chain_id, Store};
 use unchained::sync::SyncState;
 use unchained::transaction;
 
@@ -41,41 +43,21 @@ fn pick_udp_port() -> u16 {
         .port()
 }
 
-fn genesis_anchor() -> Anchor {
-    let merkle_root = [0u8; 32];
-    let hash = *blake3::hash(&merkle_root).as_bytes();
-    Anchor {
-        num: 0,
-        hash,
-        merkle_root,
-        difficulty: TARGET_LEADING_ZEROS,
-        coin_count: 0,
-        cumulative_work: Anchor::expected_work_for_difficulty(TARGET_LEADING_ZEROS),
-        mem_kib: DEFAULT_MEM_KIB,
-    }
+fn next_anchor(
+    committee: &finality_support::TestCommittee,
+    prev: &Anchor,
+    merkle_root: [u8; 32],
+    coin_count: u32,
+) -> Anchor {
+    committee.child_anchor(prev, merkle_root, coin_count)
 }
 
-fn next_anchor(prev: &Anchor, merkle_root: [u8; 32], coin_count: u32) -> Anchor {
-    let num = prev.num + 1;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&merkle_root);
-    hasher.update(&prev.hash);
-    let hash = *hasher.finalize().as_bytes();
-    Anchor {
-        num,
-        hash,
-        merkle_root,
-        difficulty: prev.difficulty,
-        coin_count,
-        cumulative_work: prev
-            .cumulative_work
-            .saturating_add(Anchor::expected_work_for_difficulty(prev.difficulty)),
-        mem_kib: prev.mem_kib,
-    }
-}
-
-fn seed_genesis(store: &Store) -> anyhow::Result<Anchor> {
-    let genesis = genesis_anchor();
+fn seed_genesis(
+    store: &Store,
+    committee: &finality_support::TestCommittee,
+) -> anyhow::Result<Anchor> {
+    let genesis = committee.genesis_anchor();
+    committee.seed_validator_state(store, genesis.position.epoch)?;
     store.put("epoch", &0u64.to_le_bytes(), &genesis)?;
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
@@ -83,6 +65,7 @@ fn seed_genesis(store: &Store) -> anyhow::Result<Anchor> {
 }
 
 fn store_anchor(store: &Store, anchor: &Anchor) -> anyhow::Result<()> {
+    store.store_validator_committee(&anchor.validator_set)?;
     store.put("epoch", &anchor.num.to_le_bytes(), anchor)?;
     store.put("epoch", b"latest", anchor)?;
     store.put("anchor", &anchor.hash, anchor)?;
@@ -207,6 +190,143 @@ async fn wait_for_condition(label: &str, timeout: Duration, mut condition: impl 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+
+    let port_a = pick_udp_port();
+    let port_b = pick_udp_port();
+    let port_c = pick_udp_port();
+    let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
+    let chain_id = protocol_chain_id();
+
+    let (_, bootstrap_a) =
+        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
+    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()])?;
+    provision_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()])?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a.clone()],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b.clone()],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c.clone()],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_identities(vec![
+        identity_a.clone(),
+        identity_b.clone(),
+        identity_c.clone(),
+    ]);
+    let genesis = committee.genesis_anchor();
+
+    let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
+    let (db_b, net_b, _) =
+        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
+    let (db_c, net_c, _) = spawn_test_node(&dir_c, build_net(port_c, vec![bootstrap_a])).await?;
+
+    wait_for_peers(&net_a, 2, "node A").await;
+    wait_for_peers(&net_b, 1, "node B").await;
+    wait_for_peers(&net_c, 1, "node C").await;
+
+    committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_c.as_ref(), genesis.position.epoch)?;
+    store_anchor(db_a.as_ref(), &genesis)?;
+    store_anchor(db_b.as_ref(), &genesis)?;
+    store_anchor(db_c.as_ref(), &genesis)?;
+
+    let leader_id = committee.leader_for(1);
+    let leader_a = validator_from_record(identity_a.record(), 1)?.id == leader_id;
+    let leader_b = validator_from_record(identity_b.record(), 1)?.id == leader_id;
+    let (leader_db, leader_net) = if leader_a {
+        (db_a.clone(), net_a.clone())
+    } else if leader_b {
+        (db_b.clone(), net_b.clone())
+    } else {
+        (db_c.clone(), net_c.clone())
+    };
+
+    let anchor = leader_net
+        .certify_local_anchor(
+            1,
+            Some(&genesis),
+            [9u8; 32],
+            0,
+            OrderingPath::FastPathPrivateTransfer,
+        )
+        .await?;
+    anchor.validate_against_parent(Some(&genesis))?;
+    assert_eq!(anchor.qc.votes.len(), 3);
+    assert_eq!(
+        anchor.qc.signed_voting_power,
+        genesis.validator_set.quorum_threshold
+    );
+
+    store_anchor(leader_db.as_ref(), &anchor)?;
+    leader_net.gossip_anchor(&anchor).await;
+
+    wait_for_condition(
+        "checkpoint adoption on node A",
+        Duration::from_secs(10),
+        || {
+            db_a.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "checkpoint adoption on node B",
+        Duration::from_secs(10),
+        || {
+            db_b.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "checkpoint adoption on node C",
+        Duration::from_secs(10),
+        || {
+            db_c.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+    net_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -219,9 +339,10 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
     let db_c_seed = Store::open(&dir_c.path().to_string_lossy())?;
 
-    let genesis = seed_genesis(&db_a_seed)?;
-    seed_genesis(&db_b_seed)?;
-    seed_genesis(&db_c_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_a_seed, &committee)?;
+    seed_genesis(&db_b_seed, &committee)?;
+    seed_genesis(&db_c_seed, &committee)?;
 
     let port_a = pick_udp_port();
     let port_b = pick_udp_port();
@@ -251,7 +372,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let mut anchor_rx_b = net_b.anchor_subscribe();
     let mut anchor_rx_c = net_c.anchor_subscribe();
 
-    let anchor1 = next_anchor(&genesis, [0u8; 32], 0);
+    let anchor1 = next_anchor(&committee, &genesis, [0u8; 32], 0);
     store_anchor(&db_a, &anchor1)?;
     net_a.gossip_anchor(&anchor1).await;
 
@@ -295,6 +416,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let leaf = Coin::id_to_leaf_hash(&coin.id);
     let leaves = vec![leaf];
     let anchor2 = next_anchor(
+        &committee,
         &anchor1,
         MerkleTree::compute_root_from_sorted_leaves(&leaves),
         1,
@@ -374,8 +496,9 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
 
     let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
     let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let genesis = seed_genesis(&db_a_seed)?;
-    seed_genesis(&db_b_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_a_seed, &committee)?;
+    seed_genesis(&db_b_seed, &committee)?;
 
     let port_a = pick_udp_port();
     let port_b = pick_udp_port();
@@ -441,8 +564,9 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
 
     let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
     let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let genesis = seed_genesis(&db_a_seed)?;
-    seed_genesis(&db_b_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_a_seed, &committee)?;
+    seed_genesis(&db_b_seed, &committee)?;
 
     let port_a = pick_udp_port();
     let port_b = pick_udp_port();
@@ -468,7 +592,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     drop(db_b);
     drop(net_b);
 
-    let anchor1 = next_anchor(&genesis, [0u8; 32], 0);
+    let anchor1 = next_anchor(&committee, &genesis, [0u8; 32], 0);
     store_anchor(&db_a, &anchor1)?;
 
     let coin = Coin::new_with_creator_pk_and_lock(
@@ -481,6 +605,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     let leaf = Coin::id_to_leaf_hash(&coin.id);
     let leaves = vec![leaf];
     let anchor2 = next_anchor(
+        &committee,
         &anchor1,
         MerkleTree::compute_root_from_sorted_leaves(&leaves),
         1,
@@ -576,7 +701,8 @@ async fn pq_network_disconnects_peer_that_sends_invalid_envelope() -> anyhow::Re
     let dir_attacker = TempDir::new()?;
 
     let db_seed = Store::open(&dir_victim.path().to_string_lossy())?;
-    let genesis = seed_genesis(&db_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_seed, &committee)?;
     drop(db_seed);
 
     let port_victim = pick_udp_port();
@@ -672,8 +798,9 @@ async fn pq_mesh_archive_provider_discovery_and_shard_sync() -> anyhow::Result<(
 
     let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
     let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let genesis = seed_genesis(&db_a_seed)?;
-    seed_genesis(&db_b_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_a_seed, &committee)?;
+    seed_genesis(&db_b_seed, &committee)?;
 
     let archived = ArchivedNullifierEpoch::new(1, vec![[11u8; 32], [22u8; 32], [33u8; 32]]);
     let mut ledger = NullifierRootLedger::default();
@@ -737,8 +864,9 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
 
     let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
     let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let genesis = seed_genesis(&db_a_seed)?;
-    seed_genesis(&db_b_seed)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&db_a_seed, &committee)?;
+    seed_genesis(&db_b_seed, &committee)?;
 
     let archived = ArchivedNullifierEpoch::new(1, vec![[11u8; 32], [22u8; 32], [33u8; 32]]);
     let mut ledger = NullifierRootLedger::default();

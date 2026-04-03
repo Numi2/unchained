@@ -35,11 +35,26 @@ fn main() -> anyhow::Result<()> {
             // Basic anchor info
             println!("\n# Epoch {}", anchor.num);
             println!("   hash: {}", hex::encode(anchor.hash));
+            println!(
+                "   position: epoch {} slot {}",
+                anchor.position.epoch, anchor.position.slot
+            );
+            println!(
+                "   parent_hash: {}",
+                anchor
+                    .parent_hash
+                    .map(hex::encode)
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            println!("   ordering_path: {:?}", anchor.ordering_path);
             println!("   merkle_root: {}", hex::encode(anchor.merkle_root));
-            println!("   difficulty: {}", anchor.difficulty);
             println!("   coin_count: {}", anchor.coin_count);
-            println!("   cumulative_work: {}", anchor.cumulative_work);
-            println!("   mem_kib: {}", anchor.mem_kib);
+            println!(
+                "   validator_set_hash: {}",
+                hex::encode(anchor.validator_set.committee_hash())
+            );
+            println!("   qc_votes: {}", anchor.qc.votes.len());
+            println!("   qc_signed_power: {}", anchor.qc.signed_voting_power);
 
             // Selected coin IDs recorded for this epoch (if any)
             match db.get_selected_coin_ids_for_epoch(anchor.num) {

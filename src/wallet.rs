@@ -1,5 +1,6 @@
 use crate::{
     canonical,
+    consensus::ValidatorId,
     crypto::{
         self, Address, TaggedKemPublicKey, TaggedSigningPublicKey, ML_KEM_768_PK_BYTES,
         ML_KEM_768_SK_BYTES,
@@ -7,7 +8,10 @@ use crate::{
     node_control::{NodeControlClient, NodeControlStateEnvelope, ShieldedRuntimeSnapshot},
     proof, shielded,
     storage::WalletStore,
-    transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
+    transaction::{
+        OrdinaryPrivateTransfer, PrivateDelegation, SharedStateAction, ShieldedOutput,
+        ShieldedOutputPlaintext, Tx,
+    },
 };
 use aws_lc_rs::unstable::signature::PqdsaKeyPair;
 use serde::{Deserialize, Serialize};
@@ -150,6 +154,16 @@ pub struct PreparedShieldedTx {
     amount: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedPrivateDelegation {
+    state_binding: PreparedShieldedTxStateBinding,
+    witness: proof_core::ProofPrivateDelegationWitness,
+    nullifiers: Vec<[u8; 32]>,
+    outputs: Vec<ShieldedOutput>,
+    selected_notes: Vec<OwnedShieldedNote>,
+    validator_id: ValidatorId,
+}
+
 impl PreparedShieldedTx {
     pub fn witness(&self) -> &proof_core::ProofShieldedTxWitness {
         &self.witness
@@ -165,6 +179,12 @@ impl PreparedShieldedTx {
 
     pub fn tx_with_proof(&self, proof: Vec<u8>) -> Tx {
         Tx::new(self.nullifiers.clone(), self.outputs.clone(), proof)
+    }
+}
+
+impl PreparedPrivateDelegation {
+    pub fn witness(&self) -> &proof_core::ProofPrivateDelegationWitness {
+        &self.witness
     }
 }
 
@@ -927,6 +947,10 @@ impl Wallet {
         Ok(notes)
     }
 
+    fn retain_payment_notes(notes: &mut Vec<OwnedShieldedNote>) {
+        notes.retain(|note| note.note.kind.is_payment());
+    }
+
     fn prepare_owned_checkpoint_requests(
         &self,
         notes: &[OwnedShieldedNote],
@@ -1240,7 +1264,31 @@ impl Wallet {
         ShieldedOutputPlaintext,
         [u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
     )> {
-        let note = shielded::ShieldedNote::new(
+        self.build_shielded_output_with_kind(
+            shielded::ShieldedNoteKind::Payment,
+            owner_signing_pk,
+            owner_kem_pk,
+            value,
+            birth_epoch,
+            entropy,
+        )
+    }
+
+    fn build_shielded_output_with_kind(
+        &self,
+        kind: shielded::ShieldedNoteKind,
+        owner_signing_pk: TaggedSigningPublicKey,
+        owner_kem_pk: TaggedKemPublicKey,
+        value: u64,
+        birth_epoch: u64,
+        entropy: &ShieldedOutputEntropy,
+    ) -> Result<(
+        ShieldedOutput,
+        ShieldedOutputPlaintext,
+        [u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
+    )> {
+        let note = shielded::ShieldedNote::new_with_kind(
+            kind,
             value,
             birth_epoch,
             owner_signing_pk,
@@ -1329,7 +1377,7 @@ impl Wallet {
     pub fn scan_tx_for_me(&self, tx: &Tx) -> Result<()> {
         let wallet_store = self.wallet_store()?;
         let tx_id = tx.id()?;
-        for (output_index, output) in tx.outputs.iter().enumerate() {
+        for (output_index, output) in tx.outputs().iter().enumerate() {
             let Some((plaintext, _receive_key_id)) = self.decrypt_shielded_output(output)? else {
                 continue;
             };
@@ -1357,8 +1405,10 @@ impl Wallet {
 
     pub fn balance(&self) -> Result<u64> {
         let node_state = self.current_node_state()?;
-        Ok(self
-            .load_owned_shielded_notes_for_snapshot(&node_state.state.shielded_runtime, true)?
+        let mut notes =
+            self.load_owned_shielded_notes_for_snapshot(&node_state.state.shielded_runtime, true)?;
+        Self::retain_payment_notes(&mut notes);
+        Ok(notes
             .into_iter()
             .fold(0u64, |sum, note| sum.saturating_add(note.note.value)))
     }
@@ -1376,6 +1426,7 @@ impl Wallet {
             .context("Invalid receiver handle")?;
         let recipient_address = recipient_signing_pk.address();
         let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
+        Self::retain_payment_notes(&mut available_notes);
         let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
         self.refresh_owned_shielded_checkpoints_with_snapshot(
             &mut available_notes,
@@ -1496,6 +1547,143 @@ impl Wallet {
         })
     }
 
+    pub async fn prepare_private_delegation(
+        &self,
+        validator_id: ValidatorId,
+        amount: u64,
+    ) -> Result<PreparedPrivateDelegation> {
+        let node_state = self.current_node_state()?;
+        let snapshot = node_state.state.shielded_runtime;
+        let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
+        Self::retain_payment_notes(&mut available_notes);
+        let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_snapshot(
+            &mut available_notes,
+            &snapshot,
+            rotation_round,
+        )
+        .await?;
+
+        let selected_notes = {
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            for note in available_notes {
+                total = total.saturating_add(note.note.value);
+                selected.push(note);
+                if total >= amount {
+                    break;
+                }
+            }
+            if total < amount {
+                bail!(
+                    "Insufficient funds for delegation: requested {}, available {}",
+                    amount,
+                    total
+                );
+            }
+            selected
+        };
+        let total_selected = selected_notes
+            .iter()
+            .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+
+        let state_binding = Self::state_binding_from_snapshot(&snapshot)?;
+        let current_epoch = snapshot.current_nullifier_epoch;
+        let note_tree = &snapshot.note_tree;
+        let tree_root = note_tree.root();
+        let chain_id = snapshot.chain_id;
+        let send_seed =
+            self.derive_send_seed(&self.address(), amount, current_epoch, &selected_notes);
+
+        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
+        let mut nullifiers = Vec::with_capacity(selected_notes.len());
+        for owned in &selected_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the delegation");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            nullifiers.push(current_nullifier);
+            input_witnesses.push(proof::input_witness_from_local(
+                &owned.note,
+                &owned.note_key,
+                &membership_proof,
+                &owned.checkpoint,
+                owned.checkpoint_accumulator.as_ref(),
+                &current_nullifier,
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        let mut output_witnesses = Vec::new();
+        let delegated_entropy = self.derive_output_entropy(&send_seed, 0);
+        let delegated_receive_kem_pk =
+            self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+        let (delegated_output, delegated_plaintext, delegated_seed) = self
+            .build_shielded_output_with_kind(
+                shielded::ShieldedNoteKind::DelegationShare {
+                    validator_id: validator_id.0,
+                },
+                self.signing_pk.clone(),
+                delegated_receive_kem_pk,
+                amount,
+                current_epoch,
+                &delegated_entropy,
+            )?;
+        output_witnesses.push(proof::output_witness_from_local(
+            &delegated_plaintext,
+            &delegated_output,
+            &delegated_seed,
+        ));
+        outputs.push(delegated_output);
+
+        let change = total_selected.saturating_sub(amount);
+        if change > 0 {
+            let change_entropy = self.derive_output_entropy(&send_seed, 1);
+            let change_receive_kem_pk =
+                self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+            let (change_output, change_plaintext, change_seed) = self.build_shielded_output(
+                self.signing_pk.clone(),
+                change_receive_kem_pk,
+                change,
+                current_epoch,
+                &change_entropy,
+            )?;
+            output_witnesses.push(proof::output_witness_from_local(
+                &change_plaintext,
+                &change_output,
+                &change_seed,
+            ));
+            outputs.push(change_output);
+        }
+
+        let witness = proof_core::ProofPrivateDelegationWitness {
+            shielded: proof_core::ProofShieldedTxWitness {
+                chain_id,
+                current_epoch,
+                note_tree_root: tree_root,
+                inputs: input_witnesses,
+                outputs: output_witnesses,
+            },
+            validator_id: validator_id.0,
+            delegated_output_index: 0,
+        };
+
+        Ok(PreparedPrivateDelegation {
+            state_binding,
+            witness,
+            nullifiers,
+            outputs,
+            selected_notes,
+            validator_id,
+        })
+    }
+
     pub async fn submit_prepared_shielded_send(
         &self,
         prepared: PreparedShieldedTx,
@@ -1531,9 +1719,46 @@ impl Wallet {
 
         Ok(SendOutcome {
             tx_id,
-            input_count: tx.nullifiers.len(),
-            output_count: tx.outputs.len(),
+            input_count: tx.input_count(),
+            output_count: tx.output_count(),
         })
+    }
+
+    pub async fn submit_prepared_private_delegation(
+        &self,
+        prepared: PreparedPrivateDelegation,
+        proof_bytes: Vec<u8>,
+    ) -> Result<[u8; 32]> {
+        let wallet_store = self.wallet_store()?;
+        let current_state = self.current_node_state()?;
+        let current_binding =
+            Self::state_binding_from_snapshot(&current_state.state.shielded_runtime)?;
+        if current_binding != prepared.state_binding {
+            bail!(
+                "prepared private delegation is stale; canonical shielded state changed, re-prepare the delegation"
+            );
+        }
+        let tx = Tx::new_shared_state(
+            SharedStateAction::PrivateDelegation(PrivateDelegation {
+                validator_id: prepared.validator_id,
+                transfer: OrdinaryPrivateTransfer {
+                    nullifiers: prepared.nullifiers.clone(),
+                    outputs: prepared.outputs,
+                    proof: proof_bytes,
+                },
+            }),
+            Vec::new(),
+        );
+        let tx_id = self.require_node_client()?.submit_tx(&tx)?;
+        for (owned, nullifier) in prepared
+            .selected_notes
+            .iter()
+            .zip(prepared.nullifiers.iter())
+        {
+            self.mark_owned_note_spent(wallet_store.as_ref(), &owned.note.commitment, nullifier)?;
+        }
+        self.scan_tx_for_me(&tx)?;
+        Ok(tx_id)
     }
 
     /// Sends a canonical shielded transaction to a verified recipient handle.
@@ -1551,6 +1776,19 @@ impl Wallet {
     /// Simple wrapper: pay using a recipient handle.
     pub async fn pay(&self, to: &str, amount: u64) -> Result<SendOutcome> {
         self.send_to_recipient_handle(to, amount).await
+    }
+
+    pub async fn delegate_to_validator(
+        &self,
+        validator_id: ValidatorId,
+        amount: u64,
+    ) -> Result<[u8; 32]> {
+        let prepared = self
+            .prepare_private_delegation(validator_id, amount)
+            .await?;
+        let (receipt, _journal) = proof::prove_private_delegation(prepared.witness())?;
+        self.submit_prepared_private_delegation(prepared, proof::receipt_to_bytes(&receipt)?)
+            .await
     }
 
     /// Gets the transaction history for this wallet

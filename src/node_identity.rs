@@ -834,6 +834,16 @@ impl NodeIdentity {
         self.node_id
     }
 
+    pub fn sign_consensus_message(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let sig_len = self
+            .auth_key
+            .sign(message, &mut sig)
+            .map_err(|_| anyhow!("failed to sign consensus message"))?;
+        sig.truncate(sig_len);
+        Ok(sig)
+    }
+
     pub fn approve_trust_update(&self, update: &mut TrustUpdateV1) -> Result<()> {
         let root = load_key(&self.dir.join(NODE_ROOT_KEY_PATH))?;
         let signer_root_spki = root
@@ -865,6 +875,19 @@ impl NodeIdentity {
         }
         Ok(())
     }
+}
+
+pub fn validator_from_record(
+    record: &NodeRecordV2,
+    voting_power: u64,
+) -> Result<crate::consensus::Validator> {
+    crate::consensus::Validator::new(
+        voting_power,
+        crate::consensus::ValidatorKeys {
+            hot_ml_dsa_65_spki: record.auth_spki.clone(),
+            cold_governance_key: record.root_spki.clone(),
+        },
+    )
 }
 
 pub fn load_local_identity_output(
@@ -1744,6 +1767,9 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::{
+        ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorVote, VoteTarget,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -1786,6 +1812,32 @@ mod tests {
         let mut expired = envelope.clone();
         expired.expires_unix_ms = expired.issued_unix_ms;
         assert!(expired.verify(identity.record(), now_unix_ms()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn node_record_derives_validator_and_real_consensus_vote() -> Result<()> {
+        let dir = TempDir::new()?;
+        let identity = NodeIdentity::load_or_create_in_dir(
+            dir.path(),
+            7,
+            Some([8u8; 32]),
+            vec!["127.0.0.1:4040".to_string()],
+        )?;
+        let validator = validator_from_record(identity.record(), 1)?;
+        let validator_set = crate::consensus::ValidatorSet::new(0, vec![validator.clone()])?;
+        let target = VoteTarget {
+            position: ConsensusPosition { epoch: 0, slot: 0 },
+            ordering_path: OrderingPath::DagBftSharedState,
+            block_digest: [5u8; 32],
+        };
+        let vote = ValidatorVote {
+            voter: validator.id,
+            target: target.clone(),
+            signature: identity.sign_consensus_message(&target.signing_bytes())?,
+        };
+        let qc = QuorumCertificate::from_votes(&validator_set, target, vec![vote])?;
+        qc.validate(&validator_set)?;
         Ok(())
     }
 

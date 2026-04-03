@@ -1,5 +1,6 @@
 use crate::consensus::{
-    calculate_retarget_consensus, DEFAULT_MEM_KIB, RETARGET_INTERVAL, TARGET_LEADING_ZEROS,
+    ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorSet, VoteTarget,
+    DEFAULT_SLOTS_PER_EPOCH, MAX_COINS_PER_CHECKPOINT,
 };
 use crate::protocol::CURRENT as PROTOCOL;
 use crate::sync::SyncState;
@@ -8,6 +9,7 @@ use crate::{
     network::NetHandle,
     storage::Store,
 };
+use anyhow::{bail, Result as AnyResult};
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
@@ -17,46 +19,305 @@ use tokio::{
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AnchorProposal {
+    pub num: u64,
+    pub hash: [u8; 32],
+    pub parent_hash: Option<[u8; 32]>,
+    pub position: ConsensusPosition,
+    pub ordering_path: OrderingPath,
+    pub merkle_root: [u8; 32],
+    pub coin_count: u32,
+    pub validator_set: ValidatorSet,
+}
+
+impl AnchorProposal {
+    pub fn position_for_num(num: u64) -> ConsensusPosition {
+        let slots_per_epoch = DEFAULT_SLOTS_PER_EPOCH as u64;
+        ConsensusPosition {
+            epoch: num / slots_per_epoch,
+            slot: (num % slots_per_epoch) as u32,
+        }
+    }
+
+    pub fn compute_hash(
+        num: u64,
+        parent_hash: Option<[u8; 32]>,
+        position: ConsensusPosition,
+        ordering_path: OrderingPath,
+        merkle_root: [u8; 32],
+        coin_count: u32,
+        validator_set: &ValidatorSet,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key("unchained.finalized-checkpoint.digest.v1");
+        hasher.update(&num.to_le_bytes());
+        match parent_hash {
+            Some(parent_hash) => {
+                hasher.update(&[1]);
+                hasher.update(&parent_hash);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&position.epoch.to_le_bytes());
+        hasher.update(&position.slot.to_le_bytes());
+        hasher.update(&[match ordering_path {
+            OrderingPath::FastPathPrivateTransfer => 0,
+            OrderingPath::DagBftSharedState => 1,
+        }]);
+        hasher.update(&merkle_root);
+        hasher.update(&coin_count.to_le_bytes());
+        hasher.update(&validator_set.committee_hash());
+        *hasher.finalize().as_bytes()
+    }
+
+    pub fn new(
+        num: u64,
+        parent_hash: Option<[u8; 32]>,
+        ordering_path: OrderingPath,
+        merkle_root: [u8; 32],
+        coin_count: u32,
+        validator_set: ValidatorSet,
+    ) -> AnyResult<Self> {
+        let position = Anchor::position_for_num(num);
+        let hash = Self::compute_hash(
+            num,
+            parent_hash,
+            position,
+            ordering_path,
+            merkle_root,
+            coin_count,
+            &validator_set,
+        );
+        let proposal = Self {
+            num,
+            hash,
+            parent_hash,
+            position,
+            ordering_path,
+            merkle_root,
+            coin_count,
+            validator_set,
+        };
+        validate_proposal_invariants(&proposal)?;
+        Ok(proposal)
+    }
+
+    pub fn vote_target(&self) -> VoteTarget {
+        VoteTarget {
+            position: self.position,
+            ordering_path: self.ordering_path,
+            block_digest: self.hash,
+        }
+    }
+
+    pub fn validate_against_parent(&self, parent: Option<&Anchor>) -> AnyResult<()> {
+        validate_proposal_fields(self, parent)
+    }
+
+    pub fn finalize(self, qc: QuorumCertificate) -> AnyResult<Anchor> {
+        validate_proposal_invariants(&self)?;
+        qc.validate(&self.validator_set)?;
+        if qc.target != self.vote_target() {
+            bail!("checkpoint QC target does not match proposal");
+        }
+        let anchor = Anchor {
+            num: self.num,
+            hash: self.hash,
+            parent_hash: self.parent_hash,
+            position: self.position,
+            ordering_path: self.ordering_path,
+            merkle_root: self.merkle_root,
+            coin_count: self.coin_count,
+            validator_set: self.validator_set,
+            qc,
+        };
+        Ok(anchor)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Anchor {
     pub num: u64,
     pub hash: [u8; 32],
+    pub parent_hash: Option<[u8; 32]>,
+    pub position: ConsensusPosition,
+    pub ordering_path: OrderingPath,
     pub merkle_root: [u8; 32],
-    pub difficulty: usize,
     pub coin_count: u32,
-    pub cumulative_work: u128,
-    pub mem_kib: u32,
+    pub validator_set: ValidatorSet,
+    pub qc: QuorumCertificate,
 }
 
 impl Anchor {
-    pub fn expected_work_for_difficulty(difficulty: usize) -> u128 {
-        if difficulty == 0 {
-            1
-        } else {
-            1u128 << (difficulty * 8)
-        }
+    pub fn position_for_num(num: u64) -> ConsensusPosition {
+        AnchorProposal::position_for_num(num)
     }
 
-    pub fn is_better_chain(&self, current_best: &Option<Anchor>) -> bool {
-        match current_best {
-            None => true,
-            Some(best) => {
-                if self.cumulative_work > best.cumulative_work {
-                    return true;
+    pub fn compute_hash(
+        num: u64,
+        parent_hash: Option<[u8; 32]>,
+        position: ConsensusPosition,
+        ordering_path: OrderingPath,
+        merkle_root: [u8; 32],
+        coin_count: u32,
+        validator_set: &ValidatorSet,
+    ) -> [u8; 32] {
+        AnchorProposal::compute_hash(
+            num,
+            parent_hash,
+            position,
+            ordering_path,
+            merkle_root,
+            coin_count,
+            validator_set,
+        )
+    }
+
+    pub fn new(
+        num: u64,
+        parent_hash: Option<[u8; 32]>,
+        ordering_path: OrderingPath,
+        merkle_root: [u8; 32],
+        coin_count: u32,
+        validator_set: ValidatorSet,
+        qc: QuorumCertificate,
+    ) -> AnyResult<Self> {
+        AnchorProposal::new(
+            num,
+            parent_hash,
+            ordering_path,
+            merkle_root,
+            coin_count,
+            validator_set,
+        )?
+        .finalize(qc)
+    }
+
+    pub fn validate_against_parent(&self, parent: Option<&Anchor>) -> AnyResult<()> {
+        validate_proposal_fields(
+            &AnchorProposal {
+                num: self.num,
+                hash: self.hash,
+                parent_hash: self.parent_hash,
+                position: self.position,
+                ordering_path: self.ordering_path,
+                merkle_root: self.merkle_root,
+                coin_count: self.coin_count,
+                validator_set: self.validator_set.clone(),
+            },
+            parent,
+        )?;
+        self.qc.validate(&self.validator_set)?;
+        if self.qc.target.position != self.position {
+            bail!("checkpoint QC position mismatch");
+        }
+        if self.qc.target.ordering_path != self.ordering_path {
+            bail!("checkpoint QC ordering path mismatch");
+        }
+        if self.qc.target.block_digest != self.hash {
+            bail!("checkpoint QC block digest mismatch");
+        }
+
+        match parent {
+            None => {
+                if self.num != 0 {
+                    bail!("non-genesis checkpoint requires a parent");
                 }
-                if self.cumulative_work == best.cumulative_work && self.num > best.num {
-                    return true;
+                if self.parent_hash.is_some() {
+                    bail!("genesis checkpoint cannot reference a parent hash");
                 }
-                // Deterministic tie-break: at equal work and height, prefer lexicographically smaller hash
-                if self.cumulative_work == best.cumulative_work
-                    && self.num == best.num
-                    && self.hash < best.hash
+            }
+            Some(parent) => {
+                if self.num != parent.num.saturating_add(1) {
+                    bail!("checkpoint numbering must be contiguous");
+                }
+                if self.parent_hash != Some(parent.hash) {
+                    bail!("checkpoint parent hash mismatch");
+                }
+                if self.position.epoch == parent.position.epoch {
+                    if self.validator_set.committee_hash() != parent.validator_set.committee_hash()
+                    {
+                        bail!("validator committee changes are only admitted at epoch boundaries");
+                    }
+                } else if self.position.epoch != parent.position.epoch.saturating_add(1)
+                    || self.position.slot != 0
                 {
-                    return true;
+                    bail!("validator committee changes must happen exactly at epoch boundaries");
                 }
-                false
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_proposal_fields(proposal: &AnchorProposal, parent: Option<&Anchor>) -> AnyResult<()> {
+    validate_proposal_invariants(proposal)?;
+    match parent {
+        None => {
+            if proposal.num != 0 {
+                bail!("non-genesis checkpoint requires a parent");
+            }
+            if proposal.parent_hash.is_some() {
+                bail!("genesis checkpoint cannot reference a parent hash");
+            }
+        }
+        Some(parent) => {
+            if proposal.num != parent.num.saturating_add(1) {
+                bail!("checkpoint numbering must be contiguous");
+            }
+            if proposal.parent_hash != Some(parent.hash) {
+                bail!("checkpoint parent hash mismatch");
+            }
+            if proposal.position.epoch == parent.position.epoch {
+                if proposal.validator_set.committee_hash() != parent.validator_set.committee_hash()
+                {
+                    bail!("validator committee changes are only admitted at epoch boundaries");
+                }
+            } else if proposal.position.epoch != parent.position.epoch.saturating_add(1)
+                || proposal.position.slot != 0
+            {
+                bail!("validator committee changes must happen exactly at epoch boundaries");
             }
         }
     }
+    Ok(())
+}
+
+fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
+    if proposal.coin_count > MAX_COINS_PER_CHECKPOINT {
+        bail!(
+            "checkpoint coin count exceeds protocol cap: {} > {}",
+            proposal.coin_count,
+            MAX_COINS_PER_CHECKPOINT
+        );
+    }
+    let expected_position = Anchor::position_for_num(proposal.num);
+    if proposal.position != expected_position {
+        bail!(
+            "checkpoint position mismatch: expected epoch {} slot {}, got epoch {} slot {}",
+            expected_position.epoch,
+            expected_position.slot,
+            proposal.position.epoch,
+            proposal.position.slot
+        );
+    }
+    if proposal.validator_set.epoch != proposal.position.epoch {
+        bail!("validator set epoch must match checkpoint epoch");
+    }
+    let expected_hash = Anchor::compute_hash(
+        proposal.num,
+        proposal.parent_hash,
+        proposal.position,
+        proposal.ordering_path,
+        proposal.merkle_root,
+        proposal.coin_count,
+        &proposal.validator_set,
+    );
+    if proposal.hash != expected_hash {
+        bail!("checkpoint hash mismatch");
+    }
+    Ok(())
 }
 
 pub struct MerkleTree;
@@ -396,9 +657,9 @@ impl Manager {
                             selected = list;
                         }
                         if let Some(last) = selected.last() {
-                            // approximate selection threshold: interpret first 8 bytes of pow_hash as u64
+                            // approximate selection threshold: interpret first 8 bytes of admission digest as u64
                             let mut eight = [0u8;8];
-                            eight.copy_from_slice(&last.pow_hash[..8]);
+                            eight.copy_from_slice(&last.admission_digest[..8]);
                             crate::metrics::SELECTION_THRESHOLD_U64.set(u64::from_le_bytes(eight) as i64);
                         }
 
@@ -413,39 +674,25 @@ impl Manager {
                         }
                         let levels = MerkleTree::build_levels_from_sorted_leaves(&leaves);
                         let merkle_root = if levels.is_empty() { [0u8;32] } else { *levels.last().unwrap().first().unwrap() };
-                        // Anchor hash commits to merkle_root and previous anchor hash (if any)
-                        let hash = {
-                            let mut h = blake3::Hasher::new();
-                            h.update(&merkle_root);
-                            if let Some(prev) = &prev_anchor { h.update(&prev.hash); }
-                            *h.finalize().as_bytes()
-                        };
-
-                        let (difficulty, mem_kib) = if current_epoch > 0 && current_epoch % RETARGET_INTERVAL == 0 {
-                            let start = current_epoch.saturating_sub(RETARGET_INTERVAL);
-                            let window = self.db.get_or_build_retarget_window(current_epoch).unwrap_or(None);
-                            match window {
-                                Some(w) if w.len() as u64 == RETARGET_INTERVAL => calculate_retarget_consensus(&w),
-                                _ => {
-                                    eprintln!("⏳ Retarget window incomplete starting at {} — waiting before emitting retarget epoch {}", start, current_epoch);
-                                    continue;
-                                }
+                        let anchor = match self
+                            .net
+                            .certify_local_anchor(
+                                current_epoch,
+                                prev_anchor.as_ref(),
+                                merkle_root,
+                                selected_ids.len() as u32,
+                                OrderingPath::FastPathPrivateTransfer,
+                            )
+                            .await
+                        {
+                            Ok(anchor) => anchor,
+                            Err(err) => {
+                                eprintln!(
+                                    "⏳ Local checkpoint {} not certified: {}",
+                                    current_epoch, err
+                                );
+                                continue;
                             }
-                        } else {
-                            prev_anchor.as_ref().map_or((TARGET_LEADING_ZEROS, DEFAULT_MEM_KIB), |p| (p.difficulty, p.mem_kib))
-                        };
-
-                        let current_work = Anchor::expected_work_for_difficulty(difficulty);
-                        let cumulative_work = prev_anchor.as_ref().map_or(current_work, |p| p.cumulative_work.saturating_add(current_work));
-
-                        let anchor = Anchor {
-                            num: current_epoch,
-                            hash,
-                            merkle_root,
-                            difficulty,
-                            coin_count: selected_ids.len() as u32,
-                            cumulative_work,
-                            mem_kib,
                         };
 
                         let mut batch = WriteBatch::default();
@@ -467,6 +714,15 @@ impl Manager {
 
                         batch.put_cf(epoch_cf, current_epoch.to_le_bytes(), &serialized_anchor);
                         batch.put_cf(epoch_cf, b"latest", &serialized_anchor);
+                        if let Some(committee_cf) = self.db.db.cf_handle("validator_committee") {
+                            if let Ok(bytes) = bincode::serialize(&anchor.validator_set) {
+                                batch.put_cf(
+                                    committee_cf,
+                                    &anchor.validator_set.epoch.to_le_bytes(),
+                                    bytes,
+                                );
+                            }
+                        }
 
                         // Persist selected coins into confirmed coin CF and index selected IDs per-epoch
                         if let (Some(coin_cf), Some(coin_epoch_cf)) = (self.db.db.cf_handle("coin"), self.db.db.cf_handle("coin_epoch")) {
@@ -517,7 +773,7 @@ impl Manager {
                         if let Err(e) = self.db.store_epoch_levels(current_epoch, &levels) { eprintln!("⚠️ Failed to store epoch levels: {}", e); }
 
                         if let Some(anchor_cf) = self.db.db.cf_handle("anchor") {
-                            batch.put_cf(anchor_cf, &hash, &serialized_anchor);
+                            batch.put_cf(anchor_cf, &anchor.hash, &serialized_anchor);
                         }
 
                         if let Err(e) = self.db.write_batch(batch) {
@@ -553,14 +809,14 @@ impl Manager {
                             // Also gossip sorted leaves to help peers serve proofs deterministically
                             let bundle = crate::network::EpochLeavesBundle { epoch_num: current_epoch, merkle_root, leaves: leaves.clone() };
                             self.net.gossip_epoch_leaves(bundle).await;
-                            if let Err(e) = self.anchor_tx.send(anchor) {
+                            if let Err(e) = self.anchor_tx.send(anchor.clone()) {
                                 eprintln!("⚠️  Failed to broadcast anchor: {}", e);
                             }
                             // Prune candidates but keep a safety window of recent epoch hashes to support reorgs
                             if let Some(latest) = self.db.get::<Anchor>("epoch", b"latest").ok().flatten() {
                                 let mut keep: Vec<[u8;32]> = Vec::new();
                                 // Keep the new parent (current hash) and recent window of parents
-                                keep.push(hash);
+                                keep.push(anchor.hash);
                                 // Walk back up to 127 previous anchors (total ~128 hashes kept)
                                 let mut n = latest.num;
                                 let mut walked: u64 = 0;
@@ -631,25 +887,19 @@ pub fn select_candidates_for_epoch(
         return (Vec::new(), 0);
     }
 
-    // Filter by PoW difficulty
     let mut filtered: Vec<crate::coin::CoinCandidate> = Vec::new();
     let mut total_candidates = 0usize;
     for cand in candidates.into_iter() {
-        if parent.difficulty > 0
-            && !cand
-                .pow_hash
-                .iter()
-                .take(parent.difficulty)
-                .all(|b| *b == 0)
-        {
-            continue;
-        }
         total_candidates += 1;
         filtered.push(cand);
     }
 
-    // Global order by pow_hash, then id (deterministic)
-    filtered.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+    // Global order by admission digest, then id (deterministic)
+    filtered.sort_by(|a, b| {
+        a.admission_digest
+            .cmp(&b.admission_digest)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     // Fair, round-based selection across creators while preserving global order.
     use std::collections::{HashMap, HashSet};
@@ -682,7 +932,111 @@ pub fn select_candidates_for_epoch(
     }
 
     // Ensure deterministic ordering of the selected set
-    picked.sort_by(|a, b| a.pow_hash.cmp(&b.pow_hash).then_with(|| a.id.cmp(&b.id)));
+    picked.sort_by(|a, b| {
+        a.admission_digest
+            .cmp(&b.admission_digest)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     (picked, total_candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::{Validator, ValidatorKeys, ValidatorVote, VoteTarget};
+    use crate::crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign};
+    use aws_lc_rs::unstable::signature::PqdsaKeyPair;
+
+    fn validator(voting_power: u64) -> (Validator, PqdsaKeyPair) {
+        let hot_key = ml_dsa_65_generate().unwrap();
+        let cold_key = ml_dsa_65_generate().unwrap();
+        (
+            Validator::new(
+                voting_power,
+                ValidatorKeys {
+                    hot_ml_dsa_65_spki: ml_dsa_65_public_key_spki(&hot_key).unwrap(),
+                    cold_governance_key: ml_dsa_65_public_key_spki(&cold_key).unwrap(),
+                },
+            )
+            .unwrap(),
+            hot_key,
+        )
+    }
+
+    fn anchor_with_validator_set(
+        num: u64,
+        parent_hash: Option<[u8; 32]>,
+        validator_set: ValidatorSet,
+        signing_keys: &[&PqdsaKeyPair],
+    ) -> Anchor {
+        let position = Anchor::position_for_num(num);
+        let hash = Anchor::compute_hash(
+            num,
+            parent_hash,
+            position,
+            OrderingPath::FastPathPrivateTransfer,
+            [num as u8; 32],
+            0,
+            &validator_set,
+        );
+        let target = VoteTarget {
+            position,
+            ordering_path: OrderingPath::FastPathPrivateTransfer,
+            block_digest: hash,
+        };
+        let target_bytes = target.signing_bytes();
+        let votes = validator_set
+            .validators
+            .iter()
+            .zip(signing_keys.iter())
+            .map(|(validator, signing_key)| ValidatorVote {
+                voter: validator.id,
+                target: target.clone(),
+                signature: ml_dsa_65_sign(signing_key, &target_bytes).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let qc = QuorumCertificate::from_votes(&validator_set, target, votes).unwrap();
+        Anchor::new(
+            num,
+            parent_hash,
+            OrderingPath::FastPathPrivateTransfer,
+            [num as u8; 32],
+            0,
+            validator_set,
+            qc,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validator_committees_change_only_at_epoch_boundaries() {
+        let (validator_a, signer_a) = validator(5);
+        let (validator_b, signer_b) = validator(7);
+        let epoch0_set = ValidatorSet::new(0, vec![validator_a.clone()]).unwrap();
+        let epoch0_changed = ValidatorSet::new(0, vec![validator_b.clone()]).unwrap();
+        let epoch1_set = ValidatorSet::new(1, vec![validator_b]).unwrap();
+
+        let genesis = anchor_with_validator_set(0, None, epoch0_set.clone(), &[&signer_a]);
+        let invalid_same_epoch =
+            anchor_with_validator_set(1, Some(genesis.hash), epoch0_changed, &[&signer_b]);
+        let epoch_boundary_parent =
+            anchor_with_validator_set(255, Some([9u8; 32]), epoch0_set, &[&signer_a]);
+        let valid_epoch_boundary = anchor_with_validator_set(
+            256,
+            Some(epoch_boundary_parent.hash),
+            epoch1_set,
+            &[&signer_b],
+        );
+
+        let err = invalid_same_epoch
+            .validate_against_parent(Some(&genesis))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only admitted at epoch boundaries"));
+        valid_epoch_boundary
+            .validate_against_parent(Some(&epoch_boundary_parent))
+            .unwrap();
+    }
 }

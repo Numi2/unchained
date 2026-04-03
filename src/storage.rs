@@ -21,37 +21,6 @@ pub struct Store {
     pub db: DB,
     path: String,
     mirror_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>)>>, // background mirroring
-    retarget_cache_mem: std::sync::Mutex<RetargetCacheMem>,
-}
-
-struct RetargetCacheMem {
-    windows_by_height: std::collections::HashMap<u64, Vec<crate::epoch::Anchor>>, // retarget_height -> window
-    order: std::collections::VecDeque<u64>,
-    capacity: usize,
-}
-
-impl RetargetCacheMem {
-    fn new(capacity: usize) -> Self {
-        Self {
-            windows_by_height: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            capacity,
-        }
-    }
-    fn get(&self, height: u64) -> Option<&Vec<crate::epoch::Anchor>> {
-        self.windows_by_height.get(&height)
-    }
-    fn insert(&mut self, height: u64, window: Vec<crate::epoch::Anchor>) {
-        if !self.windows_by_height.contains_key(&height) {
-            self.order.push_back(height);
-            if self.order.len() > self.capacity {
-                if let Some(old) = self.order.pop_front() {
-                    self.windows_by_height.remove(&old);
-                }
-            }
-        }
-        self.windows_by_height.insert(height, window);
-    }
 }
 
 fn build_cf_options() -> Options {
@@ -305,6 +274,9 @@ impl Store {
         for cf_name in [
             "epoch",
             "anchor",
+            "validator_pool",
+            "validator_committee",
+            "delegation_share",
             "tx",
             "meta",
             "shielded_note_tree",
@@ -354,9 +326,11 @@ impl Store {
             "epoch_levels",        // per-epoch merkle levels for fast proofs
             "coin_epoch", // coin_id -> epoch number mapping (child epoch that committed the coin)
             "coin_epoch_by_epoch", // epoch_num||coin_id -> 1 (reverse index for range scans)
-            "retarget_cache", // retarget_height -> Vec<Anchor> window
             "head",
             "anchor",
+            "validator_pool",      // validator_id -> ValidatorPool
+            "validator_committee", // epoch -> ValidatorSet
+            "delegation_share",    // note_commitment -> DelegationShareRecord
             "tx",
             "peers",
             "meta", // miscellaneous metadata (e.g., cursors)
@@ -376,7 +350,12 @@ impl Store {
         ];
 
         let mut db = open_db_with_families(&db_path, &cf_names)?;
-        for obsolete_cf in ["wallet", "shielded_checkpoint", "shielded_owned_note"] {
+        for obsolete_cf in [
+            "wallet",
+            "shielded_checkpoint",
+            "shielded_owned_note",
+            "retarget_cache",
+        ] {
             if db.cf_handle(obsolete_cf).is_some() {
                 db.drop_cf(obsolete_cf).with_context(|| {
                     format!("Failed to drop obsolete chain column family '{obsolete_cf}'")
@@ -417,7 +396,6 @@ impl Store {
             db,
             path: db_path,
             mirror_tx,
-            retarget_cache_mem: std::sync::Mutex::new(RetargetCacheMem::new(64)),
         };
 
         // Perform initial health check
@@ -480,73 +458,6 @@ impl Store {
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
         Ok(self.db.get_cf(handle, key)?.map(|v| v.to_vec()))
-    }
-
-    pub fn get_retarget_window_cached(
-        &self,
-        retarget_height: u64,
-    ) -> Result<Option<Vec<crate::epoch::Anchor>>> {
-        if retarget_height == 0 {
-            return Ok(Some(Vec::new()));
-        }
-        if let Ok(guard) = self.retarget_cache_mem.lock() {
-            if let Some(w) = guard.get(retarget_height) {
-                return Ok(Some(w.clone()));
-            }
-        }
-        let key = retarget_height.to_le_bytes();
-        if let Some(v) = self.get::<Vec<crate::epoch::Anchor>>("retarget_cache", &key)? {
-            if let Ok(mut guard) = self.retarget_cache_mem.lock() {
-                guard.insert(retarget_height, v.clone());
-            }
-            return Ok(Some(v));
-        }
-        Ok(None)
-    }
-
-    pub fn put_retarget_window_cached(
-        &self,
-        retarget_height: u64,
-        window: &[crate::epoch::Anchor],
-    ) -> Result<()> {
-        let key = retarget_height.to_le_bytes();
-        let handle = self
-            .db
-            .cf_handle("retarget_cache")
-            .ok_or_else(|| anyhow::anyhow!("'retarget_cache' column family missing"))?;
-        let ser =
-            bincode::serialize(window).with_context(|| "Failed to serialize retarget window")?;
-        self.db.put_cf(handle, &key, &ser)?;
-        if let Ok(mut guard) = self.retarget_cache_mem.lock() {
-            guard.insert(retarget_height, window.to_vec());
-        }
-        Ok(())
-    }
-
-    pub fn get_or_build_retarget_window(
-        &self,
-        retarget_height: u64,
-    ) -> Result<Option<Vec<crate::epoch::Anchor>>> {
-        if let Some(v) = self.get_retarget_window_cached(retarget_height)? {
-            return Ok(Some(v));
-        }
-        if retarget_height == 0 {
-            return Ok(Some(Vec::new()));
-        }
-        let start = retarget_height.saturating_sub(crate::consensus::RETARGET_INTERVAL);
-        let mut recent: Vec<crate::epoch::Anchor> =
-            Vec::with_capacity(crate::consensus::RETARGET_INTERVAL as usize);
-        for n in start..retarget_height {
-            match self.get::<crate::epoch::Anchor>("epoch", &n.to_le_bytes())? {
-                Some(a) => recent.push(a),
-                None => return Ok(None),
-            }
-        }
-        if recent.len() as u64 == crate::consensus::RETARGET_INTERVAL {
-            self.put_retarget_window_cached(retarget_height, &recent)?;
-            return Ok(Some(recent));
-        }
-        Ok(None)
     }
 
     /// Atomically applies a set of writes.
@@ -859,6 +770,77 @@ impl Store {
         for item in iter {
             let (_k, v) = item?;
             records.push(v.to_vec());
+        }
+        Ok(records)
+    }
+
+    pub fn store_validator_pool(&self, pool: &crate::staking::ValidatorPool) -> Result<()> {
+        self.put("validator_pool", &pool.validator.id.0, pool)
+    }
+
+    pub fn load_validator_pool(
+        &self,
+        validator_id: &crate::consensus::ValidatorId,
+    ) -> Result<Option<crate::staking::ValidatorPool>> {
+        self.get("validator_pool", &validator_id.0)
+    }
+
+    pub fn load_validator_pools(&self) -> Result<Vec<crate::staking::ValidatorPool>> {
+        let cf = self
+            .db
+            .cf_handle("validator_pool")
+            .ok_or_else(|| anyhow::anyhow!("'validator_pool' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut pools = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            pools.push(bincode::deserialize(&value)?);
+        }
+        Ok(pools)
+    }
+
+    pub fn store_validator_committee(
+        &self,
+        validator_set: &crate::consensus::ValidatorSet,
+    ) -> Result<()> {
+        self.put(
+            "validator_committee",
+            &validator_set.epoch.to_le_bytes(),
+            validator_set,
+        )
+    }
+
+    pub fn load_validator_committee(
+        &self,
+        epoch: u64,
+    ) -> Result<Option<crate::consensus::ValidatorSet>> {
+        self.get("validator_committee", &epoch.to_le_bytes())
+    }
+
+    pub fn store_delegation_share(
+        &self,
+        record: &crate::staking::DelegationShareRecord,
+    ) -> Result<()> {
+        self.put("delegation_share", &record.note_commitment, record)
+    }
+
+    pub fn load_delegation_share(
+        &self,
+        note_commitment: &[u8; 32],
+    ) -> Result<Option<crate::staking::DelegationShareRecord>> {
+        self.get("delegation_share", note_commitment)
+    }
+
+    pub fn load_delegation_shares(&self) -> Result<Vec<crate::staking::DelegationShareRecord>> {
+        let cf = self
+            .db
+            .cf_handle("delegation_share")
+            .ok_or_else(|| anyhow::anyhow!("'delegation_share' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut records = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            records.push(bincode::deserialize(&value)?);
         }
         Ok(records)
     }
@@ -1592,8 +1574,6 @@ pub fn protocol_chain_id() -> [u8; 32] {
 }
 
 fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]) -> Result<()> {
-    use crate::consensus::{params_from_anchor, validate_header_params, RETARGET_INTERVAL};
-
     let Some(genesis) = anchors.first() else {
         bail!("anchor snapshot is empty");
     };
@@ -1603,21 +1583,9 @@ fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]
     if genesis.hash != chain_id {
         bail!("snapshot chain_id does not match the genesis anchor hash");
     }
-    if genesis.difficulty != crate::protocol::CURRENT.genesis_difficulty as usize
-        || genesis.mem_kib != crate::protocol::CURRENT.genesis_mem_kib
-    {
-        bail!("snapshot genesis parameters do not match protocol rules");
-    }
-    if genesis.cumulative_work
-        != crate::epoch::Anchor::expected_work_for_difficulty(genesis.difficulty)
-    {
-        bail!("snapshot genesis cumulative work mismatch");
-    }
-    let mut genesis_hasher = blake3::Hasher::new();
-    genesis_hasher.update(&genesis.merkle_root);
-    if *genesis_hasher.finalize().as_bytes() != genesis.hash {
-        bail!("snapshot genesis hash mismatch");
-    }
+    genesis
+        .validate_against_parent(None)
+        .map_err(|err| anyhow!("invalid snapshot genesis checkpoint: {err}"))?;
 
     let mut validated = Vec::with_capacity(anchors.len());
     validated.push(genesis.clone());
@@ -1626,36 +1594,9 @@ fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]
         let prev = validated
             .last()
             .ok_or_else(|| anyhow!("validated snapshot unexpectedly missing parent"))?;
-        if anchor.num != prev.num.saturating_add(1) {
-            bail!("snapshot anchors must be contiguous");
-        }
-        if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 {
-            bail!("snapshot anchor merkle root cannot be zero when coins are present");
-        }
-        let window_start = validated.len().saturating_sub(RETARGET_INTERVAL as usize);
-        validate_header_params(
-            Some(prev),
-            anchor.num,
-            &validated[window_start..],
-            params_from_anchor(anchor),
-        )
-        .map_err(|err| {
-            anyhow!(
-                "snapshot consensus parameter mismatch at epoch {}: {err}",
-                anchor.num
-            )
-        })?;
-
-        let expected_work = crate::epoch::Anchor::expected_work_for_difficulty(anchor.difficulty);
-        if anchor.cumulative_work != prev.cumulative_work.saturating_add(expected_work) {
-            bail!("snapshot cumulative work mismatch at epoch {}", anchor.num);
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&anchor.merkle_root);
-        hasher.update(&prev.hash);
-        if *hasher.finalize().as_bytes() != anchor.hash {
-            bail!("snapshot anchor hash mismatch at epoch {}", anchor.num);
-        }
+        anchor
+            .validate_against_parent(Some(prev))
+            .map_err(|err| anyhow!("invalid snapshot checkpoint {}: {err}", anchor.num))?;
         validated.push(anchor.clone());
     }
 

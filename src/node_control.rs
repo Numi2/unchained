@@ -1,6 +1,6 @@
 use crate::{
-    coin::{Coin, CoinCandidate},
-    crypto,
+    coin::Coin,
+    consensus::ValidatorSet,
     epoch::Anchor,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     network::NetHandle,
@@ -8,6 +8,7 @@ use crate::{
         CheckpointExtensionRequest, HistoricalUnspentExtension, NoteCommitmentTree,
         NullifierRootLedger,
     },
+    staking::ValidatorPool,
     storage::Store,
     transaction::{self, ShieldedOutput, Tx},
 };
@@ -27,7 +28,6 @@ use crate::sync::SyncState;
 
 const NODE_CONTROL_SOCKET_FILE: &str = "node-control.sock";
 const NODE_CONTROL_CAPABILITY_FILE: &str = "node-control.cap";
-pub const RECENT_FINALIZED_SELECTION_WINDOW: u64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedRuntimeSnapshot {
@@ -40,28 +40,22 @@ pub struct ShieldedRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MiningWork {
+pub struct ConsensusStatus {
     pub chain_id: [u8; 32],
-    pub latest_anchor: Option<Anchor>,
-    pub recent_finalized_selections: Vec<FinalizedEpochSelection>,
+    pub latest_finalized_anchor: Option<Anchor>,
+    pub active_validator_set: Option<ValidatorSet>,
+    pub registered_validator_pools: Vec<ValidatorPool>,
     pub local_tip: u64,
     pub highest_seen_epoch: u64,
     pub peer_confirmed_tip: bool,
     pub synced: bool,
-    pub mining_ready: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FinalizedEpochSelection {
-    pub anchor_epoch: u64,
-    pub candidate_epoch: u64,
-    pub coin_ids: Vec<[u8; 32]>,
+    pub settlement_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeControlState {
     pub shielded_runtime: ShieldedRuntimeSnapshot,
-    pub mining_work: MiningWork,
+    pub consensus_status: ConsensusStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,15 +82,22 @@ pub fn build_shielded_runtime_snapshot(db: &Store) -> Result<ShieldedRuntimeSnap
     })
 }
 
-fn build_mining_work(
+fn build_consensus_status(
     db: &Store,
     sync_state: &Arc<Mutex<SyncState>>,
     bootstrap_configured: bool,
-) -> Result<MiningWork> {
-    let latest_anchor = db.get::<Anchor>("epoch", b"latest")?;
-    let recent_finalized_selections =
-        build_recent_finalized_selections(db, latest_anchor.as_ref())?;
-    let local_tip = latest_anchor.as_ref().map(|anchor| anchor.num).unwrap_or(0);
+) -> Result<ConsensusStatus> {
+    let latest_finalized_anchor = db.get::<Anchor>("epoch", b"latest")?;
+    let active_validator_set = latest_finalized_anchor
+        .as_ref()
+        .map(|anchor| db.load_validator_committee(anchor.position.epoch))
+        .transpose()?
+        .flatten();
+    let registered_validator_pools = db.load_validator_pools()?;
+    let local_tip = latest_finalized_anchor
+        .as_ref()
+        .map(|anchor| anchor.num)
+        .unwrap_or(0);
     let (synced, highest_seen_epoch, peer_confirmed_tip) = sync_state
         .lock()
         .map(|state| {
@@ -107,46 +108,22 @@ fn build_mining_work(
             )
         })
         .unwrap_or((false, 0, false));
-    let mining_ready = if bootstrap_configured {
+    let settlement_ready = if bootstrap_configured {
         synced && highest_seen_epoch > 0 && local_tip >= highest_seen_epoch && peer_confirmed_tip
     } else {
-        latest_anchor.is_some()
+        latest_finalized_anchor.is_some()
     };
-    Ok(MiningWork {
+    Ok(ConsensusStatus {
         chain_id: db.effective_chain_id(),
-        latest_anchor,
-        recent_finalized_selections,
+        latest_finalized_anchor,
+        active_validator_set,
+        registered_validator_pools,
         local_tip,
         highest_seen_epoch,
         peer_confirmed_tip,
         synced,
-        mining_ready,
+        settlement_ready,
     })
-}
-
-fn build_recent_finalized_selections(
-    db: &Store,
-    latest_anchor: Option<&Anchor>,
-) -> Result<Vec<FinalizedEpochSelection>> {
-    let Some(latest_anchor) = latest_anchor else {
-        return Ok(Vec::new());
-    };
-    let start_epoch = latest_anchor
-        .num
-        .saturating_sub(RECENT_FINALIZED_SELECTION_WINDOW.saturating_sub(1));
-    let mut selections = Vec::new();
-    for anchor_epoch in start_epoch..=latest_anchor.num {
-        let coin_ids = db.get_selected_coin_ids_for_epoch(anchor_epoch)?;
-        if coin_ids.is_empty() {
-            continue;
-        }
-        selections.push(FinalizedEpochSelection {
-            anchor_epoch,
-            candidate_epoch: anchor_epoch.saturating_sub(1),
-            coin_ids,
-        });
-    }
-    Ok(selections)
 }
 
 fn build_node_control_state(
@@ -156,7 +133,7 @@ fn build_node_control_state(
 ) -> Result<NodeControlState> {
     Ok(NodeControlState {
         shielded_runtime: build_shielded_runtime_snapshot(db)?,
-        mining_work: build_mining_work(db, sync_state, bootstrap_configured)?,
+        consensus_status: build_consensus_status(db, sync_state, bootstrap_configured)?,
     })
 }
 
@@ -168,9 +145,6 @@ pub enum NodeControlRequest {
         requests: Vec<CheckpointExtensionRequest>,
         rotation_round: u64,
     },
-    SubmitCoinCandidate {
-        candidate: CoinCandidate,
-    },
     SubmitTx {
         tx: Tx,
     },
@@ -181,9 +155,6 @@ pub enum NodeControlResponse {
     Pong,
     HistoricalExtensions {
         extensions: Vec<HistoricalUnspentExtension>,
-    },
-    SubmittedCoinCandidate {
-        coin_id: [u8; 32],
     },
     SubmittedTx {
         tx_id: [u8; 32],
@@ -273,8 +244,8 @@ impl NodeControlClient {
         Ok(self.current_state()?.state.shielded_runtime)
     }
 
-    pub fn mining_work(&self) -> Result<MiningWork> {
-        Ok(self.current_state()?.state.mining_work)
+    pub fn consensus_status(&self) -> Result<ConsensusStatus> {
+        Ok(self.current_state()?.state.consensus_status)
     }
 
     pub fn request_historical_extensions(
@@ -288,15 +259,6 @@ impl NodeControlClient {
         })? {
             NodeControlResponse::HistoricalExtensions { extensions } => Ok(extensions),
             other => bail!("unexpected node control historical-extension response: {other:?}"),
-        }
-    }
-
-    pub fn submit_coin_candidate(&self, candidate: &CoinCandidate) -> Result<[u8; 32]> {
-        match self.call(NodeControlRequest::SubmitCoinCandidate {
-            candidate: candidate.clone(),
-        })? {
-            NodeControlResponse::SubmittedCoinCandidate { coin_id } => Ok(coin_id),
-            other => bail!("unexpected node control coin-candidate response: {other:?}"),
         }
     }
 
@@ -427,7 +389,6 @@ pub struct NodeControlServer {
     db: Arc<Store>,
     net: NetHandle,
     sync_state: Arc<Mutex<SyncState>>,
-    coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     bootstrap_configured: bool,
     state_tx: watch::Sender<NodeControlStateEnvelope>,
     state_refresh_tx: mpsc::UnboundedSender<()>,
@@ -440,7 +401,6 @@ impl NodeControlServer {
         db: Arc<Store>,
         net: NetHandle,
         sync_state: Arc<Mutex<SyncState>>,
-        coin_tx: mpsc::UnboundedSender<[u8; 32]>,
         bootstrap_configured: bool,
     ) -> Result<Self> {
         let socket_path = node_control_socket_path(base_path);
@@ -462,7 +422,6 @@ impl NodeControlServer {
             db,
             net,
             sync_state,
-            coin_tx,
             bootstrap_configured,
             state_tx,
             state_refresh_tx,
@@ -493,7 +452,6 @@ impl NodeControlServer {
                     let (stream, _) = accept_result.context("node control accept failed")?;
                     let db = self.db.clone();
                     let net = self.net.clone();
-                    let coin_tx = self.coin_tx.clone();
                     let capability = self.capability;
                     let state_rx = self.state_tx.subscribe();
                     let state_refresh_tx = self.state_refresh_tx.clone();
@@ -503,7 +461,6 @@ impl NodeControlServer {
                             capability,
                             db,
                             net,
-                            coin_tx,
                             state_rx,
                             state_refresh_tx,
                             connection_shutdown,
@@ -522,54 +479,6 @@ impl NodeControlServer {
     }
 }
 
-fn validate_candidate_submission(db: &Store, candidate: &CoinCandidate) -> Result<()> {
-    if candidate.id
-        != Coin::calculate_id(
-            &candidate.epoch_hash,
-            candidate.nonce,
-            &candidate.creator_address,
-        )
-    {
-        bail!("coin candidate id mismatch");
-    }
-    if crypto::address_from_pk(&candidate.creator_pk) != candidate.creator_address {
-        bail!("coin candidate creator public key does not match creator address");
-    }
-    let latest_anchor = db
-        .get::<Anchor>("epoch", b"latest")?
-        .ok_or_else(|| anyhow!("missing latest anchor"))?;
-    if candidate.epoch_hash != latest_anchor.hash {
-        bail!("coin candidate targets a stale or unknown epoch");
-    }
-    if latest_anchor.difficulty > 0
-        && !candidate
-            .pow_hash
-            .iter()
-            .take(latest_anchor.difficulty)
-            .all(|byte| *byte == 0)
-    {
-        bail!("coin candidate pow hash does not satisfy current difficulty");
-    }
-    Ok(())
-}
-
-async fn accept_coin_candidate(
-    db: &Store,
-    net: &NetHandle,
-    coin_tx: &mpsc::UnboundedSender<[u8; 32]>,
-    candidate: CoinCandidate,
-) -> Result<[u8; 32]> {
-    validate_candidate_submission(db, &candidate)?;
-    let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-    db.put("coin_candidate", &key, &candidate)?;
-    db.flush()?;
-    coin_tx
-        .send(candidate.id)
-        .map_err(|_| anyhow!("epoch manager candidate channel dropped"))?;
-    net.gossip_coin(&candidate).await;
-    Ok(candidate.id)
-}
-
 impl Drop for NodeControlServer {
     fn drop(&mut self) {
         local_control::remove_local_artifacts(&self.socket_path, &self.capability_path);
@@ -580,7 +489,6 @@ async fn handle_connection(
     capability: ControlCapability,
     db: Arc<Store>,
     net: NetHandle,
-    coin_tx: mpsc::UnboundedSender<[u8; 32]>,
     mut state_rx: watch::Receiver<NodeControlStateEnvelope>,
     state_refresh_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -668,8 +576,7 @@ async fn handle_connection(
             .context("failed to close node control subscription")?;
         return Ok(());
     }
-    let response =
-        handle_request(db.as_ref(), &net, &coin_tx, &state_refresh_tx, request_body).await;
+    let response = handle_request(db.as_ref(), &net, &state_refresh_tx, request_body).await;
 
     local_control::write_async_frame(&mut write_half, &response, "node control response").await?;
     write_half
@@ -682,7 +589,6 @@ async fn handle_connection(
 async fn handle_request(
     db: &Store,
     net: &NetHandle,
-    coin_tx: &mpsc::UnboundedSender<[u8; 32]>,
     state_refresh_tx: &mpsc::UnboundedSender<()>,
     request: NodeControlRequest,
 ) -> NodeControlResponse {
@@ -700,11 +606,6 @@ async fn handle_request(
                     .request_historical_extensions(&requests, rotation_round)
                     .await?;
                 Ok(NodeControlResponse::HistoricalExtensions { extensions })
-            }
-            NodeControlRequest::SubmitCoinCandidate { candidate } => {
-                let coin_id = accept_coin_candidate(db, net, coin_tx, candidate).await?;
-                let _ = state_refresh_tx.send(());
-                Ok(NodeControlResponse::SubmittedCoinCandidate { coin_id })
             }
             NodeControlRequest::SubmitTx { tx } => {
                 let tx_id = tx.apply(db)?;

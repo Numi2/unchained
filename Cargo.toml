@@ -83,10 +83,6 @@ name = "unchained_wallet"
 path = "src/bin/unchained_wallet.rs"
 
 [[bin]]
-name = "unchained_miner"
-path = "src/bin/unchained_miner.rs"
-
-[[bin]]
 name = "inspect_db"
 path = "src/bin/inspect_db.rs"
 

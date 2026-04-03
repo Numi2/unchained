@@ -50,7 +50,7 @@ pub enum WalletControlResponse {
 pub struct WalletControlStateEnvelope {
     pub sequence: u64,
     pub node_state_sequence: u64,
-    pub identity: MiningIdentity,
+    pub identity: WalletIdentity,
     pub state: WalletObservedState,
 }
 
@@ -65,7 +65,7 @@ pub enum WalletControlStreamMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MiningIdentity {
+pub struct WalletIdentity {
     pub address: Address,
     pub signing_pk: TaggedSigningPublicKey,
 }
@@ -179,7 +179,7 @@ impl WalletControlClient {
         }
     }
 
-    pub async fn mining_identity(&self) -> Result<MiningIdentity> {
+    pub async fn identity(&self) -> Result<WalletIdentity> {
         Ok(self.state().await?.identity)
     }
 
@@ -344,8 +344,8 @@ impl WalletControlService {
         })
     }
 
-    fn mining_identity(&self) -> MiningIdentity {
-        MiningIdentity {
+    fn identity(&self) -> WalletIdentity {
+        WalletIdentity {
             address: self.wallet.address(),
             signing_pk: self.wallet.public_key().clone(),
         }
@@ -403,7 +403,7 @@ impl WalletControlServer {
         let initial_state = WalletControlStateEnvelope {
             sequence: 0,
             node_state_sequence: initial_node_state.sequence,
-            identity: service.mining_identity(),
+            identity: service.identity(),
             state: service
                 .observed_state_from_node(&initial_node_state)
                 .await?,
@@ -671,7 +671,7 @@ async fn run_wallet_state_publisher(
             latest = WalletControlStateEnvelope {
                 sequence: next_sequence,
                 node_state_sequence: node_state.sequence,
-                identity: service.mining_identity(),
+                identity: service.identity(),
                 state: next_state,
             };
             next_sequence = next_sequence.saturating_add(1);

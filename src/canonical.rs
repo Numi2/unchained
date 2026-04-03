@@ -2,11 +2,15 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::{
     coin::{Coin, CoinCandidate},
+    consensus::{
+        ConsensusPosition, OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys,
+        ValidatorSet, ValidatorVote,
+    },
     crypto::{
         Address, KemAlgorithm, SignatureAlgorithm, TaggedKemPublicKey, TaggedSigningPublicKey,
         ML_DSA_65_PK_BYTES, ML_KEM_768_PK_BYTES,
     },
-    epoch::Anchor,
+    epoch::{Anchor, AnchorProposal},
     network::{
         CompactEpoch, EpochByHash, EpochCandidatesResponse, EpochGetTxn, EpochHeadersBatch,
         EpochHeadersRange, EpochLeavesBundle, EpochTxn, SelectedIdsBundle,
@@ -23,9 +27,17 @@ use crate::{
         HistoricalUnspentCheckpoint, HistoricalUnspentExtension, HistoricalUnspentPacket,
         HistoricalUnspentSegment, HistoricalUnspentServiceResponse, HistoricalUnspentStratum,
         NoteCommitmentTree, NoteMembershipProof, NullifierMembershipWitness,
-        NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedSpendContext,
+        NullifierNonMembershipProof, NullifierRootLedger, ShieldedNote, ShieldedNoteKind,
+        ShieldedSpendContext,
     },
-    transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
+    staking::{
+        ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate, ValidatorRegistration,
+        ValidatorStatus,
+    },
+    transaction::{
+        OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization, SharedStateTx,
+        ShieldedOutput, ShieldedOutputPlaintext, Tx,
+    },
     wallet::RecipientHandle,
 };
 
@@ -271,6 +283,363 @@ fn read_option_bytes(reader: &mut CanonicalReader<'_>) -> Result<Option<Vec<u8>>
     }
 }
 
+fn write_validator_id(writer: &mut CanonicalWriter, value: &ValidatorId) {
+    writer.write_fixed(&value.0);
+}
+
+fn read_validator_id(reader: &mut CanonicalReader<'_>) -> Result<ValidatorId> {
+    Ok(ValidatorId(reader.read_fixed()?))
+}
+
+fn write_ordering_path(writer: &mut CanonicalWriter, path: OrderingPath) {
+    writer.write_u8(match path {
+        OrderingPath::FastPathPrivateTransfer => 0,
+        OrderingPath::DagBftSharedState => 1,
+    });
+}
+
+fn read_ordering_path(reader: &mut CanonicalReader<'_>) -> Result<OrderingPath> {
+    match reader.read_u8()? {
+        0 => Ok(OrderingPath::FastPathPrivateTransfer),
+        1 => Ok(OrderingPath::DagBftSharedState),
+        other => bail!("unsupported ordering path {}", other),
+    }
+}
+
+fn write_consensus_position(writer: &mut CanonicalWriter, position: &ConsensusPosition) {
+    writer.write_u64(position.epoch);
+    writer.write_u32(position.slot);
+}
+
+fn read_consensus_position(reader: &mut CanonicalReader<'_>) -> Result<ConsensusPosition> {
+    Ok(ConsensusPosition {
+        epoch: reader.read_u64()?,
+        slot: reader.read_u32()?,
+    })
+}
+
+fn write_validator_keys(writer: &mut CanonicalWriter, keys: &ValidatorKeys) -> Result<()> {
+    writer.write_bytes(&keys.hot_ml_dsa_65_spki)?;
+    writer.write_bytes(&keys.cold_governance_key)?;
+    Ok(())
+}
+
+fn read_validator_keys(reader: &mut CanonicalReader<'_>) -> Result<ValidatorKeys> {
+    Ok(ValidatorKeys {
+        hot_ml_dsa_65_spki: reader.read_bytes()?,
+        cold_governance_key: reader.read_bytes()?,
+    })
+}
+
+fn write_validator(writer: &mut CanonicalWriter, validator: &Validator) -> Result<()> {
+    write_validator_id(writer, &validator.id);
+    writer.write_u64(validator.voting_power);
+    write_validator_keys(writer, &validator.keys)?;
+    Ok(())
+}
+
+fn read_validator(reader: &mut CanonicalReader<'_>) -> Result<Validator> {
+    Ok(Validator {
+        id: read_validator_id(reader)?,
+        voting_power: reader.read_u64()?,
+        keys: read_validator_keys(reader)?,
+    })
+}
+
+fn write_validator_set(writer: &mut CanonicalWriter, validator_set: &ValidatorSet) -> Result<()> {
+    writer.write_u64(validator_set.epoch);
+    writer.write_vec(&validator_set.validators, |writer, validator| {
+        write_validator(writer, validator)
+    })?;
+    Ok(())
+}
+
+fn read_validator_set(reader: &mut CanonicalReader<'_>) -> Result<ValidatorSet> {
+    let epoch = reader.read_u64()?;
+    let validators = reader.read_vec(read_validator)?;
+    ValidatorSet::new(epoch, validators)
+}
+
+fn write_option_string(writer: &mut CanonicalWriter, value: &Option<String>) -> Result<()> {
+    writer.write_bool(value.is_some());
+    if let Some(value) = value {
+        writer.write_string(value)?;
+    }
+    Ok(())
+}
+
+fn read_option_string(reader: &mut CanonicalReader<'_>) -> Result<Option<String>> {
+    if reader.read_bool()? {
+        Ok(Some(reader.read_string()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_validator_status(writer: &mut CanonicalWriter, status: ValidatorStatus) {
+    writer.write_u8(match status {
+        ValidatorStatus::PendingActivation => 0,
+        ValidatorStatus::Active => 1,
+        ValidatorStatus::Jailed => 2,
+        ValidatorStatus::Retired => 3,
+    });
+}
+
+fn read_validator_status(reader: &mut CanonicalReader<'_>) -> Result<ValidatorStatus> {
+    match reader.read_u8()? {
+        0 => Ok(ValidatorStatus::PendingActivation),
+        1 => Ok(ValidatorStatus::Active),
+        2 => Ok(ValidatorStatus::Jailed),
+        3 => Ok(ValidatorStatus::Retired),
+        other => bail!("unsupported validator status {}", other),
+    }
+}
+
+fn write_validator_metadata(
+    writer: &mut CanonicalWriter,
+    metadata: &ValidatorMetadata,
+) -> Result<()> {
+    writer.write_string(&metadata.display_name)?;
+    write_option_string(writer, &metadata.website)?;
+    write_option_string(writer, &metadata.description)?;
+    Ok(())
+}
+
+fn read_validator_metadata(reader: &mut CanonicalReader<'_>) -> Result<ValidatorMetadata> {
+    let metadata = ValidatorMetadata {
+        display_name: reader.read_string()?,
+        website: read_option_string(reader)?,
+        description: read_option_string(reader)?,
+    };
+    metadata.validate()?;
+    Ok(metadata)
+}
+
+fn write_validator_pool(writer: &mut CanonicalWriter, pool: &ValidatorPool) -> Result<()> {
+    write_validator(writer, &pool.validator)?;
+    writer.write_fixed(&pool.node_id);
+    writer.write_u32(pool.commission_bps as u32);
+    writer.write_u64(pool.total_bonded_stake);
+    writer.write_u128(pool.total_delegation_shares);
+    writer.write_u64(pool.activation_epoch);
+    write_validator_status(writer, pool.status);
+    write_validator_metadata(writer, &pool.metadata)?;
+    Ok(())
+}
+
+fn read_validator_pool(reader: &mut CanonicalReader<'_>) -> Result<ValidatorPool> {
+    let validator = read_validator(reader)?;
+    let node_id = reader.read_fixed()?;
+    let commission_bps = u16::try_from(reader.read_u32()?)
+        .map_err(|_| anyhow!("validator commission exceeds u16"))?;
+    let total_bonded_stake = reader.read_u64()?;
+    let total_delegation_shares = reader.read_u128()?;
+    let activation_epoch = reader.read_u64()?;
+    let status = read_validator_status(reader)?;
+    let metadata = read_validator_metadata(reader)?;
+    let mut pool = ValidatorPool::new(
+        validator,
+        node_id,
+        commission_bps,
+        total_bonded_stake,
+        activation_epoch,
+        status,
+        metadata,
+    )?;
+    pool.total_delegation_shares = total_delegation_shares;
+    pool.validate()?;
+    Ok(pool)
+}
+
+fn write_validator_registration(
+    writer: &mut CanonicalWriter,
+    registration: &ValidatorRegistration,
+) -> Result<()> {
+    write_validator_pool(writer, &registration.pool)
+}
+
+fn read_validator_registration(reader: &mut CanonicalReader<'_>) -> Result<ValidatorRegistration> {
+    let registration = ValidatorRegistration {
+        pool: read_validator_pool(reader)?,
+    };
+    registration.validate()?;
+    Ok(registration)
+}
+
+fn write_validator_profile_update(
+    writer: &mut CanonicalWriter,
+    update: &ValidatorProfileUpdate,
+) -> Result<()> {
+    write_validator_id(writer, &update.validator_id);
+    writer.write_u32(update.commission_bps as u32);
+    write_validator_metadata(writer, &update.metadata)?;
+    Ok(())
+}
+
+fn read_validator_profile_update(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<ValidatorProfileUpdate> {
+    let update = ValidatorProfileUpdate {
+        validator_id: read_validator_id(reader)?,
+        commission_bps: u16::try_from(reader.read_u32()?)
+            .map_err(|_| anyhow!("validator commission exceeds u16"))?,
+        metadata: read_validator_metadata(reader)?,
+    };
+    update.validate()?;
+    Ok(update)
+}
+
+fn write_shared_state_action(
+    writer: &mut CanonicalWriter,
+    action: &SharedStateAction,
+) -> Result<()> {
+    match action {
+        SharedStateAction::RegisterValidator(registration) => {
+            writer.write_u8(1);
+            write_validator_registration(writer, registration)?;
+        }
+        SharedStateAction::UpdateValidatorProfile(update) => {
+            writer.write_u8(2);
+            write_validator_profile_update(writer, update)?;
+        }
+        SharedStateAction::PrivateDelegation(delegation) => {
+            writer.write_u8(3);
+            write_validator_id(writer, &delegation.validator_id);
+            write_ordinary_private_transfer(writer, &delegation.transfer)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_shared_state_action(reader: &mut CanonicalReader<'_>) -> Result<SharedStateAction> {
+    match reader.read_u8()? {
+        1 => Ok(SharedStateAction::RegisterValidator(
+            read_validator_registration(reader)?,
+        )),
+        2 => Ok(SharedStateAction::UpdateValidatorProfile(
+            read_validator_profile_update(reader)?,
+        )),
+        3 => Ok(SharedStateAction::PrivateDelegation(
+            crate::transaction::PrivateDelegation {
+                validator_id: read_validator_id(reader)?,
+                transfer: read_ordinary_private_transfer(reader)?,
+            },
+        )),
+        other => bail!("unsupported shared-state action tag {}", other),
+    }
+}
+
+fn write_shared_state_authorization(
+    writer: &mut CanonicalWriter,
+    authorization: &SharedStateAuthorization,
+) -> Result<()> {
+    writer.write_bytes(&authorization.signature)
+}
+
+fn read_shared_state_authorization(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<SharedStateAuthorization> {
+    Ok(SharedStateAuthorization {
+        signature: reader.read_bytes()?,
+    })
+}
+
+fn write_ordinary_private_transfer(
+    writer: &mut CanonicalWriter,
+    transfer: &OrdinaryPrivateTransfer,
+) -> Result<()> {
+    writer.write_vec(&transfer.nullifiers, |writer, nullifier| {
+        writer.write_fixed(nullifier);
+        Ok(())
+    })?;
+    writer.write_vec(&transfer.outputs, |writer, output| {
+        writer.write_bytes(&encode_shielded_output(output)?)?;
+        Ok(())
+    })?;
+    writer.write_bytes(&transfer.proof)?;
+    Ok(())
+}
+
+fn read_ordinary_private_transfer(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<OrdinaryPrivateTransfer> {
+    Ok(OrdinaryPrivateTransfer {
+        nullifiers: reader.read_vec(|reader| reader.read_fixed())?,
+        outputs: reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?,
+        proof: reader.read_bytes()?,
+    })
+}
+
+fn write_shared_state_tx(writer: &mut CanonicalWriter, tx: &SharedStateTx) -> Result<()> {
+    write_shared_state_action(writer, &tx.action)?;
+    write_shared_state_authorization(writer, &tx.authorization)?;
+    Ok(())
+}
+
+fn read_shared_state_tx(reader: &mut CanonicalReader<'_>) -> Result<SharedStateTx> {
+    Ok(SharedStateTx {
+        action: read_shared_state_action(reader)?,
+        authorization: read_shared_state_authorization(reader)?,
+    })
+}
+
+fn write_vote_target(writer: &mut CanonicalWriter, target: &crate::consensus::VoteTarget) {
+    write_consensus_position(writer, &target.position);
+    write_ordering_path(writer, target.ordering_path);
+    writer.write_fixed(&target.block_digest);
+}
+
+fn read_vote_target(reader: &mut CanonicalReader<'_>) -> Result<crate::consensus::VoteTarget> {
+    Ok(crate::consensus::VoteTarget {
+        position: read_consensus_position(reader)?,
+        ordering_path: read_ordering_path(reader)?,
+        block_digest: reader.read_fixed()?,
+    })
+}
+
+fn write_validator_vote(writer: &mut CanonicalWriter, vote: &ValidatorVote) -> Result<()> {
+    write_validator_id(writer, &vote.voter);
+    write_vote_target(writer, &vote.target);
+    writer.write_bytes(&vote.signature)?;
+    Ok(())
+}
+
+fn read_validator_vote(reader: &mut CanonicalReader<'_>) -> Result<ValidatorVote> {
+    Ok(ValidatorVote {
+        voter: read_validator_id(reader)?,
+        target: read_vote_target(reader)?,
+        signature: reader.read_bytes()?,
+    })
+}
+
+pub fn encode_validator_vote(vote: &ValidatorVote) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_validator_vote(&mut writer, vote)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_validator_vote(bytes: &[u8]) -> Result<ValidatorVote> {
+    let mut reader = CanonicalReader::new(bytes);
+    let vote = read_validator_vote(&mut reader)?;
+    reader.finish()?;
+    Ok(vote)
+}
+
+fn write_quorum_certificate(writer: &mut CanonicalWriter, qc: &QuorumCertificate) -> Result<()> {
+    write_vote_target(writer, &qc.target);
+    writer.write_vec(&qc.votes, |writer, vote| write_validator_vote(writer, vote))?;
+    writer.write_u64(qc.signed_voting_power);
+    Ok(())
+}
+
+fn read_quorum_certificate(reader: &mut CanonicalReader<'_>) -> Result<QuorumCertificate> {
+    Ok(QuorumCertificate {
+        target: read_vote_target(reader)?,
+        votes: reader.read_vec(read_validator_vote)?,
+        signed_voting_power: reader.read_u64()?,
+    })
+}
+
 fn write_merkle_proof(writer: &mut CanonicalWriter, proof: &[([u8; 32], bool)]) -> Result<()> {
     writer.write_vec(proof, |writer, (hash, is_left)| {
         writer.write_fixed(hash);
@@ -290,26 +659,85 @@ fn read_merkle_proof(reader: &mut CanonicalReader<'_>) -> Result<Vec<([u8; 32], 
 pub fn write_anchor(writer: &mut CanonicalWriter, anchor: &Anchor) -> Result<()> {
     writer.write_u64(anchor.num);
     writer.write_fixed(&anchor.hash);
+    write_option_fixed32(writer, &anchor.parent_hash);
+    write_consensus_position(writer, &anchor.position);
+    write_ordering_path(writer, anchor.ordering_path);
     writer.write_fixed(&anchor.merkle_root);
-    let difficulty =
-        u32::try_from(anchor.difficulty).map_err(|_| anyhow!("difficulty too large"))?;
-    writer.write_u32(difficulty);
     writer.write_u32(anchor.coin_count);
-    writer.write_u128(anchor.cumulative_work);
-    writer.write_u32(anchor.mem_kib);
+    write_validator_set(writer, &anchor.validator_set)?;
+    write_quorum_certificate(writer, &anchor.qc)?;
     Ok(())
 }
 
+pub fn write_anchor_proposal(
+    writer: &mut CanonicalWriter,
+    proposal: &AnchorProposal,
+) -> Result<()> {
+    writer.write_u64(proposal.num);
+    writer.write_fixed(&proposal.hash);
+    write_option_fixed32(writer, &proposal.parent_hash);
+    write_consensus_position(writer, &proposal.position);
+    write_ordering_path(writer, proposal.ordering_path);
+    writer.write_fixed(&proposal.merkle_root);
+    writer.write_u32(proposal.coin_count);
+    write_validator_set(writer, &proposal.validator_set)?;
+    Ok(())
+}
+
+pub fn read_anchor_proposal(reader: &mut CanonicalReader<'_>) -> Result<AnchorProposal> {
+    let num = reader.read_u64()?;
+    let hash = reader.read_fixed()?;
+    let parent_hash = read_option_fixed32(reader)?;
+    let position = read_consensus_position(reader)?;
+    let ordering_path = read_ordering_path(reader)?;
+    let merkle_root = reader.read_fixed()?;
+    let coin_count = reader.read_u32()?;
+    let validator_set = read_validator_set(reader)?;
+    let proposal = AnchorProposal::new(
+        num,
+        parent_hash,
+        ordering_path,
+        merkle_root,
+        coin_count,
+        validator_set,
+    )
+    .map_err(|err| anyhow!(err))?;
+    if proposal.hash != hash {
+        bail!("checkpoint proposal hash mismatch");
+    }
+    if proposal.position != position {
+        bail!("checkpoint proposal position mismatch");
+    }
+    Ok(proposal)
+}
+
 pub fn read_anchor(reader: &mut CanonicalReader<'_>) -> Result<Anchor> {
-    Ok(Anchor {
-        num: reader.read_u64()?,
-        hash: reader.read_fixed()?,
-        merkle_root: reader.read_fixed()?,
-        difficulty: reader.read_u32()? as usize,
-        coin_count: reader.read_u32()?,
-        cumulative_work: reader.read_u128()?,
-        mem_kib: reader.read_u32()?,
-    })
+    let num = reader.read_u64()?;
+    let hash = reader.read_fixed()?;
+    let parent_hash = read_option_fixed32(reader)?;
+    let position = read_consensus_position(reader)?;
+    let ordering_path = read_ordering_path(reader)?;
+    let merkle_root = reader.read_fixed()?;
+    let coin_count = reader.read_u32()?;
+    let validator_set = read_validator_set(reader)?;
+    let qc = read_quorum_certificate(reader)?;
+    let anchor = Anchor::new(
+        num,
+        parent_hash,
+        ordering_path,
+        merkle_root,
+        coin_count,
+        validator_set,
+        qc,
+    )
+    .map_err(|err| anyhow!(err))?;
+    if anchor.hash != hash {
+        bail!("checkpoint hash mismatch");
+    }
+    if anchor.position != position {
+        bail!("checkpoint position mismatch");
+    }
+    Ok(anchor)
 }
 
 pub fn encode_anchor(anchor: &Anchor) -> Result<Vec<u8>> {
@@ -318,11 +746,48 @@ pub fn encode_anchor(anchor: &Anchor) -> Result<Vec<u8>> {
     Ok(writer.into_vec())
 }
 
+pub fn encode_anchor_proposal(proposal: &AnchorProposal) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_anchor_proposal(&mut writer, proposal)?;
+    Ok(writer.into_vec())
+}
+
 pub fn decode_anchor(bytes: &[u8]) -> Result<Anchor> {
     let mut reader = CanonicalReader::new(bytes);
-    let anchor = read_anchor(&mut reader)?;
+    let num = reader.read_u64()?;
+    let hash = reader.read_fixed()?;
+    let parent_hash = read_option_fixed32(&mut reader)?;
+    let position = read_consensus_position(&mut reader)?;
+    let ordering_path = read_ordering_path(&mut reader)?;
+    let merkle_root = reader.read_fixed()?;
+    let coin_count = reader.read_u32()?;
+    let validator_set = read_validator_set(&mut reader)?;
+    let qc = read_quorum_certificate(&mut reader)?;
     reader.finish()?;
+    let anchor = Anchor::new(
+        num,
+        parent_hash,
+        ordering_path,
+        merkle_root,
+        coin_count,
+        validator_set,
+        qc,
+    )
+    .map_err(|err| anyhow!(err))?;
+    if anchor.hash != hash {
+        bail!("checkpoint hash mismatch");
+    }
+    if anchor.position != position {
+        bail!("checkpoint position mismatch");
+    }
     Ok(anchor)
+}
+
+pub fn decode_anchor_proposal(bytes: &[u8]) -> Result<AnchorProposal> {
+    let mut reader = CanonicalReader::new(bytes);
+    let proposal = read_anchor_proposal(&mut reader)?;
+    reader.finish()?;
+    Ok(proposal)
 }
 
 pub fn write_coin(writer: &mut CanonicalWriter, coin: &Coin) -> Result<()> {
@@ -369,7 +834,7 @@ pub fn write_coin_candidate(writer: &mut CanonicalWriter, coin: &CoinCandidate) 
     write_address(writer, &coin.creator_address);
     write_tagged_signing_public_key(writer, &coin.creator_pk);
     writer.write_fixed(&coin.lock_hash);
-    writer.write_fixed(&coin.pow_hash);
+    writer.write_fixed(&coin.admission_digest);
     Ok(())
 }
 
@@ -382,7 +847,7 @@ pub fn read_coin_candidate(reader: &mut CanonicalReader<'_>) -> Result<CoinCandi
         creator_address: read_address(reader)?,
         creator_pk: read_tagged_signing_public_key(reader)?,
         lock_hash: reader.read_fixed()?,
-        pow_hash: reader.read_fixed()?,
+        admission_digest: reader.read_fixed()?,
     })
 }
 
@@ -445,34 +910,44 @@ pub fn decode_shielded_output_plaintext(bytes: &[u8]) -> Result<ShieldedOutputPl
 
 pub fn encode_tx(tx: &Tx) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(b"unchained.shielded_tx.v2")?;
-    writer.write_vec(&tx.nullifiers, |writer, nullifier| {
-        writer.write_fixed(nullifier);
-        Ok(())
-    })?;
-    writer.write_vec(&tx.outputs, |writer, output| {
-        writer.write_bytes(&encode_shielded_output(output)?)?;
-        Ok(())
-    })?;
-    writer.write_bytes(&tx.proof)?;
+    writer.write_bytes(b"unchained.settlement_tx.v1")?;
+    match tx {
+        Tx::OrdinaryPrivateTransfer(transfer) => {
+            writer.write_u8(0);
+            write_ordinary_private_transfer(&mut writer, transfer)?;
+        }
+        Tx::SharedState(shared) => {
+            writer.write_u8(1);
+            write_shared_state_tx(&mut writer, shared)?;
+        }
+    }
     Ok(writer.into_vec())
 }
 
 pub fn decode_tx(bytes: &[u8]) -> Result<Tx> {
     let mut reader = CanonicalReader::new(bytes);
     let domain = reader.read_bytes()?;
-    if domain.as_slice() != b"unchained.shielded_tx.v2" {
+    if domain.as_slice() != b"unchained.settlement_tx.v1" {
         bail!("unsupported transaction encoding");
     }
-    let nullifiers = reader.read_vec(|reader| reader.read_fixed())?;
-    let outputs = reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?;
-    let proof = reader.read_bytes()?;
+    let tx = match reader.read_u8()? {
+        0 => Tx::OrdinaryPrivateTransfer(read_ordinary_private_transfer(&mut reader)?),
+        1 => Tx::SharedState(read_shared_state_tx(&mut reader)?),
+        other => bail!("unsupported transaction class tag {}", other),
+    };
     reader.finish()?;
-    Ok(Tx {
-        nullifiers,
-        outputs,
-        proof,
-    })
+    Ok(tx)
+}
+
+pub fn encode_shared_state_action_signing_message(
+    chain_id: &[u8; 32],
+    action: &SharedStateAction,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(b"unchained.shared_state_authorization.v1")?;
+    writer.write_fixed(chain_id);
+    write_shared_state_action(&mut writer, action)?;
+    Ok(writer.into_vec())
 }
 
 pub fn encode_recipient_handle_signable(
@@ -829,9 +1304,42 @@ pub fn decode_signed_envelope(bytes: &[u8]) -> Result<SignedEnvelope> {
     Ok(envelope)
 }
 
+fn write_shielded_note_kind(writer: &mut CanonicalWriter, kind: &ShieldedNoteKind) {
+    match kind {
+        ShieldedNoteKind::Payment => writer.write_u8(0),
+        ShieldedNoteKind::DelegationShare { validator_id } => {
+            writer.write_u8(1);
+            writer.write_fixed(validator_id);
+        }
+        ShieldedNoteKind::UnbondingClaim {
+            validator_id,
+            release_epoch,
+        } => {
+            writer.write_u8(2);
+            writer.write_fixed(validator_id);
+            writer.write_u64(*release_epoch);
+        }
+    }
+}
+
+fn read_shielded_note_kind(reader: &mut CanonicalReader<'_>) -> Result<ShieldedNoteKind> {
+    match reader.read_u8()? {
+        0 => Ok(ShieldedNoteKind::Payment),
+        1 => Ok(ShieldedNoteKind::DelegationShare {
+            validator_id: reader.read_fixed()?,
+        }),
+        2 => Ok(ShieldedNoteKind::UnbondingClaim {
+            validator_id: reader.read_fixed()?,
+            release_epoch: reader.read_u64()?,
+        }),
+        other => bail!("unsupported shielded note kind {}", other),
+    }
+}
+
 pub fn encode_shielded_note(note: &ShieldedNote) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(note.version);
+    write_shielded_note_kind(&mut writer, &note.kind);
     writer.write_u64(note.value);
     writer.write_u64(note.birth_epoch);
     write_address(&mut writer, &note.owner_address);
@@ -848,6 +1356,7 @@ pub fn decode_shielded_note(bytes: &[u8]) -> Result<ShieldedNote> {
     let mut reader = CanonicalReader::new(bytes);
     let note = ShieldedNote {
         version: reader.read_u8()?,
+        kind: read_shielded_note_kind(&mut reader)?,
         value: reader.read_u64()?,
         birth_epoch: reader.read_u64()?,
         owner_address: read_address(&mut reader)?,

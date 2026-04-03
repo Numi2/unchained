@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
 use atty;
+use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
 use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaPublicKey, ML_DSA_65, ML_DSA_65_SIGNING};
 use blake3::Hasher;
@@ -209,6 +209,14 @@ pub fn ml_dsa_65_public_key(keypair: &PqdsaKeyPair) -> TaggedSigningPublicKey {
     TaggedSigningPublicKey::from_public_key(keypair.public_key())
 }
 
+pub fn ml_dsa_65_public_key_spki(keypair: &PqdsaKeyPair) -> Result<Vec<u8>> {
+    keypair
+        .public_key()
+        .as_der()
+        .map(|der| der.as_ref().to_vec())
+        .map_err(|_| anyhow!("failed to DER-encode ML-DSA-65 public key"))
+}
+
 pub fn ml_dsa_65_sign(keypair: &PqdsaKeyPair, msg: &[u8]) -> Result<Vec<u8>> {
     let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
     let len = keypair
@@ -253,21 +261,6 @@ fn ml_kem_768_ciphertext_from_bytes(
 ) -> ml_kem::Ciphertext<MlKem768> {
     ml_kem::Ciphertext::<MlKem768>::try_from(&bytes[..])
         .expect("ML-KEM-768 ciphertext bytes have fixed width")
-}
-
-/// Computes the Argon2id hash for Proof-of-Work.
-/// Consensus parameters: lanes must be 1. Salt = BLAKE3(header)[0..16].
-pub fn argon2id_pow(input: &[u8], mem_kib: u32) -> Result<[u8; 32]> {
-    let params = Params::new(mem_kib, 1, 1, None)
-        .map_err(|e| anyhow!("Invalid Argon2id parameters: {}", e))?;
-    let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut hash = [0u8; 32];
-    let full_salt = blake3::hash(input);
-    let salt = &full_salt.as_bytes()[..16];
-
-    a2.hash_password_into(input, salt, &mut hash)
-        .map_err(|e| anyhow!("Argon2id hashing failed: {}", e))?;
-    Ok(hash)
 }
 
 /// Hashes arbitrary data with a domain-specific key for internal consistency.

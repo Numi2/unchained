@@ -47,8 +47,62 @@ const GENESIS_NOTE_RHO_DOMAIN: &str = "unchained-shielded-genesis-note-rho-v1";
 const GENESIS_NOTE_RANDOMIZER_DOMAIN: &str = "unchained-shielded-genesis-note-randomizer-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ShieldedNoteKind {
+    Payment,
+    DelegationShare {
+        validator_id: [u8; 32],
+    },
+    UnbondingClaim {
+        validator_id: [u8; 32],
+        release_epoch: u64,
+    },
+}
+
+impl ShieldedNoteKind {
+    pub fn payment() -> Self {
+        Self::Payment
+    }
+
+    pub fn is_payment(&self) -> bool {
+        matches!(self, Self::Payment)
+    }
+
+    pub fn is_delegation_share_for(&self, validator_id: &[u8; 32]) -> bool {
+        matches!(
+            self,
+            Self::DelegationShare {
+                validator_id: note_validator_id
+            } if note_validator_id == validator_id
+        )
+    }
+
+    fn commitment_bytes(&self) -> [u8; 41] {
+        let mut out = [0u8; 41];
+        match self {
+            Self::Payment => {
+                out[0] = 0;
+            }
+            Self::DelegationShare { validator_id } => {
+                out[0] = 1;
+                out[1..33].copy_from_slice(validator_id);
+            }
+            Self::UnbondingClaim {
+                validator_id,
+                release_epoch,
+            } => {
+                out[0] = 2;
+                out[1..33].copy_from_slice(validator_id);
+                out[33..41].copy_from_slice(&release_epoch.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedNote {
     pub version: u8,
+    pub kind: ShieldedNoteKind,
     pub value: u64,
     pub birth_epoch: u64,
     pub owner_address: Address,
@@ -411,10 +465,33 @@ impl ShieldedNote {
         rho: [u8; 32],
         note_randomizer: [u8; 32],
     ) -> Self {
+        Self::new_with_kind(
+            ShieldedNoteKind::Payment,
+            value,
+            birth_epoch,
+            owner_signing_pk,
+            owner_kem_pk,
+            note_key,
+            rho,
+            note_randomizer,
+        )
+    }
+
+    pub fn new_with_kind(
+        kind: ShieldedNoteKind,
+        value: u64,
+        birth_epoch: u64,
+        owner_signing_pk: TaggedSigningPublicKey,
+        owner_kem_pk: TaggedKemPublicKey,
+        note_key: [u8; 32],
+        rho: [u8; 32],
+        note_randomizer: [u8; 32],
+    ) -> Self {
         let owner_address = owner_signing_pk.address();
         let note_key_commitment = note_key_commitment(&note_key);
         let commitment = compute_note_commitment(
             SHIELDED_NOTE_VERSION,
+            &kind,
             value,
             birth_epoch,
             &owner_address,
@@ -426,6 +503,7 @@ impl ShieldedNote {
         );
         Self {
             version: SHIELDED_NOTE_VERSION,
+            kind,
             value,
             birth_epoch,
             owner_address,
@@ -447,6 +525,7 @@ impl ShieldedNote {
         }
         let expected = compute_note_commitment(
             self.version,
+            &self.kind,
             self.value,
             self.birth_epoch,
             &self.owner_address,
@@ -3063,6 +3142,7 @@ pub fn nullifier_leaf_hash(nullifier: &[u8; 32]) -> [u8; 32] {
 
 fn compute_note_commitment(
     version: u8,
+    kind: &ShieldedNoteKind,
     value: u64,
     birth_epoch: u64,
     owner_address: &Address,
@@ -3074,6 +3154,7 @@ fn compute_note_commitment(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(NOTE_COMMIT_DOMAIN);
     hasher.update(&[version]);
+    hasher.update(&kind.commitment_bytes());
     hasher.update(&value.to_le_bytes());
     hasher.update(&birth_epoch.to_le_bytes());
     hasher.update(owner_address);

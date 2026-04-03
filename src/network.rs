@@ -1,8 +1,9 @@
 use crate::canonical::{self, CanonicalReader, CanonicalWriter};
 use crate::consensus::{
-    calculate_retarget_consensus, DEFAULT_MEM_KIB, RETARGET_INTERVAL, TARGET_LEADING_ZEROS,
+    OrderingPath, QuorumCertificate, ValidatorId, ValidatorVote, DAG_BFT_TIMEOUT_MS,
+    FAST_PATH_TIMEOUT_MS,
 };
-use crate::epoch::{Anchor, MerkleTree};
+use crate::epoch::{Anchor, AnchorProposal, MerkleTree};
 use crate::metrics;
 use crate::node_identity::{
     build_client_config, build_server_config, load_local_node_id, tls_peer_spki,
@@ -10,11 +11,15 @@ use crate::node_identity::{
     TrustPolicy,
 };
 use crate::protocol::CURRENT as PROTOCOL;
+use crate::staking::{
+    expected_validator_set_for_epoch, load_or_compute_active_validator_set,
+    register_genesis_local_validator_pool,
+};
 use crate::storage::Store;
 use crate::sync::SyncState;
 use crate::{
     coin::{Coin, CoinCandidate},
-    config, crypto,
+    config,
     shielded::{
         local_archive_custody_commitments, local_archive_provider_manifest,
         local_archive_replica_attestations, route_checkpoint_requests, ArchiveCustodyCommitment,
@@ -25,13 +30,15 @@ use crate::{
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
+use aws_lc_rs::signature::UnparsedPublicKey;
+use aws_lc_rs::unstable::signature::ML_DSA_65;
 use once_cell::sync::Lazy;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint};
 use rand::RngCore;
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -163,6 +170,8 @@ struct HelloMessage {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum WireTopic {
     Anchor,
+    AnchorProposal,
+    ValidatorVote,
     CoinCandidate,
     Coin,
     Tx,
@@ -208,69 +217,72 @@ enum WireMessage {
 fn wire_topic_id(topic: WireTopic) -> u8 {
     match topic {
         WireTopic::Anchor => 1,
-        WireTopic::CoinCandidate => 2,
-        WireTopic::Coin => 3,
-        WireTopic::Tx => 4,
-        WireTopic::CompactEpoch => 5,
-        WireTopic::EpochLeaves => 7,
-        WireTopic::EpochSelectedResponse => 8,
-        WireTopic::EpochCandidatesResponse => 9,
-        WireTopic::EpochHeadersResponse => 10,
-        WireTopic::EpochByHashResponse => 11,
-        WireTopic::RequestEpoch => 12,
-        WireTopic::RequestEpochHeadersRange => 13,
-        WireTopic::RequestEpochByHash => 14,
-        WireTopic::RequestCoin => 15,
-        WireTopic::RequestLatestEpoch => 16,
-        WireTopic::RequestEpochTxn => 17,
-        WireTopic::EpochTxn => 18,
-        WireTopic::RequestEpochSelected => 19,
-        WireTopic::RequestEpochLeaves => 20,
-        WireTopic::RequestEpochCandidates => 21,
-        WireTopic::NodeRecord => 22,
-        WireTopic::ArchiveManifest => 23,
-        WireTopic::ArchiveReplica => 24,
-        WireTopic::RequestArchiveShard => 25,
-        WireTopic::ArchiveShard => 26,
-        WireTopic::RequestCheckpointBatch => 27,
-        WireTopic::CheckpointBatch => 28,
-        WireTopic::ArchiveCustodyCommitment => 29,
-        WireTopic::ArchiveRetrievalReceipt => 30,
+        WireTopic::AnchorProposal => 2,
+        WireTopic::ValidatorVote => 3,
+        WireTopic::CoinCandidate => 4,
+        WireTopic::Coin => 5,
+        WireTopic::Tx => 6,
+        WireTopic::CompactEpoch => 7,
+        WireTopic::EpochLeaves => 8,
+        WireTopic::EpochSelectedResponse => 9,
+        WireTopic::EpochCandidatesResponse => 10,
+        WireTopic::EpochHeadersResponse => 11,
+        WireTopic::EpochByHashResponse => 12,
+        WireTopic::RequestEpoch => 13,
+        WireTopic::RequestEpochHeadersRange => 14,
+        WireTopic::RequestEpochByHash => 15,
+        WireTopic::RequestCoin => 16,
+        WireTopic::RequestLatestEpoch => 17,
+        WireTopic::RequestEpochTxn => 18,
+        WireTopic::EpochTxn => 19,
+        WireTopic::RequestEpochSelected => 20,
+        WireTopic::RequestEpochLeaves => 21,
+        WireTopic::RequestEpochCandidates => 22,
+        WireTopic::NodeRecord => 23,
+        WireTopic::ArchiveManifest => 24,
+        WireTopic::ArchiveReplica => 25,
+        WireTopic::RequestArchiveShard => 26,
+        WireTopic::ArchiveShard => 27,
+        WireTopic::RequestCheckpointBatch => 28,
+        WireTopic::CheckpointBatch => 29,
+        WireTopic::ArchiveCustodyCommitment => 30,
+        WireTopic::ArchiveRetrievalReceipt => 31,
     }
 }
 
 fn decode_wire_topic(id: u8) -> Result<WireTopic> {
     Ok(match id {
         1 => WireTopic::Anchor,
-        2 => WireTopic::CoinCandidate,
-        3 => WireTopic::Coin,
-        4 => WireTopic::Tx,
-        5 => WireTopic::CompactEpoch,
-        6 => bail!("unsupported deprecated wire topic {}", id),
-        7 => WireTopic::EpochLeaves,
-        8 => WireTopic::EpochSelectedResponse,
-        9 => WireTopic::EpochCandidatesResponse,
-        10 => WireTopic::EpochHeadersResponse,
-        11 => WireTopic::EpochByHashResponse,
-        12 => WireTopic::RequestEpoch,
-        13 => WireTopic::RequestEpochHeadersRange,
-        14 => WireTopic::RequestEpochByHash,
-        15 => WireTopic::RequestCoin,
-        16 => WireTopic::RequestLatestEpoch,
-        17 => WireTopic::RequestEpochTxn,
-        18 => WireTopic::EpochTxn,
-        19 => WireTopic::RequestEpochSelected,
-        20 => WireTopic::RequestEpochLeaves,
-        21 => WireTopic::RequestEpochCandidates,
-        22 => WireTopic::NodeRecord,
-        23 => WireTopic::ArchiveManifest,
-        24 => WireTopic::ArchiveReplica,
-        25 => WireTopic::RequestArchiveShard,
-        26 => WireTopic::ArchiveShard,
-        27 => WireTopic::RequestCheckpointBatch,
-        28 => WireTopic::CheckpointBatch,
-        29 => WireTopic::ArchiveCustodyCommitment,
-        30 => WireTopic::ArchiveRetrievalReceipt,
+        2 => WireTopic::AnchorProposal,
+        3 => WireTopic::ValidatorVote,
+        4 => WireTopic::CoinCandidate,
+        5 => WireTopic::Coin,
+        6 => WireTopic::Tx,
+        7 => WireTopic::CompactEpoch,
+        8 => WireTopic::EpochLeaves,
+        9 => WireTopic::EpochSelectedResponse,
+        10 => WireTopic::EpochCandidatesResponse,
+        11 => WireTopic::EpochHeadersResponse,
+        12 => WireTopic::EpochByHashResponse,
+        13 => WireTopic::RequestEpoch,
+        14 => WireTopic::RequestEpochHeadersRange,
+        15 => WireTopic::RequestEpochByHash,
+        16 => WireTopic::RequestCoin,
+        17 => WireTopic::RequestLatestEpoch,
+        18 => WireTopic::RequestEpochTxn,
+        19 => WireTopic::EpochTxn,
+        20 => WireTopic::RequestEpochSelected,
+        21 => WireTopic::RequestEpochLeaves,
+        22 => WireTopic::RequestEpochCandidates,
+        23 => WireTopic::NodeRecord,
+        24 => WireTopic::ArchiveManifest,
+        25 => WireTopic::ArchiveReplica,
+        26 => WireTopic::RequestArchiveShard,
+        27 => WireTopic::ArchiveShard,
+        28 => WireTopic::RequestCheckpointBatch,
+        29 => WireTopic::CheckpointBatch,
+        30 => WireTopic::ArchiveCustodyCommitment,
+        31 => WireTopic::ArchiveRetrievalReceipt,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -404,6 +416,14 @@ struct PendingAnchor {
     received_at: Instant,
 }
 
+struct PendingAnchorCertification {
+    proposal: AnchorProposal,
+    proposal_message_id: [u8; 32],
+    votes: BTreeMap<ValidatorId, ValidatorVote>,
+    reply: Option<oneshot::Sender<Result<QuorumCertificate>>>,
+    created_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct P2pPolicy {
     max_validation_failures_per_peer: u32,
@@ -469,6 +489,8 @@ struct RuntimeState {
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
+    pending_anchor_certifications: Arc<AsyncMutex<HashMap<[u8; 32], PendingAnchorCertification>>>,
+    cast_anchor_votes: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
     archive_replicas: Arc<RwLock<HashMap<([u8; 32], u64), ArchiveReplicaAttestation>>>,
     peer_exchange: bool,
@@ -486,6 +508,7 @@ pub struct Network {
     tasks: TaskTracker,
     endpoint: Arc<AsyncMutex<Option<Endpoint>>>,
     db: Arc<Store>,
+    identity: Option<Arc<RwLock<NodeIdentity>>>,
     archive_sync_timeout: Duration,
     local_node_id: [u8; 32],
     known_records: Arc<RwLock<HashMap<[u8; 32], NodeRecordV2>>>,
@@ -498,6 +521,11 @@ enum NetworkCommand {
     GossipCoin(CoinCandidate),
     GossipTx(crate::transaction::Tx),
     GossipCompactEpoch(CompactEpoch),
+    ProposeAnchor {
+        proposal: AnchorProposal,
+        reply: oneshot::Sender<Result<QuorumCertificate>>,
+    },
+    AbandonAnchorProposal([u8; 32]),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
@@ -542,6 +570,7 @@ pub fn testing_stub_handle() -> NetHandle {
         tasks: TaskTracker::new(),
         endpoint: Arc::new(AsyncMutex::new(None)),
         db,
+        identity: None,
         archive_sync_timeout: Duration::from_secs(1),
         local_node_id: [0u8; 32],
         known_records: Arc::new(RwLock::new(HashMap::new())),
@@ -1481,6 +1510,250 @@ impl RuntimeState {
         guard.insert(message_id, now).is_none()
     }
 
+    async fn mark_anchor_vote_cast(&self, proposal_hash: [u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut guard = self.cast_anchor_votes.lock().await;
+        guard
+            .retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(PENDING_ANCHOR_TTL_SECS));
+        guard.insert(proposal_hash, now).is_none()
+    }
+
+    fn pending_anchor_vote_power(
+        proposal: &AnchorProposal,
+        votes: &BTreeMap<ValidatorId, ValidatorVote>,
+    ) -> Result<u64> {
+        let mut signed_voting_power = 0u64;
+        for voter in votes.keys() {
+            let validator = proposal
+                .validator_set
+                .validator(voter)
+                .ok_or_else(|| anyhow!("pending anchor vote references unknown validator"))?;
+            signed_voting_power = signed_voting_power
+                .checked_add(validator.voting_power)
+                .ok_or_else(|| anyhow!("pending anchor vote power overflow"))?;
+        }
+        Ok(signed_voting_power)
+    }
+
+    fn pending_anchor_qc(
+        pending: &PendingAnchorCertification,
+    ) -> Result<Option<QuorumCertificate>> {
+        let signed_voting_power =
+            Self::pending_anchor_vote_power(&pending.proposal, &pending.votes)?;
+        if signed_voting_power < pending.proposal.validator_set.quorum_threshold {
+            return Ok(None);
+        }
+        Ok(Some(QuorumCertificate::from_votes(
+            &pending.proposal.validator_set,
+            pending.proposal.vote_target(),
+            pending.votes.values().cloned().collect(),
+        )?))
+    }
+
+    async fn remove_pending_anchor_proposal(&self, proposal_hash: [u8; 32]) {
+        let mut guard = self.pending_anchor_certifications.lock().await;
+        guard.remove(&proposal_hash);
+    }
+
+    async fn fail_pending_anchor_proposal(&self, proposal_hash: [u8; 32], message: String) {
+        let reply = {
+            let mut guard = self.pending_anchor_certifications.lock().await;
+            guard
+                .remove(&proposal_hash)
+                .and_then(|mut pending| pending.reply.take())
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(Err(anyhow!(message)));
+        }
+    }
+
+    async fn register_pending_anchor_proposal(
+        &self,
+        proposal: AnchorProposal,
+        proposal_message_id: [u8; 32],
+        local_vote: ValidatorVote,
+        reply: oneshot::Sender<Result<QuorumCertificate>>,
+    ) -> Result<()> {
+        let proposal_hash = proposal.hash;
+        let mut pending = PendingAnchorCertification {
+            proposal,
+            proposal_message_id,
+            votes: BTreeMap::new(),
+            reply: Some(reply),
+            created_at: Instant::now(),
+        };
+        pending.votes.insert(local_vote.voter, local_vote);
+        let ready_qc = Self::pending_anchor_qc(&pending)?;
+
+        let mut guard = self.pending_anchor_certifications.lock().await;
+        guard.retain(|_, pending| {
+            pending.created_at.elapsed() < Duration::from_secs(PENDING_ANCHOR_TTL_SECS)
+        });
+        if let Some(qc) = ready_qc {
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Ok(qc));
+            }
+            guard.remove(&proposal_hash);
+        } else {
+            guard.insert(proposal_hash, pending);
+        }
+        Ok(())
+    }
+
+    async fn start_local_anchor_proposal(
+        &self,
+        proposal: AnchorProposal,
+        reply: oneshot::Sender<Result<QuorumCertificate>>,
+    ) -> Result<()> {
+        let start_result: Result<(SignedEnvelope, ValidatorVote)> = async {
+            let identity = self.identity.read().await;
+            let local_validator_id = ValidatorId::from_hot_key(&identity.record().auth_spki);
+            let local_validator = proposal
+                .validator_set
+                .validator(&local_validator_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("local node is not part of the finalized validator set"))?;
+            let expected_leader = proposal.validator_set.leader_for(proposal.position);
+            if local_validator.id != expected_leader {
+                bail!(
+                    "local node is not the deterministic leader for epoch {} slot {}",
+                    proposal.position.epoch,
+                    proposal.position.slot
+                );
+            }
+            let target = proposal.vote_target();
+            let local_vote = ValidatorVote {
+                voter: local_validator.id,
+                target: target.clone(),
+                signature: identity.sign_consensus_message(&target.signing_bytes())?,
+            };
+            drop(identity);
+            let envelope = self
+                .sign_topic_envelope(
+                    WireTopic::AnchorProposal,
+                    canonical::encode_anchor_proposal(&proposal)?,
+                )
+                .await?;
+            Ok((envelope, local_vote))
+        }
+        .await;
+
+        let (envelope, local_vote) = match start_result {
+            Ok(values) => values,
+            Err(err) => {
+                let _ = reply.send(Err(anyhow!(err.to_string())));
+                return Ok(());
+            }
+        };
+
+        let proposal_message_id = envelope.message_id;
+        self.register_pending_anchor_proposal(
+            proposal.clone(),
+            proposal_message_id,
+            local_vote,
+            reply,
+        )
+        .await?;
+        if let Err(err) = self.broadcast_envelope(envelope, None).await {
+            self.fail_pending_anchor_proposal(proposal.hash, err.to_string())
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn cast_anchor_proposal_vote(
+        &self,
+        proposer_record: &NodeRecordV2,
+        proposal_message_id: [u8; 32],
+        proposal: AnchorProposal,
+    ) -> Result<()> {
+        let local_node_id = self.local_node_id().await;
+        if proposer_record.node_id == local_node_id {
+            return Ok(());
+        }
+        let parent = if proposal.num == 0 {
+            None
+        } else {
+            Some(
+                self.db
+                    .get::<Anchor>("epoch", &(proposal.num - 1).to_le_bytes())?
+                    .ok_or_else(|| anyhow!("checkpoint proposal parent is unavailable"))?,
+            )
+        };
+        validate_anchor_proposal_against_store(&proposal, parent.as_ref(), self.db.as_ref())
+            .map_err(|err| anyhow!(err))?;
+        validate_anchor_proposal_author(&proposal, proposer_record)?;
+
+        let local_validator_id = {
+            let identity = self.identity.read().await;
+            ValidatorId::from_hot_key(&identity.record().auth_spki)
+        };
+        let Some(local_validator) = proposal
+            .validator_set
+            .validator(&local_validator_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if !self.mark_anchor_vote_cast(proposal.hash).await {
+            return Ok(());
+        }
+        let target = proposal.vote_target();
+        let signature = {
+            let identity = self.identity.read().await;
+            identity.sign_consensus_message(&target.signing_bytes())?
+        };
+        let vote = ValidatorVote {
+            voter: local_validator.id,
+            target: target.clone(),
+            signature,
+        };
+
+        let _ = self
+            .sign_and_send_to_record_related(
+                proposer_record.clone(),
+                WireTopic::ValidatorVote,
+                canonical::encode_validator_vote(&vote)?,
+                Some(proposal_message_id),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn record_anchor_vote(
+        &self,
+        voter_record: &NodeRecordV2,
+        response_to_message_id: Option<[u8; 32]>,
+        vote: ValidatorVote,
+    ) -> Result<()> {
+        let proposal_hash = vote.target.block_digest;
+        let mut completion = None;
+        {
+            let mut guard = self.pending_anchor_certifications.lock().await;
+            guard.retain(|_, pending| {
+                pending.created_at.elapsed() < Duration::from_secs(PENDING_ANCHOR_TTL_SECS)
+            });
+            let Some(pending) = guard.get_mut(&proposal_hash) else {
+                return Ok(());
+            };
+            if response_to_message_id != Some(pending.proposal_message_id) {
+                bail!("validator vote correlation does not match the pending proposal");
+            }
+            validate_anchor_vote(&pending.proposal, voter_record, &vote)?;
+            pending.votes.insert(vote.voter, vote);
+            if let Some(qc) = Self::pending_anchor_qc(pending)? {
+                completion = Some((pending.reply.take(), qc));
+            }
+            if completion.is_some() {
+                guard.remove(&proposal_hash);
+            }
+        }
+        if let Some((Some(reply), qc)) = completion {
+            let _ = reply.send(Ok(qc));
+        }
+        Ok(())
+    }
+
     async fn validate_peer_record(
         &self,
         record: NodeRecordV2,
@@ -1709,6 +1982,16 @@ impl RuntimeState {
             WireTopic::Anchor | WireTopic::EpochByHashResponse => {
                 let anchor = canonical::decode_anchor(&frame.body)?;
                 self.handle_anchor(anchor).await?;
+            }
+            WireTopic::AnchorProposal => {
+                let proposal = canonical::decode_anchor_proposal(&frame.body)?;
+                self.cast_anchor_proposal_vote(&record, message_id, proposal)
+                    .await?;
+            }
+            WireTopic::ValidatorVote => {
+                let vote = canonical::decode_validator_vote(&frame.body)?;
+                self.record_anchor_vote(&record, response_to_message_id, vote)
+                    .await?;
             }
             WireTopic::CoinCandidate => {
                 let candidate = canonical::decode_coin_candidate(&frame.body)?;
@@ -2276,22 +2559,21 @@ impl RuntimeState {
             let Some(mut candidates) = candidates else {
                 break;
             };
-            candidates.sort_by(|a, b| {
-                b.anchor
-                    .cumulative_work
-                    .cmp(&a.anchor.cumulative_work)
-                    .then_with(|| b.anchor.num.cmp(&a.anchor.num))
-            });
+            candidates.sort_by_key(|pending| pending.anchor.hash);
 
             let mut adopted = false;
             let mut rejected = Vec::new();
             for pending in candidates {
                 if validate_anchor(&pending.anchor, &self.db).is_ok() {
-                    let current_best = self.db.get::<Anchor>("epoch", b"latest")?;
-                    if pending.anchor.is_better_chain(&current_best) {
+                    if self
+                        .db
+                        .get::<Anchor>("epoch", &pending.anchor.num.to_le_bytes())?
+                        .is_none()
+                    {
                         self.adopt_anchor(pending.anchor.clone()).await?;
+                        adopted = true;
+                        break;
                     }
-                    adopted = true;
                 } else {
                     rejected.push(pending);
                 }
@@ -2322,14 +2604,17 @@ impl RuntimeState {
 
         match validate_anchor(&anchor, &self.db) {
             Ok(()) => {
-                let current_best = self.db.get::<Anchor>("epoch", b"latest")?;
-                if anchor.is_better_chain(&current_best) {
+                if self
+                    .db
+                    .get::<Anchor>("epoch", &anchor.num.to_le_bytes())?
+                    .is_none()
+                {
                     self.adopt_anchor(anchor.clone()).await?;
                 }
                 self.process_pending_anchors(anchor.num.saturating_add(1))
                     .await?;
             }
-            Err(err) => {
+            Err(_err) => {
                 metrics::VALIDATION_FAIL_ANCHOR.inc();
                 self.buffer_anchor(anchor.clone()).await;
                 if anchor.num > 0 {
@@ -2340,21 +2625,18 @@ impl RuntimeState {
                             REQUEST_FANOUT_RECOVERY,
                         )
                         .await;
-                    if err.contains("Retarget window incomplete") || err.contains("Previous anchor")
-                    {
-                        let start = anchor.num.saturating_sub(64);
-                        let range = EpochHeadersRange {
-                            start_height: start,
-                            count: 128,
-                        };
-                        let _ = self
-                            .sign_and_send_to_targets(
-                                WireTopic::RequestEpochHeadersRange,
-                                canonical::encode_epoch_headers_range(&range),
-                                REQUEST_FANOUT_HEADERS,
-                            )
-                            .await;
-                    }
+                    let start = anchor.num.saturating_sub(64);
+                    let range = EpochHeadersRange {
+                        start_height: start,
+                        count: 128,
+                    };
+                    let _ = self
+                        .sign_and_send_to_targets(
+                            WireTopic::RequestEpochHeadersRange,
+                            canonical::encode_epoch_headers_range(&range),
+                            REQUEST_FANOUT_HEADERS,
+                        )
+                        .await;
                 }
             }
         }
@@ -2362,6 +2644,7 @@ impl RuntimeState {
     }
 
     async fn adopt_anchor(&self, anchor: Anchor) -> Result<()> {
+        self.db.store_validator_committee(&anchor.validator_set)?;
         self.db.put("epoch", &anchor.num.to_le_bytes(), &anchor)?;
         self.db.put("epoch", b"latest", &anchor)?;
         metrics::EPOCH_HEIGHT.set(anchor.num as i64);
@@ -2460,6 +2743,8 @@ pub async fn spawn(
         tx_tx: tx_tx.clone(),
         headers_tx: headers_tx.clone(),
         checkpoint_tx: checkpoint_tx.clone(),
+        pending_anchor_certifications: Arc::new(AsyncMutex::new(HashMap::new())),
+        cast_anchor_votes: Arc::new(AsyncMutex::new(HashMap::new())),
         archive_manifests: Arc::new(RwLock::new(
             persisted_archive_manifests
                 .into_iter()
@@ -2502,6 +2787,7 @@ pub async fn spawn(
         tasks,
         endpoint: Arc::new(AsyncMutex::new(Some(endpoint.clone()))),
         db: state.db.clone(),
+        identity: Some(state.identity.clone()),
         archive_sync_timeout: Duration::from_secs(net_cfg.sync_timeout_secs.max(1)),
         local_node_id: local_record.node_id,
         known_records: state.known_records.clone(),
@@ -2752,6 +3038,14 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
+        NetworkCommand::ProposeAnchor { proposal, reply } => {
+            if let Err(err) = state.start_local_anchor_proposal(proposal, reply).await {
+                net_log!("⚠️  Failed to start local anchor proposal: {}", err);
+            }
+        }
+        NetworkCommand::AbandonAnchorProposal(proposal_hash) => {
+            state.remove_pending_anchor_proposal(proposal_hash).await;
+        }
         NetworkCommand::RequestEpoch(epoch) => {
             let _ = state
                 .sign_and_send_to_targets(
@@ -2946,6 +3240,82 @@ impl Network {
 
     pub fn anchor_sender(&self) -> broadcast::Sender<Anchor> {
         self.anchor_tx.clone()
+    }
+
+    pub async fn certify_local_anchor(
+        &self,
+        num: u64,
+        parent: Option<&Anchor>,
+        merkle_root: [u8; 32],
+        coin_count: u32,
+        ordering_path: OrderingPath,
+    ) -> Result<Anchor> {
+        let position = Anchor::position_for_num(num);
+        let validator_set = match parent {
+            Some(parent) if parent.position.epoch == position.epoch => parent.validator_set.clone(),
+            Some(_) => load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?,
+            None => {
+                let identity = self
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                    .clone();
+                let identity = identity.read().await;
+                register_genesis_local_validator_pool(self.db.as_ref(), identity.record())?;
+                load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?
+            }
+        };
+
+        let proposal = AnchorProposal::new(
+            num,
+            parent.map(|parent| parent.hash),
+            ordering_path,
+            merkle_root,
+            coin_count,
+            validator_set,
+        )?;
+
+        let timeout_ms = match ordering_path {
+            OrderingPath::FastPathPrivateTransfer => FAST_PATH_TIMEOUT_MS,
+            OrderingPath::DagBftSharedState => DAG_BFT_TIMEOUT_MS,
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::ProposeAnchor {
+                proposal: proposal.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("anchor proposal command channel closed"))?;
+
+        let qc = match tokio::time::timeout(Duration::from_millis(timeout_ms), reply_rx).await {
+            Ok(Ok(Ok(qc))) => qc,
+            Ok(Ok(Err(err))) => {
+                let _ = self
+                    .command_tx
+                    .send(NetworkCommand::AbandonAnchorProposal(proposal.hash));
+                return Err(err);
+            }
+            Ok(Err(_)) => {
+                let _ = self
+                    .command_tx
+                    .send(NetworkCommand::AbandonAnchorProposal(proposal.hash));
+                bail!("local anchor proposal waiter dropped");
+            }
+            Err(_) => {
+                let _ = self
+                    .command_tx
+                    .send(NetworkCommand::AbandonAnchorProposal(proposal.hash));
+                bail!(
+                    "timed out collecting quorum votes for epoch {} slot {}",
+                    proposal.position.epoch,
+                    proposal.position.slot
+                );
+            }
+        };
+
+        let anchor = proposal.finalize(qc)?;
+        anchor.validate_against_parent(parent)?;
+        Ok(anchor)
     }
 
     pub async fn request_epoch(&self, epoch: u64) {
@@ -3562,6 +3932,7 @@ fn should_relay_topic(topic: WireTopic) -> bool {
     matches!(
         topic,
         WireTopic::Anchor
+            | WireTopic::AnchorProposal
             | WireTopic::CoinCandidate
             | WireTopic::Tx
             | WireTopic::CompactEpoch
@@ -3577,7 +3948,7 @@ fn chain_compatible(local_chain_id: Option<[u8; 32]>, remote_chain_id: Option<[u
 }
 
 fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
-    let anchor: Anchor = db
+    let _anchor: Anchor = db
         .get_epoch_for_coin(&coin.id)
         .ok()
         .flatten()
@@ -3597,21 +3968,15 @@ fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), Strin
         return Err("Creator public key/address mismatch".into());
     }
 
-    let header = Coin::header_bytes(&coin.epoch_hash, coin.nonce, &coin.creator_address);
-    let calculated_pow =
-        crypto::argon2id_pow(&header, anchor.mem_kib).map_err(|e| e.to_string())?;
-    if calculated_pow != coin.pow_hash {
-        return Err("PoW validation failed".into());
-    }
-    if !calculated_pow
-        .iter()
-        .take(anchor.difficulty)
-        .all(|byte| *byte == 0)
-    {
-        return Err(format!(
-            "PoW does not meet difficulty: requires {} leading zero bytes",
-            anchor.difficulty
-        ));
+    let expected_digest = CoinCandidate::admission_digest(
+        &coin.epoch_hash,
+        coin.nonce,
+        &coin.creator_address,
+        &coin.creator_pk,
+        &coin.lock_hash,
+    );
+    if coin.admission_digest != expected_digest {
+        return Err("candidate admission digest mismatch".into());
     }
     if Coin::calculate_id(&coin.epoch_hash, coin.nonce, &coin.creator_address) != coin.id {
         return Err("Coin ID mismatch".into());
@@ -3623,78 +3988,107 @@ fn validate_tx(tx: &crate::transaction::Tx, db: &Store) -> Result<(), String> {
     tx.validate(db).map_err(|e| e.to_string())
 }
 
-fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
-    if anchor.hash == [0u8; 32] {
-        return Err("Anchor hash cannot be zero".into());
-    }
-    if anchor.difficulty == 0 {
-        return Err("Difficulty cannot be zero".into());
-    }
-    if anchor.mem_kib == 0 {
-        return Err("Memory cannot be zero".into());
-    }
-    if anchor.num == 0 {
-        if anchor.difficulty != TARGET_LEADING_ZEROS || anchor.mem_kib != DEFAULT_MEM_KIB {
-            return Err("Consensus params mismatch at genesis".into());
-        }
-        let expected = Anchor::expected_work_for_difficulty(anchor.difficulty);
-        if anchor.cumulative_work != expected {
-            return Err("Genesis cumulative_work mismatch".into());
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&anchor.merkle_root);
-        if *hasher.finalize().as_bytes() != anchor.hash {
-            return Err("Genesis hash mismatch".into());
-        }
+fn validate_anchor_proposal_against_store(
+    proposal: &AnchorProposal,
+    parent: Option<&Anchor>,
+    db: &Store,
+) -> Result<(), String> {
+    proposal
+        .validate_against_parent(parent)
+        .map_err(|e| e.to_string())?;
+    let epoch_boundary = parent
+        .map(|parent| parent.position.epoch != proposal.position.epoch)
+        .unwrap_or(true);
+    if !epoch_boundary {
         return Ok(());
     }
-    if anchor.merkle_root == [0u8; 32] && anchor.coin_count > 0 {
-        return Err("Merkle root cannot be zero when coins are present".into());
-    }
-
-    let prev = db
-        .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())
+    match expected_validator_set_for_epoch(db, proposal.position.epoch)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Previous anchor #{} not found", anchor.num - 1))?;
-
-    let (expected_difficulty, expected_mem_kib) = if anchor.num % RETARGET_INTERVAL == 0 {
-        let start = anchor.num.saturating_sub(RETARGET_INTERVAL);
-        let window = db
-            .get_or_build_retarget_window(anchor.num)
-            .map_err(|e| e.to_string())?;
-        match window {
-            Some(window) if window.len() as u64 == RETARGET_INTERVAL => {
-                calculate_retarget_consensus(&window)
+    {
+        Some(expected) => {
+            if expected != proposal.validator_set {
+                return Err(format!(
+                    "checkpoint committee for epoch {} does not match canonical activation state",
+                    proposal.position.epoch
+                ));
             }
-            _ => return Err(format!("Retarget window incomplete starting at {}", start)),
         }
-    } else {
-        (prev.difficulty, prev.mem_kib)
-    };
-
-    if anchor.difficulty != expected_difficulty || anchor.mem_kib != expected_mem_kib {
-        return Err(format!(
-            "Consensus params mismatch. Expected difficulty={}, mem_kib={}, got difficulty={}, mem_kib={}",
-            expected_difficulty, expected_mem_kib, anchor.difficulty, anchor.mem_kib
-        ));
-    }
-
-    let expected_work = Anchor::expected_work_for_difficulty(anchor.difficulty);
-    let expected_cumulative_work = prev.cumulative_work.saturating_add(expected_work);
-    if anchor.cumulative_work != expected_cumulative_work {
-        return Err(format!(
-            "Invalid cumulative work. Expected: {}, Got: {}",
-            expected_cumulative_work, anchor.cumulative_work
-        ));
-    }
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&anchor.merkle_root);
-    hasher.update(&prev.hash);
-    if *hasher.finalize().as_bytes() != anchor.hash {
-        return Err("Anchor hash mismatch".into());
+        None if proposal.num == 0 => {}
+        None => {
+            return Err(format!(
+                "missing validator pool state for epoch {}; cannot validate epoch-boundary committee change",
+                proposal.position.epoch
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_anchor_proposal_author(
+    proposal: &AnchorProposal,
+    proposer_record: &NodeRecordV2,
+) -> Result<()> {
+    let proposer_id = ValidatorId::from_hot_key(&proposer_record.auth_spki);
+    let expected_leader = proposal.validator_set.leader_for(proposal.position);
+    if proposer_id != expected_leader {
+        bail!("checkpoint proposal author is not the deterministic leader");
+    }
+    if proposal.validator_set.validator(&proposer_id).is_none() {
+        bail!("checkpoint proposal author is not part of the validator set");
+    }
+    Ok(())
+}
+
+fn validate_anchor_vote(
+    proposal: &AnchorProposal,
+    voter_record: &NodeRecordV2,
+    vote: &ValidatorVote,
+) -> Result<()> {
+    let expected_voter = ValidatorId::from_hot_key(&voter_record.auth_spki);
+    if vote.voter != expected_voter {
+        bail!("validator vote author does not match the envelope signer");
+    }
+    let target = proposal.vote_target();
+    if vote.target != target {
+        bail!("validator vote target does not match the pending proposal");
+    }
+    let validator = proposal
+        .validator_set
+        .validator(&vote.voter)
+        .ok_or_else(|| anyhow!("validator vote references an unknown validator"))?;
+    UnparsedPublicKey::new(&ML_DSA_65, validator.keys.hot_ml_dsa_65_spki.as_slice())
+        .verify(&target.signing_bytes(), vote.signature.as_slice())
+        .map_err(|_| anyhow!("validator vote signature verification failed"))?;
+    Ok(())
+}
+
+fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
+    let parent = if anchor.num == 0 {
+        None
+    } else {
+        Some(
+            db.get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Previous checkpoint #{} not found", anchor.num - 1))?,
+        )
+    };
+    validate_anchor_proposal_against_store(
+        &AnchorProposal {
+            num: anchor.num,
+            hash: anchor.hash,
+            parent_hash: anchor.parent_hash,
+            position: anchor.position,
+            ordering_path: anchor.ordering_path,
+            merkle_root: anchor.merkle_root,
+            coin_count: anchor.coin_count,
+            validator_set: anchor.validator_set.clone(),
+        },
+        parent.as_ref(),
+        db,
+    )?;
+    anchor
+        .validate_against_parent(parent.as_ref())
+        .map_err(|e| e.to_string())
 }
 
 fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {

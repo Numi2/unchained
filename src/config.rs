@@ -10,7 +10,6 @@ pub struct Config {
     pub p2p: P2p,
     pub storage: Storage,
     pub epoch: Epoch,
-    pub mining: Mining,
     pub metrics: Metrics,
     #[serde(default)]
     pub compact: Compact,
@@ -64,55 +63,6 @@ pub struct Storage {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Epoch {
     pub seconds: u64,
-    #[serde(default = "default_target_leading_zeros")]
-    pub target_leading_zeros: usize,
-    #[serde(default = "default_target_coins")]
-    pub target_coins_per_epoch: u32,
-    /// Hard cap of selected coins per epoch (consensus). If not specified,
-    /// defaults to the same as target_coins_per_epoch.
-    #[serde(default = "default_max_coins")]
-    pub max_coins_per_epoch: u32,
-    #[serde(default = "default_retarget_interval")]
-    pub retarget_interval: u64,
-    /// Minimum/maximum difficulty clamp for retargeting
-    #[serde(default = "default_difficulty_min")]
-    pub difficulty_min: usize,
-    #[serde(default = "default_difficulty_max")]
-    pub difficulty_max: usize,
-
-    #[serde(default = "default_retarget_upper_pct")]
-    pub retarget_upper_pct: u64,
-    #[serde(default = "default_retarget_lower_pct")]
-    pub retarget_lower_pct: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct Mining {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_mem")]
-    pub mem_kib: u32,
-    #[serde(default = "default_min_mem")]
-    pub min_mem_kib: u32,
-    #[serde(default = "default_max_mem")]
-    pub max_mem_kib: u32,
-    #[serde(default = "default_max_memory_adjustment")]
-    pub max_memory_adjustment: f64,
-    /// Miner heartbeat timeout interval (seconds)
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval_secs: u64,
-    /// Maximum attempts per epoch before giving up
-    #[serde(default = "default_max_mining_attempts", alias = "max_mining_attempts")]
-    pub max_attempts: u64,
-    /// Attempts between runtime yield/anchor checks
-    #[serde(default = "default_check_interval_attempts")]
-    pub check_interval_attempts: u64,
-
-    #[serde(default = "default_workers")]
-    pub workers: u32,
-    /// Offload Argon2 hashing to blocking threads
-    #[serde(default = "default_offload_blocking")]
-    pub offload_blocking: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -150,72 +100,12 @@ impl Default for Compact {
     }
 }
 
-fn default_mem() -> u32 {
-    65_536
-} // 64 MiB
 fn default_bind() -> String {
     "127.0.0.1:9100".into()
 }
 fn default_last_epochs_to_show() -> u64 {
     10
 }
-// Epoch retargeting defaults
-fn default_target_coins() -> u32 {
-    11
-}
-fn default_max_coins() -> u32 {
-    111
-}
-fn default_retarget_interval() -> u64 {
-    2000
-}
-fn default_difficulty_min() -> usize {
-    1
-}
-fn default_difficulty_max() -> usize {
-    12
-}
-fn default_retarget_upper_pct() -> u64 {
-    110
-}
-fn default_retarget_lower_pct() -> u64 {
-    90
-}
-fn default_target_leading_zeros() -> usize {
-    2
-}
-
-// Mining memory retargeting defaults
-pub fn default_min_mem() -> u32 {
-    16_192
-} // 16 MiB
-pub fn default_max_mem() -> u32 {
-    262_144
-} // 256 MiB
-pub fn default_max_memory_adjustment() -> f64 {
-    1.5
-}
-
-// Miner stability defaults
-pub fn default_heartbeat_interval() -> u64 {
-    30
-} // 30 seconds
-pub fn default_max_consecutive_failures() -> u32 {
-    5
-}
-pub fn default_max_mining_attempts() -> u64 {
-    1_000_000
-}
-fn default_check_interval_attempts() -> u64 {
-    1_000
-}
-fn default_workers() -> u32 {
-    1
-}
-fn default_offload_blocking() -> bool {
-    true
-}
-
 // Network defaults for production deployment
 fn default_max_peers() -> u32 {
     100
@@ -271,13 +161,6 @@ pub fn load<P: AsRef<Path>>(p: P) -> Result<Config> {
         .try_into()
         .with_context(|| "📝  invalid config schema".to_string())?;
     apply_protocol_overrides(&mut cfg);
-    // Sanity clamps
-    if cfg.mining.mem_kib < cfg.mining.min_mem_kib {
-        cfg.mining.mem_kib = cfg.mining.min_mem_kib;
-    }
-    if cfg.mining.mem_kib > cfg.mining.max_mem_kib {
-        cfg.mining.mem_kib = cfg.mining.max_mem_kib;
-    }
     Ok(cfg)
 }
 
@@ -311,24 +194,15 @@ pub fn load_from_str(text: &str) -> Result<Config> {
         .try_into()
         .with_context(|| "📝  invalid config schema".to_string())?;
     apply_protocol_overrides(&mut cfg);
-    // Sanity clamps
-    if cfg.mining.mem_kib < cfg.mining.min_mem_kib {
-        cfg.mining.mem_kib = cfg.mining.min_mem_kib;
-    }
-    if cfg.mining.mem_kib > cfg.mining.max_mem_kib {
-        cfg.mining.mem_kib = cfg.mining.max_mem_kib;
-    }
     Ok(cfg)
 }
 
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
-    let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "mining", "metrics", "compact",
-    ]
-    .into_iter()
-    .collect();
+    let top_allowed: HashSet<&str> = ["net", "p2p", "storage", "epoch", "metrics", "compact"]
+        .into_iter()
+        .collect();
     if let Some(table) = val.as_table() {
         for (k, v) in table.iter() {
             if !top_allowed.contains(k.as_str()) {
@@ -362,36 +236,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     ],
                 ),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
-                ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(
-                    t,
-                    &[
-                        "seconds",
-                        "target_leading_zeros",
-                        "target_coins_per_epoch",
-                        "max_coins_per_epoch",
-                        "_interval",
-                        "difficulty_min",
-                        "difficulty_max",
-                        "retarget_upper_pct",
-                        "retarget_lower_pct",
-                    ],
-                ),
-                ("mining", TomlValue::Table(t)) => warn_unknown_keys_in(
-                    t,
-                    &[
-                        "enabled",
-                        "mem_kib",
-                        "min_mem_kib",
-                        "max_mem_kib",
-                        "max_memory_adjustment",
-                        "heartbeat_interval_secs",
-                        "max_attempts",
-                        "max_mining_attempts",
-                        "check_interval_attempts",
-                        "workers",
-                        "offload_blocking",
-                    ],
-                ),
+                ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["seconds"]),
                 ("metrics", TomlValue::Table(t)) => {
                     warn_unknown_keys_in(t, &["bind", "last_epochs_to_show"])
                 }
@@ -415,29 +260,6 @@ fn warn_unknown_keys_in(table: &toml::map::Map<String, TomlValue>, allowed: &[&s
 }
 
 fn apply_protocol_overrides(cfg: &mut Config) {
-    let epoch = &mut cfg.epoch;
-    let changed = epoch.target_leading_zeros != PROTOCOL.genesis_difficulty as usize
-        || epoch.target_coins_per_epoch != PROTOCOL.target_coins_per_epoch as u32
-        || epoch.max_coins_per_epoch != PROTOCOL.max_coins_per_epoch
-        || epoch.retarget_interval != PROTOCOL.retarget_interval
-        || epoch.difficulty_min != PROTOCOL.difficulty_min as usize
-        || epoch.difficulty_max != PROTOCOL.difficulty_max as usize
-        || epoch.retarget_upper_pct != PROTOCOL.retarget_upper_pct
-        || epoch.retarget_lower_pct != PROTOCOL.retarget_lower_pct;
-
-    if changed {
-        eprintln!(
-            "⚠️  Consensus policy is protocol-locked (v{}). Ignoring epoch policy values from config.toml.",
-            PROTOCOL.version
-        );
-    }
-
-    epoch.target_leading_zeros = PROTOCOL.genesis_difficulty as usize;
-    epoch.target_coins_per_epoch = PROTOCOL.target_coins_per_epoch as u32;
-    epoch.max_coins_per_epoch = PROTOCOL.max_coins_per_epoch;
-    epoch.retarget_interval = PROTOCOL.retarget_interval;
-    epoch.difficulty_min = PROTOCOL.difficulty_min as usize;
-    epoch.difficulty_max = PROTOCOL.difficulty_max as usize;
-    epoch.retarget_upper_pct = PROTOCOL.retarget_upper_pct;
-    epoch.retarget_lower_pct = PROTOCOL.retarget_lower_pct;
+    let _ = PROTOCOL.version;
+    let _ = cfg;
 }

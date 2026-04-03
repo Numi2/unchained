@@ -1,7 +1,9 @@
 use crate::crypto::{Address, TaggedSigningPublicKey};
 use serde::{Deserialize, Serialize};
 
-/// Confirmed coin committed in an epoch anchor (does not store PoW hash).
+const CANDIDATE_ADMISSION_DOMAIN: &str = "unchained.coin-candidate.admission.v1";
+
+/// Confirmed coin committed in a finalized settlement checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Coin {
     pub id: [u8; 32],
@@ -11,12 +13,13 @@ pub struct Coin {
     pub creator_address: Address,
     /// Full creator signing key tagged with its PQ signature algorithm.
     pub creator_pk: TaggedSigningPublicKey,
-    /// Signatureless spend lock: H(preimage_current). For genesis, set by miner.
+    /// Signatureless spend lock: H(preimage_current). For genesis, set during
+    /// the bootstrap distribution flow.
     #[serde(default)]
     pub lock_hash: [u8; 32],
 }
 
-/// Unconfirmed coin candidate used during selection. Contains the PoW hash.
+/// Unconfirmed coin candidate used during checkpoint selection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CoinCandidate {
     pub id: [u8; 32],
@@ -29,7 +32,7 @@ pub struct CoinCandidate {
     /// Signatureless spend lock to be committed at confirmation.
     #[serde(default)]
     pub lock_hash: [u8; 32],
-    pub pow_hash: [u8; 32],
+    pub admission_digest: [u8; 32],
 }
 
 impl Coin {
@@ -88,13 +91,28 @@ impl Coin {
 }
 
 impl CoinCandidate {
+    pub fn admission_digest(
+        epoch_hash: &[u8; 32],
+        nonce: u64,
+        creator_address: &Address,
+        creator_pk: &TaggedSigningPublicKey,
+        lock_hash: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_ADMISSION_DOMAIN);
+        hasher.update(epoch_hash);
+        hasher.update(&nonce.to_le_bytes());
+        hasher.update(creator_address);
+        hasher.update(creator_pk.as_slice());
+        hasher.update(lock_hash);
+        *hasher.finalize().as_bytes()
+    }
+
     pub fn new(
         epoch_hash: [u8; 32],
         nonce: u64,
         creator_address: Address,
         creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
-        pow_hash: [u8; 32],
     ) -> Self {
         let id = Coin::calculate_id(&epoch_hash, nonce, &creator_address);
         CoinCandidate {
@@ -103,9 +121,15 @@ impl CoinCandidate {
             epoch_hash,
             nonce,
             creator_address,
-            creator_pk,
+            creator_pk: creator_pk.clone(),
             lock_hash,
-            pow_hash,
+            admission_digest: Self::admission_digest(
+                &epoch_hash,
+                nonce,
+                &creator_address,
+                &creator_pk,
+                &lock_hash,
+            ),
         }
     }
 

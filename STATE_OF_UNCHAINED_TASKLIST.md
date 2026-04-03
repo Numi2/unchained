@@ -39,36 +39,40 @@ transitional and should be removed rather than preserved.
 
 ## 2. Remove Legacy PoW And Mining Architecture
 
-- `[ ]` Remove epoch-based proof-of-work from the protocol model
-- `[ ]` Remove miner-specific control-plane flows and miner-facing wallet/node
+- `[x]` Remove epoch-based proof-of-work from the protocol model
+- `[x]` Remove miner-specific control-plane flows and miner-facing wallet/node
   interfaces
-- `[ ]` Remove heaviest-chain, anchor-weight, retarget, and candidate-admission
+- `[x]` Remove heaviest-chain, anchor-weight, retarget, and candidate-admission
   logic
-- `[ ]` Remove `unchained_miner` as a product-facing binary
-- `[ ]` Remove PoW-specific terminology from CLI help, config, metrics, and
+- `[x]` Remove `unchained_miner` as a product-facing binary
+- `[~]` Remove PoW-specific terminology from CLI help, config, metrics, and
   tests
-- `[ ]` Replace PoW bootstrap assumptions in persistence and replay code with
+- `[~]` Replace PoW bootstrap assumptions in persistence and replay code with
   validator-set bootstrap assumptions
 
 ## 3. Consensus And Ordering
 
-- `[ ]` Define the canonical validator-set object model
-- `[ ]` Define epoch boundaries, slot timing, and validator rotation as
+- `[x]` Define the canonical validator-set object model
+- `[x]` Define epoch boundaries, slot timing, and validator rotation as
   consensus rules
-- `[ ]` Implement stake-weighted committee membership for a small active
+- `[x]` Implement deterministic leader-gated checkpoint proposal and validator
+  vote wire flow
+- `[x]` Implement stake-weighted committee membership for a small active
   validator set
-- `[ ]` Implement quorum-certificate formation using `ML-DSA` validator votes
+- `[x]` Implement quorum-certificate formation using `ML-DSA` validator votes
 - `[ ]` Implement Mysticeti-class DAG dissemination and batch availability
 - `[ ]` Implement a fast path for ordinary owned-note transfers
 - `[ ]` Define automatic fallback from fast path to full BFT ordering for
   shared-state or contended transactions
-- `[ ]` Define finality, fork-choice, and replay rules for deterministic BFT
+- `[~]` Define finality, fork-choice, and replay rules for deterministic BFT
   history
 - `[ ]` Define validator liveness, equivocation, and slashing evidence rules
 
 ## 4. Shielded Staking
 
-- `[ ]` Define validator registration and validator metadata objects
+- `[x]` Define validator registration and validator metadata objects
+- `[x]` Implement validator registration and validator-profile shared-state
+  execution with cold-governance authorization
 - `[ ]` Define shielded delegation notes or pool-share notes
 - `[ ]` Define private undelegation and unbonding flows
 - `[ ]` Define reward accrual through pool accounting rather than public
@@ -89,7 +93,7 @@ transitional and should be removed rather than preserved.
   transparent payment path
 - `[ ]` Keep ordinary transfers on a native fast path without revealing extra
   sender or recipient metadata
-- `[ ]` Define native transaction classes clearly: ordinary transfer vs
+- `[x]` Define native transaction classes clearly: ordinary transfer vs
   shared-state operation
 - `[ ]` Remove legacy archive-query assumptions from wallet spend and sync
   flows
@@ -163,7 +167,7 @@ transitional and should be removed rather than preserved.
 
 - `[x]` General-purpose smart contracts rejected as the base protocol direction
 - `[x]` Public mempool DeFi rejected as the base product direction
-- `[ ]` Define the exact native action set for v1:
+- `[~]` Define the exact native action set for v1:
   private transfer, private staking, issuance/redemption, governed actions,
   and optional batch settlement
 - `[ ]` Remove or quarantine abstractions that assume Unchained is a generic
@@ -174,15 +178,18 @@ transitional and should be removed rather than preserved.
 - `[ ]` Redesign config around validators, relays, gateways, and wallet
   services rather than miners and epoch PoW knobs
 - `[ ]` Redesign CLI language around validator operation and private settlement
-- `[ ]` Remove legacy config keys that control PoW, epoch seconds, archive
+- `[~]` Remove legacy config keys that control PoW, epoch seconds, archive
   provider behavior, or mining workflows
 - `[ ]` Define operational ceremonies for validator hot/cold keys and ingress
   operator separation
 
 ## 13. Tests And Verification
 
-- `[ ]` Replace PoW/miner/epoch integration tests with validator/BFT/finality
+- `[~]` Replace PoW/miner/epoch integration tests with validator/BFT/finality
   integration tests
+- `[x]` Add a multi-validator proposer-to-QC network test for finalized
+  checkpoint certification
+- `[x]` Add signed shared-state validator registration/profile-update tests
 - `[ ]` Add tests for ordinary-payment fast-path privacy invariants
 - `[ ]` Add tests for fallback from fast path to full BFT ordering
 - `[ ]` Add tests for private delegation and unbonding flows
@@ -192,10 +199,10 @@ transitional and should be removed rather than preserved.
 
 ## 14. Immediate Next Steps
 
-- `[ ]` Remove the mining/PoW architecture from protocol definitions and docs
+- `[~]` Remove the mining/PoW architecture from protocol definitions and docs
   that still reference it
-- `[ ]` Define the validator-set and quorum-certificate data structures
-- `[ ]` Define the native transaction classes and fast-path eligibility rules
+- `[x]` Define the validator-set and quorum-certificate data structures
+- `[x]` Define the native transaction classes and fast-path eligibility rules
 - `[ ]` Define shielded staking note semantics
 - `[ ]` Define the two-role ingress wire model
 - `[ ]` Define the replacement proof architecture and circuit inventory

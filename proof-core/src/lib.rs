@@ -45,8 +45,62 @@ const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProofShieldedNoteKind {
+    Payment,
+    DelegationShare {
+        validator_id: [u8; 32],
+    },
+    UnbondingClaim {
+        validator_id: [u8; 32],
+        release_epoch: u64,
+    },
+}
+
+impl ProofShieldedNoteKind {
+    pub fn payment() -> Self {
+        Self::Payment
+    }
+
+    pub fn is_payment(&self) -> bool {
+        matches!(self, Self::Payment)
+    }
+
+    pub fn is_delegation_share_for(&self, validator_id: &[u8; 32]) -> bool {
+        matches!(
+            self,
+            Self::DelegationShare {
+                validator_id: note_validator_id
+            } if note_validator_id == validator_id
+        )
+    }
+
+    fn commitment_bytes(&self) -> [u8; 41] {
+        let mut out = [0u8; 41];
+        match self {
+            Self::Payment => {
+                out[0] = 0;
+            }
+            Self::DelegationShare { validator_id } => {
+                out[0] = 1;
+                out[1..33].copy_from_slice(validator_id);
+            }
+            Self::UnbondingClaim {
+                validator_id,
+                release_epoch,
+            } => {
+                out[0] = 2;
+                out[1..33].copy_from_slice(validator_id);
+                out[33..41].copy_from_slice(&release_epoch.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProofShieldedNote {
     pub version: u8,
+    pub kind: ProofShieldedNoteKind,
     pub value: u64,
     pub birth_epoch: u64,
     pub owner_address: [u8; 32],
@@ -238,6 +292,26 @@ pub struct ProofShieldedTxJournal {
     pub outputs: Vec<ProofShieldedOutputBinding>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofPrivateDelegationWitness {
+    pub shielded: ProofShieldedTxWitness,
+    pub validator_id: [u8; 32],
+    pub delegated_output_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofPrivateDelegationJournal {
+    pub chain_id: [u8; 32],
+    pub current_epoch: u64,
+    pub note_tree_root: [u8; 32],
+    pub inputs: Vec<ProofShieldedInputBinding>,
+    pub outputs: Vec<ProofShieldedOutputBinding>,
+    pub validator_id: [u8; 32],
+    pub delegated_output_index: u32,
+    pub delegated_note_commitment: [u8; 32],
+    pub delegated_value: u64,
+}
+
 pub fn validate_shielded_tx_witness(
     witness: &ProofShieldedTxWitness,
 ) -> Result<ProofShieldedTxJournal> {
@@ -258,6 +332,9 @@ pub fn validate_shielded_tx_witness(
 
     for input in &witness.inputs {
         input.note.validate()?;
+        if !input.note.kind.is_payment() {
+            bail!("ordinary shielded spends only accept payment notes as inputs");
+        }
         if note_key_commitment(&input.note_key) != input.note.note_key_commitment {
             bail!("input note key commitment mismatch");
         }
@@ -341,6 +418,9 @@ pub fn validate_shielded_tx_witness(
 
     for output in &witness.outputs {
         output.plaintext.note.validate()?;
+        if !output.plaintext.note.kind.is_payment() {
+            bail!("ordinary shielded spends only emit payment notes");
+        }
         if output.plaintext.note.birth_epoch != witness.current_epoch {
             bail!("output birth epoch must match current epoch");
         }
@@ -383,6 +463,186 @@ pub fn validate_shielded_tx_witness(
     })
 }
 
+pub fn validate_private_delegation_witness(
+    witness: &ProofPrivateDelegationWitness,
+) -> Result<ProofPrivateDelegationJournal> {
+    if witness.shielded.inputs.is_empty() {
+        bail!("delegation witness must contain at least one input");
+    }
+    if witness.shielded.outputs.is_empty() {
+        bail!("delegation witness must contain at least one output");
+    }
+    let delegated_output_index = witness.delegated_output_index as usize;
+    if delegated_output_index >= witness.shielded.outputs.len() {
+        bail!("delegated output index is out of range");
+    }
+
+    let mut total_in = 0u128;
+    let mut total_out = 0u128;
+    let mut seen_nullifiers = HashSet::new();
+    let mut seen_input_commitments = HashSet::new();
+    let mut seen_output_commitments = HashSet::new();
+    let mut input_bindings = Vec::with_capacity(witness.shielded.inputs.len());
+    let mut output_bindings = Vec::with_capacity(witness.shielded.outputs.len());
+    let mut delegated_note_commitment = None;
+    let mut delegated_value = None;
+
+    for input in &witness.shielded.inputs {
+        input.note.validate()?;
+        if !input.note.kind.is_payment() {
+            bail!("private delegation inputs must be ordinary payment notes");
+        }
+        if note_key_commitment(&input.note_key) != input.note.note_key_commitment {
+            bail!("input note key commitment mismatch");
+        }
+        if !seen_input_commitments.insert(input.note.commitment) {
+            bail!("duplicate input note commitment");
+        }
+        if !seen_nullifiers.insert(input.current_nullifier) {
+            bail!("duplicate current nullifier");
+        }
+        if input.membership_proof.note_commitment != input.note.commitment {
+            bail!("input membership proof commitment mismatch");
+        }
+        if input.membership_proof.root != witness.shielded.note_tree_root
+            || !input.membership_proof.verify()
+        {
+            bail!("invalid note membership proof");
+        }
+        if input.historical_checkpoint.note_commitment != input.note.commitment {
+            bail!("historical checkpoint note mismatch");
+        }
+        let genesis_checkpoint =
+            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_image_id,
+        ) = match &input.historical_accumulator {
+            Some(accumulator) => {
+                if input
+                    .historical_accumulator_receipt
+                    .as_ref()
+                    .map_or(true, Vec::is_empty)
+                {
+                    bail!("historical accumulator receipt is missing");
+                }
+                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
+                if witness.shielded.current_epoch == 0
+                    || accumulator.covered_through_epoch != witness.shielded.current_epoch - 1
+                {
+                    bail!("historical checkpoint does not cover all prior epochs");
+                }
+                (
+                    input.note.birth_epoch,
+                    accumulator.covered_through_epoch,
+                    accumulator.historical_root_digest,
+                    accumulator.accumulator_image_id,
+                )
+            }
+            None => {
+                if witness.shielded.current_epoch != input.note.birth_epoch {
+                    bail!("historical accumulator proof missing");
+                }
+                if input.historical_checkpoint != genesis_checkpoint {
+                    bail!("historical checkpoint mismatch");
+                }
+                (
+                    input.note.birth_epoch,
+                    input.historical_checkpoint.covered_through_epoch,
+                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
+                    [0u32; 8],
+                )
+            }
+        };
+        let expected_nullifier = input.note.derive_evolving_nullifier(
+            &input.note_key,
+            &witness.shielded.chain_id,
+            witness.shielded.current_epoch,
+        )?;
+        if expected_nullifier != input.current_nullifier {
+            bail!("current nullifier mismatch");
+        }
+        total_in = total_in.saturating_add(input.note.value as u128);
+        input_bindings.push(ProofShieldedInputBinding {
+            current_nullifier: input.current_nullifier,
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_image_id,
+        });
+    }
+
+    for (index, output) in witness.shielded.outputs.iter().enumerate() {
+        output.plaintext.note.validate()?;
+        if output.plaintext.note.birth_epoch != witness.shielded.current_epoch {
+            bail!("output birth epoch must match current epoch");
+        }
+        if note_key_commitment(&output.plaintext.note_key)
+            != output.plaintext.note.note_key_commitment
+        {
+            bail!("output note key commitment mismatch");
+        }
+        let expected_checkpoint = HistoricalUnspentCheckpoint::genesis(
+            output.plaintext.note.commitment,
+            witness.shielded.current_epoch,
+        );
+        if output.plaintext.checkpoint != expected_checkpoint {
+            bail!("output checkpoint mismatch");
+        }
+        if output.public_output.note_commitment != output.plaintext.note.commitment {
+            bail!("public output note commitment mismatch");
+        }
+        verify_public_output_encryption(output)?;
+        if !seen_output_commitments.insert(output.public_output.note_commitment) {
+            bail!("duplicate output note commitment");
+        }
+
+        if index == delegated_output_index {
+            if !output
+                .plaintext
+                .note
+                .kind
+                .is_delegation_share_for(&witness.validator_id)
+            {
+                bail!("delegated output note kind does not match the delegated validator");
+            }
+            if output.plaintext.note.value == 0 {
+                bail!("delegated output value must be non-zero");
+            }
+            delegated_note_commitment = Some(output.plaintext.note.commitment);
+            delegated_value = Some(output.plaintext.note.value);
+        } else if !output.plaintext.note.kind.is_payment() {
+            bail!("non-delegated outputs in a delegation proof must remain payment notes");
+        }
+
+        total_out = total_out.saturating_add(output.plaintext.note.value as u128);
+        output_bindings.push(ProofShieldedOutputBinding {
+            note_commitment: output.public_output.note_commitment,
+            public_output_digest: public_output_digest(&output.public_output),
+        });
+    }
+
+    if total_in != total_out {
+        bail!("shielded value balance mismatch");
+    }
+
+    Ok(ProofPrivateDelegationJournal {
+        chain_id: witness.shielded.chain_id,
+        current_epoch: witness.shielded.current_epoch,
+        note_tree_root: witness.shielded.note_tree_root,
+        inputs: input_bindings,
+        outputs: output_bindings,
+        validator_id: witness.validator_id,
+        delegated_output_index: witness.delegated_output_index,
+        delegated_note_commitment: delegated_note_commitment
+            .ok_or_else(|| anyhow!("missing delegated output note commitment"))?,
+        delegated_value: delegated_value
+            .ok_or_else(|| anyhow!("missing delegated output value"))?,
+    })
+}
+
 impl ProofShieldedNote {
     pub fn validate(&self) -> Result<()> {
         if self.version != SHIELDED_NOTE_VERSION {
@@ -393,6 +653,7 @@ impl ProofShieldedNote {
         }
         let expected = compute_note_commitment(
             self.version,
+            &self.kind,
             self.value,
             self.birth_epoch,
             &self.owner_address,
@@ -1084,6 +1345,7 @@ fn verify_merkle_proof(leaf_hash: &[u8; 32], proof: &[([u8; 32], bool)], root: &
 
 fn compute_note_commitment(
     version: u8,
+    kind: &ProofShieldedNoteKind,
     value: u64,
     birth_epoch: u64,
     owner_address: &[u8; 32],
@@ -1095,6 +1357,7 @@ fn compute_note_commitment(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(NOTE_COMMIT_DOMAIN);
     hasher.update(&[version]);
+    hasher.update(&kind.commitment_bytes());
     hasher.update(&value.to_le_bytes());
     hasher.update(&birth_epoch.to_le_bytes());
     hasher.update(owner_address);
@@ -1382,6 +1645,7 @@ mod tests {
         let note_key_commitment = note_key_commitment(&note_key);
         let commitment = compute_note_commitment(
             SHIELDED_NOTE_VERSION,
+            &ProofShieldedNoteKind::Payment,
             value,
             birth_epoch,
             &owner_address,
@@ -1394,6 +1658,7 @@ mod tests {
         (
             ProofShieldedNote {
                 version: SHIELDED_NOTE_VERSION,
+                kind: ProofShieldedNoteKind::Payment,
                 value,
                 birth_epoch,
                 owner_address,
