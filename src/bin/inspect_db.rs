@@ -4,24 +4,7 @@ use unchained::{epoch::Anchor, storage};
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting unchained Database...");
 
-    // Load configured storage path; fall back to embedded config if needed
-    let mut cfg = match config::load("config.toml") {
-        Ok(c) => c,
-        Err(_) => {
-            let embedded = include_str!("../../config.toml");
-            config::load_from_str(embedded)?
-        }
-    };
-    // If relative, resolve under user's home like main.rs
-    if std::path::Path::new(&cfg.storage.path).is_relative() {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
-        let abs = std::path::Path::new(&home)
-            .join(".unchained")
-            .join("unchained_data");
-        cfg.storage.path = abs.to_string_lossy().into_owned();
-    }
+    let cfg = config::load_resolved("config.toml")?;
 
     let db = storage::open(&cfg.storage);
 

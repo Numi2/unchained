@@ -4,9 +4,10 @@ use crate::{
         self, Address, MlKem768SecretKey, TaggedKemPublicKey, TaggedSigningPublicKey,
         ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES,
     },
+    node_control::{NodeControlClient, ShieldedRuntimeSnapshot},
     proof, shielded,
-    storage::{Store, WalletStore},
-    transaction::{self, ShieldedOutput, ShieldedOutputPlaintext, Tx},
+    storage::WalletStore,
+    transaction::{ShieldedOutput, ShieldedOutputPlaintext, Tx},
 };
 use aws_lc_rs::unstable::signature::PqdsaKeyPair;
 use serde::{Deserialize, Serialize};
@@ -33,13 +34,12 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rpassword;
 
-const WALLET_KEY: &[u8] = b"default_keypair";
+const WALLET_SECRET_KEY: &[u8] = b"default_keypair";
 const WALLET_FORMAT_MAGIC: &[u8; 4] = b"UCW3";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const WALLET_VERSION_STANDARDIZED: u8 = 3;
 const KEY_DOC_VERSION: u8 = 2;
-const SENT_TX_PREFIX: &[u8] = b"shielded_sent_tx/";
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
@@ -88,8 +88,8 @@ struct SentShieldedTxRecord {
 }
 
 pub struct Wallet {
-    chain_db: Option<Arc<Store>>,
     wallet_db: Arc<WalletStore>,
+    node_client: Option<NodeControlClient>,
     signing_pk: TaggedSigningPublicKey,
     signing_key: PqdsaKeyPair,
     kem_pk: TaggedKemPublicKey,
@@ -137,20 +137,30 @@ impl PreparedShieldedTx {
 }
 
 impl Wallet {
-    fn chain_store(&self) -> Result<Arc<Store>> {
-        self.chain_db
-            .clone()
-            .ok_or_else(|| anyhow!("wallet chain store is unavailable in private-only mode"))
+    fn require_node_client(&self) -> Result<&NodeControlClient> {
+        self.node_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("wallet requires an active node control client"))
     }
 
     fn wallet_store(&self) -> Result<Arc<WalletStore>> {
         Ok(self.wallet_db.clone())
     }
 
-    fn load_or_create_with_chain(
-        chain_db: Option<Arc<Store>>,
-        wallet_db: Arc<WalletStore>,
-    ) -> Result<Self> {
+    pub fn with_node_client(mut self, node_client: NodeControlClient) -> Self {
+        self.node_client = Some(node_client);
+        self
+    }
+
+    fn effective_chain_id(&self) -> Result<[u8; 32]> {
+        self.require_node_client()?.chain_id()
+    }
+
+    fn shielded_runtime_snapshot(&self) -> Result<ShieldedRuntimeSnapshot> {
+        self.require_node_client()?.shielded_runtime_snapshot()
+    }
+
+    fn load_or_create_private_inner(wallet_db: Arc<WalletStore>) -> Result<Self> {
         // Helper to obtain a pass-phrase depending on environment
         fn obtain_passphrase(prompt: &str) -> Result<String> {
             if let Ok(p) = std::env::var("WALLET_PASSPHRASE") {
@@ -167,7 +177,7 @@ impl Wallet {
             }
         }
 
-        if let Some(encoded) = wallet_db.get::<Vec<u8>>("wallet", WALLET_KEY)? {
+        if let Some(encoded) = wallet_db.get_raw_bytes("wallet_secret", WALLET_SECRET_KEY)? {
             if encoded.len() < WALLET_FORMAT_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN {
                 bail!("Unsupported wallet encoding");
             }
@@ -210,8 +220,8 @@ impl Wallet {
             key_zero.iter_mut().for_each(|b| *b = 0);
 
             return Ok(Wallet {
-                chain_db,
                 wallet_db,
+                node_client: None,
                 signing_pk: signing_pk.clone(),
                 signing_key,
                 kem_pk,
@@ -263,11 +273,11 @@ impl Wallet {
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
 
-        wallet_db.put("wallet", WALLET_KEY, &encoded)?;
+        wallet_db.put_raw_bytes("wallet_secret", WALLET_SECRET_KEY, &encoded)?;
         println!("✅ New wallet created and saved");
         Ok(Wallet {
-            chain_db,
             wallet_db,
+            node_client: None,
             signing_pk,
             signing_key,
             kem_pk,
@@ -277,15 +287,10 @@ impl Wallet {
         })
     }
 
-    /// Loads the default keypair from the store, or creates a new one if none exists.
-    pub fn load_or_create(chain_db: Arc<Store>, wallet_db: Arc<WalletStore>) -> Result<Self> {
-        Self::load_or_create_with_chain(Some(chain_db), wallet_db)
-    }
-
     /// Loads the private wallet material without opening the chain database.
     /// Use this for runtimes that only need signing identity and lock derivation.
     pub fn load_or_create_private(wallet_db: Arc<WalletStore>) -> Result<Self> {
-        Self::load_or_create_with_chain(None, wallet_db)
+        Self::load_or_create_private_inner(wallet_db)
     }
 
     pub fn address(&self) -> Address {
@@ -434,8 +439,7 @@ impl Wallet {
     // ---------------------------------------------------------------------
     // Recipient handles are signed KeyDoc JSON documents. Unsigned address blobs are no longer accepted.
     pub fn export_address(&self) -> Result<String> {
-        let store = self.chain_store()?;
-        let chain_id = store.effective_chain_id();
+        let chain_id = self.effective_chain_id()?;
         let msg = canonical::encode_key_doc_signable(
             KEY_DOC_VERSION,
             &chain_id,
@@ -498,8 +502,7 @@ impl Wallet {
         handle: &str,
     ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
         if let Ok((addr, signing_pk, kem_pk)) = Self::parse_address(handle) {
-            let store = self.chain_store()?;
-            let chain_id = store.effective_chain_id();
+            let chain_id = self.effective_chain_id()?;
             let doc: KeyDocV2 =
                 serde_json::from_str(handle.trim()).context("Invalid KeyDoc JSON")?;
             if doc.chain_id != chain_id {
@@ -521,17 +524,17 @@ impl Wallet {
         self.parse_recipient_handle(handle).map(|_| ())
     }
 
-    fn materialize_owned_genesis_notes(&self) -> Result<()> {
-        let store = self.chain_store()?;
+    fn materialize_owned_genesis_notes(
+        &self,
+        snapshot: &ShieldedRuntimeSnapshot,
+    ) -> Result<()> {
         let wallet_store = self.wallet_store()?;
-        transaction::ensure_shielded_runtime_state(store.as_ref())?;
-        let chain_id = store.effective_chain_id();
-        for (birth_epoch, coin) in store.iterate_committed_coins()? {
+        for (birth_epoch, coin) in &snapshot.committed_coins {
             if coin.creator_address != self.address {
                 continue;
             }
             let (note, note_key, checkpoint) =
-                shielded::deterministic_genesis_note(&coin, birth_epoch, &chain_id);
+                shielded::deterministic_genesis_note(coin, *birth_epoch, &snapshot.chain_id);
             if self
                 .load_owned_note_record(wallet_store.as_ref(), &note.commitment)?
                 .is_none()
@@ -584,10 +587,9 @@ impl Wallet {
         Ok(Some(decoded))
     }
 
-    fn rescan_shielded_outputs(&self) -> Result<()> {
-        let store = self.chain_store()?;
+    fn rescan_shielded_outputs(&self, snapshot: &ShieldedRuntimeSnapshot) -> Result<()> {
         let wallet_store = self.wallet_store()?;
-        for (tx_id, output_index, output) in store.iterate_shielded_outputs()? {
+        for (tx_id, output_index, output) in &snapshot.shielded_outputs {
             let Some(plaintext) = self.decrypt_shielded_output(&output)? else {
                 continue;
             };
@@ -603,8 +605,8 @@ impl Wallet {
                 checkpoint: plaintext.checkpoint,
                 checkpoint_accumulator: None,
                 source: OwnedShieldedNoteSource::Received {
-                    tx_id,
-                    output_index,
+                    tx_id: *tx_id,
+                    output_index: *output_index,
                 },
             };
             self.store_owned_note_record(wallet_store.as_ref(), &owned)?;
@@ -614,8 +616,9 @@ impl Wallet {
     }
 
     fn sync_owned_shielded_notes(&self) -> Result<()> {
-        self.materialize_owned_genesis_notes()?;
-        self.rescan_shielded_outputs()?;
+        let snapshot = self.shielded_runtime_snapshot()?;
+        self.materialize_owned_genesis_notes(&snapshot)?;
+        self.rescan_shielded_outputs(&snapshot)?;
         Ok(())
     }
 
@@ -632,7 +635,6 @@ impl Wallet {
         sync: bool,
         unspent_only: bool,
     ) -> Result<Vec<OwnedShieldedNote>> {
-        let store = self.chain_store()?;
         let wallet_store = self.wallet_store()?;
         if sync {
             self.sync_owned_shielded_notes()?;
@@ -640,8 +642,7 @@ impl Wallet {
         let mut notes = self.iterate_owned_note_records(wallet_store.as_ref())?;
         if unspent_only {
             notes.retain(|note| {
-                store
-                    .is_shielded_note_spent(&note.note.commitment)
+                self.is_owned_note_spent(wallet_store.as_ref(), &note.note.commitment)
                     .map(|spent| !spent)
                     .unwrap_or(false)
             });
@@ -658,11 +659,10 @@ impl Wallet {
     async fn refresh_owned_shielded_checkpoints(
         &self,
         notes: &mut [OwnedShieldedNote],
-        network: &crate::network::NetHandle,
     ) -> Result<()> {
         let store = self.wallet_store()?;
         let rotation_round = self.next_shielded_sync_round(store.as_ref())?;
-        self.refresh_owned_shielded_checkpoints_with_round(notes, network, rotation_round)
+        self.refresh_owned_shielded_checkpoints_with_round(notes, rotation_round)
             .await
     }
 
@@ -716,17 +716,15 @@ impl Wallet {
     async fn refresh_owned_shielded_checkpoints_with_round(
         &self,
         notes: &mut [OwnedShieldedNote],
-        network: &crate::network::NetHandle,
         rotation_round: u64,
     ) -> Result<()> {
-        let store = self.chain_store()?;
         let wallet_store = self.wallet_store()?;
-        transaction::ensure_shielded_runtime_state(store.as_ref())?;
-        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
+        let snapshot = self.shielded_runtime_snapshot()?;
+        let current_epoch = snapshot.current_nullifier_epoch;
         let Some(through_epoch) = current_epoch.checked_sub(1) else {
             return Ok(());
         };
-        let chain_id = store.effective_chain_id();
+        let chain_id = snapshot.chain_id;
 
         let prepared_requests =
             self.prepare_owned_checkpoint_requests(notes, through_epoch, chain_id)?;
@@ -739,12 +737,10 @@ impl Wallet {
             return Ok(());
         }
 
-        let extensions = network
-            .request_historical_extensions(&requests, rotation_round)
-            .await?;
-        let ledger = store
-            .load_shielded_root_ledger()?
-            .ok_or_else(|| anyhow!("missing shielded root ledger"))?;
+        let extensions = self
+            .require_node_client()?
+            .request_historical_extensions(&requests, rotation_round)?;
+        let ledger = snapshot.root_ledger;
 
         for (request_index, (note_index, request_checkpoint, _)) in
             prepared_requests.into_iter().enumerate()
@@ -880,14 +876,12 @@ impl Wallet {
 
     pub async fn run_oblivious_refresh_cycle(
         &self,
-        network: &crate::network::NetHandle,
     ) -> Result<()> {
-        let store = self.chain_store()?;
         let wallet_store = self.wallet_store()?;
-        transaction::ensure_shielded_runtime_state(store.as_ref())?;
+        let snapshot = self.shielded_runtime_snapshot()?;
         self.sync_owned_shielded_notes()?;
         let mut notes = self.load_owned_shielded_notes(false, true)?;
-        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
+        let current_epoch = snapshot.current_nullifier_epoch;
         let rotation_round = self.next_shielded_sync_round(wallet_store.as_ref())?;
         let cover_span_templates = current_epoch
             .checked_sub(1)
@@ -895,7 +889,7 @@ impl Wallet {
                 self.prepare_owned_checkpoint_requests(
                     &notes,
                     through_epoch,
-                    store.effective_chain_id(),
+                    snapshot.chain_id,
                 )
                 .map(|prepared| {
                     prepared
@@ -907,7 +901,7 @@ impl Wallet {
             .transpose()?
             .unwrap_or_default();
         if !notes.is_empty() {
-            self.refresh_owned_shielded_checkpoints_with_round(&mut notes, network, rotation_round)
+            self.refresh_owned_shielded_checkpoints_with_round(&mut notes, rotation_round)
                 .await?;
         }
         let cover_requests = self.build_cover_checkpoint_requests(
@@ -917,9 +911,9 @@ impl Wallet {
             crate::protocol::CURRENT.oblivious_sync_cover_queries as usize,
         );
         if !cover_requests.is_empty() {
-            let _ = network
-                .request_historical_extensions(&cover_requests, rotation_round)
-                .await?;
+            let _ = self
+                .require_node_client()?
+                .request_historical_extensions(&cover_requests, rotation_round)?;
         }
         Ok(())
     }
@@ -1031,12 +1025,9 @@ impl Wallet {
         amount: u64,
         counterparty: Address,
     ) -> Result<()> {
-        let mut key = Vec::with_capacity(SENT_TX_PREFIX.len() + tx_id.len());
-        key.extend_from_slice(SENT_TX_PREFIX);
-        key.extend_from_slice(tx_id);
         store.put(
-            "wallet",
-            &key,
+            "wallet_sent_tx",
+            tx_id,
             &SentShieldedTxRecord {
                 tx_id: *tx_id,
                 commit_epoch,
@@ -1047,22 +1038,34 @@ impl Wallet {
     }
 
     fn sent_tx_records(&self, store: &WalletStore) -> Result<Vec<SentShieldedTxRecord>> {
-        let wallet_cf = store
+        let sent_cf = store
             .db
-            .cf_handle("wallet")
-            .ok_or_else(|| anyhow!("'wallet' column family missing"))?;
+            .cf_handle("wallet_sent_tx")
+            .ok_or_else(|| anyhow!("'wallet_sent_tx' column family missing"))?;
         let iter = store
             .db
-            .iterator_cf(wallet_cf, rocksdb::IteratorMode::Start);
+            .iterator_cf(sent_cf, rocksdb::IteratorMode::Start);
         let mut records = Vec::new();
         for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(SENT_TX_PREFIX) {
-                continue;
-            }
+            let (_key, value) = item?;
             records.push(bincode::deserialize::<SentShieldedTxRecord>(&value)?);
         }
         Ok(records)
+    }
+
+    fn mark_owned_note_spent(
+        &self,
+        store: &WalletStore,
+        note_commitment: &[u8; 32],
+        current_nullifier: &[u8; 32],
+    ) -> Result<()> {
+        store.put_raw_bytes("wallet_spent_note", note_commitment, current_nullifier)
+    }
+
+    fn is_owned_note_spent(&self, store: &WalletStore, note_commitment: &[u8; 32]) -> Result<bool> {
+        Ok(store
+            .get_raw_bytes("wallet_spent_note", note_commitment)?
+            .is_some())
     }
 
     pub fn scan_tx_for_me(&self, tx: &Tx) -> Result<()> {
@@ -1106,18 +1109,14 @@ impl Wallet {
         &self,
         receiver_paycode: &str,
         amount: u64,
-        network: &crate::network::NetHandle,
     ) -> Result<PreparedShieldedTx> {
         let (_recipient_addr, recipient_signing_pk, receiver_kem_pk) = self
             .parse_recipient_handle(receiver_paycode)
             .context("Invalid receiver handle")?;
         let recipient_address = recipient_signing_pk.address();
-        let store = self.chain_store()?;
-        transaction::ensure_shielded_runtime_state(store.as_ref())?;
         self.sync_owned_shielded_notes()?;
         let mut available_notes = self.load_owned_shielded_notes(false, true)?;
-        self.refresh_owned_shielded_checkpoints(&mut available_notes, network)
-            .await?;
+        self.refresh_owned_shielded_checkpoints(&mut available_notes).await?;
         let selected_notes = {
             let mut selected = Vec::new();
             let mut total = 0u64;
@@ -1141,12 +1140,11 @@ impl Wallet {
             .iter()
             .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
 
-        let current_epoch = transaction::current_nullifier_epoch(store.as_ref())?;
-        let note_tree = store
-            .load_shielded_note_tree()?
-            .ok_or_else(|| anyhow!("missing shielded note tree"))?;
+        let snapshot = self.shielded_runtime_snapshot()?;
+        let current_epoch = snapshot.current_nullifier_epoch;
+        let note_tree = snapshot.note_tree;
         let tree_root = note_tree.root();
-        let chain_id = store.effective_chain_id();
+        let chain_id = snapshot.chain_id;
         let send_seed =
             self.derive_send_seed(&recipient_address, amount, current_epoch, &selected_notes);
 
@@ -1233,18 +1231,16 @@ impl Wallet {
         &self,
         prepared: PreparedShieldedTx,
         proof_bytes: Vec<u8>,
-        network: &crate::network::NetHandle,
     ) -> Result<SendOutcome> {
-        let store = self.chain_store()?;
         let wallet_store = self.wallet_store()?;
         let tx = Tx::new(prepared.nullifiers.clone(), prepared.outputs, proof_bytes);
-        let tx_id = tx.apply(store.as_ref())?;
+        let tx_id = self.require_node_client()?.submit_tx(&tx)?;
         for (owned, nullifier) in prepared
             .selected_notes
             .iter()
             .zip(prepared.nullifiers.iter())
         {
-            store.mark_shielded_note_spent(&owned.note.commitment, nullifier)?;
+            self.mark_owned_note_spent(wallet_store.as_ref(), &owned.note.commitment, nullifier)?;
         }
         self.store_sent_tx_record(
             wallet_store.as_ref(),
@@ -1254,7 +1250,6 @@ impl Wallet {
             prepared.recipient_address,
         )?;
         self.scan_tx_for_me(&tx)?;
-        network.gossip_tx(&tx).await;
         crate::metrics::V3_SENDS.inc();
 
         Ok(SendOutcome {
@@ -1269,18 +1264,11 @@ impl Wallet {
         &self,
         receiver_paycode: &str,
         amount: u64,
-        network: &crate::network::NetHandle,
     ) -> Result<SendOutcome> {
-        let prepared = self
-            .prepare_shielded_send(receiver_paycode, amount, network)
-            .await?;
+        let prepared = self.prepare_shielded_send(receiver_paycode, amount).await?;
         let (receipt, _journal) = proof::prove_shielded_tx(prepared.witness())?;
-        self.submit_prepared_shielded_send(
-            prepared,
-            proof::receipt_to_bytes(&receipt)?,
-            network,
-        )
-        .await
+        self.submit_prepared_shielded_send(prepared, proof::receipt_to_bytes(&receipt)?)
+            .await
     }
 
     /// Simple wrapper: pay using a recipient handle (address or KeyDoc JSON) with empty note.
@@ -1288,9 +1276,8 @@ impl Wallet {
         &self,
         to: &str,
         amount: u64,
-        network: &crate::network::NetHandle,
     ) -> Result<SendOutcome> {
-        self.send_with_paycode_and_note(to, amount, network).await
+        self.send_with_paycode_and_note(to, amount).await
     }
 
     /// Gets the transaction history for this wallet
@@ -1383,9 +1370,8 @@ mod tests {
     fn shielded_wallet_state_is_encrypted_at_rest() -> Result<()> {
         let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
         let tempdir = TempDir::new()?;
-        let chain_store = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
         let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
-        let wallet = Wallet::load_or_create(chain_store, wallet_store.clone())?;
+        let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
 
         let note = shielded::ShieldedNote::new(
             7,

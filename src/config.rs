@@ -276,6 +276,27 @@ pub fn load<P: AsRef<Path>>(p: P) -> Result<Config> {
     Ok(cfg)
 }
 
+pub fn resolve_storage_path(path: &str) -> String {
+    if Path::new(path).is_relative() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        Path::new(&home)
+            .join(".unchained")
+            .join("unchained_data")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_string()
+    }
+}
+
+pub fn load_resolved<P: AsRef<Path>>(p: P) -> Result<Config> {
+    let mut cfg = load(p)?;
+    cfg.storage.path = resolve_storage_path(&cfg.storage.path);
+    Ok(cfg)
+}
+
 /// Parse configuration from a TOML string and apply the same validations as `load`.
 pub fn load_from_str(text: &str) -> Result<Config> {
     let val: TomlValue = toml::from_str(text)

@@ -8,11 +8,13 @@ use unchained::config::{Net, P2p};
 use unchained::consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS};
 use unchained::epoch::Anchor;
 use unchained::network;
+use unchained::node_control;
 use unchained::node_identity;
 use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::storage::{Store, WalletStore};
 use unchained::sync::SyncState;
 use unchained::wallet::Wallet;
+use tokio::sync::broadcast;
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -125,6 +127,27 @@ async fn spawn_sender_network(
     network::spawn(build_net(port), build_p2p(), sender_db, sync_state).await
 }
 
+async fn spawn_node_control(
+    base_path: &str,
+    db: Arc<Store>,
+    net: unchained::network::NetHandle,
+) -> anyhow::Result<(broadcast::Sender<()>, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (coin_tx, _coin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = node_control::NodeControlServer::bind(
+        base_path,
+        db,
+        net,
+        sync_state,
+        coin_tx,
+        false,
+    )
+    .await?;
+    let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+    Ok((shutdown_tx, task))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -135,38 +158,33 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let receiver_dir = TempDir::new()?;
 
     let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
-    let receiver_db = Arc::new(Store::open(&receiver_dir.path().to_string_lossy())?);
     let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
     let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
 
     let genesis = seed_genesis(sender_db.as_ref())?;
-    seed_genesis(receiver_db.as_ref())?;
+    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db)?;
+    let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let sender_wallet = Arc::new(Wallet::load_or_create(
-        sender_db.clone(),
-        sender_wallet_db,
-    )?);
-    let receiver_wallet = Arc::new(Wallet::load_or_create(
-        receiver_db.clone(),
-        receiver_wallet_db,
-    )?);
-
-    let sender_coin = seed_sender_coin(sender_db.as_ref(), sender_wallet.as_ref(), &genesis)?;
-    receiver_db.put("coin", &sender_coin.id, &sender_coin)?;
-    receiver_db.put_coin_epoch(&sender_coin.id, genesis.num)?;
-    receiver_db.put_coin_epoch_rev(genesis.num, &sender_coin.id)?;
+    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
+    let (node_control_shutdown, node_control_task) =
+        spawn_node_control(&sender_dir.path().to_string_lossy(), sender_db.clone(), net.clone())
+            .await?;
+    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
+    node_client.ping()?;
+    let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
+    let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
     let recipient_handle = receiver_wallet.export_address()?;
 
     assert_eq!(sender_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.balance()?, 0);
 
     let prepared_a = sender_wallet
-        .prepare_shielded_send(&recipient_handle, 1, &net)
+        .prepare_shielded_send(&recipient_handle, 1)
         .await?;
     let prepared_b = sender_wallet
-        .prepare_shielded_send(&recipient_handle, 1, &net)
+        .prepare_shielded_send(&recipient_handle, 1)
         .await?;
 
     assert_eq!(prepared_a.input_count(), 1);
@@ -188,6 +206,8 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
 
     net.shutdown().await;
+    let _ = node_control_shutdown.send(());
+    node_control_task.await??;
     Ok(())
 }
 
@@ -202,34 +222,29 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let receiver_dir = TempDir::new()?;
 
     let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
-    let receiver_db = Arc::new(Store::open(&receiver_dir.path().to_string_lossy())?);
     let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
     let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
 
     let genesis = seed_genesis(sender_db.as_ref())?;
-    seed_genesis(receiver_db.as_ref())?;
+    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db)?;
+    let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let sender_wallet = Arc::new(Wallet::load_or_create(
-        sender_db.clone(),
-        sender_wallet_db,
-    )?);
-    let receiver_wallet = Arc::new(Wallet::load_or_create(
-        receiver_db.clone(),
-        receiver_wallet_db,
-    )?);
-
-    let sender_coin = seed_sender_coin(sender_db.as_ref(), sender_wallet.as_ref(), &genesis)?;
-    receiver_db.put("coin", &sender_coin.id, &sender_coin)?;
-    receiver_db.put_coin_epoch(&sender_coin.id, genesis.num)?;
-    receiver_db.put_coin_epoch_rev(genesis.num, &sender_coin.id)?;
+    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
+    let (node_control_shutdown, node_control_task) =
+        spawn_node_control(&sender_dir.path().to_string_lossy(), sender_db.clone(), net.clone())
+            .await?;
+    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
+    node_client.ping()?;
+    let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
+    let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
     let recipient_handle = receiver_wallet.export_address()?;
 
     assert_eq!(sender_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.balance()?, 0);
 
-    let outcome = sender_wallet.pay(&recipient_handle, 1, &net).await?;
+    let outcome = sender_wallet.pay(&recipient_handle, 1).await?;
     let tx_id = outcome.tx_id;
     assert_eq!(outcome.input_count, 1);
     assert_eq!(outcome.output_count, 1);
@@ -241,13 +256,12 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     assert_eq!(tx.nullifiers.len(), 1);
     assert_eq!(tx.outputs.len(), 1);
 
-    tx.apply(receiver_db.as_ref())?;
-    receiver_wallet.scan_tx_for_me(&tx)?;
-
     assert_eq!(sender_wallet.balance()?, 0);
     assert_eq!(receiver_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
 
     net.shutdown().await;
+    let _ = node_control_shutdown.send(());
+    node_control_task.await??;
     Ok(())
 }

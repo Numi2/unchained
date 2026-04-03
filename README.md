@@ -20,8 +20,12 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
   (`src/canonical.rs`, `src/node_identity.rs`).
 - Persistence uses RocksDB with separate chain and wallet-private stores. Chain
   state lives in the main node database, while wallet secrets, owned notes,
-  checkpoints, and wallet-local metadata live under a dedicated private store
-  rooted at `wallet_private/` (`src/storage.rs`, `src/wallet.rs`).
+  sent-transaction history, spent-note markers, checkpoints, and wallet-local
+  metadata live under a dedicated private store rooted at `wallet_private/`
+  with explicit wallet-only column families (`src/storage.rs`, `src/wallet.rs`).
+- Raw coin mirroring to loose files is opt-in only; the checked-in runtime does
+  not mirror canonical coin data unless `COIN_MIRRORING=1` is set explicitly
+  (`src/storage.rs`).
 - Wallet recipient handles are signed KeyDoc JSON documents that bind a chain ID
   to ML-DSA and ML-KEM public keys (`src/wallet.rs`).
 - Shielded outputs are ML-KEM-768 encrypted and carry opaque ciphertext plus a
@@ -48,9 +52,10 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 
 ## Wallet Refresh And Archive Layer
 
-- `unchained_wallet send` and `unchained_miner` use the wallet-private store for
-  owned note state and advance checkpoint refresh from that role boundary
-  (`src/app.rs`, `src/wallet.rs`, `src/storage.rs`).
+- `unchained_wallet send` uses the wallet-private store for owned note state,
+  while `unchained_wallet serve` exposes only the narrow mining-identity and
+  lock-derivation surface the miner needs (`src/app.rs`, `src/wallet.rs`,
+  `src/storage.rs`, `src/wallet_control.rs`).
 - Each refresh can issue real checkpoint requests for owned notes and synthetic
   cover requests even when no spend is pending (`src/wallet.rs`).
 - Checkpoint queries are segmented by archive shard, routed across providers,
@@ -73,6 +78,13 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 - `unchained_wallet serve` owns the wallet-private store and exposes a local
   Unix-domain control socket for mining identity and lock derivation
   (`src/app.rs`, `src/wallet_control.rs`).
+- `unchained_node start` owns chain state and the live network runtime and now
+  exposes a separate local Unix-domain control socket for shielded state
+  snapshots, checkpoint relay, and tx submission (`src/app.rs`,
+  `src/node_control.rs`).
+- `unchained_node start` also owns epoch management and candidate admission; the
+  miner no longer embeds an epoch manager or opens the chain database
+  (`src/app.rs`, `src/epoch.rs`, `src/node_control.rs`, `src/miner.rs`).
 - Remote interaction happens through signed envelopes on the node-to-node
   transport (`src/network.rs`, `src/node_identity.rs`).
 - The only HTTP surface in the checked-in runtime is the local metrics/log
@@ -84,6 +96,10 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 - Runtime operation only needs the installed auth key and signed node record;
   the offline root is not required by `NodeIdentity::load_runtime_in_dir`
   (`src/node_identity.rs`).
+- The checked-in CLI no longer falls back to embedded config blobs; operators
+  are expected to run the binaries with an explicit on-disk config
+  (`src/app.rs`, `src/config.rs`, `src/bin/inspect_db.rs`,
+  `src/bin/list_epochs.rs`).
 
 ## Proofs
 
@@ -114,16 +130,16 @@ cargo fmt
 cargo check
 cargo test
 cargo test --test shielded_tx_flow -- --nocapture
-cargo run --release --bin unchained_wallet -- serve
 cargo run --release --bin unchained_node -- start
+cargo run --release --bin unchained_wallet -- serve
 cargo run --release --bin unchained_wallet -- receive
 cargo run --release --bin unchained_miner
 ```
 
 The default test suite includes:
 
-- `tests/shielded_tx_flow.rs`: deterministic prepared-send CI coverage plus an
-  ignored live-proving soak roundtrip
+- `tests/shielded_tx_flow.rs`: deterministic prepared-send CI coverage through
+  the node control socket plus an ignored live-proving soak roundtrip
 - `tests/shielded_pool.rs`: shielded note, checkpoint, archive, and
   rerandomization coverage
 - `tests/pq_network.rs`: PQ bootstrap, anchor recovery, and network
@@ -140,7 +156,7 @@ Primary binaries:
 
 - `unchained_node`: node runtime, identity ceremony, message topic, anchor import/export, replay
 - `unchained_wallet`: wallet control service, receive, send, balance, history, rescan
-- `unchained_miner`: dedicated mining runtime that consumes the wallet control socket
+- `unchained_miner`: dedicated mining runtime that consumes node-control mining work and the wallet control socket
 
 `unchained_wallet receive` exports a signed KeyDoc JSON recipient document, and
 `unchained_wallet send` validates that document before constructing a proof-backed
@@ -149,6 +165,19 @@ shielded transaction (`src/wallet.rs`).
 Run `unchained_wallet serve` before `unchained_miner`; the miner no longer opens
 the wallet-private database or loads wallet secrets directly (`src/wallet_control.rs`,
 `src/miner.rs`).
+
+Run `unchained_node start` before `unchained_miner`; the miner no longer opens
+the chain database, owns a QUIC endpoint, or runs the epoch manager locally
+(`src/node_control.rs`, `src/miner.rs`, `src/app.rs`).
+
+Run `unchained_node start` before wallet receive/send/balance/history/rescan;
+the wallet role now reads canonical chain and network state through the node
+control socket rather than opening the chain database directly
+(`src/node_control.rs`, `src/wallet.rs`, `src/app.rs`).
+
+Wallet chain-aware actions now require the node control socket; there is no
+direct wallet-to-chain fallback path in the checked-in runtime
+(`src/node_control.rs`, `src/wallet.rs`).
 
 `unchained_node message send` and `unchained_node message listen` operate on a
 shared text topic rather than a direct wallet-to-wallet transport

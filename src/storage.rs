@@ -174,16 +174,22 @@ impl WalletStore {
 
     pub fn open(base_path: &str) -> Result<Self> {
         let db_path = wallet_store_path(base_path);
-        let db = open_db_with_families(
+        let mut db = open_db_with_families(
             &db_path,
             &[
                 "default",
-                "wallet",
                 "meta",
+                "wallet_secret",
+                "wallet_sent_tx",
+                "wallet_spent_note",
                 "shielded_checkpoint",
                 "shielded_owned_note",
             ],
         )?;
+        if db.cf_handle("wallet").is_some() {
+            db.drop_cf("wallet")
+                .with_context(|| "Failed to drop obsolete wallet column family")?;
+        }
         let store = Self { db, path: db_path };
         store
             .health_check()
@@ -228,6 +234,16 @@ impl WalletStore {
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
         Ok(self.db.get_cf(handle, key)?.map(|v| v.to_vec()))
+    }
+
+    pub fn put_raw_bytes(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
+        self.db.put_cf(handle, key, value).with_context(|| {
+            format!("Failed to PUT raw bytes to wallet database for key '{key:?}' in CF '{cf}'")
+        })
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -370,12 +386,12 @@ impl Store {
         fs::create_dir_all(&coins_dir).ok();
 
         // ----------------------------------------------------
-        // Background coin mirroring (enabled by default)
-        // Can be disabled by setting env VAR COIN_MIRRORING=0
+        // Optional background coin mirroring for explicit operator opt-in.
+        // Disabled by default because it leaks canonical coin data to loose files.
         // ----------------------------------------------------
         let mirror_enabled = std::env::var("COIN_MIRRORING")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mirror_tx = if mirror_enabled {
             let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
             std::thread::Builder::new()
@@ -444,22 +460,13 @@ impl Store {
 
         match self.db.get_cf(handle, key)? {
             Some(value) => {
-                // First attempt: assume data is compressed
-                if let Ok(decompressed) = zstd::decode_all(&value[..]) {
-                    if let Ok(deser) = bincode::deserialize(&decompressed) {
-                        return Ok(Some(deser));
-                    }
-                }
-
-                // Fallback: treat data as uncompressed bincode
-                match bincode::deserialize(&value[..]) {
-                    Ok(deser) => Ok(Some(deser)),
-                    Err(_) => Err(anyhow::anyhow!(
+                bincode::deserialize(&value[..]).map(Some).map_err(|_| {
+                    anyhow::anyhow!(
                         "Failed to deserialize value for key '{:?}' in CF '{}'",
                         key,
                         cf
-                    )),
-                }
+                    )
+                })
             }
             None => Ok(None),
         }
@@ -853,34 +860,6 @@ impl Store {
             records.push(v.to_vec());
         }
         Ok(records)
-    }
-
-    /// Legacy peer-address helpers retained until the network module replacement lands.
-    pub fn store_peer_addr(&self, addr: &str) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("peers")
-            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
-        self.db.put_cf(cf, addr.as_bytes(), &[])?;
-        Ok(())
-    }
-
-    pub fn load_peer_addrs(&self) -> Result<Vec<String>> {
-        let cf = self
-            .db
-            .cf_handle("peers")
-            .ok_or_else(|| anyhow::anyhow!("'peers' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut addrs = Vec::new();
-        for item in iter {
-            let (k, v) = item?;
-            if v.is_empty() {
-                if let Ok(s) = std::str::from_utf8(&k) {
-                    addrs.push(s.to_string());
-                }
-            }
-        }
-        Ok(addrs)
     }
 
     pub fn store_shielded_note_tree(
@@ -1353,31 +1332,9 @@ impl Store {
         }
     }
 
-    /// Fallback: scan `epoch_selected` to find the epoch that selected this coin
-    pub fn find_coin_epoch_via_scan(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
-        let sel_cf = self
-            .db
-            .cf_handle("epoch_selected")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
-        // Iterate all entries; stop on first matching suffix
-        let iter = self.db.iterator_cf(sel_cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (k, _v) = item?;
-            if k.len() == 8 + 32 && &k[8..] == coin_id {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&k[0..8]);
-                return Ok(Some(u64::from_le_bytes(arr)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Retrieve the epoch number for a coin using the index or fallback scan
+    /// Retrieve the epoch number for a coin from the committed reverse index.
     pub fn get_epoch_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
-        if let Some(n) = self.get_coin_epoch(coin_id)? {
-            return Ok(Some(n));
-        }
-        self.find_coin_epoch_via_scan(coin_id)
+        self.get_coin_epoch(coin_id)
     }
 
     /// Persist headers sync cursor (highest requested and highest stored header heights)
@@ -1446,20 +1403,9 @@ impl Store {
             if k.len() != 8 {
                 continue;
             }
-            // Tolerant decode: try zstd first, then plain bincode
-            let anchor: crate::epoch::Anchor = if let Ok(decompressed) = zstd::decode_all(&v[..]) {
-                match bincode::deserialize(&decompressed) {
-                    Ok(a) => a,
-                    Err(_) => match bincode::deserialize(&v[..]) {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    },
-                }
-            } else {
-                match bincode::deserialize(&v[..]) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                }
+            let anchor: crate::epoch::Anchor = match bincode::deserialize(&v[..]) {
+                Ok(a) => a,
+                Err(_) => continue,
             };
             anchors.push(anchor);
         }
@@ -1509,11 +1455,8 @@ impl Store {
 
         let bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read snapshot file '{}'", path))?;
-        // Try zstd then plain
-        let data = match zstd::decode_all(&bytes[..]) {
-            Ok(d) => d,
-            Err(_) => bytes,
-        };
+        let data =
+            zstd::decode_all(&bytes[..]).context("Failed to decompress anchors snapshot")?;
         let snapshot: AnchorsSnapshotV1 = bincode::deserialize(&data)
             .context("Failed to deserialize anchors snapshot (expected AnchorsSnapshotV1)")?;
 

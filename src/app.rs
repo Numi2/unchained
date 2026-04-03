@@ -10,8 +10,9 @@ use tokio::time::Duration;
 
 use crate::{
     canonical, config,
-    epoch::{self, Anchor},
-    metrics, miner, network, node_identity, protocol, storage, sync, wallet, wallet_control,
+    epoch,
+    metrics, miner, network, node_control, node_identity, protocol, storage, sync, wallet,
+    wallet_control,
 };
 use crate::{
     network::{NetHandle, RateLimitedMessage},
@@ -34,7 +35,7 @@ struct CommonArgs {
     author,
     version,
     about = "Unchained node runtime",
-    long_about = "Run the Unchained network node, bootstrap identity, and manage network-facing maintenance tasks.",
+    long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and miner clients.",
     after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node start\n  unchained_node message listen\n"
 )]
 struct NodeCli {
@@ -50,8 +51,8 @@ struct NodeCli {
     author,
     version,
     about = "Unchained wallet runtime",
-    long_about = "Operate the Unchained shielded wallet, export addresses, send shielded transactions, inspect local wallet state, and host the local wallet control socket for mining.",
-    after_help = "Examples:\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <KEYDOC_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
+    long_about = "Operate the Unchained shielded wallet, export addresses, send shielded transactions, inspect local wallet state, and host the local wallet control socket for mining. Wallet commands require `unchained_node start`; only `serve` runs without the node control socket.",
+    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <KEYDOC_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -66,7 +67,7 @@ struct WalletCli {
     author,
     version,
     about = "Unchained miner runtime",
-    long_about = "Run the Unchained dedicated miner and block-production runtime. Requires a wallet control socket from `unchained_wallet serve`."
+    long_about = "Run the Unchained dedicated miner and block-production runtime. Requires `unchained_node start` for mining work and `unchained_wallet serve` for local wallet secrets."
 )]
 struct MinerCli {
     #[command(flatten)]
@@ -222,6 +223,7 @@ struct NetworkRuntime {
     db: Arc<Store>,
     net: NetHandle,
     sync_state: Arc<Mutex<SyncState>>,
+    coin_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -256,11 +258,6 @@ fn load_receiver_code(input: &str) -> Result<String> {
         .trim_matches('\'')
         .trim_matches('`')
         .to_string();
-    if cleaned.eq_ignore_ascii_case("test") {
-        return Ok(std::fs::read_to_string("test_stealth_address.txt")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default());
-    }
     if let Some(path) = cleaned.strip_prefix("file:") {
         return Ok(std::fs::read_to_string(
             path.trim()
@@ -291,52 +288,8 @@ fn short_text(value: &str) -> String {
     }
 }
 
-fn resolve_storage_path(path: &str) -> String {
-    if std::path::Path::new(path).is_relative() {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
-        std::path::Path::new(&home)
-            .join(".unchained")
-            .join("unchained_data")
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        path.to_string()
-    }
-}
-
 fn load_config(path: &str) -> Result<config::Config> {
-    let mut cfg = match config::load(path) {
-        Ok(cfg) => cfg,
-        Err(e1) => {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-            if let Some(dir) = exe_dir {
-                let candidate = dir.join("config.toml");
-                match config::load(&candidate) {
-                    Ok(cfg) => cfg,
-                    Err(e2) => {
-                        eprintln!(
-                            "⚠️  Could not read config from '{}' or exe dir: {} | {}",
-                            path, e1, e2
-                        );
-                        const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
-                        config::load_from_str(EMBEDDED_CONFIG).map_err(|e3| {
-                            anyhow!("failed to load configuration: {} / {} / {}", e1, e2, e3)
-                        })?
-                    }
-                }
-            } else {
-                const EMBEDDED_CONFIG: &str = include_str!("../config.toml");
-                config::load_from_str(EMBEDDED_CONFIG)
-                    .map_err(|e3| anyhow!("failed to load configuration: {} / {}", e1, e3))?
-            }
-        }
-    };
-    cfg.storage.path = resolve_storage_path(&cfg.storage.path);
-    Ok(cfg)
+    config::load_resolved(path)
 }
 
 fn apply_quiet_logging(common: &CommonArgs, cfg: &config::Config) {
@@ -360,6 +313,19 @@ fn open_wallet_store(cfg: &config::Config) -> Result<Arc<WalletStore>> {
         Ok(Err(err)) => Err(err),
         Err(_) => Err(anyhow!("failed to open wallet database")),
     }
+}
+
+fn open_node_control_client(cfg: &config::Config) -> Result<node_control::NodeControlClient> {
+    let client = node_control::NodeControlClient::new(&cfg.storage.path);
+    client.ping()?;
+    Ok(client)
+}
+
+fn open_wallet_runtime(cfg: &config::Config) -> Result<(Arc<WalletStore>, wallet::Wallet)> {
+    let wallet_db = open_wallet_store(cfg)?;
+    let node_client = open_node_control_client(cfg)?;
+    let wallet = wallet::Wallet::load_or_create_private(wallet_db.clone())?.with_node_client(node_client);
+    Ok((wallet_db, wallet))
 }
 
 fn published_identity_addresses(cfg: &config::Config) -> Vec<String> {
@@ -518,6 +484,7 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
 async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     let db = open_store(cfg)?;
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
+    let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let net = network::spawn(
         cfg.net.clone(),
@@ -541,10 +508,22 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
         shutdown_tx.subscribe(),
         !cfg.net.bootstrap.is_empty(),
     );
+    let epoch_mgr = epoch::Manager::new(
+        db.clone(),
+        cfg.epoch.clone(),
+        cfg.net.clone(),
+        net.clone(),
+        coin_rx,
+        shutdown_tx.subscribe(),
+        sync_state.clone(),
+        cfg.compact.clone(),
+    );
+    epoch_mgr.spawn_loop();
     Ok(NetworkRuntime {
         db,
         net,
         sync_state,
+        coin_tx,
         shutdown_tx,
     })
 }
@@ -574,106 +553,8 @@ async fn wait_for_shutdown(signal_label: &str, runtime: NetworkRuntime) -> Resul
     }
 }
 
-async fn sync_before_mining(cfg: &config::Config, runtime: &NetworkRuntime) -> Result<()> {
-    println!("Syncing with the network before mining...");
-    runtime.net.request_latest_epoch().await;
-
-    let mut anchor_rx = runtime.net.anchor_subscribe();
-    let poll_interval_ms: u64 = 500;
-    let max_attempts: u64 =
-        ((cfg.net.sync_timeout_secs.saturating_mul(1000)) / poll_interval_ms).max(1);
-    let mut synced = false;
-    let mut attempt: u64 = 0;
-    let mut last_local_displayed: u64 = u64::MAX;
-
-    while attempt < max_attempts {
-        let highest_seen = runtime
-            .sync_state
-            .lock()
-            .map(|s| s.highest_seen_epoch)
-            .unwrap_or(0);
-        let peer_confirmed = runtime
-            .sync_state
-            .lock()
-            .map(|s| s.peer_confirmed_tip)
-            .unwrap_or(false);
-        let latest_opt = runtime.db.get::<Anchor>("epoch", b"latest").unwrap_or(None);
-        let local_epoch = latest_opt.as_ref().map_or(0, |a| a.num);
-
-        if highest_seen > 0
-            && local_epoch >= highest_seen
-            && (cfg.net.bootstrap.is_empty() || peer_confirmed)
-        {
-            println!("Synchronized at epoch {local_epoch}.");
-            if let Ok(mut st) = runtime.sync_state.lock() {
-                st.synced = true;
-            }
-            synced = true;
-            break;
-        }
-        if highest_seen == 0 && latest_opt.is_some() && cfg.net.bootstrap.is_empty() {
-            println!("No peers responded; using local chain at epoch {local_epoch}.");
-            if let Ok(mut st) = runtime.sync_state.lock() {
-                st.synced = true;
-                if st.highest_seen_epoch == 0 {
-                    st.highest_seen_epoch = local_epoch;
-                }
-            }
-            synced = true;
-            break;
-        }
-        if highest_seen > 0 {
-            if last_local_displayed != local_epoch || attempt == 0 {
-                if cfg.net.bootstrap.is_empty() {
-                    println!("Syncing... local epoch {local_epoch}, network epoch {highest_seen}");
-                } else {
-                    println!(
-                        "Syncing... local {local_epoch}, network {highest_seen}, peer-confirmed {peer_confirmed}"
-                    );
-                }
-                last_local_displayed = local_epoch;
-            }
-        } else {
-            println!("Waiting for network response... attempt {}", attempt + 1);
-        }
-
-        tokio::select! {
-            Ok(_) = anchor_rx.recv() => { continue; }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => { attempt += 1; }
-        }
-    }
-
-    if !synced {
-        println!(
-            "Could not sync with the network after {}s.",
-            cfg.net.sync_timeout_secs
-        );
-        let highest_seen = runtime
-            .sync_state
-            .lock()
-            .map(|s| s.highest_seen_epoch)
-            .unwrap_or(0);
-        if cfg.net.bootstrap.is_empty() && highest_seen == 0 {
-            if let Ok(Some(latest)) = runtime.db.get::<Anchor>("epoch", b"latest") {
-                if let Ok(mut st) = runtime.sync_state.lock() {
-                    st.synced = true;
-                    if st.highest_seen_epoch == 0 {
-                        st.highest_seen_epoch = latest.num;
-                    }
-                }
-                println!("Proceeding with local chain at epoch {}.", latest.num);
-            }
-        } else {
-            println!("Mining remains disabled until local state catches up to the network tip.");
-        }
-    }
-
-    Ok(())
-}
-
 async fn run_send_flow(
     wallet: &Arc<wallet::Wallet>,
-    net: &network::NetHandle,
     args: &SendArgs,
 ) -> Result<()> {
     let guided = args.to.is_none() || args.amount.is_none();
@@ -714,7 +595,7 @@ async fn run_send_flow(
         }
     }
 
-    let outcome = wallet.send_with_paycode_and_note(&to, amount, net).await?;
+    let outcome = wallet.send_with_paycode_and_note(&to, amount).await?;
 
     if args.json {
         println!(
@@ -868,22 +749,9 @@ fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> Result<(
     Ok(())
 }
 
-fn rescan_wallet_transactions(db: &Store, wallet: &wallet::Wallet) -> Result<()> {
-    let cf = db
-        .db
-        .cf_handle("tx")
-        .ok_or_else(|| anyhow!("'tx' column family missing"))?;
-    let iter = db.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-    let mut scanned = 0u64;
-    for item in iter {
-        let (_k, v) = item?;
-        if let Ok(tx) = canonical::decode_tx(&v) {
-            let _ = wallet.scan_tx_for_me(&tx);
-            scanned += 1;
-        }
-    }
-    let _ = wallet.sync_shielded_notes();
-    println!("✅ Rescanned {scanned} transactions for this wallet");
+fn rescan_wallet_transactions(wallet: &wallet::Wallet) -> Result<()> {
+    wallet.sync_shielded_notes()?;
+    println!("✅ Rescanned wallet state from the local node");
     Ok(())
 }
 
@@ -992,17 +860,37 @@ pub async fn run_node_cli() -> Result<()> {
         NodeCmd::Start => {
             println!("Database: {}", cfg.storage.path);
             let runtime = start_network_runtime(&cfg).await?;
+            let node_control_shutdown = runtime.shutdown_tx.subscribe();
+            let node_control_server = node_control::NodeControlServer::bind(
+                &cfg.storage.path,
+                runtime.db.clone(),
+                runtime.net.clone(),
+                runtime.sync_state.clone(),
+                runtime.coin_tx.clone(),
+                !cfg.net.bootstrap.is_empty(),
+            )
+            .await?;
+            let node_control_socket = node_control_server.socket_path().display().to_string();
+            let node_control_task = tokio::spawn(async move {
+                node_control_server.serve(node_control_shutdown).await
+            });
             metrics::serve(cfg.metrics.clone())?;
             println!();
             println!("Unchained node is running.");
             println!("Listening on port {}", cfg.net.listen_port);
+            println!("Node control socket: {node_control_socket}");
             if let Some(public_ip) = cfg.net.public_ip.clone() {
                 println!("Public IP: {public_ip}");
             }
             println!("Epoch length: {} seconds", cfg.epoch.seconds);
-            println!("Mining: disabled");
+            println!("Mining: external clients only");
+            println!("Epoch manager: enabled");
             println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);
-            wait_for_shutdown("Unchained node", runtime).await
+            let shutdown_result = wait_for_shutdown("Unchained node", runtime).await;
+            let node_control_result = node_control_task.await.map_err(|err| anyhow!(err))?;
+            shutdown_result?;
+            node_control_result?;
+            Ok(())
         }
         NodeCmd::InitRoot { .. }
         | NodeCmd::AuthPrepare { .. }
@@ -1058,69 +946,49 @@ pub async fn run_wallet_cli() -> Result<()> {
             }
         }
         WalletCmd::Receive(args) => {
-            let db = open_store(&cfg)?;
-            let wallet_db = open_wallet_store(&cfg)?;
-            let wallet = wallet::Wallet::load_or_create(db.clone(), wallet_db.clone())?;
+            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
             let result = print_receive_output(&wallet, &args);
             drop(wallet);
             let wallet_close_result = wallet_db.close();
-            let close_result = db.close();
             result?;
             wallet_close_result?;
-            close_result?;
             Ok(())
         }
         WalletCmd::Balance(args) => {
-            let db = open_store(&cfg)?;
-            let wallet_db = open_wallet_store(&cfg)?;
-            let wallet = wallet::Wallet::load_or_create(db.clone(), wallet_db.clone())?;
+            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
             let result = print_balance_output(&wallet, &args);
             drop(wallet);
             let wallet_close_result = wallet_db.close();
-            let close_result = db.close();
             result?;
             wallet_close_result?;
-            close_result?;
             Ok(())
         }
         WalletCmd::History(args) => {
-            let db = open_store(&cfg)?;
-            let wallet_db = open_wallet_store(&cfg)?;
-            let wallet = wallet::Wallet::load_or_create(db.clone(), wallet_db.clone())?;
+            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
             let result = print_history_output(&wallet, &args);
             drop(wallet);
             let wallet_close_result = wallet_db.close();
-            let close_result = db.close();
             result?;
             wallet_close_result?;
-            close_result?;
             Ok(())
         }
         WalletCmd::Rescan => {
-            let db = open_store(&cfg)?;
-            let wallet_db = open_wallet_store(&cfg)?;
-            let wallet = wallet::Wallet::load_or_create(db.clone(), wallet_db.clone())?;
-            let result = rescan_wallet_transactions(db.as_ref(), &wallet);
+            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
+            let result = rescan_wallet_transactions(&wallet);
             drop(wallet);
             let wallet_close_result = wallet_db.close();
-            let close_result = db.close();
             result?;
             wallet_close_result?;
-            close_result?;
             Ok(())
         }
         WalletCmd::Send(args) => {
-            let runtime = start_network_runtime(&cfg).await?;
-            let wallet_db = open_wallet_store(&cfg)?;
-            let wallet =
-                Arc::new(wallet::Wallet::load_or_create(runtime.db.clone(), wallet_db.clone())?);
-            let result = run_send_flow(&wallet, &runtime.net, &args).await;
+            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
+            let wallet = Arc::new(wallet);
+            let result = run_send_flow(&wallet, &args).await;
             drop(wallet);
             let wallet_close_result = wallet_db.close();
-            let shutdown_result = shutdown_network_runtime(runtime).await;
             result?;
             wallet_close_result?;
-            shutdown_result?;
             Ok(())
         }
     }
@@ -1132,47 +1000,42 @@ pub async fn run_miner_cli() -> Result<()> {
     cfg.mining.enabled = true;
     apply_quiet_logging(&cli.common, &cfg);
 
+    let node_control = open_node_control_client(&cfg)?;
     let wallet_control = wallet_control::WalletControlClient::new(&cfg.storage.path);
     wallet_control.ping().await?;
     let mining_identity = wallet_control.mining_identity().await?;
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     println!("Database: {}", cfg.storage.path);
-    let runtime = start_network_runtime(&cfg).await?;
-    let (coin_tx, coin_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let epoch_mgr = epoch::Manager::new(
-        runtime.db.clone(),
-        cfg.epoch.clone(),
-        cfg.net.clone(),
-        runtime.net.clone(),
-        coin_rx,
-        runtime.shutdown_tx.subscribe(),
-        runtime.sync_state.clone(),
-        cfg.compact.clone(),
-    );
-    epoch_mgr.spawn_loop();
-
-    sync_before_mining(&cfg, &runtime).await?;
-
-    miner::spawn(
+    let miner_task = miner::spawn(
         cfg.mining.clone(),
-        runtime.db.clone(),
-        runtime.net.clone(),
+        node_control,
         wallet_control,
         mining_identity,
-        coin_tx,
-        runtime.shutdown_tx.subscribe(),
-        runtime.sync_state.clone(),
+        shutdown_rx,
     );
 
     println!();
     println!("Unchained miner is running.");
-    println!("Listening on port {}", cfg.net.listen_port);
-    if let Some(public_ip) = cfg.net.public_ip.clone() {
-        println!("Public IP: {public_ip}");
-    }
+    println!("Node runtime: external");
+    println!("Wallet runtime: external");
     println!("Epoch length: {} seconds", cfg.epoch.seconds);
     println!("Mining: enabled");
     println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);
-    wait_for_shutdown("Unchained miner", runtime).await
+    println!("Press Ctrl+C to stop.");
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            println!();
+            println!("Shutdown signal received. Cleaning up Unchained miner...");
+            let _ = shutdown_tx.send(());
+            let _ = miner_task.await;
+            println!("Unchained miner stopped.");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = shutdown_tx.send(());
+            let _ = miner_task.await;
+            Err(err.into())
+        }
+    }
 }

@@ -91,10 +91,6 @@ name = "inspect_db"
 path = "src/bin/inspect_db.rs"
 
 [[bin]]
-name = "wallet_cf"
-path = "src/bin/wallet_cf.rs"
-
-[[bin]]
 name = "list_epochs"
 path = "src/bin/list_epochs.rs"
 

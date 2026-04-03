@@ -365,7 +365,7 @@ pub struct ShieldedSyncServer {
     ledger: NullifierRootLedger,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointExtensionRequest {
     pub checkpoint: Option<HistoricalUnspentCheckpoint>,
     pub presentation: CheckpointPresentation,
