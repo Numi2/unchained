@@ -9,7 +9,7 @@ use crate::{
     epoch::Anchor,
     network::{
         CompactEpoch, EpochByHash, EpochCandidatesResponse, EpochGetTxn, EpochHeadersBatch,
-        EpochHeadersRange, EpochLeavesBundle, EpochTxn, RateLimitedMessage, SelectedIdsBundle,
+        EpochHeadersRange, EpochLeavesBundle, EpochTxn, SelectedIdsBundle,
     },
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
@@ -489,6 +489,26 @@ pub fn encode_key_doc_signable(
     Ok(writer.into_vec())
 }
 
+pub fn encode_key_doc_v3_signable(
+    version: u8,
+    chain_id: &[u8; 32],
+    signing_pk: &TaggedSigningPublicKey,
+    kem_pk: &TaggedKemPublicKey,
+    receive_key_id: &[u8; 32],
+    issued_unix_ms: u64,
+    expires_unix_ms: u64,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(version);
+    writer.write_fixed(chain_id);
+    write_tagged_signing_public_key(&mut writer, signing_pk);
+    write_tagged_kem_public_key(&mut writer, kem_pk);
+    writer.write_fixed(receive_key_id);
+    writer.write_u64(issued_unix_ms);
+    writer.write_u64(expires_unix_ms);
+    Ok(writer.into_vec())
+}
+
 pub fn encode_key_doc(doc: &KeyDocV2) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(doc.version);
@@ -510,21 +530,6 @@ pub fn decode_key_doc(bytes: &[u8]) -> Result<KeyDocV2> {
     };
     reader.finish()?;
     Ok(doc)
-}
-
-pub fn encode_rate_limited_message(message: &RateLimitedMessage) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_string(&message.content)?;
-    Ok(writer.into_vec())
-}
-
-pub fn decode_rate_limited_message(bytes: &[u8]) -> Result<RateLimitedMessage> {
-    let mut reader = CanonicalReader::new(bytes);
-    let message = RateLimitedMessage {
-        content: reader.read_string()?,
-    };
-    reader.finish()?;
-    Ok(message)
 }
 
 pub fn encode_epoch_leaves_bundle(bundle: &EpochLeavesBundle) -> Result<Vec<u8>> {

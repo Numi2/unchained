@@ -84,11 +84,6 @@ static RECENT_RANGE_REQS: Lazy<Mutex<HashMap<u64, Instant>>> =
 pub type NetHandle = Arc<Network>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitedMessage {
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochLeavesBundle {
     pub epoch_num: u64,
     pub merkle_root: [u8; 32],
@@ -172,7 +167,6 @@ enum WireTopic {
     Coin,
     Tx,
     CompactEpoch,
-    RateLimited,
     EpochLeaves,
     EpochSelectedResponse,
     EpochCandidatesResponse,
@@ -218,7 +212,6 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::Coin => 3,
         WireTopic::Tx => 4,
         WireTopic::CompactEpoch => 5,
-        WireTopic::RateLimited => 6,
         WireTopic::EpochLeaves => 7,
         WireTopic::EpochSelectedResponse => 8,
         WireTopic::EpochCandidatesResponse => 9,
@@ -253,7 +246,7 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         3 => WireTopic::Coin,
         4 => WireTopic::Tx,
         5 => WireTopic::CompactEpoch,
-        6 => WireTopic::RateLimited,
+        6 => bail!("unsupported deprecated wire topic {}", id),
         7 => WireTopic::EpochLeaves,
         8 => WireTopic::EpochSelectedResponse,
         9 => WireTopic::EpochCandidatesResponse,
@@ -474,7 +467,6 @@ struct RuntimeState {
     seen_messages: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
     anchor_tx: broadcast::Sender<Anchor>,
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
-    rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
@@ -486,7 +478,6 @@ struct RuntimeState {
 pub struct Network {
     anchor_tx: broadcast::Sender<Anchor>,
     tx_tx: broadcast::Sender<crate::transaction::Tx>,
-    rate_limited_tx: broadcast::Sender<RateLimitedMessage>,
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
@@ -507,7 +498,6 @@ enum NetworkCommand {
     GossipCoin(CoinCandidate),
     GossipTx(crate::transaction::Tx),
     GossipCompactEpoch(CompactEpoch),
-    GossipRateLimited(RateLimitedMessage),
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
@@ -538,14 +528,12 @@ pub fn testing_stub_handle() -> NetHandle {
     std::mem::forget(tempdir);
     let (tx_tx, _) = broadcast::channel(1);
     let (anchor_tx, _) = broadcast::channel(1);
-    let (rate_limited_tx, _) = broadcast::channel(1);
     let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
     let (checkpoint_tx, _) = broadcast::channel::<CheckpointBatchEvent>(1);
     let (command_tx, _) = mpsc::unbounded_channel();
     Arc::new(Network {
         anchor_tx,
         tx_tx,
-        rate_limited_tx,
         headers_tx,
         checkpoint_tx,
         command_tx,
@@ -1754,10 +1742,6 @@ impl RuntimeState {
                 metrics::COMPACT_EPOCHS_RECV.inc();
                 self.handle_anchor(compact.anchor).await?;
             }
-            WireTopic::RateLimited => {
-                let msg = canonical::decode_rate_limited_message(&frame.body)?;
-                let _ = self.rate_limited_tx.send(msg);
-            }
             WireTopic::NodeRecord => {
                 let discovered = canonical::decode_node_record(&frame.body)?;
                 let is_new = self.remember_record(discovered.clone()).await?;
@@ -2428,7 +2412,13 @@ pub async fn spawn(
     endpoint.set_default_client_config(client_config.clone());
 
     let bootstrap_records = load_bootstrap_records(&net_cfg.bootstrap)?;
-    let trust_policy = TrustPolicy::load(&bootstrap_records, &net_cfg.trust_updates)?;
+    if net_cfg.strict_trust && bootstrap_records.is_empty() {
+        bail!(
+            "strict trust is enabled, but no bootstrap node records were configured"
+        );
+    }
+    let trust_policy = TrustPolicy::load(&bootstrap_records, &net_cfg.trust_updates)?
+        .with_strict_root_pinning(net_cfg.strict_trust);
     let banned_node_ids = net_cfg
         .banned_peer_ids
         .iter()
@@ -2440,7 +2430,6 @@ pub async fn spawn(
     let persisted_archive_replicas = db.load_shielded_archive_replicas()?;
     let (anchor_tx, _) = broadcast::channel(256);
     let (tx_tx, _) = broadcast::channel(256);
-    let (rate_limited_tx, _) = broadcast::channel(64);
     let (headers_tx, _) = broadcast::channel(256);
     let (checkpoint_tx, _) = broadcast::channel(256);
     let connected_peers = Arc::new(Mutex::new(HashSet::new()));
@@ -2471,7 +2460,6 @@ pub async fn spawn(
         seen_messages: Arc::new(AsyncMutex::new(HashMap::new())),
         anchor_tx: anchor_tx.clone(),
         tx_tx: tx_tx.clone(),
-        rate_limited_tx: rate_limited_tx.clone(),
         headers_tx: headers_tx.clone(),
         checkpoint_tx: checkpoint_tx.clone(),
         archive_manifests: Arc::new(RwLock::new(
@@ -2508,7 +2496,6 @@ pub async fn spawn(
     let net = Arc::new(Network {
         anchor_tx,
         tx_tx,
-        rate_limited_tx,
         headers_tx,
         checkpoint_tx,
         command_tx: command_tx.clone(),
@@ -2767,14 +2754,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::GossipRateLimited(msg) => {
-            state
-                .sign_and_broadcast(
-                    WireTopic::RateLimited,
-                    canonical::encode_rate_limited_message(&msg)?,
-                )
-                .await?;
-        }
         NetworkCommand::RequestEpoch(epoch) => {
             let _ = state
                 .sign_and_send_to_targets(
@@ -2925,10 +2904,6 @@ impl Network {
             .send(NetworkCommand::GossipCompactEpoch(compact));
     }
 
-    pub async fn gossip_rate_limited(&self, msg: RateLimitedMessage) {
-        let _ = self.command_tx.send(NetworkCommand::GossipRateLimited(msg));
-    }
-
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> {
         self.anchor_tx.subscribe()
     }
@@ -2939,10 +2914,6 @@ impl Network {
 
     pub fn headers_subscribe(&self) -> broadcast::Receiver<EpochHeadersBatch> {
         self.headers_tx.subscribe()
-    }
-
-    pub fn rate_limited_subscribe(&self) -> broadcast::Receiver<RateLimitedMessage> {
-        self.rate_limited_tx.subscribe()
     }
 
     fn checkpoint_subscribe(&self) -> broadcast::Receiver<CheckpointBatchEvent> {
@@ -3596,7 +3567,6 @@ fn should_relay_topic(topic: WireTopic) -> bool {
             | WireTopic::CoinCandidate
             | WireTopic::Tx
             | WireTopic::CompactEpoch
-            | WireTopic::RateLimited
             | WireTopic::NodeRecord
     )
 }

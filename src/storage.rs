@@ -180,6 +180,7 @@ impl WalletStore {
                 "default",
                 "meta",
                 "wallet_secret",
+                "wallet_receive_key",
                 "wallet_sent_tx",
                 "wallet_spent_note",
                 "shielded_checkpoint",

@@ -13,7 +13,7 @@ use crate::{
     storage, sync, wallet, wallet_control,
 };
 use crate::{
-    network::{NetHandle, RateLimitedMessage},
+    network::NetHandle,
     storage::{Store, WalletStore},
     sync::SyncState,
 };
@@ -34,7 +34,7 @@ struct CommonArgs {
     version,
     about = "Unchained node runtime",
     long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and miner clients.",
-    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node start\n  unchained_node message listen\n"
+    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node start\n"
 )]
 struct NodeCli {
     #[command(flatten)]
@@ -139,11 +139,6 @@ enum NodeCmd {
         #[arg(long)]
         input: String,
     },
-    /// Messaging commands on the bounded P2P topic
-    Message {
-        #[command(subcommand)]
-        cmd: MessageCmd,
-    },
 }
 
 #[derive(Args, Clone)]
@@ -195,26 +190,6 @@ enum WalletCmd {
     History(HistoryArgs),
     /// Rescan local transactions against this wallet
     Rescan,
-}
-
-#[derive(Args, Clone)]
-struct MessageSendArgs {
-    #[arg(long)]
-    text: Option<String>,
-}
-
-#[derive(Args, Clone)]
-struct MessageListenArgs {
-    #[arg(long, default_value_t = false)]
-    once: bool,
-    #[arg(long)]
-    count: Option<u64>,
-}
-
-#[derive(Subcommand)]
-enum MessageCmd {
-    Send(MessageSendArgs),
-    Listen(MessageListenArgs),
 }
 
 struct NetworkRuntime {
@@ -475,8 +450,7 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
         NodeCmd::Start
         | NodeCmd::ReplayTransactions
         | NodeCmd::ExportAnchors { .. }
-        | NodeCmd::ImportAnchors { .. }
-        | NodeCmd::Message { .. } => Ok(false),
+        | NodeCmd::ImportAnchors { .. } => Ok(false),
     }
 }
 
@@ -796,64 +770,6 @@ pub async fn run_node_cli() -> Result<()> {
             shutdown_network_runtime(runtime).await?;
             println!("✅ Re-gossiped {replayed} transactions");
             Ok(())
-        }
-        NodeCmd::Message { cmd } => {
-            let runtime = start_network_runtime(&cfg).await?;
-            match cmd {
-                MessageCmd::Send(MessageSendArgs { text }) => {
-                    let message = if let Some(text) = text {
-                        text
-                    } else {
-                        if !atty::is(atty::Stream::Stdin) {
-                            bail!(
-                                "Interactive message send requires a TTY. Pass --text in non-interactive mode."
-                            );
-                        }
-                        prompt_line("Message: ")?
-                    };
-                    if message.is_empty() {
-                        println!("Nothing to send.");
-                    } else {
-                        runtime
-                            .net
-                            .gossip_rate_limited(RateLimitedMessage { content: message })
-                            .await;
-                        println!("Message submitted to the shared topic.");
-                    }
-                    shutdown_network_runtime(runtime).await
-                }
-                MessageCmd::Listen(MessageListenArgs { once, count }) => {
-                    println!(
-                        "Listening for P2P messages on the bounded topic. Press Ctrl+C to exit."
-                    );
-                    let mut rx = runtime.net.rate_limited_subscribe();
-                    let mut remaining = count.unwrap_or(u64::MAX);
-                    loop {
-                        tokio::select! {
-                            Ok(message) = rx.recv() => {
-                                println!("{}", message.content);
-                                if once {
-                                    break;
-                                }
-                                if remaining != u64::MAX {
-                                    if remaining == 0 {
-                                        break;
-                                    }
-                                    remaining -= 1;
-                                    if remaining == 0 {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                            _ = signal::ctrl_c() => {
-                                break;
-                            }
-                        }
-                    }
-                    shutdown_network_runtime(runtime).await
-                }
-            }
         }
         NodeCmd::Start => {
             println!("Database: {}", cfg.storage.path);

@@ -38,6 +38,7 @@ fn build_net(port: u16) -> Net {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
+        strict_trust: false,
         peer_exchange: true,
         max_peers: 8,
         connection_timeout_secs: 5,
@@ -185,6 +186,15 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
     let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
     let recipient_handle = receiver_wallet.export_address()?;
+    let recipient_handle_repeat = receiver_wallet.export_address()?;
+    let (_recipient_addr, recipient_signing_pk, recipient_kem_pk) =
+        Wallet::parse_address(&recipient_handle)?;
+    let (_recipient_addr_repeat, recipient_signing_pk_repeat, recipient_kem_pk_repeat) =
+        Wallet::parse_address(&recipient_handle_repeat)?;
+
+    assert_eq!(recipient_signing_pk, recipient_signing_pk_repeat);
+    assert_eq!(recipient_kem_pk, recipient_kem_pk_repeat);
+    assert_ne!(recipient_kem_pk, receiver_wallet.kem_public_key().clone());
 
     assert_eq!(sender_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.balance()?, 0);
@@ -286,6 +296,10 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
     let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
     let recipient_handle = receiver_wallet.export_address()?;
+    let (_recipient_addr, _recipient_signing_pk, recipient_kem_pk) =
+        Wallet::parse_address(&recipient_handle)?;
+
+    assert_ne!(recipient_kem_pk, receiver_wallet.kem_public_key().clone());
 
     assert_eq!(sender_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.balance()?, 0);

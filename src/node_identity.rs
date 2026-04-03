@@ -165,7 +165,9 @@ struct TrustUpdateSignableV1 {
 #[derive(Debug, Clone, Default)]
 pub struct TrustPolicy {
     trustees: HashSet<Vec<u8>>,
+    allowed_roots: HashSet<Vec<u8>>,
     required_approvals: usize,
+    require_known_roots: bool,
     revoked_node_ids: HashSet<[u8; 32]>,
     replacement_node_ids: HashMap<[u8; 32], [u8; 32]>,
 }
@@ -472,6 +474,7 @@ impl TrustPolicy {
         if items.is_empty() {
             return Ok(Self {
                 required_approvals: required_trust_approvals(trustees.len()),
+                allowed_roots: trustees.clone(),
                 trustees,
                 ..Self::default()
             });
@@ -481,6 +484,7 @@ impl TrustPolicy {
         }
         let required_approvals = required_trust_approvals(trustees.len());
         let mut policy = Self {
+            allowed_roots: trustees.clone(),
             trustees,
             required_approvals,
             ..Self::default()
@@ -494,13 +498,24 @@ impl TrustPolicy {
                     .replacement_node_ids
                     .insert(update.subject_node_id, replacement_node_id);
             }
+            if let Some(replacement_root_spki) = update.replacement_root_spki {
+                policy.allowed_roots.insert(replacement_root_spki);
+            }
         }
         Ok(policy)
+    }
+
+    pub fn with_strict_root_pinning(mut self, enabled: bool) -> Self {
+        self.require_known_roots = enabled;
+        self
     }
 
     pub fn ensure_record_allowed(&self, record: &NodeRecordV2) -> Result<()> {
         if self.revoked_node_ids.contains(&record.node_id) {
             bail!("node record revoked by trust policy");
+        }
+        if self.require_known_roots && !self.allowed_roots.contains(&record.root_spki) {
+            bail!("node record root is not explicitly trusted");
         }
         Ok(())
     }

@@ -23,6 +23,8 @@ pub struct Net {
     pub bootstrap: Vec<String>, // signed NodeRecordV2 strings or file paths
     #[serde(default)]
     pub trust_updates: Vec<String>, // signed TrustUpdateV1 strings or file paths
+    #[serde(default = "default_strict_trust")]
+    pub strict_trust: bool, // require peers to chain back to explicitly configured bootstrap roots
     #[serde(default)]
     pub peer_exchange: bool, // gossip known peers
     #[serde(default = "default_max_peers")]
@@ -224,6 +226,9 @@ fn default_connection_timeout() -> u64 {
 fn default_sync_timeout() -> u64 {
     180
 }
+fn default_strict_trust() -> bool {
+    true
+}
 
 // P2P defaults
 fn default_max_validation_failures_per_peer() -> u32 {
@@ -337,6 +342,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                         "listen_port",
                         "bootstrap",
                         "trust_updates",
+                        "strict_trust",
                         "peer_exchange",
                         "max_peers",
                         "connection_timeout_secs",

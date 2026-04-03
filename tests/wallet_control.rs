@@ -52,6 +52,7 @@ fn build_net(port: u16) -> Net {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
+        strict_trust: false,
         peer_exchange: true,
         max_peers: 8,
         connection_timeout_secs: 5,
