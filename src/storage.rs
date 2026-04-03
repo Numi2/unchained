@@ -207,7 +207,9 @@ impl WalletStore {
             .ok_or_else(|| anyhow::anyhow!("Wallet column family '{}' not found", cf))?;
         self.db
             .put_cf(handle, key, &data_to_store)
-            .with_context(|| format!("Failed to PUT to wallet database for key '{key:?}' in CF '{cf}'"))
+            .with_context(|| {
+                format!("Failed to PUT to wallet database for key '{key:?}' in CF '{cf}'")
+            })
     }
 
     pub fn get<T: DeserializeOwned + 'static>(&self, cf: &str, key: &[u8]) -> Result<Option<T>> {
@@ -459,15 +461,13 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("Column family '{}' not found", cf))?;
 
         match self.db.get_cf(handle, key)? {
-            Some(value) => {
-                bincode::deserialize(&value[..]).map(Some).map_err(|_| {
-                    anyhow::anyhow!(
-                        "Failed to deserialize value for key '{:?}' in CF '{}'",
-                        key,
-                        cf
-                    )
-                })
-            }
+            Some(value) => bincode::deserialize(&value[..]).map(Some).map_err(|_| {
+                anyhow::anyhow!(
+                    "Failed to deserialize value for key '{:?}' in CF '{}'",
+                    key,
+                    cf
+                )
+            }),
             None => Ok(None),
         }
     }
@@ -1455,8 +1455,7 @@ impl Store {
 
         let bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read snapshot file '{}'", path))?;
-        let data =
-            zstd::decode_all(&bytes[..]).context("Failed to decompress anchors snapshot")?;
+        let data = zstd::decode_all(&bytes[..]).context("Failed to decompress anchors snapshot")?;
         let snapshot: AnchorsSnapshotV1 = bincode::deserialize(&data)
             .context("Failed to deserialize anchors snapshot (expected AnchorsSnapshotV1)")?;
 

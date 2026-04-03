@@ -9,9 +9,7 @@ use unchained::{
     config::{Net, P2p},
     consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS},
     epoch::Anchor,
-    network,
-    node_control,
-    node_identity,
+    network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
     storage::{Store, WalletStore},
     sync::SyncState,
@@ -64,12 +62,43 @@ fn genesis_anchor() -> Anchor {
     }
 }
 
+fn child_anchor(parent: &Anchor) -> Anchor {
+    let num = parent.num.saturating_add(1);
+    let merkle_root = [num as u8; 32];
+    let hash = *blake3::hash(&[parent.hash.as_slice(), merkle_root.as_slice()].concat()).as_bytes();
+    Anchor {
+        num,
+        hash,
+        merkle_root,
+        difficulty: parent.difficulty,
+        coin_count: 0,
+        cumulative_work: parent
+            .cumulative_work
+            .saturating_add(Anchor::expected_work_for_difficulty(parent.difficulty)),
+        mem_kib: parent.mem_kib,
+    }
+}
+
 fn seed_genesis(store: &Store) -> Result<Anchor> {
     let genesis = genesis_anchor();
     store.put("epoch", &0u64.to_le_bytes(), &genesis)?;
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
     Ok(genesis)
+}
+
+fn mark_epoch_selected(store: &Store, epoch_num: u64, coin_ids: &[[u8; 32]]) -> Result<()> {
+    let sel_cf = store
+        .db
+        .cf_handle("epoch_selected")
+        .expect("epoch_selected column family");
+    for coin_id in coin_ids {
+        let mut key = Vec::with_capacity(8 + 32);
+        key.extend_from_slice(&epoch_num.to_le_bytes());
+        key.extend_from_slice(coin_id);
+        store.db.put_cf(sel_cf, key, [])?;
+    }
+    Ok(())
 }
 
 fn provision_runtime_identity(
@@ -90,7 +119,11 @@ fn provision_runtime_identity(
     Ok(())
 }
 
-async fn spawn_network(tempdir: &TempDir, db: Arc<Store>, genesis: &Anchor) -> Result<unchained::network::NetHandle> {
+async fn spawn_network(
+    tempdir: &TempDir,
+    db: Arc<Store>,
+    genesis: &Anchor,
+) -> Result<unchained::network::NetHandle> {
     let port = pick_udp_port();
     provision_runtime_identity(tempdir, genesis.hash, format!("127.0.0.1:{port}"))?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
@@ -148,10 +181,26 @@ async fn node_control_serves_mining_work_and_accepts_candidates() -> Result<()> 
 
     let client = node_control::NodeControlClient::new(&tempdir.path().to_string_lossy());
     client.ping()?;
+    let mut state_rx = client.subscribe_state()?;
+    let initial_state = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(state) = state_rx.borrow().clone() {
+                return Ok::<_, anyhow::Error>(state);
+            }
+            state_rx.changed().await?;
+        }
+    })
+    .await??;
+    let capability_path =
+        node_control::node_control_capability_path(&tempdir.path().to_string_lossy());
+    assert!(capability_path.exists());
     let work = client.mining_work()?;
     assert!(work.mining_ready);
     assert_eq!(work.local_tip, genesis.num);
-    assert_eq!(work.latest_anchor.as_ref().map(|anchor| anchor.hash), Some(genesis.hash));
+    assert_eq!(
+        work.latest_anchor.as_ref().map(|anchor| anchor.hash),
+        Some(genesis.hash)
+    );
 
     let candidate = CoinCandidate::new(
         genesis.hash,
@@ -176,6 +225,46 @@ async fn node_control_serves_mining_work_and_accepts_candidates() -> Result<()> 
         )?
         .expect("candidate persisted");
     assert_eq!(stored.id, candidate.id);
+
+    let next_anchor = child_anchor(&genesis);
+    db.put("epoch", &next_anchor.num.to_le_bytes(), &next_anchor)?;
+    db.put("epoch", b"latest", &next_anchor)?;
+    db.put("anchor", &next_anchor.hash, &next_anchor)?;
+    mark_epoch_selected(db.as_ref(), next_anchor.num, &[candidate.id])?;
+
+    let updated_state = timeout(Duration::from_secs(2), async {
+        loop {
+            state_rx.changed().await?;
+            if let Some(state) = state_rx.borrow_and_update().clone() {
+                if state.sequence > initial_state.sequence {
+                    return Ok::<_, anyhow::Error>(state);
+                }
+            }
+        }
+    })
+    .await??;
+    assert_eq!(updated_state.state.mining_work.local_tip, next_anchor.num);
+    assert_eq!(
+        updated_state
+            .state
+            .mining_work
+            .latest_anchor
+            .as_ref()
+            .map(|anchor| anchor.hash),
+        Some(next_anchor.hash)
+    );
+    let finalized = updated_state
+        .state
+        .mining_work
+        .recent_finalized_selections
+        .iter()
+        .find(|selection| selection.anchor_epoch == next_anchor.num)
+        .expect("latest finalized selection carried in stream");
+    assert_eq!(finalized.candidate_epoch, genesis.num);
+    assert_eq!(finalized.coin_ids, vec![candidate.id]);
+
+    std::fs::write(&capability_path, [0u8; 32])?;
+    assert!(client.ping().is_err());
 
     let _ = shutdown_tx.send(());
     server_task.await??;

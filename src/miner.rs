@@ -2,15 +2,17 @@ use crate::{
     coin::{Coin, CoinCandidate},
     crypto::{self, Address, TaggedSigningPublicKey},
     epoch::Anchor,
-    node_control::{MiningWork, NodeControlClient},
-    wallet_control::{MiningIdentity, WalletControlClient},
+    node_control::{
+        MiningWork, NodeControlClient, NodeControlStateEnvelope, RECENT_FINALIZED_SELECTION_WINDOW,
+    },
+    wallet_control::{MiningIdentity, WalletControlClient, WalletControlStateEnvelope},
 };
-use anyhow::Result as AnyResult;
+use anyhow::{anyhow, bail, Result as AnyResult};
 use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
-    sync::broadcast::Receiver,
+    sync::{broadcast::Receiver, watch},
     task,
     time::{self, Duration},
 };
@@ -24,14 +26,13 @@ pub fn spawn(
     cfg: crate::config::Mining,
     node_control: NodeControlClient,
     wallet_control: WalletControlClient,
-    mining_identity: MiningIdentity,
     shutdown_rx: Receiver<()>,
 ) -> task::JoinHandle<()> {
     task::spawn(async move {
         let mut miner = Miner::new(
             cfg,
             node_control,
-            MinerWalletAuthority::new(wallet_control, mining_identity),
+            MinerWalletAuthority::new(wallet_control),
             shutdown_rx,
         );
         miner.run().await;
@@ -41,25 +42,42 @@ pub fn spawn(
 #[derive(Clone)]
 struct MinerWalletAuthority {
     control: WalletControlClient,
-    address: Address,
-    signing_pk: TaggedSigningPublicKey,
+    identity: Option<MiningIdentity>,
 }
 
 impl MinerWalletAuthority {
-    fn new(control: WalletControlClient, identity: MiningIdentity) -> Self {
+    fn new(control: WalletControlClient) -> Self {
         Self {
             control,
-            address: identity.address,
-            signing_pk: identity.signing_pk,
+            identity: None,
         }
     }
 
-    fn address(&self) -> Address {
-        self.address
+    fn bind_or_verify_identity(&mut self, identity: MiningIdentity) -> AnyResult<()> {
+        match self.identity.as_ref() {
+            Some(current) if current != &identity => {
+                bail!("wallet mining identity changed while miner was running; restart the miner intentionally")
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.identity = Some(identity);
+                Ok(())
+            }
+        }
     }
 
-    fn public_key(&self) -> &TaggedSigningPublicKey {
-        &self.signing_pk
+    fn address(&self) -> AnyResult<Address> {
+        self.identity
+            .as_ref()
+            .map(|identity| identity.address)
+            .ok_or_else(|| anyhow!("wallet mining identity not yet bound"))
+    }
+
+    fn public_key(&self) -> AnyResult<&TaggedSigningPublicKey> {
+        self.identity
+            .as_ref()
+            .map(|identity| &identity.signing_pk)
+            .ok_or_else(|| anyhow!("wallet mining identity not yet bound"))
     }
 
     async fn derive_genesis_lock_secret(
@@ -85,6 +103,11 @@ struct Miner {
     reported_candidates: HashSet<[u8; 32]>,
 }
 
+enum MineEpochOutcome {
+    AwaitStateChange,
+    Reevaluate(NodeControlStateEnvelope),
+}
+
 impl Miner {
     fn new(
         cfg: crate::config::Mining,
@@ -106,47 +129,79 @@ impl Miner {
     }
 
     async fn run(&mut self) {
-        loop {
-            match self.wait_for_mineable_work().await {
-                Ok(()) => break,
-                Err(err) if err.to_string() == "Shutdown" => {
-                    println!("🛑 Miner shut down gracefully");
-                    return;
-                }
-                Err(err) => {
-                    eprintln!("Failed to fetch mining work: {err}");
-                    time::sleep(Duration::from_secs(1)).await;
-                }
+        let mut wallet_state_rx = match self.wallet.control.subscribe_state() {
+            Ok(rx) => rx,
+            Err(err) => {
+                eprintln!("Failed to subscribe to wallet state: {err}");
+                return;
             }
-        }
-
+        };
+        let mut wallet_sequence = match self
+            .wait_for_wallet_authority(&mut wallet_state_rx, None)
+            .await
+        {
+            Ok(state) => Some(state.sequence),
+            Err(err) if err.to_string() == "Shutdown" => {
+                println!("🛑 Miner shut down gracefully");
+                return;
+            }
+            Err(err) => {
+                eprintln!("Failed to bind wallet mining identity: {err}");
+                return;
+            }
+        };
+        let mut state_rx = match self.node.subscribe_state() {
+            Ok(rx) => rx,
+            Err(err) => {
+                eprintln!("Failed to subscribe to node state: {err}");
+                return;
+            }
+        };
+        let mut state = match self
+            .wait_for_mineable_work(&mut state_rx, &mut wallet_state_rx, &mut wallet_sequence)
+            .await
+        {
+            Ok(state) => state,
+            Err(err) if err.to_string() == "Shutdown" => {
+                println!("🛑 Miner shut down gracefully");
+                return;
+            }
+            Err(err) => {
+                eprintln!("Failed to fetch mining work: {err}");
+                return;
+            }
+        };
         loop {
-            let work = match self.node.mining_work() {
-                Ok(work) => work,
-                Err(err) => {
-                    self.consecutive_failures += 1;
-                    eprintln!(
-                        "(attempt {}/{}) : {}",
-                        self.consecutive_failures, self.max_consecutive_failures, err
-                    );
-                    let backoff =
-                        Duration::from_secs(2u64.pow(self.consecutive_failures.min(6)));
-                    if self.wait_or_shutdown(backoff).await.is_err() {
-                        println!("🛑 Miner shut down gracefully");
-                        return;
-                    }
-                    continue;
-                }
-            };
+            let work = state.state.mining_work.clone();
 
             if let Err(err) = self.report_selection_results(&work) {
                 eprintln!("⚠️  Could not report selection results: {err}");
             }
 
             let Some(anchor) = work.latest_anchor.clone() else {
-                if self.wait_or_shutdown(Duration::from_secs(1)).await.is_err() {
-                    println!("🛑 Miner shut down gracefully");
-                    return;
+                match self
+                    .wait_for_next_state(
+                        &mut state_rx,
+                        &mut wallet_state_rx,
+                        &mut wallet_sequence,
+                        Some(state.sequence),
+                    )
+                    .await
+                {
+                    Ok(next_state) => {
+                        state = next_state;
+                    }
+                    Err(err) if err.to_string() == "Shutdown" => {
+                        println!("🛑 Miner shut down gracefully");
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to fetch mining work: {err}");
+                        if self.wait_or_shutdown(Duration::from_secs(1)).await.is_err() {
+                            println!("🛑 Miner shut down gracefully");
+                            return;
+                        }
+                    }
                 }
                 continue;
             };
@@ -158,25 +213,109 @@ impl Miner {
                     work.highest_seen_epoch,
                     work.peer_confirmed_tip
                 );
-                if self.wait_or_shutdown(Duration::from_secs(1)).await.is_err() {
-                    println!("🛑 Miner shut down gracefully");
-                    return;
+                match self
+                    .wait_for_mineable_work(
+                        &mut state_rx,
+                        &mut wallet_state_rx,
+                        &mut wallet_sequence,
+                    )
+                    .await
+                {
+                    Ok(next_state) => {
+                        state = next_state;
+                        self.consecutive_failures = 0;
+                    }
+                    Err(err) if err.to_string() == "Shutdown" => {
+                        println!("🛑 Miner shut down gracefully");
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to fetch mining work: {err}");
+                        if self.wait_or_shutdown(Duration::from_secs(1)).await.is_err() {
+                            println!("🛑 Miner shut down gracefully");
+                            return;
+                        }
+                    }
                 }
                 continue;
             }
 
             if self.current_epoch == Some(anchor.num) {
-                if self.wait_or_shutdown(Duration::from_millis(250)).await.is_err() {
-                    println!("🛑 Miner shut down gracefully");
-                    return;
+                match self
+                    .wait_for_next_state(
+                        &mut state_rx,
+                        &mut wallet_state_rx,
+                        &mut wallet_sequence,
+                        Some(state.sequence),
+                    )
+                    .await
+                {
+                    Ok(next_state) => {
+                        state = next_state;
+                    }
+                    Err(err) if err.to_string() == "Shutdown" => {
+                        println!("🛑 Miner shut down gracefully");
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to fetch mining work: {err}");
+                        if self
+                            .wait_or_shutdown(Duration::from_millis(250))
+                            .await
+                            .is_err()
+                        {
+                            println!("🛑 Miner shut down gracefully");
+                            return;
+                        }
+                    }
                 }
                 continue;
             }
 
             self.current_epoch = Some(anchor.num);
-            match self.mine_epoch(&work, anchor).await {
-                Ok(()) => {
+            match self
+                .mine_epoch(
+                    &work,
+                    anchor,
+                    &mut state_rx,
+                    &mut wallet_state_rx,
+                    &mut wallet_sequence,
+                    state.sequence,
+                )
+                .await
+            {
+                Ok(MineEpochOutcome::AwaitStateChange) => {
                     self.consecutive_failures = 0;
+                    match self
+                        .wait_for_next_state(
+                            &mut state_rx,
+                            &mut wallet_state_rx,
+                            &mut wallet_sequence,
+                            Some(state.sequence),
+                        )
+                        .await
+                    {
+                        Ok(next_state) => state = next_state,
+                        Err(err) if err.to_string() == "Shutdown" => {
+                            println!("🛑 Miner shut down gracefully");
+                            return;
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to fetch mining work: {err}");
+                            if self
+                                .wait_or_shutdown(Duration::from_millis(250))
+                                .await
+                                .is_err()
+                            {
+                                println!("🛑 Miner shut down gracefully");
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(MineEpochOutcome::Reevaluate(next_state)) => {
+                    self.consecutive_failures = 0;
+                    state = next_state;
                 }
                 Err(err) if err.to_string() == "Shutdown" => {
                     println!("🛑 Miner shut down gracefully");
@@ -188,8 +327,7 @@ impl Miner {
                         "(attempt {}/{}) : {}",
                         self.consecutive_failures, self.max_consecutive_failures, err
                     );
-                    let backoff =
-                        Duration::from_secs(2u64.pow(self.consecutive_failures.min(6)));
+                    let backoff = Duration::from_secs(2u64.pow(self.consecutive_failures.min(6)));
                     if self.wait_or_shutdown(backoff).await.is_err() {
                         println!("🛑 Miner shut down gracefully");
                         return;
@@ -201,15 +339,23 @@ impl Miner {
 
     async fn wait_for_mineable_work(
         &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        state_rx: &mut watch::Receiver<Option<NodeControlStateEnvelope>>,
+        wallet_state_rx: &mut watch::Receiver<Option<WalletControlStateEnvelope>>,
+        wallet_sequence: &mut Option<u64>,
+    ) -> Result<NodeControlStateEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        let mut last_sequence = None;
         loop {
-            let work = self.node.mining_work()?;
+            let state = self
+                .wait_for_next_state(state_rx, wallet_state_rx, wallet_sequence, last_sequence)
+                .await?;
+            last_sequence = Some(state.sequence);
+            let work = state.state.mining_work.clone();
             if let Err(err) = self.report_selection_results(&work) {
                 eprintln!("⚠️  Could not report selection results: {err}");
             }
             if work.mining_ready {
                 miner_routine!("🚀 Node is fully synced – starting mining");
-                return Ok(());
+                return Ok(state);
             }
             miner_routine!(
                 "⌛ Waiting for mineable node state… local {} / net {} (peer-confirmed: {})",
@@ -217,7 +363,38 @@ impl Miner {
                 work.highest_seen_epoch,
                 work.peer_confirmed_tip
             );
-            self.wait_or_shutdown(Duration::from_secs(1)).await?;
+        }
+    }
+
+    async fn wait_for_next_state(
+        &mut self,
+        state_rx: &mut watch::Receiver<Option<NodeControlStateEnvelope>>,
+        wallet_state_rx: &mut watch::Receiver<Option<WalletControlStateEnvelope>>,
+        wallet_sequence: &mut Option<u64>,
+        current_sequence: Option<u64>,
+    ) -> Result<NodeControlStateEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            if let Some(state) = state_rx.borrow().clone() {
+                if current_sequence.map_or(true, |sequence| state.sequence != sequence) {
+                    return Ok(state);
+                }
+            }
+            tokio::select! {
+                _ = self.shutdown_rx.recv() => {
+                    return Err("Shutdown".into());
+                }
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        return Err("node control state stream closed".into());
+                    }
+                }
+                changed = wallet_state_rx.changed() => {
+                    if changed.is_err() {
+                        return Err("wallet control state stream closed".into());
+                    }
+                    self.drain_wallet_state_updates(wallet_state_rx, wallet_sequence)?;
+                }
+            }
         }
     }
 
@@ -235,45 +412,50 @@ impl Miner {
         &mut self,
         work: &MiningWork,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(anchor) = &work.latest_anchor else {
-            return Ok(());
-        };
-        let prev_epoch = anchor.num.saturating_sub(1);
-        let ours_prev: Vec<[u8; 32]> = self
-            .recent_candidates
-            .iter()
-            .filter_map(|(epoch, id)| {
-                if *epoch == prev_epoch && !self.reported_candidates.contains(id) {
-                    Some(*id)
-                } else {
-                    None
+        for selection in &work.recent_finalized_selections {
+            let our_candidates: Vec<[u8; 32]> = self
+                .recent_candidates
+                .iter()
+                .filter_map(|(epoch, id)| {
+                    if *epoch == selection.candidate_epoch && !self.reported_candidates.contains(id)
+                    {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if our_candidates.is_empty() {
+                continue;
+            }
+            let selected_set: HashSet<[u8; 32]> = selection.coin_ids.iter().copied().collect();
+            for id in our_candidates {
+                if selected_set.contains(&id) {
+                    println!(
+                        "🎉 Epoch #{} finalized: your coin {} was SELECTED",
+                        selection.candidate_epoch,
+                        hex::encode(id)
+                    );
                 }
-            })
-            .collect();
-
-        if ours_prev.is_empty() {
-            return Ok(());
+                self.reported_candidates.insert(id);
+            }
         }
 
-        let selected_ids = self.node.selected_coin_ids_for_epoch(anchor.num)?;
-        let selected_set: HashSet<[u8; 32]> = selected_ids.into_iter().collect();
-        for id in ours_prev {
-            if selected_set.contains(&id) {
-                println!(
-                    "🎉 Epoch #{} finalized: your coin {} was SELECTED",
-                    prev_epoch,
-                    hex::encode(id)
-                );
+        if let Some(anchor) = &work.latest_anchor {
+            let retain_from_epoch = anchor.num.saturating_sub(RECENT_FINALIZED_SELECTION_WINDOW);
+            while let Some((epoch, id)) = self.recent_candidates.front().copied() {
+                if epoch < retain_from_epoch {
+                    self.recent_candidates.pop_front();
+                    self.reported_candidates.remove(&id);
+                } else {
+                    break;
+                }
             }
-            self.reported_candidates.insert(id);
-        }
-
-        while let Some((epoch, _)) = self.recent_candidates.front() {
-            if *epoch + 2 < anchor.num {
-                self.recent_candidates.pop_front();
-            } else {
-                break;
-            }
+            self.reported_candidates.retain(|id| {
+                self.recent_candidates
+                    .iter()
+                    .any(|(_, candidate_id)| candidate_id == id)
+            });
         }
         Ok(())
     }
@@ -282,8 +464,12 @@ impl Miner {
         &mut self,
         work: &MiningWork,
         anchor: Anchor,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let creator_address = self.wallet.address();
+        state_rx: &mut watch::Receiver<Option<NodeControlStateEnvelope>>,
+        wallet_state_rx: &mut watch::Receiver<Option<WalletControlStateEnvelope>>,
+        wallet_sequence: &mut Option<u64>,
+        mut current_sequence: u64,
+    ) -> Result<MineEpochOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let creator_address = self.wallet.address()?;
         let mem_kib = anchor.mem_kib;
         let difficulty = anchor.difficulty;
         let mut attempts = 0u64;
@@ -308,7 +494,7 @@ impl Miner {
                     "⚠️  Reached max attempts ({}) for epoch #{}, waiting for the next epoch",
                     max_attempts, anchor.num
                 );
-                return Ok(());
+                return Ok(MineEpochOutcome::AwaitStateChange);
             }
 
             let batch_size = std::cmp::min(check_every, max_attempts - attempts);
@@ -363,7 +549,7 @@ impl Miner {
             crate::metrics::MINING_ATTEMPTS.inc_by(batch_attempts);
 
             if let Some((nonce, pow_hash)) = found_opt {
-                let creator_pk = self.wallet.public_key().clone();
+                let creator_pk = self.wallet.public_key()?.clone();
                 let candidate_id = Coin::calculate_id(&anchor.hash, nonce, &creator_addr);
                 let s0 = self
                     .wallet
@@ -393,7 +579,7 @@ impl Miner {
                 if self.recent_candidates.len() > 64 {
                     self.recent_candidates.pop_front();
                 }
-                return Ok(());
+                return Ok(MineEpochOutcome::AwaitStateChange);
             }
 
             if attempts % PROGRESS_LOG_INTERVAL_ATTEMPTS == 0 {
@@ -414,33 +600,144 @@ impl Miner {
                 }
             }
 
-            let latest_work = self.node.mining_work()?;
-            if !latest_work.mining_ready {
-                return Ok(());
-            }
-            if let Some(latest_anchor) = latest_work.latest_anchor {
-                if latest_anchor.num > anchor.num
-                    || (latest_anchor.num == anchor.num && latest_anchor.hash != anchor.hash)
-                {
-                    println!(
-                        "🔄 Newer epoch #{} detected while mining #{} – switching",
-                        latest_anchor.num, anchor.num
-                    );
-                    return Ok(());
+            if let Some(next_state) = self.drain_state_updates(state_rx, &mut current_sequence)? {
+                let latest_work = next_state.state.mining_work.clone();
+                if !latest_work.mining_ready {
+                    return Ok(MineEpochOutcome::Reevaluate(next_state));
+                }
+                if let Some(latest_anchor) = latest_work.latest_anchor.clone() {
+                    if latest_anchor.num > anchor.num
+                        || (latest_anchor.num == anchor.num && latest_anchor.hash != anchor.hash)
+                    {
+                        println!(
+                            "🔄 Newer epoch #{} detected while mining #{} – switching",
+                            latest_anchor.num, anchor.num
+                        );
+                        return Ok(MineEpochOutcome::Reevaluate(next_state));
+                    }
                 }
             }
+            self.drain_wallet_state_updates(wallet_state_rx, wallet_sequence)?;
 
             match self.shutdown_rx.try_recv() {
                 Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                     return Err("Shutdown".into());
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    return Err(format!("Shutdown channel lagged, skipped {skipped} messages").into());
+                    return Err(
+                        format!("Shutdown channel lagged, skipped {skipped} messages").into(),
+                    );
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
             }
 
             tokio::task::yield_now().await;
         }
+    }
+
+    fn drain_state_updates(
+        &mut self,
+        state_rx: &mut watch::Receiver<Option<NodeControlStateEnvelope>>,
+        current_sequence: &mut u64,
+    ) -> Result<Option<NodeControlStateEnvelope>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut latest_state = None;
+        loop {
+            match state_rx.has_changed() {
+                Ok(false) => break,
+                Ok(true) => match state_rx.borrow_and_update().clone() {
+                    Some(state) if state.sequence != *current_sequence => {
+                        *current_sequence = state.sequence;
+                        latest_state = Some(state);
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err("node control state stream disconnected".into());
+                    }
+                },
+                Err(_) => return Err("node control state stream closed".into()),
+            }
+        }
+        Ok(latest_state)
+    }
+
+    async fn wait_for_wallet_authority(
+        &mut self,
+        state_rx: &mut watch::Receiver<Option<WalletControlStateEnvelope>>,
+        current_sequence: Option<u64>,
+    ) -> Result<WalletControlStateEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            if let Some(state) = state_rx.borrow().clone() {
+                if current_sequence.map_or(true, |sequence| state.sequence != sequence) {
+                    self.wallet
+                        .bind_or_verify_identity(state.identity.clone())?;
+                    return Ok(state);
+                }
+            }
+            tokio::select! {
+                _ = self.shutdown_rx.recv() => {
+                    return Err("Shutdown".into());
+                }
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        return Err("wallet control state stream closed".into());
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_wallet_state_updates(
+        &mut self,
+        state_rx: &mut watch::Receiver<Option<WalletControlStateEnvelope>>,
+        current_sequence: &mut Option<u64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match state_rx.has_changed() {
+                Ok(false) => break,
+                Ok(true) => match state_rx.borrow_and_update().clone() {
+                    Some(state)
+                        if current_sequence.map_or(true, |sequence| state.sequence != sequence) =>
+                    {
+                        self.wallet
+                            .bind_or_verify_identity(state.identity.clone())?;
+                        *current_sequence = Some(state.sequence);
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err("wallet control state stream disconnected".into());
+                    }
+                },
+                Err(_) => return Err("wallet control state stream closed".into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::TaggedSigningPublicKey;
+
+    #[test]
+    fn miner_wallet_authority_rejects_identity_drift() {
+        let client = WalletControlClient::new("/tmp/unchained-miner-wallet-authority-test");
+        let mut authority = MinerWalletAuthority::new(client);
+        let first = MiningIdentity {
+            address: [1u8; 32],
+            signing_pk: TaggedSigningPublicKey::zero_ml_dsa_65(),
+        };
+        authority
+            .bind_or_verify_identity(first.clone())
+            .expect("bind initial identity");
+        authority
+            .bind_or_verify_identity(first)
+            .expect("same identity remains valid");
+
+        let drifted = MiningIdentity {
+            address: [2u8; 32],
+            signing_pk: TaggedSigningPublicKey::from_ml_dsa_65_array([3u8; 1952]),
+        };
+        assert!(authority.bind_or_verify_identity(drifted).is_err());
     }
 }

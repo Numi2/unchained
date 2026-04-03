@@ -8,6 +8,7 @@ pub mod config;
 pub mod consensus;
 pub mod crypto;
 pub mod epoch;
+pub mod local_control;
 pub mod metrics;
 pub mod miner;
 pub mod network;

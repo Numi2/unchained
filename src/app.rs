@@ -9,10 +9,8 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use crate::{
-    canonical, config,
-    epoch,
-    metrics, miner, network, node_control, node_identity, protocol, storage, sync, wallet,
-    wallet_control,
+    canonical, config, epoch, metrics, miner, network, node_control, node_identity, protocol,
+    storage, sync, wallet, wallet_control,
 };
 use crate::{
     network::{NetHandle, RateLimitedMessage},
@@ -51,7 +49,7 @@ struct NodeCli {
     author,
     version,
     about = "Unchained wallet runtime",
-    long_about = "Operate the Unchained shielded wallet, export addresses, send shielded transactions, inspect local wallet state, and host the local wallet control socket for mining. Wallet commands require `unchained_node start`; only `serve` runs without the node control socket.",
+    long_about = "Operate the Unchained shielded wallet service, export addresses, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
     after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <KEYDOC_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
@@ -321,11 +319,12 @@ fn open_node_control_client(cfg: &config::Config) -> Result<node_control::NodeCo
     Ok(client)
 }
 
-fn open_wallet_runtime(cfg: &config::Config) -> Result<(Arc<WalletStore>, wallet::Wallet)> {
-    let wallet_db = open_wallet_store(cfg)?;
-    let node_client = open_node_control_client(cfg)?;
-    let wallet = wallet::Wallet::load_or_create_private(wallet_db.clone())?.with_node_client(node_client);
-    Ok((wallet_db, wallet))
+async fn open_wallet_control_client(
+    cfg: &config::Config,
+) -> Result<wallet_control::WalletControlClient> {
+    let client = wallet_control::WalletControlClient::new(&cfg.storage.path);
+    client.ping().await?;
+    Ok(client)
 }
 
 fn published_identity_addresses(cfg: &config::Config) -> Vec<String> {
@@ -554,7 +553,7 @@ async fn wait_for_shutdown(signal_label: &str, runtime: NetworkRuntime) -> Resul
 }
 
 async fn run_send_flow(
-    wallet: &Arc<wallet::Wallet>,
+    client: &wallet_control::WalletControlClient,
     args: &SendArgs,
 ) -> Result<()> {
     let guided = args.to.is_none() || args.amount.is_none();
@@ -569,7 +568,6 @@ async fn run_send_flow(
     if to.is_empty() {
         bail!("Address cannot be empty");
     }
-    wallet.validate_recipient_handle(&to)?;
 
     let amount = match args.amount {
         Some(amount) => amount,
@@ -595,7 +593,7 @@ async fn run_send_flow(
         }
     }
 
-    let outcome = wallet.send_with_paycode_and_note(&to, amount).await?;
+    let outcome = client.send(&to, amount).await?;
 
     if args.json {
         println!(
@@ -630,8 +628,8 @@ async fn run_send_flow(
     Ok(())
 }
 
-fn print_receive_output(wallet: &wallet::Wallet, args: &ReceiveArgs) -> Result<()> {
-    let address = wallet.export_address()?;
+fn print_receive_output(state: &wallet::WalletObservedState, args: &ReceiveArgs) -> Result<()> {
+    let address = state.receive_handle.clone();
     let copied = if args.copy {
         copy_to_clipboard(&address).is_ok()
     } else {
@@ -675,10 +673,10 @@ fn print_receive_output(wallet: &wallet::Wallet, args: &ReceiveArgs) -> Result<(
     Ok(())
 }
 
-fn print_balance_output(wallet: &wallet::Wallet, args: &BalanceArgs) -> Result<()> {
-    let balance = wallet.balance()?;
-    let outputs = wallet.list_owned_shielded_notes()?.len();
-    let address = wallet.export_address()?;
+fn print_balance_output(state: &wallet::WalletObservedState, args: &BalanceArgs) -> Result<()> {
+    let balance = state.balance;
+    let outputs = state.spendable_outputs;
+    let address = state.receive_handle.clone();
     if args.json {
         println!(
             "{}",
@@ -702,8 +700,8 @@ fn print_balance_output(wallet: &wallet::Wallet, args: &BalanceArgs) -> Result<(
     Ok(())
 }
 
-fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> Result<()> {
-    let mut history = wallet.get_transaction_history()?;
+fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArgs) -> Result<()> {
+    let mut history = history.to_vec();
     if let Some(limit) = args.limit {
         history.truncate(limit);
     }
@@ -749,8 +747,8 @@ fn print_history_output(wallet: &wallet::Wallet, args: &HistoryArgs) -> Result<(
     Ok(())
 }
 
-fn rescan_wallet_transactions(wallet: &wallet::Wallet) -> Result<()> {
-    wallet.sync_shielded_notes()?;
+async fn rescan_wallet_transactions(client: &wallet_control::WalletControlClient) -> Result<()> {
+    client.force_sync().await?;
     println!("✅ Rescanned wallet state from the local node");
     Ok(())
 }
@@ -871,14 +869,18 @@ pub async fn run_node_cli() -> Result<()> {
             )
             .await?;
             let node_control_socket = node_control_server.socket_path().display().to_string();
-            let node_control_task = tokio::spawn(async move {
-                node_control_server.serve(node_control_shutdown).await
-            });
+            let node_control_capability =
+                node_control::node_control_capability_path(&cfg.storage.path)
+                    .display()
+                    .to_string();
+            let node_control_task =
+                tokio::spawn(async move { node_control_server.serve(node_control_shutdown).await });
             metrics::serve(cfg.metrics.clone())?;
             println!();
             println!("Unchained node is running.");
             println!("Listening on port {}", cfg.net.listen_port);
             println!("Node control socket: {node_control_socket}");
+            println!("Node control capability: {node_control_capability}");
             if let Some(public_ip) = cfg.net.public_ip.clone() {
                 println!("Public IP: {public_ip}");
             }
@@ -911,15 +913,23 @@ pub async fn run_wallet_cli() -> Result<()> {
     match cli.cmd {
         WalletCmd::Serve => {
             let wallet_db = open_wallet_store(&cfg)?;
-            let wallet = Arc::new(wallet::Wallet::load_or_create_private(wallet_db.clone())?);
+            let node_client = open_node_control_client(&cfg)?;
+            let wallet = Arc::new(
+                wallet::Wallet::load_or_create_private(wallet_db.clone())?
+                    .with_node_client(node_client),
+            );
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
             let server =
                 wallet_control::WalletControlServer::bind(&cfg.storage.path, wallet.clone())
                     .await?;
             let socket_path = server.socket_path().display().to_string();
+            let capability_path = wallet_control::wallet_control_capability_path(&cfg.storage.path)
+                .display()
+                .to_string();
             let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
 
             println!("Wallet control socket: {socket_path}");
+            println!("Wallet control capability: {capability_path}");
             println!("Wallet control runtime is running.");
             println!("Press Ctrl+C to stop.");
 
@@ -946,49 +956,31 @@ pub async fn run_wallet_cli() -> Result<()> {
             }
         }
         WalletCmd::Receive(args) => {
-            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
-            let result = print_receive_output(&wallet, &args);
-            drop(wallet);
-            let wallet_close_result = wallet_db.close();
-            result?;
-            wallet_close_result?;
+            let client = open_wallet_control_client(&cfg).await?;
+            let state = client.state().await?;
+            print_receive_output(&state.state, &args)?;
             Ok(())
         }
         WalletCmd::Balance(args) => {
-            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
-            let result = print_balance_output(&wallet, &args);
-            drop(wallet);
-            let wallet_close_result = wallet_db.close();
-            result?;
-            wallet_close_result?;
+            let client = open_wallet_control_client(&cfg).await?;
+            let state = client.state().await?;
+            print_balance_output(&state.state, &args)?;
             Ok(())
         }
         WalletCmd::History(args) => {
-            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
-            let result = print_history_output(&wallet, &args);
-            drop(wallet);
-            let wallet_close_result = wallet_db.close();
-            result?;
-            wallet_close_result?;
+            let client = open_wallet_control_client(&cfg).await?;
+            let state = client.state().await?;
+            print_history_output(&state.state.history, &args)?;
             Ok(())
         }
         WalletCmd::Rescan => {
-            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
-            let result = rescan_wallet_transactions(&wallet);
-            drop(wallet);
-            let wallet_close_result = wallet_db.close();
-            result?;
-            wallet_close_result?;
+            let client = open_wallet_control_client(&cfg).await?;
+            rescan_wallet_transactions(&client).await?;
             Ok(())
         }
         WalletCmd::Send(args) => {
-            let (wallet_db, wallet) = open_wallet_runtime(&cfg)?;
-            let wallet = Arc::new(wallet);
-            let result = run_send_flow(&wallet, &args).await;
-            drop(wallet);
-            let wallet_close_result = wallet_db.close();
-            result?;
-            wallet_close_result?;
+            let client = open_wallet_control_client(&cfg).await?;
+            run_send_flow(&client, &args).await?;
             Ok(())
         }
     }
@@ -1003,7 +995,6 @@ pub async fn run_miner_cli() -> Result<()> {
     let node_control = open_node_control_client(&cfg)?;
     let wallet_control = wallet_control::WalletControlClient::new(&cfg.storage.path);
     wallet_control.ping().await?;
-    let mining_identity = wallet_control.mining_identity().await?;
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     println!("Database: {}", cfg.storage.path);
@@ -1011,7 +1002,6 @@ pub async fn run_miner_cli() -> Result<()> {
         cfg.mining.clone(),
         node_control,
         wallet_control,
-        mining_identity,
         shutdown_rx,
     );
 

@@ -52,9 +52,10 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
 
 ## Wallet Refresh And Archive Layer
 
-- `unchained_wallet send` uses the wallet-private store for owned note state,
-  while `unchained_wallet serve` exposes only the narrow mining-identity and
-  lock-derivation surface the miner needs (`src/app.rs`, `src/wallet.rs`,
+- `unchained_wallet serve` owns the wallet-private store and publishes the
+  canonical local wallet state surface. `receive`, `balance`, `history`,
+  `rescan`, and `send` are wallet-control clients of that running service
+  rather than direct wallet-database readers (`src/app.rs`, `src/wallet.rs`,
   `src/storage.rs`, `src/wallet_control.rs`).
 - Each refresh can issue real checkpoint requests for owned notes and synthetic
   cover requests even when no spend is pending (`src/wallet.rs`).
@@ -76,11 +77,13 @@ This README is aligned to the current implementation in `src/`, `proof-core/`,
   `src/bin/unchained_node.rs`, `src/bin/unchained_wallet.rs`,
   `src/bin/unchained_miner.rs`).
 - `unchained_wallet serve` owns the wallet-private store and exposes a local
-  Unix-domain control socket for mining identity and lock derivation
+  Unix-domain control socket plus a per-start capability file for streamed
+  wallet state, send/sync operations, and lock derivation
   (`src/app.rs`, `src/wallet_control.rs`).
 - `unchained_node start` owns chain state and the live network runtime and now
-  exposes a separate local Unix-domain control socket for shielded state
-  snapshots, checkpoint relay, and tx submission (`src/app.rs`,
+  exposes a separate local Unix-domain control socket plus a per-start
+  capability file for streamed canonical node state, checkpoint relay, and tx
+  submission (`src/app.rs`,
   `src/node_control.rs`).
 - `unchained_node start` also owns epoch management and candidate admission; the
   miner no longer embeds an epoch manager or opens the chain database
@@ -145,7 +148,7 @@ The default test suite includes:
 - `tests/pq_network.rs`: PQ bootstrap, anchor recovery, and network
   archive/proof flows
 - `tests/wallet_control.rs`: local wallet control socket coverage for miner-facing
-  identity and lock derivation
+  state streaming, miner-facing identity, lock derivation, and capability tamper
 
 Run `cargo test --test shielded_tx_flow -- --ignored --nocapture` when you want
 the full zkVM proving soak on CPU-only proving hosts.
@@ -166,6 +169,11 @@ Run `unchained_wallet serve` before `unchained_miner`; the miner no longer opens
 the wallet-private database or loads wallet secrets directly (`src/wallet_control.rs`,
 `src/miner.rs`).
 
+Run `unchained_wallet serve` before wallet receive/send/balance/history/rescan;
+those commands are now pure clients of the wallet control service and no longer
+open the wallet-private database directly (`src/wallet_control.rs`,
+`src/wallet.rs`, `src/app.rs`).
+
 Run `unchained_node start` before `unchained_miner`; the miner no longer opens
 the chain database, owns a QUIC endpoint, or runs the epoch manager locally
 (`src/node_control.rs`, `src/miner.rs`, `src/app.rs`).
@@ -178,6 +186,34 @@ control socket rather than opening the chain database directly
 Wallet chain-aware actions now require the node control socket; there is no
 direct wallet-to-chain fallback path in the checked-in runtime
 (`src/node_control.rs`, `src/wallet.rs`).
+
+Both local control planes are capability-authenticated; socket filesystem
+permissions are no longer the only authorization boundary
+(`src/local_control.rs`, `src/node_control.rs`, `src/wallet_control.rs`).
+
+The node control plane maintains a long-lived authenticated state stream.
+Wallet and miner clients cache canonical node state from that stream instead of
+repeatedly polling local RPC snapshots for mining readiness or shielded runtime
+state, and the mining side also receives recent finalized-selection summaries
+through that same stream (`src/node_control.rs`, `src/miner.rs`,
+`src/wallet.rs`).
+
+The wallet control plane also maintains a long-lived authenticated wallet-state
+stream. Wallet clients observe receive handles, balances, history, and owned
+shielded-note state through that service instead of reloading wallet-private
+state directly on each command (`src/wallet_control.rs`, `src/wallet.rs`,
+`src/app.rs`).
+
+The miner also binds its creator address and signing key to that streamed
+wallet authority state instead of taking a boot-time wallet identity snapshot.
+If the wallet authority changes underneath a running miner, the miner fails
+closed rather than silently switching identity (`src/miner.rs`,
+`src/wallet_control.rs`).
+
+Wallet refresh, balance, history, and prepared-send flows execute against a
+single coherent node-state envelope per operation, and a prepared shielded send
+is rejected if the canonical shielded state changes before submit
+(`src/wallet.rs`, `src/node_control.rs`).
 
 `unchained_node message send` and `unchained_node message listen` operate on a
 shared text topic rather than a direct wallet-to-wallet transport

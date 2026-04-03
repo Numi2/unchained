@@ -16,7 +16,7 @@ use tokio::{
     time,
 };
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Anchor {
     pub num: u64,
     pub hash: [u8; 32],

@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
+use tokio::sync::broadcast;
+use tokio::time::{timeout, Duration};
 use unchained::coin::Coin;
 use unchained::config::{Net, P2p};
 use unchained::consensus::{DEFAULT_MEM_KIB, TARGET_LEADING_ZEROS};
@@ -14,7 +16,6 @@ use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::storage::{Store, WalletStore};
 use unchained::sync::SyncState;
 use unchained::wallet::Wallet;
-use tokio::sync::broadcast;
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -98,6 +99,13 @@ fn seed_sender_coin(store: &Store, wallet: &Wallet, genesis: &Anchor) -> anyhow:
     Ok(coin)
 }
 
+fn mutate_shielded_note_tree(store: &Store, commitment: [u8; 32]) -> anyhow::Result<()> {
+    let mut tree = store.load_shielded_note_tree()?.unwrap_or_default();
+    tree.append(commitment)?;
+    store.store_shielded_note_tree(&tree)?;
+    Ok(())
+}
+
 fn provision_runtime_identity(
     tempdir: &TempDir,
     chain_id: [u8; 32],
@@ -131,19 +139,16 @@ async fn spawn_node_control(
     base_path: &str,
     db: Arc<Store>,
     net: unchained::network::NetHandle,
-) -> anyhow::Result<(broadcast::Sender<()>, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+) -> anyhow::Result<(
+    broadcast::Sender<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
     let (coin_tx, _coin_rx) = tokio::sync::mpsc::unbounded_channel();
-    let server = node_control::NodeControlServer::bind(
-        base_path,
-        db,
-        net,
-        sync_state,
-        coin_tx,
-        false,
-    )
-    .await?;
+    let server =
+        node_control::NodeControlServer::bind(base_path, db, net, sync_state, coin_tx, false)
+            .await?;
     let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
     Ok((shutdown_tx, task))
 }
@@ -168,11 +173,15 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
-    let (node_control_shutdown, node_control_task) =
-        spawn_node_control(&sender_dir.path().to_string_lossy(), sender_db.clone(), net.clone())
-            .await?;
+    let (node_control_shutdown, node_control_task) = spawn_node_control(
+        &sender_dir.path().to_string_lossy(),
+        sender_db.clone(),
+        net.clone(),
+    )
+    .await?;
     let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
     node_client.ping()?;
+    let mut state_rx = node_client.subscribe_state()?;
     let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
     let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
     let recipient_handle = receiver_wallet.export_address()?;
@@ -193,6 +202,40 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
         bincode::serialize(prepared_a.witness())?,
         bincode::serialize(prepared_b.witness())?
     );
+
+    let initial_state = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(state) = state_rx.borrow().clone() {
+                return Ok::<_, anyhow::Error>(state);
+            }
+            state_rx.changed().await?;
+        }
+    })
+    .await??;
+    mutate_shielded_note_tree(sender_db.as_ref(), [0xabu8; 32])?;
+    let advanced_state = timeout(Duration::from_secs(2), async {
+        loop {
+            state_rx.changed().await?;
+            if let Some(state) = state_rx.borrow_and_update().clone() {
+                if state.sequence > initial_state.sequence {
+                    return Ok::<_, anyhow::Error>(state);
+                }
+            }
+        }
+    })
+    .await??;
+    assert_ne!(
+        advanced_state.state.shielded_runtime.note_tree.root(),
+        initial_state.state.shielded_runtime.note_tree.root()
+    );
+    let stale_submit = sender_wallet
+        .submit_prepared_shielded_send(prepared_b, Vec::new())
+        .await;
+    assert!(stale_submit
+        .err()
+        .map(|err| err.to_string())
+        .unwrap_or_default()
+        .contains("prepared shielded transaction is stale"));
 
     let journal = proof_core::validate_shielded_tx_witness(prepared_a.witness())?;
     assert_eq!(journal.inputs.len(), 1);
@@ -232,9 +275,12 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
-    let (node_control_shutdown, node_control_task) =
-        spawn_node_control(&sender_dir.path().to_string_lossy(), sender_db.clone(), net.clone())
-            .await?;
+    let (node_control_shutdown, node_control_task) = spawn_node_control(
+        &sender_dir.path().to_string_lossy(),
+        sender_db.clone(),
+        net.clone(),
+    )
+    .await?;
     let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
     node_client.ping()?;
     let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
