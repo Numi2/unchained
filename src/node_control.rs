@@ -587,7 +587,7 @@ async fn handle_connection(
 }
 
 async fn handle_request(
-    db: &Store,
+    _db: &Store,
     net: &NetHandle,
     state_refresh_tx: &mpsc::UnboundedSender<()>,
     request: NodeControlRequest,
@@ -608,8 +608,7 @@ async fn handle_request(
                 Ok(NodeControlResponse::HistoricalExtensions { extensions })
             }
             NodeControlRequest::SubmitTx { tx } => {
-                let tx_id = tx.apply(db)?;
-                net.gossip_tx(&tx).await;
+                let tx_id = net.submit_tx(&tx).await?;
                 let _ = state_refresh_tx.send(());
                 Ok(NodeControlResponse::SubmittedTx { tx_id })
             }

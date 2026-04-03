@@ -76,6 +76,23 @@ impl ShieldedNoteKind {
         )
     }
 
+    pub fn is_unbonding_claim_for(&self, validator_id: &[u8; 32]) -> bool {
+        matches!(
+            self,
+            Self::UnbondingClaim {
+                validator_id: note_validator_id,
+                ..
+            } if note_validator_id == validator_id
+        )
+    }
+
+    pub fn unbonding_release_epoch(&self) -> Option<u64> {
+        match self {
+            Self::UnbondingClaim { release_epoch, .. } => Some(*release_epoch),
+            _ => None,
+        }
+    }
+
     fn commitment_bytes(&self) -> [u8; 41] {
         let mut out = [0u8; 41];
         match self {

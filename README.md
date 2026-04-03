@@ -208,8 +208,10 @@ The current foundation slice now includes:
   selection at epoch boundaries
 - leader-proposed checkpoint certification with explicit validator vote
   collection over the network
+- content-addressed shared-state batch dissemination and batch retrieval for
+  validator-ordered actions
 - finalized checkpoint objects that commit parent linkage, ordering path,
-  committee hash, and quorum evidence
+  committee hash, ordered shared-state batch root/count, and quorum evidence
 - finalized-history replay and sync rules based on contiguous checkpoint
   validation rather than heaviest-chain work
 - deterministic candidate admission digests instead of PoW-based coin
@@ -221,21 +223,34 @@ The current foundation slice now includes:
 - removal of the public miner binary and miner-facing local control surface
 
 Shared-state transaction execution now has a real canonical runtime for
-validator-pool registration and profile updates. Those actions mutate the
-public validator-pool state directly, remain off the ordinary transfer fast
-path, and require explicit cold-governance authorization rather than being
-routed through payment logic.
+validator-pool registration, profile updates, private delegation,
+private undelegation, and unbonding claims. Those actions are staged pending
+order, diffused as validator-authored shared-state DAG batches, reconstructed
+into a deterministic quorum round/frontier plan, committed into finalized
+checkpoints by explicit DAG frontier plus ordered batch list, and only then
+applied to public validator-pool state plus shielded note state. Shared-state
+execution no longer mutates canonical state on gossip arrival.
 
 Checkpoint certification now requires a deterministic slot leader to propose an
 `AnchorProposal`, gather validator votes, and assemble a quorum certificate
-before a finalized checkpoint is produced. The remaining consensus gap is not
-basic QC formation; it is DAG dissemination plus full shared-state BFT ordering
-for delegation, undelegation, issuance, redemption, and governed slash flows.
+before a finalized checkpoint is produced. Shared-state ordering now has a real
+round/parent/frontier structure with availability-driven leader proposals over
+quorum DAG rounds. The remaining consensus gap is narrower: ordinary-payment
+fast-path certificates, deterministic fallback between fast-path and full BFT
+ordering, richer multi-round DAG scheduling, and governed slash/evidence flows.
 
 Validator activation is now pulled from persisted validator-pool state rather
-than inherited indefinitely from the parent checkpoint. What still does not
-exist is the canonical source for those stake totals: shielded delegation /
-undelegation notes and their native staking circuits.
+than inherited indefinitely from the parent checkpoint. The staking lifecycle
+now has real private delegation and undelegation semantics: delegation-share
+notes carry pool shares rather than plain stake amount, undelegation burns
+those shares into delayed unbonding-claim notes, and mature claims have a
+native redemption proof path back into ordinary payment notes.
+
+Shared-state staking transactions now expose their embedded shielded transfers
+to wallet scanning rather than disappearing behind the shared-state wrapper.
+Full zk proving remains available for delegation and the new staking actions,
+but the heavy proving paths stay in explicit soak coverage rather than routine
+test targets.
 
 ## Build
 

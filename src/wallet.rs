@@ -6,11 +6,13 @@ use crate::{
         ML_KEM_768_SK_BYTES,
     },
     node_control::{NodeControlClient, NodeControlStateEnvelope, ShieldedRuntimeSnapshot},
-    proof, shielded,
+    proof,
+    protocol::CURRENT as PROTOCOL,
+    shielded,
     storage::WalletStore,
     transaction::{
-        OrdinaryPrivateTransfer, PrivateDelegation, SharedStateAction, ShieldedOutput,
-        ShieldedOutputPlaintext, Tx,
+        ClaimUnbonding, OrdinaryPrivateTransfer, PrivateDelegation, PrivateUndelegation,
+        SharedStateAction, ShieldedOutput, ShieldedOutputPlaintext, Tx,
     },
 };
 use aws_lc_rs::unstable::signature::PqdsaKeyPair;
@@ -164,6 +166,25 @@ pub struct PreparedPrivateDelegation {
     validator_id: ValidatorId,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedPrivateUndelegation {
+    state_binding: PreparedShieldedTxStateBinding,
+    witness: proof_core::ProofPrivateUndelegationWitness,
+    nullifiers: Vec<[u8; 32]>,
+    outputs: Vec<ShieldedOutput>,
+    selected_notes: Vec<OwnedShieldedNote>,
+    validator_id: ValidatorId,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedUnbondingClaim {
+    state_binding: PreparedShieldedTxStateBinding,
+    witness: proof_core::ProofShieldedTxWitness,
+    nullifiers: Vec<[u8; 32]>,
+    outputs: Vec<ShieldedOutput>,
+    selected_notes: Vec<OwnedShieldedNote>,
+}
+
 impl PreparedShieldedTx {
     pub fn witness(&self) -> &proof_core::ProofShieldedTxWitness {
         &self.witness
@@ -185,6 +206,59 @@ impl PreparedShieldedTx {
 impl PreparedPrivateDelegation {
     pub fn witness(&self) -> &proof_core::ProofPrivateDelegationWitness {
         &self.witness
+    }
+
+    pub fn tx_with_proof(&self, proof: Vec<u8>) -> Tx {
+        Tx::new_shared_state(
+            SharedStateAction::PrivateDelegation(PrivateDelegation {
+                validator_id: self.validator_id,
+                transfer: OrdinaryPrivateTransfer {
+                    nullifiers: self.nullifiers.clone(),
+                    outputs: self.outputs.clone(),
+                    proof,
+                },
+            }),
+            Vec::new(),
+        )
+    }
+}
+
+impl PreparedPrivateUndelegation {
+    pub fn witness(&self) -> &proof_core::ProofPrivateUndelegationWitness {
+        &self.witness
+    }
+
+    pub fn tx_with_proof(&self, proof: Vec<u8>) -> Tx {
+        Tx::new_shared_state(
+            SharedStateAction::PrivateUndelegation(PrivateUndelegation {
+                validator_id: self.validator_id,
+                transfer: OrdinaryPrivateTransfer {
+                    nullifiers: self.nullifiers.clone(),
+                    outputs: self.outputs.clone(),
+                    proof,
+                },
+            }),
+            Vec::new(),
+        )
+    }
+}
+
+impl PreparedUnbondingClaim {
+    pub fn witness(&self) -> &proof_core::ProofShieldedTxWitness {
+        &self.witness
+    }
+
+    pub fn tx_with_proof(&self, proof: Vec<u8>) -> Tx {
+        Tx::new_shared_state(
+            SharedStateAction::ClaimUnbonding(ClaimUnbonding {
+                transfer: OrdinaryPrivateTransfer {
+                    nullifiers: self.nullifiers.clone(),
+                    outputs: self.outputs.clone(),
+                    proof,
+                },
+            }),
+            Vec::new(),
+        )
     }
 }
 
@@ -951,6 +1025,37 @@ impl Wallet {
         notes.retain(|note| note.note.kind.is_payment());
     }
 
+    fn retain_delegation_share_notes(
+        notes: &mut Vec<OwnedShieldedNote>,
+        validator_id: ValidatorId,
+    ) {
+        notes.retain(|note| note.note.kind.is_delegation_share_for(&validator_id.0));
+    }
+
+    fn retain_mature_unbonding_claim_notes(notes: &mut Vec<OwnedShieldedNote>, current_epoch: u64) {
+        notes.retain(|note| {
+            note.note
+                .kind
+                .unbonding_release_epoch()
+                .map(|release_epoch| release_epoch <= current_epoch)
+                .unwrap_or(false)
+        });
+    }
+
+    fn validator_pool_from_state(
+        state: &NodeControlStateEnvelope,
+        validator_id: ValidatorId,
+    ) -> Result<crate::staking::ValidatorPool> {
+        state
+            .state
+            .consensus_status
+            .registered_validator_pools
+            .iter()
+            .find(|pool| pool.validator.id == validator_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("validator pool not found"))
+    }
+
     fn prepare_owned_checkpoint_requests(
         &self,
         notes: &[OwnedShieldedNote],
@@ -1553,6 +1658,8 @@ impl Wallet {
         amount: u64,
     ) -> Result<PreparedPrivateDelegation> {
         let node_state = self.current_node_state()?;
+        let pool = Self::validator_pool_from_state(&node_state, validator_id)?;
+        let delegation_preview = pool.preview_delegation(amount)?;
         let snapshot = node_state.state.shielded_runtime;
         let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
         Self::retain_payment_notes(&mut available_notes);
@@ -1631,7 +1738,7 @@ impl Wallet {
                 },
                 self.signing_pk.clone(),
                 delegated_receive_kem_pk,
-                amount,
+                delegation_preview.minted_shares,
                 current_epoch,
                 &delegated_entropy,
             )?;
@@ -1672,6 +1779,7 @@ impl Wallet {
             },
             validator_id: validator_id.0,
             delegated_output_index: 0,
+            delegated_amount: delegation_preview.delegated_amount,
         };
 
         Ok(PreparedPrivateDelegation {
@@ -1681,6 +1789,246 @@ impl Wallet {
             outputs,
             selected_notes,
             validator_id,
+        })
+    }
+
+    pub async fn prepare_private_undelegation(
+        &self,
+        validator_id: ValidatorId,
+        share_amount: u64,
+    ) -> Result<PreparedPrivateUndelegation> {
+        let node_state = self.current_node_state()?;
+        let pool = Self::validator_pool_from_state(&node_state, validator_id)?;
+        let snapshot = node_state.state.shielded_runtime;
+        let undelegation_preview = pool.preview_undelegation(
+            share_amount,
+            snapshot.current_nullifier_epoch,
+            PROTOCOL.stake_unbonding_epochs,
+        )?;
+        let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
+        Self::retain_delegation_share_notes(&mut available_notes, validator_id);
+        let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_snapshot(
+            &mut available_notes,
+            &snapshot,
+            rotation_round,
+        )
+        .await?;
+
+        let selected_notes = {
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            for note in available_notes {
+                total = total.saturating_add(note.note.value);
+                selected.push(note);
+                if total >= share_amount {
+                    break;
+                }
+            }
+            if total < share_amount {
+                bail!(
+                    "Insufficient delegation shares for undelegation: requested {}, available {}",
+                    share_amount,
+                    total
+                );
+            }
+            selected
+        };
+        let total_selected_shares = selected_notes
+            .iter()
+            .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+
+        let state_binding = Self::state_binding_from_snapshot(&snapshot)?;
+        let current_epoch = snapshot.current_nullifier_epoch;
+        let note_tree = &snapshot.note_tree;
+        let tree_root = note_tree.root();
+        let chain_id = snapshot.chain_id;
+        let send_seed = self.derive_send_seed(
+            &self.address(),
+            share_amount,
+            current_epoch,
+            &selected_notes,
+        );
+
+        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
+        let mut nullifiers = Vec::with_capacity(selected_notes.len());
+        for owned in &selected_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the undelegation");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            nullifiers.push(current_nullifier);
+            input_witnesses.push(proof::input_witness_from_local(
+                &owned.note,
+                &owned.note_key,
+                &membership_proof,
+                &owned.checkpoint,
+                owned.checkpoint_accumulator.as_ref(),
+                &current_nullifier,
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        let mut output_witnesses = Vec::new();
+        let claim_entropy = self.derive_output_entropy(&send_seed, 0);
+        let claim_receive_kem_pk =
+            self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+        let (claim_output, claim_plaintext, claim_seed) = self.build_shielded_output_with_kind(
+            shielded::ShieldedNoteKind::UnbondingClaim {
+                validator_id: validator_id.0,
+                release_epoch: undelegation_preview.release_epoch,
+            },
+            self.signing_pk.clone(),
+            claim_receive_kem_pk,
+            undelegation_preview.claim_amount,
+            current_epoch,
+            &claim_entropy,
+        )?;
+        output_witnesses.push(proof::output_witness_from_local(
+            &claim_plaintext,
+            &claim_output,
+            &claim_seed,
+        ));
+        outputs.push(claim_output);
+
+        let change_shares = total_selected_shares.saturating_sub(share_amount);
+        if change_shares > 0 {
+            let change_entropy = self.derive_output_entropy(&send_seed, 1);
+            let change_receive_kem_pk =
+                self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+            let (change_output, change_plaintext, change_seed) = self
+                .build_shielded_output_with_kind(
+                    shielded::ShieldedNoteKind::DelegationShare {
+                        validator_id: validator_id.0,
+                    },
+                    self.signing_pk.clone(),
+                    change_receive_kem_pk,
+                    change_shares,
+                    current_epoch,
+                    &change_entropy,
+                )?;
+            output_witnesses.push(proof::output_witness_from_local(
+                &change_plaintext,
+                &change_output,
+                &change_seed,
+            ));
+            outputs.push(change_output);
+        }
+
+        let witness = proof_core::ProofPrivateUndelegationWitness {
+            shielded: proof_core::ProofShieldedTxWitness {
+                chain_id,
+                current_epoch,
+                note_tree_root: tree_root,
+                inputs: input_witnesses,
+                outputs: output_witnesses,
+            },
+            validator_id: validator_id.0,
+            claim_output_index: 0,
+        };
+
+        Ok(PreparedPrivateUndelegation {
+            state_binding,
+            witness,
+            nullifiers,
+            outputs,
+            selected_notes,
+            validator_id,
+        })
+    }
+
+    pub async fn prepare_unbonding_claims(&self) -> Result<PreparedUnbondingClaim> {
+        let node_state = self.current_node_state()?;
+        let snapshot = node_state.state.shielded_runtime;
+        let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
+        Self::retain_mature_unbonding_claim_notes(
+            &mut available_notes,
+            snapshot.current_nullifier_epoch,
+        );
+        let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_snapshot(
+            &mut available_notes,
+            &snapshot,
+            rotation_round,
+        )
+        .await?;
+        if available_notes.is_empty() {
+            bail!("no mature unbonding claims are available");
+        }
+
+        let total_claim_amount = available_notes
+            .iter()
+            .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+        let state_binding = Self::state_binding_from_snapshot(&snapshot)?;
+        let current_epoch = snapshot.current_nullifier_epoch;
+        let note_tree = &snapshot.note_tree;
+        let tree_root = note_tree.root();
+        let chain_id = snapshot.chain_id;
+        let send_seed = self.derive_send_seed(
+            &self.address(),
+            total_claim_amount,
+            current_epoch,
+            &available_notes,
+        );
+
+        let mut input_witnesses = Vec::with_capacity(available_notes.len());
+        let mut nullifiers = Vec::with_capacity(available_notes.len());
+        for owned in &available_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the unbonding claim");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            nullifiers.push(current_nullifier);
+            input_witnesses.push(proof::input_witness_from_local(
+                &owned.note,
+                &owned.note_key,
+                &membership_proof,
+                &owned.checkpoint,
+                owned.checkpoint_accumulator.as_ref(),
+                &current_nullifier,
+            ));
+        }
+
+        let payout_entropy = self.derive_output_entropy(&send_seed, 0);
+        let payout_receive_kem_pk =
+            self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+        let (payout_output, payout_plaintext, payout_seed) = self.build_shielded_output(
+            self.signing_pk.clone(),
+            payout_receive_kem_pk,
+            total_claim_amount,
+            current_epoch,
+            &payout_entropy,
+        )?;
+        let witness = proof_core::ProofShieldedTxWitness {
+            chain_id,
+            current_epoch,
+            note_tree_root: tree_root,
+            inputs: input_witnesses,
+            outputs: vec![proof::output_witness_from_local(
+                &payout_plaintext,
+                &payout_output,
+                &payout_seed,
+            )],
+        };
+
+        Ok(PreparedUnbondingClaim {
+            state_binding,
+            witness,
+            nullifiers,
+            outputs: vec![payout_output],
+            selected_notes: available_notes,
         })
     }
 
@@ -1738,17 +2086,61 @@ impl Wallet {
                 "prepared private delegation is stale; canonical shielded state changed, re-prepare the delegation"
             );
         }
-        let tx = Tx::new_shared_state(
-            SharedStateAction::PrivateDelegation(PrivateDelegation {
-                validator_id: prepared.validator_id,
-                transfer: OrdinaryPrivateTransfer {
-                    nullifiers: prepared.nullifiers.clone(),
-                    outputs: prepared.outputs,
-                    proof: proof_bytes,
-                },
-            }),
-            Vec::new(),
-        );
+        let tx = prepared.tx_with_proof(proof_bytes);
+        let tx_id = self.require_node_client()?.submit_tx(&tx)?;
+        for (owned, nullifier) in prepared
+            .selected_notes
+            .iter()
+            .zip(prepared.nullifiers.iter())
+        {
+            self.mark_owned_note_spent(wallet_store.as_ref(), &owned.note.commitment, nullifier)?;
+        }
+        self.scan_tx_for_me(&tx)?;
+        Ok(tx_id)
+    }
+
+    pub async fn submit_prepared_private_undelegation(
+        &self,
+        prepared: PreparedPrivateUndelegation,
+        proof_bytes: Vec<u8>,
+    ) -> Result<[u8; 32]> {
+        let wallet_store = self.wallet_store()?;
+        let current_state = self.current_node_state()?;
+        let current_binding =
+            Self::state_binding_from_snapshot(&current_state.state.shielded_runtime)?;
+        if current_binding != prepared.state_binding {
+            bail!(
+                "prepared private undelegation is stale; canonical shielded state changed, re-prepare the undelegation"
+            );
+        }
+        let tx = prepared.tx_with_proof(proof_bytes);
+        let tx_id = self.require_node_client()?.submit_tx(&tx)?;
+        for (owned, nullifier) in prepared
+            .selected_notes
+            .iter()
+            .zip(prepared.nullifiers.iter())
+        {
+            self.mark_owned_note_spent(wallet_store.as_ref(), &owned.note.commitment, nullifier)?;
+        }
+        self.scan_tx_for_me(&tx)?;
+        Ok(tx_id)
+    }
+
+    pub async fn submit_prepared_unbonding_claim(
+        &self,
+        prepared: PreparedUnbondingClaim,
+        proof_bytes: Vec<u8>,
+    ) -> Result<[u8; 32]> {
+        let wallet_store = self.wallet_store()?;
+        let current_state = self.current_node_state()?;
+        let current_binding =
+            Self::state_binding_from_snapshot(&current_state.state.shielded_runtime)?;
+        if current_binding != prepared.state_binding {
+            bail!(
+                "prepared unbonding claim is stale; canonical shielded state changed, re-prepare the claim"
+            );
+        }
+        let tx = prepared.tx_with_proof(proof_bytes);
         let tx_id = self.require_node_client()?.submit_tx(&tx)?;
         for (owned, nullifier) in prepared
             .selected_notes
@@ -1788,6 +2180,26 @@ impl Wallet {
             .await?;
         let (receipt, _journal) = proof::prove_private_delegation(prepared.witness())?;
         self.submit_prepared_private_delegation(prepared, proof::receipt_to_bytes(&receipt)?)
+            .await
+    }
+
+    pub async fn undelegate_from_validator(
+        &self,
+        validator_id: ValidatorId,
+        share_amount: u64,
+    ) -> Result<[u8; 32]> {
+        let prepared = self
+            .prepare_private_undelegation(validator_id, share_amount)
+            .await?;
+        let (receipt, _journal) = proof::prove_private_undelegation(prepared.witness())?;
+        self.submit_prepared_private_undelegation(prepared, proof::receipt_to_bytes(&receipt)?)
+            .await
+    }
+
+    pub async fn claim_mature_unbondings(&self) -> Result<[u8; 32]> {
+        let prepared = self.prepare_unbonding_claims().await?;
+        let (receipt, _journal) = proof::prove_unbonding_claim(prepared.witness())?;
+        self.submit_prepared_unbonding_claim(prepared, proof::receipt_to_bytes(&receipt)?)
             .await
     }
 

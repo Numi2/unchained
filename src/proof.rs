@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use methods::{
     CHECKPOINT_ACCUMULATOR_METHOD_ELF, CHECKPOINT_ACCUMULATOR_METHOD_ID,
-    PRIVATE_DELEGATION_METHOD_ELF, PRIVATE_DELEGATION_METHOD_ID, SHIELDED_SPEND_METHOD_ELF,
-    SHIELDED_SPEND_METHOD_ID,
+    PRIVATE_DELEGATION_METHOD_ELF, PRIVATE_DELEGATION_METHOD_ID, PRIVATE_UNDELEGATION_METHOD_ELF,
+    PRIVATE_UNDELEGATION_METHOD_ID, SHIELDED_SPEND_METHOD_ELF, SHIELDED_SPEND_METHOD_ID,
+    UNBONDING_CLAIM_METHOD_ELF, UNBONDING_CLAIM_METHOD_ID,
 };
 use proof_core::{
     CheckpointAccumulatorJournal, CheckpointAccumulatorStepWitness,
@@ -14,7 +15,8 @@ use proof_core::{
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
     NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofPrivateDelegationJournal,
-    ProofPrivateDelegationWitness, ProofShieldedInputWitness, ProofShieldedNote,
+    ProofPrivateDelegationWitness, ProofPrivateUndelegationJournal,
+    ProofPrivateUndelegationWitness, ProofShieldedInputWitness, ProofShieldedNote,
     ProofShieldedNoteKind, ProofShieldedOutput, ProofShieldedOutputBinding,
     ProofShieldedOutputPlaintext, ProofShieldedOutputWitness, ProofShieldedTxJournal,
     ProofShieldedTxWitness,
@@ -145,6 +147,118 @@ pub fn verify_private_delegation_receipt_bytes(
         .verify(PRIVATE_DELEGATION_METHOD_ID)
         .context("verify private delegation receipt")?;
     decode_private_delegation_journal(&receipt)
+}
+
+pub fn prove_private_undelegation(
+    witness: &ProofPrivateUndelegationWitness,
+) -> Result<(Receipt, ProofPrivateUndelegationJournal)> {
+    let mut builder = ExecutorEnv::builder();
+    for input in &witness.shielded.inputs {
+        match (
+            input.historical_accumulator.as_ref(),
+            input.historical_accumulator_receipt.as_ref(),
+        ) {
+            (Some(accumulator), Some(bytes)) => {
+                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                if &journal != accumulator {
+                    bail!("historical accumulator witness does not match its receipt");
+                }
+                builder.add_assumption(receipt_from_bytes(bytes)?);
+            }
+            (Some(_), None) => bail!("historical accumulator receipt is missing"),
+            (None, Some(_)) => bail!("unexpected accumulator receipt without a journal"),
+            (None, None) => {}
+        }
+    }
+    let env = builder
+        .write(witness)
+        .context("serialize private undelegation witness")?
+        .build()
+        .context("build private undelegation executor environment")?;
+    let prove_info = default_prover()
+        .prove_with_opts(
+            env,
+            PRIVATE_UNDELEGATION_METHOD_ELF,
+            &ProverOpts::succinct(),
+        )
+        .context("prove private undelegation witness")?;
+    let receipt = prove_info.receipt;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("private undelegation requires a succinct STARK receipt"),
+    }
+    receipt
+        .verify(PRIVATE_UNDELEGATION_METHOD_ID)
+        .context("verify locally generated private undelegation receipt")?;
+    let journal = decode_private_undelegation_journal(&receipt)?;
+    Ok((receipt, journal))
+}
+
+pub fn verify_private_undelegation_receipt_bytes(
+    bytes: &[u8],
+) -> Result<ProofPrivateUndelegationJournal> {
+    let receipt = receipt_from_bytes(bytes)?;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("only succinct private undelegation receipts are accepted"),
+    }
+    receipt
+        .verify(PRIVATE_UNDELEGATION_METHOD_ID)
+        .context("verify private undelegation receipt")?;
+    decode_private_undelegation_journal(&receipt)
+}
+
+pub fn prove_unbonding_claim(
+    witness: &ProofShieldedTxWitness,
+) -> Result<(Receipt, ProofShieldedTxJournal)> {
+    let mut builder = ExecutorEnv::builder();
+    for input in &witness.inputs {
+        match (
+            input.historical_accumulator.as_ref(),
+            input.historical_accumulator_receipt.as_ref(),
+        ) {
+            (Some(accumulator), Some(bytes)) => {
+                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                if &journal != accumulator {
+                    bail!("historical accumulator witness does not match its receipt");
+                }
+                builder.add_assumption(receipt_from_bytes(bytes)?);
+            }
+            (Some(_), None) => bail!("historical accumulator receipt is missing"),
+            (None, Some(_)) => bail!("unexpected accumulator receipt without a journal"),
+            (None, None) => {}
+        }
+    }
+    let env = builder
+        .write(witness)
+        .context("serialize unbonding claim witness")?
+        .build()
+        .context("build unbonding claim executor environment")?;
+    let prove_info = default_prover()
+        .prove_with_opts(env, UNBONDING_CLAIM_METHOD_ELF, &ProverOpts::succinct())
+        .context("prove unbonding claim witness")?;
+    let receipt = prove_info.receipt;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("unbonding claim requires a succinct STARK receipt"),
+    }
+    receipt
+        .verify(UNBONDING_CLAIM_METHOD_ID)
+        .context("verify locally generated unbonding claim receipt")?;
+    let journal = decode_shielded_tx_journal(&receipt)?;
+    Ok((receipt, journal))
+}
+
+pub fn verify_unbonding_claim_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
+    let receipt = receipt_from_bytes(bytes)?;
+    match &receipt.inner {
+        InnerReceipt::Succinct(_) => {}
+        _ => bail!("only succinct unbonding claim receipts are accepted"),
+    }
+    receipt
+        .verify(UNBONDING_CLAIM_METHOD_ID)
+        .context("verify unbonding claim receipt")?;
+    decode_shielded_tx_journal(&receipt)
 }
 
 pub fn receipt_to_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
@@ -348,6 +462,15 @@ fn decode_private_delegation_journal(receipt: &Receipt) -> Result<ProofPrivateDe
         .journal
         .decode()
         .map_err(|err| anyhow!("decode private delegation receipt journal: {err}"))
+}
+
+fn decode_private_undelegation_journal(
+    receipt: &Receipt,
+) -> Result<ProofPrivateUndelegationJournal> {
+    receipt
+        .journal
+        .decode()
+        .map_err(|err| anyhow!("decode private undelegation receipt journal: {err}"))
 }
 
 fn decode_checkpoint_accumulator_journal(

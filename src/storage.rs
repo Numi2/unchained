@@ -276,8 +276,9 @@ impl Store {
             "anchor",
             "validator_pool",
             "validator_committee",
-            "delegation_share",
             "tx",
+            "shared_state_pending_tx",
+            "shared_state_batch",
             "meta",
             "shielded_note_tree",
             "shielded_nullifier_epoch",
@@ -330,8 +331,12 @@ impl Store {
             "anchor",
             "validator_pool",      // validator_id -> ValidatorPool
             "validator_committee", // epoch -> ValidatorSet
-            "delegation_share",    // note_commitment -> DelegationShareRecord
             "tx",
+            "shared_state_pending_tx", // tx_id -> pending shared-state Tx
+            "shared_state_batch",      // ordered_tx_root -> SharedStateBatch
+            "shared_state_dag_batch",  // batch_id -> SharedStateDagBatch
+            "shared_state_dag_round",  // epoch||round||author -> batch_id
+            "shared_state_finalized_batch", // batch_id -> anchor_num
             "peers",
             "meta", // miscellaneous metadata (e.g., cursors)
             // Shielded pool state
@@ -354,6 +359,7 @@ impl Store {
             "wallet",
             "shielded_checkpoint",
             "shielded_owned_note",
+            "delegation_share",
             "retarget_cache",
         ] {
             if db.cf_handle(obsolete_cf).is_some() {
@@ -817,32 +823,218 @@ impl Store {
         self.get("validator_committee", &epoch.to_le_bytes())
     }
 
-    pub fn store_delegation_share(
+    pub fn store_shared_state_pending_tx(
         &self,
-        record: &crate::staking::DelegationShareRecord,
+        tx_id: &[u8; 32],
+        tx: &crate::transaction::Tx,
     ) -> Result<()> {
-        self.put("delegation_share", &record.note_commitment, record)
+        self.put("shared_state_pending_tx", tx_id, tx)
     }
 
-    pub fn load_delegation_share(
+    pub fn load_shared_state_pending_tx(
         &self,
-        note_commitment: &[u8; 32],
-    ) -> Result<Option<crate::staking::DelegationShareRecord>> {
-        self.get("delegation_share", note_commitment)
+        tx_id: &[u8; 32],
+    ) -> Result<Option<crate::transaction::Tx>> {
+        self.get("shared_state_pending_tx", tx_id)
     }
 
-    pub fn load_delegation_shares(&self) -> Result<Vec<crate::staking::DelegationShareRecord>> {
+    pub fn load_shared_state_pending_txs(&self) -> Result<Vec<([u8; 32], crate::transaction::Tx)>> {
         let cf = self
             .db
-            .cf_handle("delegation_share")
-            .ok_or_else(|| anyhow::anyhow!("'delegation_share' column family missing"))?;
+            .cf_handle("shared_state_pending_tx")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_pending_tx' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut records = Vec::new();
+        let mut txs = Vec::new();
         for item in iter {
-            let (_key, value) = item?;
-            records.push(bincode::deserialize(&value)?);
+            let (key, value) = item?;
+            let key: [u8; 32] = key
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("invalid shared-state pending tx key length"))?;
+            txs.push((key, bincode::deserialize(&value)?));
         }
-        Ok(records)
+        Ok(txs)
+    }
+
+    pub fn delete_shared_state_pending_tx(&self, tx_id: &[u8; 32]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle("shared_state_pending_tx")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_pending_tx' column family missing"))?;
+        self.db.delete_cf(cf, tx_id)?;
+        Ok(())
+    }
+
+    pub fn store_shared_state_batch(
+        &self,
+        batch: &crate::transaction::SharedStateBatch,
+    ) -> Result<()> {
+        self.put("shared_state_batch", &batch.ordered_tx_root, batch)
+    }
+
+    pub fn load_shared_state_batch(
+        &self,
+        ordered_tx_root: &[u8; 32],
+    ) -> Result<Option<crate::transaction::SharedStateBatch>> {
+        self.get("shared_state_batch", ordered_tx_root)
+    }
+
+    fn shared_state_dag_round_key(epoch: u64, round: u64, author: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + 8 + 32);
+        key.extend_from_slice(&epoch.to_le_bytes());
+        key.extend_from_slice(&round.to_le_bytes());
+        key.extend_from_slice(author);
+        key
+    }
+
+    fn shared_state_dag_round_prefix(epoch: u64, round: u64) -> [u8; 16] {
+        let mut prefix = [0u8; 16];
+        prefix[..8].copy_from_slice(&epoch.to_le_bytes());
+        prefix[8..].copy_from_slice(&round.to_le_bytes());
+        prefix
+    }
+
+    fn shared_state_dag_epoch_prefix(epoch: u64) -> [u8; 8] {
+        epoch.to_le_bytes()
+    }
+
+    pub fn store_shared_state_dag_batch(
+        &self,
+        batch: &crate::transaction::SharedStateDagBatch,
+    ) -> Result<()> {
+        let dag_cf = self
+            .db
+            .cf_handle("shared_state_dag_batch")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_dag_batch' column family missing"))?;
+        let round_cf = self
+            .db
+            .cf_handle("shared_state_dag_round")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_dag_round' column family missing"))?;
+        let mut write_batch = rocksdb::WriteBatch::default();
+        write_batch.put_cf(
+            dag_cf,
+            &batch.batch_id,
+            bincode::serialize(batch).context("serialize shared-state DAG batch")?,
+        );
+        write_batch.put_cf(
+            round_cf,
+            Self::shared_state_dag_round_key(batch.epoch, batch.round, &batch.author.0),
+            batch.batch_id,
+        );
+        self.write_batch(write_batch)
+    }
+
+    pub fn load_shared_state_dag_batch(
+        &self,
+        batch_id: &[u8; 32],
+    ) -> Result<Option<crate::transaction::SharedStateDagBatch>> {
+        self.get("shared_state_dag_batch", batch_id)
+    }
+
+    pub fn load_shared_state_dag_round(
+        &self,
+        epoch: u64,
+        round: u64,
+    ) -> Result<Vec<crate::transaction::SharedStateDagBatch>> {
+        let cf = self
+            .db
+            .cf_handle("shared_state_dag_round")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_dag_round' column family missing"))?;
+        let dag_cf = self
+            .db
+            .cf_handle("shared_state_dag_batch")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_dag_batch' column family missing"))?;
+        let prefix = Self::shared_state_dag_round_prefix(epoch, round);
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.as_ref().starts_with(&prefix) {
+                break;
+            }
+            let batch_id: [u8; 32] = value
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("invalid shared-state DAG round index value"))?;
+            let bytes = self
+                .db
+                .get_cf(dag_cf, batch_id)?
+                .ok_or_else(|| anyhow!("shared-state DAG batch is missing from storage"))?;
+            out.push(
+                bincode::deserialize(&bytes)
+                    .context("deserialize shared-state DAG batch from storage")?,
+            );
+        }
+        Ok(out)
+    }
+
+    pub fn load_highest_shared_state_dag_round(&self, epoch: u64) -> Result<Option<u64>> {
+        let cf = self
+            .db
+            .cf_handle("shared_state_dag_round")
+            .ok_or_else(|| anyhow::anyhow!("'shared_state_dag_round' column family missing"))?;
+        let prefix = Self::shared_state_dag_epoch_prefix(epoch);
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut highest = None;
+        for item in iter {
+            let (key, _) = item?;
+            if !key.as_ref().starts_with(&prefix) {
+                break;
+            }
+            let round = u64::from_le_bytes(
+                key.as_ref()[8..16]
+                    .try_into()
+                    .map_err(|_| anyhow!("invalid shared-state DAG round key"))?,
+            );
+            highest = Some(highest.map_or(round, |current: u64| current.max(round)));
+        }
+        Ok(highest)
+    }
+
+    pub fn has_shared_state_dag_batch_author(
+        &self,
+        epoch: u64,
+        round: u64,
+        author: &crate::consensus::ValidatorId,
+    ) -> Result<bool> {
+        let key = Self::shared_state_dag_round_key(epoch, round, &author.0);
+        Ok(self
+            .get_raw_bytes("shared_state_dag_round", &key)?
+            .is_some())
+    }
+
+    pub fn mark_shared_state_dag_batch_finalized(
+        &self,
+        batch_id: &[u8; 32],
+        anchor_num: u64,
+    ) -> Result<()> {
+        self.put(
+            "shared_state_finalized_batch",
+            batch_id,
+            &anchor_num.to_le_bytes().to_vec(),
+        )
+    }
+
+    pub fn load_shared_state_dag_batch_finalization(
+        &self,
+        batch_id: &[u8; 32],
+    ) -> Result<Option<u64>> {
+        match self.get::<Vec<u8>>("shared_state_finalized_batch", batch_id)? {
+            Some(bytes) => {
+                let array: [u8; 8] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("invalid shared-state finalized batch marker"))?;
+                Ok(Some(u64::from_le_bytes(array)))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn store_shielded_note_tree(

@@ -60,7 +60,10 @@ transitional and should be removed rather than preserved.
 - `[x]` Implement stake-weighted committee membership for a small active
   validator set
 - `[x]` Implement quorum-certificate formation using `ML-DSA` validator votes
-- `[ ]` Implement Mysticeti-class DAG dissemination and batch availability
+- `[~]` Implement Mysticeti-class DAG dissemination and batch availability
+  Batch parents, round/frontier reconstruction, quorum-round checkpoint
+  proposals, and multi-validator DAG-order tests now exist. Richer
+  multi-round scheduling and fallback behavior are still open.
 - `[ ]` Implement a fast path for ordinary owned-note transfers
 - `[ ]` Define automatic fallback from fast path to full BFT ordering for
   shared-state or contended transactions
@@ -73,13 +76,14 @@ transitional and should be removed rather than preserved.
 - `[x]` Define validator registration and validator metadata objects
 - `[x]` Implement validator registration and validator-profile shared-state
   execution with cold-governance authorization
-- `[ ]` Define shielded delegation notes or pool-share notes
-- `[ ]` Define private undelegation and unbonding flows
+- `[x]` Define shielded delegation notes or pool-share notes
+- `[x]` Define private undelegation and unbonding flows
+- `[x]` Define shielded staking note semantics
 - `[ ]` Define reward accrual through pool accounting rather than public
   per-wallet rewards
 - `[ ]` Define slash handling at the validator-pool level while keeping
   delegator ownership shielded
-- `[ ]` Implement native circuits for delegation, undelegation, and stake claim
+- `[~]` Implement native circuits for delegation, undelegation, and stake claim
 - `[ ]` Define wallet UX for delegation without exposing a public delegator
   graph
 
@@ -189,10 +193,14 @@ transitional and should be removed rather than preserved.
   integration tests
 - `[x]` Add a multi-validator proposer-to-QC network test for finalized
   checkpoint certification
+- `[x]` Add a multi-validator DAG frontier/finalization test for shared-state
+  ordering
 - `[x]` Add signed shared-state validator registration/profile-update tests
+- `[x]` Add ordered shared-state batch finalization tests for validator
+  lifecycle actions
 - `[ ]` Add tests for ordinary-payment fast-path privacy invariants
 - `[ ]` Add tests for fallback from fast path to full BFT ordering
-- `[ ]` Add tests for private delegation and unbonding flows
+- `[~]` Add tests for private delegation and unbonding flows
 - `[ ]` Add tests for ingress role separation and metadata-handling invariants
 - `[ ]` Add tests for compact wallet sync and fuzzy detection
 - `[ ]` Add proof-system tests aligned to the new native circuits
@@ -203,7 +211,10 @@ transitional and should be removed rather than preserved.
   that still reference it
 - `[x]` Define the validator-set and quorum-certificate data structures
 - `[x]` Define the native transaction classes and fast-path eligibility rules
-- `[ ]` Define shielded staking note semantics
+- `[x]` Define shielded delegation-share notes and a native private-delegation
+  proof path
+- `[x]` Define private undelegation and delayed-claim shared-state actions
+- `[x]` Define shielded staking note semantics
 - `[ ]` Define the two-role ingress wire model
 - `[ ]` Define the replacement proof architecture and circuit inventory
 

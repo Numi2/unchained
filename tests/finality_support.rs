@@ -129,6 +129,11 @@ impl TestCommittee {
             ordering_path,
             merkle_root,
             coin_count,
+            0,
+            &[],
+            &[],
+            [0u8; 32],
+            0,
             &validator_set,
         );
         let target = VoteTarget {
@@ -161,6 +166,11 @@ impl TestCommittee {
             ordering_path,
             merkle_root,
             coin_count,
+            0,
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            0,
             validator_set,
             qc,
         )

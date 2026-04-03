@@ -35,8 +35,8 @@ use crate::{
         ValidatorStatus,
     },
     transaction::{
-        OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization, SharedStateTx,
-        ShieldedOutput, ShieldedOutputPlaintext, Tx,
+        OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization, SharedStateBatch,
+        SharedStateDagBatch, SharedStateTx, ShieldedOutput, ShieldedOutputPlaintext, Tx,
     },
     wallet::RecipientHandle,
 };
@@ -507,6 +507,15 @@ fn write_shared_state_action(
             write_validator_id(writer, &delegation.validator_id);
             write_ordinary_private_transfer(writer, &delegation.transfer)?;
         }
+        SharedStateAction::PrivateUndelegation(undelegation) => {
+            writer.write_u8(4);
+            write_validator_id(writer, &undelegation.validator_id);
+            write_ordinary_private_transfer(writer, &undelegation.transfer)?;
+        }
+        SharedStateAction::ClaimUnbonding(claim) => {
+            writer.write_u8(5);
+            write_ordinary_private_transfer(writer, &claim.transfer)?;
+        }
     }
     Ok(())
 }
@@ -522,6 +531,17 @@ fn read_shared_state_action(reader: &mut CanonicalReader<'_>) -> Result<SharedSt
         3 => Ok(SharedStateAction::PrivateDelegation(
             crate::transaction::PrivateDelegation {
                 validator_id: read_validator_id(reader)?,
+                transfer: read_ordinary_private_transfer(reader)?,
+            },
+        )),
+        4 => Ok(SharedStateAction::PrivateUndelegation(
+            crate::transaction::PrivateUndelegation {
+                validator_id: read_validator_id(reader)?,
+                transfer: read_ordinary_private_transfer(reader)?,
+            },
+        )),
+        5 => Ok(SharedStateAction::ClaimUnbonding(
+            crate::transaction::ClaimUnbonding {
                 transfer: read_ordinary_private_transfer(reader)?,
             },
         )),
@@ -581,6 +601,81 @@ fn read_shared_state_tx(reader: &mut CanonicalReader<'_>) -> Result<SharedStateT
         action: read_shared_state_action(reader)?,
         authorization: read_shared_state_authorization(reader)?,
     })
+}
+
+fn write_shared_state_batch(writer: &mut CanonicalWriter, batch: &SharedStateBatch) -> Result<()> {
+    writer.write_fixed(&batch.ordered_tx_root);
+    writer.write_vec(&batch.txs, |writer, tx| {
+        writer.write_bytes(&encode_tx(tx)?)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn read_shared_state_batch(reader: &mut CanonicalReader<'_>) -> Result<SharedStateBatch> {
+    let ordered_tx_root = reader.read_fixed()?;
+    let txs = reader.read_vec(|reader| decode_tx(&reader.read_bytes()?))?;
+    let batch = SharedStateBatch::new(txs)?;
+    if batch.ordered_tx_root != ordered_tx_root {
+        bail!("shared-state batch ordered tx root mismatch");
+    }
+    Ok(batch)
+}
+
+fn write_shared_state_dag_batch(
+    writer: &mut CanonicalWriter,
+    batch: &SharedStateDagBatch,
+) -> Result<()> {
+    writer.write_u64(batch.epoch);
+    writer.write_u64(batch.round);
+    write_validator_id(writer, &batch.author);
+    writer.write_vec(&batch.parents, |writer, parent| {
+        writer.write_fixed(parent);
+        Ok(())
+    })?;
+    writer.write_fixed(&batch.batch_id);
+    write_shared_state_batch(writer, &batch.batch)?;
+    Ok(())
+}
+
+fn read_shared_state_dag_batch(reader: &mut CanonicalReader<'_>) -> Result<SharedStateDagBatch> {
+    let epoch = reader.read_u64()?;
+    let round = reader.read_u64()?;
+    let author = read_validator_id(reader)?;
+    let parents = reader.read_vec(|reader| reader.read_fixed())?;
+    let batch_id = reader.read_fixed()?;
+    let batch = read_shared_state_batch(reader)?;
+    let dag_batch = SharedStateDagBatch::new(epoch, round, author, parents, batch)?;
+    if dag_batch.batch_id != batch_id {
+        bail!("shared-state DAG batch id mismatch");
+    }
+    Ok(dag_batch)
+}
+
+pub fn encode_shared_state_batch(batch: &SharedStateBatch) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_shared_state_batch(&mut writer, batch)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_shared_state_batch(bytes: &[u8]) -> Result<SharedStateBatch> {
+    let mut reader = CanonicalReader::new(bytes);
+    let batch = read_shared_state_batch(&mut reader)?;
+    reader.finish()?;
+    Ok(batch)
+}
+
+pub fn encode_shared_state_dag_batch(batch: &SharedStateDagBatch) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_shared_state_dag_batch(&mut writer, batch)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_shared_state_dag_batch(bytes: &[u8]) -> Result<SharedStateDagBatch> {
+    let mut reader = CanonicalReader::new(bytes);
+    let batch = read_shared_state_dag_batch(&mut reader)?;
+    reader.finish()?;
+    Ok(batch)
 }
 
 fn write_vote_target(writer: &mut CanonicalWriter, target: &crate::consensus::VoteTarget) {
@@ -664,6 +759,17 @@ pub fn write_anchor(writer: &mut CanonicalWriter, anchor: &Anchor) -> Result<()>
     write_ordering_path(writer, anchor.ordering_path);
     writer.write_fixed(&anchor.merkle_root);
     writer.write_u32(anchor.coin_count);
+    writer.write_u64(anchor.dag_round);
+    writer.write_vec(&anchor.dag_frontier, |writer, batch_id| {
+        writer.write_fixed(batch_id);
+        Ok(())
+    })?;
+    writer.write_vec(&anchor.ordered_batch_ids, |writer, batch_id| {
+        writer.write_fixed(batch_id);
+        Ok(())
+    })?;
+    writer.write_fixed(&anchor.ordered_tx_root);
+    writer.write_u32(anchor.ordered_tx_count);
     write_validator_set(writer, &anchor.validator_set)?;
     write_quorum_certificate(writer, &anchor.qc)?;
     Ok(())
@@ -680,6 +786,17 @@ pub fn write_anchor_proposal(
     write_ordering_path(writer, proposal.ordering_path);
     writer.write_fixed(&proposal.merkle_root);
     writer.write_u32(proposal.coin_count);
+    writer.write_u64(proposal.dag_round);
+    writer.write_vec(&proposal.dag_frontier, |writer, batch_id| {
+        writer.write_fixed(batch_id);
+        Ok(())
+    })?;
+    writer.write_vec(&proposal.ordered_batch_ids, |writer, batch_id| {
+        writer.write_fixed(batch_id);
+        Ok(())
+    })?;
+    writer.write_fixed(&proposal.ordered_tx_root);
+    writer.write_u32(proposal.ordered_tx_count);
     write_validator_set(writer, &proposal.validator_set)?;
     Ok(())
 }
@@ -692,6 +809,11 @@ pub fn read_anchor_proposal(reader: &mut CanonicalReader<'_>) -> Result<AnchorPr
     let ordering_path = read_ordering_path(reader)?;
     let merkle_root = reader.read_fixed()?;
     let coin_count = reader.read_u32()?;
+    let dag_round = reader.read_u64()?;
+    let dag_frontier = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_batch_ids = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_tx_root = reader.read_fixed()?;
+    let ordered_tx_count = reader.read_u32()?;
     let validator_set = read_validator_set(reader)?;
     let proposal = AnchorProposal::new(
         num,
@@ -699,6 +821,11 @@ pub fn read_anchor_proposal(reader: &mut CanonicalReader<'_>) -> Result<AnchorPr
         ordering_path,
         merkle_root,
         coin_count,
+        dag_round,
+        dag_frontier,
+        ordered_batch_ids,
+        ordered_tx_root,
+        ordered_tx_count,
         validator_set,
     )
     .map_err(|err| anyhow!(err))?;
@@ -719,6 +846,11 @@ pub fn read_anchor(reader: &mut CanonicalReader<'_>) -> Result<Anchor> {
     let ordering_path = read_ordering_path(reader)?;
     let merkle_root = reader.read_fixed()?;
     let coin_count = reader.read_u32()?;
+    let dag_round = reader.read_u64()?;
+    let dag_frontier = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_batch_ids = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_tx_root = reader.read_fixed()?;
+    let ordered_tx_count = reader.read_u32()?;
     let validator_set = read_validator_set(reader)?;
     let qc = read_quorum_certificate(reader)?;
     let anchor = Anchor::new(
@@ -727,6 +859,11 @@ pub fn read_anchor(reader: &mut CanonicalReader<'_>) -> Result<Anchor> {
         ordering_path,
         merkle_root,
         coin_count,
+        dag_round,
+        dag_frontier,
+        ordered_batch_ids,
+        ordered_tx_root,
+        ordered_tx_count,
         validator_set,
         qc,
     )
@@ -761,6 +898,11 @@ pub fn decode_anchor(bytes: &[u8]) -> Result<Anchor> {
     let ordering_path = read_ordering_path(&mut reader)?;
     let merkle_root = reader.read_fixed()?;
     let coin_count = reader.read_u32()?;
+    let dag_round = reader.read_u64()?;
+    let dag_frontier = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_batch_ids = reader.read_vec(|reader| reader.read_fixed())?;
+    let ordered_tx_root = reader.read_fixed()?;
+    let ordered_tx_count = reader.read_u32()?;
     let validator_set = read_validator_set(&mut reader)?;
     let qc = read_quorum_certificate(&mut reader)?;
     reader.finish()?;
@@ -770,6 +912,11 @@ pub fn decode_anchor(bytes: &[u8]) -> Result<Anchor> {
         ordering_path,
         merkle_root,
         coin_count,
+        dag_round,
+        dag_frontier,
+        ordered_batch_ids,
+        ordered_tx_root,
+        ordered_tx_count,
         validator_set,
         qc,
     )

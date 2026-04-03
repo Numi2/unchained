@@ -7,4 +7,4 @@ edition = "2021"
 risc0-build = { version = "3.0.5" }
 
 [package.metadata.risc0]
-methods = ["guest", "checkpoint-guest", "delegation-guest"]
+methods = ["guest", "checkpoint-guest", "delegation-guest", "undelegation-guest", "claim-guest"]

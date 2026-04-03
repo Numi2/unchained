@@ -12,8 +12,10 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
 use unchained::coin::Coin;
 use unchained::config::{Net, P2p};
-use unchained::consensus::OrderingPath;
-use unchained::crypto::TaggedSigningPublicKey;
+use unchained::consensus::{OrderingPath, Validator, ValidatorKeys};
+use unchained::crypto::{
+    ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign, TaggedSigningPublicKey,
+};
 use unchained::epoch::{Anchor, MerkleTree};
 use unchained::network::{self, NetHandle};
 use unchained::node_identity::{self, validator_from_record, NodeIdentity};
@@ -23,9 +25,12 @@ use unchained::shielded::{
     ArchiveDirectory, ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
     HistoricalUnspentCheckpoint, NullifierRootLedger,
 };
+use unchained::staking::{
+    ValidatorMetadata, ValidatorPool, ValidatorRegistration, ValidatorStatus,
+};
 use unchained::storage::{protocol_chain_id, Store};
 use unchained::sync::SyncState;
-use unchained::transaction;
+use unchained::transaction::{self, SharedStateAction, Tx};
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -70,6 +75,46 @@ fn store_anchor(store: &Store, anchor: &Anchor) -> anyhow::Result<()> {
     store.put("epoch", b"latest", anchor)?;
     store.put("anchor", &anchor.hash, anchor)?;
     Ok(())
+}
+
+fn signed_shared_state_tx(
+    store: &Store,
+    action: SharedStateAction,
+    cold_key: &aws_lc_rs::unstable::signature::PqdsaKeyPair,
+) -> Tx {
+    let signable = Tx::shared_state_signing_bytes(store.effective_chain_id(), &action)
+        .expect("encode shared-state signing message");
+    let signature = ml_dsa_65_sign(cold_key, &signable).expect("sign shared-state action");
+    Tx::new_shared_state(action, signature)
+}
+
+fn build_pending_validator_pool(
+    voting_power: u64,
+    activation_epoch: u64,
+) -> anyhow::Result<(ValidatorPool, aws_lc_rs::unstable::signature::PqdsaKeyPair)> {
+    let hot_key = ml_dsa_65_generate()?;
+    let cold_key = ml_dsa_65_generate()?;
+    let validator = Validator::new(
+        voting_power,
+        ValidatorKeys {
+            hot_ml_dsa_65_spki: ml_dsa_65_public_key_spki(&hot_key)?,
+            cold_governance_key: ml_dsa_65_public_key_spki(&cold_key)?,
+        },
+    )?;
+    let pool = ValidatorPool::new(
+        validator,
+        [7u8; 32],
+        175,
+        voting_power,
+        activation_epoch,
+        ValidatorStatus::PendingActivation,
+        ValidatorMetadata {
+            display_name: "dag validator".to_string(),
+            website: Some("https://dag.example".to_string()),
+            description: Some("dag-ordered validator".to_string()),
+        },
+    )?;
+    Ok((pool, cold_key))
 }
 
 fn store_coin_epoch(
@@ -270,6 +315,11 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
             Some(&genesis),
             [9u8; 32],
             0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            0,
             OrderingPath::FastPathPrivateTransfer,
         )
         .await?;
@@ -319,6 +369,203 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
         },
     )
     .await;
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+    net_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+
+    let port_a = pick_udp_port();
+    let port_b = pick_udp_port();
+    let port_c = pick_udp_port();
+    let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
+    let chain_id = protocol_chain_id();
+
+    let (_, bootstrap_a) =
+        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
+    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()])?;
+    provision_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()])?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a.clone()],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b.clone()],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c.clone()],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_identities(vec![
+        identity_a.clone(),
+        identity_b.clone(),
+        identity_c.clone(),
+    ]);
+    let genesis = committee.genesis_anchor();
+    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
+
+    let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
+    let (db_b, net_b, _) =
+        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
+    let (db_c, net_c, _) = spawn_test_node(&dir_c, build_net(port_c, vec![bootstrap_a])).await?;
+
+    wait_for_peers(&net_a, 2, "node A").await;
+    wait_for_peers(&net_b, 1, "node B").await;
+    wait_for_peers(&net_c, 1, "node C").await;
+
+    committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_c.as_ref(), genesis.position.epoch)?;
+    store_anchor(db_a.as_ref(), &genesis)?;
+    store_anchor(db_b.as_ref(), &genesis)?;
+    store_anchor(db_c.as_ref(), &genesis)?;
+
+    let tx = signed_shared_state_tx(
+        db_a.as_ref(),
+        SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
+        &cold_key,
+    );
+    let tx_id = net_a.submit_tx(&tx).await?;
+    wait_for_condition(
+        "shared-state tx propagation to node B",
+        Duration::from_secs(10),
+        || {
+            db_b.load_shared_state_pending_tx(&tx_id)
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state tx propagation to node C",
+        Duration::from_secs(10),
+        || {
+            db_c.load_shared_state_pending_tx(&tx_id)
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
+
+    let batch_a = net_a
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node A");
+    let batch_b = net_b
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node B");
+    let batch_c = net_c
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node C");
+    assert_eq!(batch_a.ordered_tx_count()?, 1);
+    assert_eq!(batch_b.ordered_tx_count()?, 1);
+    assert_eq!(batch_c.ordered_tx_count()?, 1);
+
+    let dag_a = net_a.author_local_shared_state_batch(&batch_a).await?;
+    let dag_b = net_b.author_local_shared_state_batch(&batch_b).await?;
+    let dag_c = net_c.author_local_shared_state_batch(&batch_c).await?;
+    assert_eq!(dag_a.round, 1);
+    assert_eq!(dag_b.round, 1);
+    assert_eq!(dag_c.round, 1);
+    assert!(dag_a.parents.is_empty());
+    assert!(dag_b.parents.is_empty());
+    assert!(dag_c.parents.is_empty());
+
+    wait_for_condition(
+        "round-1 DAG batch availability on node A",
+        Duration::from_secs(10),
+        || {
+            db_a.load_shared_state_dag_round(genesis.position.epoch, 1)
+                .map(|batches| batches.len() == 3)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let leader_id = committee.leader_for(1);
+    let leader_net = if validator_from_record(identity_a.record(), 1)?.id == leader_id {
+        net_a.clone()
+    } else if validator_from_record(identity_b.record(), 1)?.id == leader_id {
+        net_b.clone()
+    } else {
+        net_c.clone()
+    };
+
+    let anchor = leader_net
+        .finalize_available_shared_state_anchor()
+        .await?
+        .expect("finalized shared-state anchor");
+    assert_eq!(anchor.ordering_path, OrderingPath::DagBftSharedState);
+    assert_eq!(anchor.dag_round, 1);
+    assert_eq!(anchor.dag_frontier.len(), 3);
+    assert_eq!(anchor.ordered_batch_ids.len(), 3);
+    assert_eq!(anchor.ordered_tx_count, 1);
+
+    wait_for_condition(
+        "shared-state anchor adoption on node A",
+        Duration::from_secs(10),
+        || {
+            db_a.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state anchor adoption on node B",
+        Duration::from_secs(10),
+        || {
+            db_b.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state anchor adoption on node C",
+        Duration::from_secs(10),
+        || {
+            db_c.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    assert!(db_a.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_a.load_validator_pool(&pool.validator.id)?.is_some());
+    assert!(db_b.load_validator_pool(&pool.validator.id)?.is_some());
+    assert!(db_c.load_validator_pool(&pool.validator.id)?.is_some());
 
     net_a.shutdown().await;
     net_b.shutdown().await;

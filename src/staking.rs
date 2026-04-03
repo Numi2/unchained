@@ -62,6 +62,21 @@ pub struct ValidatorPool {
     pub metadata: ValidatorMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationPreview {
+    pub delegated_amount: u64,
+    pub minted_shares: u64,
+    pub updated_pool: ValidatorPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndelegationPreview {
+    pub burned_shares: u64,
+    pub claim_amount: u64,
+    pub release_epoch: u64,
+    pub updated_pool: ValidatorPool,
+}
+
 impl ValidatorPool {
     pub fn new(
         validator: Validator,
@@ -145,23 +160,25 @@ impl ValidatorPool {
     }
 
     pub fn with_profile(&self, commission_bps: u16, metadata: ValidatorMetadata) -> Result<Self> {
-        Self::new(
-            Validator::new(self.total_bonded_stake, self.validator.keys.clone())?,
-            self.node_id,
+        if commission_bps > 10_000 {
+            bail!("validator commission exceeds 100%");
+        }
+        metadata.validate()?;
+        let updated = Self {
+            validator: Validator::new(self.total_bonded_stake, self.validator.keys.clone())?,
+            node_id: self.node_id,
             commission_bps,
-            self.total_bonded_stake,
-            self.activation_epoch,
-            self.status,
+            total_bonded_stake: self.total_bonded_stake,
+            total_delegation_shares: self.total_delegation_shares,
+            activation_epoch: self.activation_epoch,
+            status: self.status,
             metadata,
-        )
+        };
+        updated.validate()?;
+        Ok(updated)
     }
 
-    pub fn mint_delegation(
-        &self,
-        delegated_amount: u64,
-        delegated_epoch: u64,
-        note_commitment: [u8; 32],
-    ) -> Result<(Self, DelegationShareRecord)> {
+    pub fn preview_delegation(&self, delegated_amount: u64) -> Result<DelegationPreview> {
         self.validate()?;
         if delegated_amount == 0 {
             bail!("delegated amount must be non-zero");
@@ -173,17 +190,20 @@ impl ValidatorPool {
             bail!("delegation into jailed or retired validator pools is not allowed");
         }
 
-        let minted_shares = if self.total_bonded_stake == 0 || self.total_delegation_shares == 0 {
-            delegated_amount as u128
-        } else {
-            (delegated_amount as u128)
-                .checked_mul(self.total_delegation_shares)
-                .ok_or_else(|| anyhow::anyhow!("delegation share supply overflow"))?
-                / (self.total_bonded_stake as u128)
-        };
-        if minted_shares == 0 {
+        let minted_shares_u128 =
+            if self.total_bonded_stake == 0 || self.total_delegation_shares == 0 {
+                delegated_amount as u128
+            } else {
+                (delegated_amount as u128)
+                    .checked_mul(self.total_delegation_shares)
+                    .ok_or_else(|| anyhow::anyhow!("delegation share supply overflow"))?
+                    / (self.total_bonded_stake as u128)
+            };
+        if minted_shares_u128 == 0 {
             bail!("delegation amount is too small to mint any pool shares");
         }
+        let minted_shares = u64::try_from(minted_shares_u128)
+            .map_err(|_| anyhow::anyhow!("delegation share value exceeds u64 note capacity"))?;
 
         let updated_total_bonded_stake = self
             .total_bonded_stake
@@ -191,7 +211,7 @@ impl ValidatorPool {
             .ok_or_else(|| anyhow::anyhow!("validator bonded stake overflow"))?;
         let updated_total_delegation_shares = self
             .total_delegation_shares
-            .checked_add(minted_shares)
+            .checked_add(minted_shares as u128)
             .ok_or_else(|| anyhow::anyhow!("validator delegation share supply overflow"))?;
 
         let updated_pool = Self {
@@ -204,47 +224,100 @@ impl ValidatorPool {
             status: self.status,
             metadata: self.metadata.clone(),
         };
-        let record = DelegationShareRecord::new(
-            note_commitment,
-            self.validator.id,
+        updated_pool.validate()?;
+        Ok(DelegationPreview {
             delegated_amount,
             minted_shares,
-            delegated_epoch,
-        )?;
-        Ok((updated_pool, record))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DelegationShareRecord {
-    pub note_commitment: [u8; 32],
-    pub validator_id: ValidatorId,
-    pub delegated_amount: u64,
-    pub minted_shares: u128,
-    pub delegated_epoch: u64,
-}
-
-impl DelegationShareRecord {
-    pub fn new(
-        note_commitment: [u8; 32],
-        validator_id: ValidatorId,
-        delegated_amount: u64,
-        minted_shares: u128,
-        delegated_epoch: u64,
-    ) -> Result<Self> {
-        if delegated_amount == 0 {
-            bail!("delegation record amount must be non-zero");
-        }
-        if minted_shares == 0 {
-            bail!("delegation record minted shares must be non-zero");
-        }
-        Ok(Self {
-            note_commitment,
-            validator_id,
-            delegated_amount,
-            minted_shares,
-            delegated_epoch,
+            updated_pool,
         })
+    }
+
+    pub fn apply_delegation(&self, delegated_amount: u64, minted_shares: u64) -> Result<Self> {
+        let preview = self.preview_delegation(delegated_amount)?;
+        if preview.minted_shares != minted_shares {
+            bail!("delegation share value does not match the canonical pool mint result");
+        }
+        Ok(preview.updated_pool)
+    }
+
+    pub fn preview_undelegation(
+        &self,
+        burned_shares: u64,
+        requested_epoch: u64,
+        unbonding_epochs: u64,
+    ) -> Result<UndelegationPreview> {
+        self.validate()?;
+        if burned_shares == 0 {
+            bail!("undelegated share amount must be non-zero");
+        }
+        if (burned_shares as u128) >= self.total_delegation_shares {
+            bail!("undelegation cannot consume the validator's full share supply");
+        }
+
+        let claim_amount_u128 = (burned_shares as u128)
+            .checked_mul(self.total_bonded_stake as u128)
+            .ok_or_else(|| anyhow::anyhow!("undelegation claim amount overflow"))?
+            / self.total_delegation_shares;
+        if claim_amount_u128 == 0 {
+            bail!("undelegated share amount is too small to realize any bonded stake");
+        }
+        let claim_amount = u64::try_from(claim_amount_u128)
+            .map_err(|_| anyhow::anyhow!("undelegation claim amount exceeds u64"))?;
+
+        let updated_total_bonded_stake = self
+            .total_bonded_stake
+            .checked_sub(claim_amount)
+            .ok_or_else(|| anyhow::anyhow!("undelegation exceeds bonded stake"))?;
+        if updated_total_bonded_stake == 0 {
+            bail!("undelegation cannot drain the validator's full bonded stake");
+        }
+        let updated_total_delegation_shares = self
+            .total_delegation_shares
+            .checked_sub(burned_shares as u128)
+            .ok_or_else(|| anyhow::anyhow!("undelegation exceeds share supply"))?;
+        if updated_total_delegation_shares == 0 {
+            bail!("undelegation cannot drain the validator's full share supply");
+        }
+
+        let release_epoch = requested_epoch
+            .checked_add(unbonding_epochs.max(1))
+            .ok_or_else(|| anyhow::anyhow!("unbonding release epoch overflow"))?;
+        let updated_pool = Self {
+            validator: Validator::new(updated_total_bonded_stake, self.validator.keys.clone())?,
+            node_id: self.node_id,
+            commission_bps: self.commission_bps,
+            total_bonded_stake: updated_total_bonded_stake,
+            total_delegation_shares: updated_total_delegation_shares,
+            activation_epoch: self.activation_epoch,
+            status: self.status,
+            metadata: self.metadata.clone(),
+        };
+        updated_pool.validate()?;
+        Ok(UndelegationPreview {
+            burned_shares,
+            claim_amount,
+            release_epoch,
+            updated_pool,
+        })
+    }
+
+    pub fn apply_undelegation(
+        &self,
+        burned_shares: u64,
+        claim_amount: u64,
+        requested_epoch: u64,
+        release_epoch: u64,
+        unbonding_epochs: u64,
+    ) -> Result<Self> {
+        let preview =
+            self.preview_undelegation(burned_shares, requested_epoch, unbonding_epochs)?;
+        if preview.claim_amount != claim_amount {
+            bail!("unbonding claim amount does not match the canonical pool redeem result");
+        }
+        if preview.release_epoch != release_epoch {
+            bail!("unbonding release epoch does not match the canonical pool unbonding schedule");
+        }
+        Ok(preview.updated_pool)
     }
 }
 

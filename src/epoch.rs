@@ -27,6 +27,11 @@ pub struct AnchorProposal {
     pub ordering_path: OrderingPath,
     pub merkle_root: [u8; 32],
     pub coin_count: u32,
+    pub dag_round: u64,
+    pub dag_frontier: Vec<[u8; 32]>,
+    pub ordered_batch_ids: Vec<[u8; 32]>,
+    pub ordered_tx_root: [u8; 32],
+    pub ordered_tx_count: u32,
     pub validator_set: ValidatorSet,
 }
 
@@ -46,6 +51,11 @@ impl AnchorProposal {
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
         coin_count: u32,
+        dag_round: u64,
+        dag_frontier: &[[u8; 32]],
+        ordered_batch_ids: &[[u8; 32]],
+        ordered_tx_root: [u8; 32],
+        ordered_tx_count: u32,
         validator_set: &ValidatorSet,
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key("unchained.finalized-checkpoint.digest.v1");
@@ -67,6 +77,17 @@ impl AnchorProposal {
         }]);
         hasher.update(&merkle_root);
         hasher.update(&coin_count.to_le_bytes());
+        hasher.update(&dag_round.to_le_bytes());
+        hasher.update(&(dag_frontier.len() as u64).to_le_bytes());
+        for batch_id in dag_frontier {
+            hasher.update(batch_id);
+        }
+        hasher.update(&(ordered_batch_ids.len() as u64).to_le_bytes());
+        for batch_id in ordered_batch_ids {
+            hasher.update(batch_id);
+        }
+        hasher.update(&ordered_tx_root);
+        hasher.update(&ordered_tx_count.to_le_bytes());
         hasher.update(&validator_set.committee_hash());
         *hasher.finalize().as_bytes()
     }
@@ -77,8 +98,15 @@ impl AnchorProposal {
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
         coin_count: u32,
+        dag_round: u64,
+        dag_frontier: Vec<[u8; 32]>,
+        ordered_batch_ids: Vec<[u8; 32]>,
+        ordered_tx_root: [u8; 32],
+        ordered_tx_count: u32,
         validator_set: ValidatorSet,
     ) -> AnyResult<Self> {
+        let mut dag_frontier = dag_frontier;
+        dag_frontier.sort();
         let position = Anchor::position_for_num(num);
         let hash = Self::compute_hash(
             num,
@@ -87,6 +115,11 @@ impl AnchorProposal {
             ordering_path,
             merkle_root,
             coin_count,
+            dag_round,
+            &dag_frontier,
+            &ordered_batch_ids,
+            ordered_tx_root,
+            ordered_tx_count,
             &validator_set,
         );
         let proposal = Self {
@@ -97,6 +130,11 @@ impl AnchorProposal {
             ordering_path,
             merkle_root,
             coin_count,
+            dag_round,
+            dag_frontier,
+            ordered_batch_ids,
+            ordered_tx_root,
+            ordered_tx_count,
             validator_set,
         };
         validate_proposal_invariants(&proposal)?;
@@ -129,6 +167,11 @@ impl AnchorProposal {
             ordering_path: self.ordering_path,
             merkle_root: self.merkle_root,
             coin_count: self.coin_count,
+            dag_round: self.dag_round,
+            dag_frontier: self.dag_frontier,
+            ordered_batch_ids: self.ordered_batch_ids,
+            ordered_tx_root: self.ordered_tx_root,
+            ordered_tx_count: self.ordered_tx_count,
             validator_set: self.validator_set,
             qc,
         };
@@ -145,6 +188,11 @@ pub struct Anchor {
     pub ordering_path: OrderingPath,
     pub merkle_root: [u8; 32],
     pub coin_count: u32,
+    pub dag_round: u64,
+    pub dag_frontier: Vec<[u8; 32]>,
+    pub ordered_batch_ids: Vec<[u8; 32]>,
+    pub ordered_tx_root: [u8; 32],
+    pub ordered_tx_count: u32,
     pub validator_set: ValidatorSet,
     pub qc: QuorumCertificate,
 }
@@ -161,6 +209,11 @@ impl Anchor {
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
         coin_count: u32,
+        dag_round: u64,
+        dag_frontier: &[[u8; 32]],
+        ordered_batch_ids: &[[u8; 32]],
+        ordered_tx_root: [u8; 32],
+        ordered_tx_count: u32,
         validator_set: &ValidatorSet,
     ) -> [u8; 32] {
         AnchorProposal::compute_hash(
@@ -170,6 +223,11 @@ impl Anchor {
             ordering_path,
             merkle_root,
             coin_count,
+            dag_round,
+            dag_frontier,
+            ordered_batch_ids,
+            ordered_tx_root,
+            ordered_tx_count,
             validator_set,
         )
     }
@@ -180,6 +238,11 @@ impl Anchor {
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
         coin_count: u32,
+        dag_round: u64,
+        dag_frontier: Vec<[u8; 32]>,
+        ordered_batch_ids: Vec<[u8; 32]>,
+        ordered_tx_root: [u8; 32],
+        ordered_tx_count: u32,
         validator_set: ValidatorSet,
         qc: QuorumCertificate,
     ) -> AnyResult<Self> {
@@ -189,6 +252,11 @@ impl Anchor {
             ordering_path,
             merkle_root,
             coin_count,
+            dag_round,
+            dag_frontier,
+            ordered_batch_ids,
+            ordered_tx_root,
+            ordered_tx_count,
             validator_set,
         )?
         .finalize(qc)
@@ -204,6 +272,11 @@ impl Anchor {
                 ordering_path: self.ordering_path,
                 merkle_root: self.merkle_root,
                 coin_count: self.coin_count,
+                dag_round: self.dag_round,
+                dag_frontier: self.dag_frontier.clone(),
+                ordered_batch_ids: self.ordered_batch_ids.clone(),
+                ordered_tx_root: self.ordered_tx_root,
+                ordered_tx_count: self.ordered_tx_count,
                 validator_set: self.validator_set.clone(),
             },
             parent,
@@ -234,6 +307,18 @@ impl Anchor {
                 }
                 if self.parent_hash != Some(parent.hash) {
                     bail!("checkpoint parent hash mismatch");
+                }
+                if self.ordering_path == OrderingPath::DagBftSharedState {
+                    let parent_round = if self.position.epoch == parent.position.epoch {
+                        parent.dag_round
+                    } else {
+                        0
+                    };
+                    if self.dag_round <= parent_round {
+                        bail!(
+                            "shared-state DAG round must increase beyond the finalized parent round"
+                        );
+                    }
                 }
                 if self.position.epoch == parent.position.epoch {
                     if self.validator_set.committee_hash() != parent.validator_set.committee_hash()
@@ -268,6 +353,16 @@ fn validate_proposal_fields(proposal: &AnchorProposal, parent: Option<&Anchor>) 
             }
             if proposal.parent_hash != Some(parent.hash) {
                 bail!("checkpoint parent hash mismatch");
+            }
+            if proposal.ordering_path == OrderingPath::DagBftSharedState {
+                let parent_round = if proposal.position.epoch == parent.position.epoch {
+                    parent.dag_round
+                } else {
+                    0
+                };
+                if proposal.dag_round <= parent_round {
+                    bail!("shared-state DAG round must increase beyond the finalized parent round");
+                }
             }
             if proposal.position.epoch == parent.position.epoch {
                 if proposal.validator_set.committee_hash() != parent.validator_set.committee_hash()
@@ -305,6 +400,54 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
     if proposal.validator_set.epoch != proposal.position.epoch {
         bail!("validator set epoch must match checkpoint epoch");
     }
+    match proposal.ordering_path {
+        OrderingPath::FastPathPrivateTransfer => {
+            if proposal.ordered_tx_count != 0
+                || proposal.ordered_tx_root != [0u8; 32]
+                || proposal.dag_round != 0
+                || !proposal.dag_frontier.is_empty()
+                || !proposal.ordered_batch_ids.is_empty()
+            {
+                bail!("fast-path checkpoints cannot commit shared-state batches");
+            }
+        }
+        OrderingPath::DagBftSharedState => {
+            if proposal.coin_count != 0 || proposal.merkle_root != [0u8; 32] {
+                bail!("shared-state checkpoints cannot carry ordinary transfer coin commitments");
+            }
+            if proposal.dag_round == 0 {
+                bail!("shared-state checkpoints must commit a non-zero DAG round");
+            }
+            if proposal.dag_frontier.is_empty() {
+                bail!("shared-state checkpoints must commit a non-empty DAG frontier");
+            }
+            if proposal.ordered_batch_ids.is_empty() {
+                bail!("shared-state checkpoints must commit ordered DAG batch ids");
+            }
+            if proposal.ordered_tx_count == 0 || proposal.ordered_tx_root == [0u8; 32] {
+                bail!("shared-state checkpoints must commit a non-empty ordered tx batch");
+            }
+        }
+    }
+    let mut last_frontier = None;
+    for batch_id in &proposal.dag_frontier {
+        if *batch_id == [0u8; 32] {
+            bail!("DAG frontier batch id cannot be zero");
+        }
+        if last_frontier == Some(*batch_id) {
+            bail!("DAG frontier contains duplicate batch ids");
+        }
+        last_frontier = Some(*batch_id);
+    }
+    let mut seen_ordered = std::collections::BTreeSet::new();
+    for batch_id in &proposal.ordered_batch_ids {
+        if *batch_id == [0u8; 32] {
+            bail!("ordered DAG batch id cannot be zero");
+        }
+        if !seen_ordered.insert(*batch_id) {
+            bail!("ordered DAG batch list contains duplicate ids");
+        }
+    }
     let expected_hash = Anchor::compute_hash(
         proposal.num,
         proposal.parent_hash,
@@ -312,6 +455,11 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
         proposal.ordering_path,
         proposal.merkle_root,
         proposal.coin_count,
+        proposal.dag_round,
+        &proposal.dag_frontier,
+        &proposal.ordered_batch_ids,
+        proposal.ordered_tx_root,
+        proposal.ordered_tx_count,
         &proposal.validator_set,
     );
     if proposal.hash != expected_hash {
@@ -649,6 +797,45 @@ impl Manager {
                         // Determine previous anchor (for epoch linkage and candidate filtering)
                         let prev_anchor = self.db.get::<Anchor>("epoch", &(current_epoch.saturating_sub(1)).to_le_bytes()).unwrap_or_default();
 
+                        match self.net.select_pending_shared_state_batch() {
+                            Ok(Some(shared_state_batch)) => {
+                                if let Err(err) = self
+                                    .net
+                                    .author_local_shared_state_batch(&shared_state_batch)
+                                    .await
+                                {
+                                    eprintln!("⚠️ Failed authoring shared-state DAG batch: {}", err);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!("⚠️ Failed selecting shared-state batch: {}", err);
+                            }
+                        }
+
+                        match self.net.finalize_available_shared_state_anchor().await {
+                            Ok(Some(anchor)) => {
+                                crate::metrics::EPOCH_HEIGHT.set(anchor.num as i64);
+                                if let Err(e) = self.anchor_tx.send(anchor.clone()) {
+                                    eprintln!("⚠️  Failed to broadcast shared-state anchor: {}", e);
+                                }
+                                current_epoch = anchor.num.saturating_add(1);
+                                ticker = time::interval_at(
+                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
+                                    time::Duration::from_secs(self.cfg.seconds)
+                                );
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "⏳ Local shared-state checkpoint {} not certified: {}",
+                                    current_epoch, err
+                                );
+                            }
+                        }
+
                         // Use canonical fair selection that ensures diversity across creators
                         let mut selected: Vec<CoinCandidate> = Vec::new();
                         if let Some(prev) = &prev_anchor {
@@ -681,6 +868,11 @@ impl Manager {
                                 prev_anchor.as_ref(),
                                 merkle_root,
                                 selected_ids.len() as u32,
+                                0,
+                                Vec::new(),
+                                Vec::new(),
+                                [0u8; 32],
+                                0,
                                 OrderingPath::FastPathPrivateTransfer,
                             )
                             .await
@@ -978,6 +1170,11 @@ mod tests {
             OrderingPath::FastPathPrivateTransfer,
             [num as u8; 32],
             0,
+            0,
+            &[],
+            &[],
+            [0u8; 32],
+            0,
             &validator_set,
         );
         let target = VoteTarget {
@@ -1002,6 +1199,11 @@ mod tests {
             parent_hash,
             OrderingPath::FastPathPrivateTransfer,
             [num as u8; 32],
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
             0,
             validator_set,
             qc,

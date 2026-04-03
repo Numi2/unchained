@@ -17,6 +17,7 @@ use crate::staking::{
 };
 use crate::storage::Store;
 use crate::sync::SyncState;
+use crate::transaction::{SharedStateBatch, SharedStateDagBatch};
 use crate::{
     coin::{Coin, CoinCandidate},
     config,
@@ -172,6 +173,7 @@ enum WireTopic {
     Anchor,
     AnchorProposal,
     ValidatorVote,
+    SharedStateDagBatch,
     CoinCandidate,
     Coin,
     Tx,
@@ -200,6 +202,7 @@ enum WireTopic {
     CheckpointBatch,
     ArchiveCustodyCommitment,
     ArchiveRetrievalReceipt,
+    RequestSharedStateDagBatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,34 +222,36 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::Anchor => 1,
         WireTopic::AnchorProposal => 2,
         WireTopic::ValidatorVote => 3,
-        WireTopic::CoinCandidate => 4,
-        WireTopic::Coin => 5,
-        WireTopic::Tx => 6,
-        WireTopic::CompactEpoch => 7,
-        WireTopic::EpochLeaves => 8,
-        WireTopic::EpochSelectedResponse => 9,
-        WireTopic::EpochCandidatesResponse => 10,
-        WireTopic::EpochHeadersResponse => 11,
-        WireTopic::EpochByHashResponse => 12,
-        WireTopic::RequestEpoch => 13,
-        WireTopic::RequestEpochHeadersRange => 14,
-        WireTopic::RequestEpochByHash => 15,
-        WireTopic::RequestCoin => 16,
-        WireTopic::RequestLatestEpoch => 17,
-        WireTopic::RequestEpochTxn => 18,
-        WireTopic::EpochTxn => 19,
-        WireTopic::RequestEpochSelected => 20,
-        WireTopic::RequestEpochLeaves => 21,
-        WireTopic::RequestEpochCandidates => 22,
-        WireTopic::NodeRecord => 23,
-        WireTopic::ArchiveManifest => 24,
-        WireTopic::ArchiveReplica => 25,
-        WireTopic::RequestArchiveShard => 26,
-        WireTopic::ArchiveShard => 27,
-        WireTopic::RequestCheckpointBatch => 28,
-        WireTopic::CheckpointBatch => 29,
-        WireTopic::ArchiveCustodyCommitment => 30,
-        WireTopic::ArchiveRetrievalReceipt => 31,
+        WireTopic::SharedStateDagBatch => 4,
+        WireTopic::CoinCandidate => 5,
+        WireTopic::Coin => 6,
+        WireTopic::Tx => 7,
+        WireTopic::CompactEpoch => 8,
+        WireTopic::EpochLeaves => 9,
+        WireTopic::EpochSelectedResponse => 10,
+        WireTopic::EpochCandidatesResponse => 11,
+        WireTopic::EpochHeadersResponse => 12,
+        WireTopic::EpochByHashResponse => 13,
+        WireTopic::RequestEpoch => 14,
+        WireTopic::RequestEpochHeadersRange => 15,
+        WireTopic::RequestEpochByHash => 16,
+        WireTopic::RequestCoin => 17,
+        WireTopic::RequestLatestEpoch => 18,
+        WireTopic::RequestEpochTxn => 19,
+        WireTopic::EpochTxn => 20,
+        WireTopic::RequestEpochSelected => 21,
+        WireTopic::RequestEpochLeaves => 22,
+        WireTopic::RequestEpochCandidates => 23,
+        WireTopic::NodeRecord => 24,
+        WireTopic::ArchiveManifest => 25,
+        WireTopic::ArchiveReplica => 26,
+        WireTopic::RequestArchiveShard => 27,
+        WireTopic::ArchiveShard => 28,
+        WireTopic::RequestCheckpointBatch => 29,
+        WireTopic::CheckpointBatch => 30,
+        WireTopic::ArchiveCustodyCommitment => 31,
+        WireTopic::ArchiveRetrievalReceipt => 32,
+        WireTopic::RequestSharedStateDagBatch => 33,
     }
 }
 
@@ -255,34 +260,36 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         1 => WireTopic::Anchor,
         2 => WireTopic::AnchorProposal,
         3 => WireTopic::ValidatorVote,
-        4 => WireTopic::CoinCandidate,
-        5 => WireTopic::Coin,
-        6 => WireTopic::Tx,
-        7 => WireTopic::CompactEpoch,
-        8 => WireTopic::EpochLeaves,
-        9 => WireTopic::EpochSelectedResponse,
-        10 => WireTopic::EpochCandidatesResponse,
-        11 => WireTopic::EpochHeadersResponse,
-        12 => WireTopic::EpochByHashResponse,
-        13 => WireTopic::RequestEpoch,
-        14 => WireTopic::RequestEpochHeadersRange,
-        15 => WireTopic::RequestEpochByHash,
-        16 => WireTopic::RequestCoin,
-        17 => WireTopic::RequestLatestEpoch,
-        18 => WireTopic::RequestEpochTxn,
-        19 => WireTopic::EpochTxn,
-        20 => WireTopic::RequestEpochSelected,
-        21 => WireTopic::RequestEpochLeaves,
-        22 => WireTopic::RequestEpochCandidates,
-        23 => WireTopic::NodeRecord,
-        24 => WireTopic::ArchiveManifest,
-        25 => WireTopic::ArchiveReplica,
-        26 => WireTopic::RequestArchiveShard,
-        27 => WireTopic::ArchiveShard,
-        28 => WireTopic::RequestCheckpointBatch,
-        29 => WireTopic::CheckpointBatch,
-        30 => WireTopic::ArchiveCustodyCommitment,
-        31 => WireTopic::ArchiveRetrievalReceipt,
+        4 => WireTopic::SharedStateDagBatch,
+        5 => WireTopic::CoinCandidate,
+        6 => WireTopic::Coin,
+        7 => WireTopic::Tx,
+        8 => WireTopic::CompactEpoch,
+        9 => WireTopic::EpochLeaves,
+        10 => WireTopic::EpochSelectedResponse,
+        11 => WireTopic::EpochCandidatesResponse,
+        12 => WireTopic::EpochHeadersResponse,
+        13 => WireTopic::EpochByHashResponse,
+        14 => WireTopic::RequestEpoch,
+        15 => WireTopic::RequestEpochHeadersRange,
+        16 => WireTopic::RequestEpochByHash,
+        17 => WireTopic::RequestCoin,
+        18 => WireTopic::RequestLatestEpoch,
+        19 => WireTopic::RequestEpochTxn,
+        20 => WireTopic::EpochTxn,
+        21 => WireTopic::RequestEpochSelected,
+        22 => WireTopic::RequestEpochLeaves,
+        23 => WireTopic::RequestEpochCandidates,
+        24 => WireTopic::NodeRecord,
+        25 => WireTopic::ArchiveManifest,
+        26 => WireTopic::ArchiveReplica,
+        27 => WireTopic::RequestArchiveShard,
+        28 => WireTopic::ArchiveShard,
+        29 => WireTopic::RequestCheckpointBatch,
+        30 => WireTopic::CheckpointBatch,
+        31 => WireTopic::ArchiveCustodyCommitment,
+        32 => WireTopic::ArchiveRetrievalReceipt,
+        33 => WireTopic::RequestSharedStateDagBatch,
         other => bail!("unsupported wire topic {}", other),
     })
 }
@@ -424,6 +431,21 @@ struct PendingAnchorCertification {
     created_at: Instant,
 }
 
+struct PendingSharedStateProposal {
+    proposer_record: NodeRecordV2,
+    proposal_message_id: [u8; 32],
+    proposal: AnchorProposal,
+    received_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SharedStateDagPlan {
+    round: u64,
+    frontier: Vec<[u8; 32]>,
+    ordered_batches: Vec<SharedStateDagBatch>,
+    aggregate_batch: SharedStateBatch,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct P2pPolicy {
     max_validation_failures_per_peer: u32,
@@ -490,6 +512,7 @@ struct RuntimeState {
     headers_tx: broadcast::Sender<EpochHeadersBatch>,
     checkpoint_tx: broadcast::Sender<CheckpointBatchEvent>,
     pending_anchor_certifications: Arc<AsyncMutex<HashMap<[u8; 32], PendingAnchorCertification>>>,
+    pending_shared_state_proposals: Arc<AsyncMutex<Vec<PendingSharedStateProposal>>>,
     cast_anchor_votes: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
     archive_manifests: Arc<RwLock<HashMap<[u8; 32], ArchiveProviderManifest>>>,
     archive_replicas: Arc<RwLock<HashMap<([u8; 32], u64), ArchiveReplicaAttestation>>>,
@@ -520,6 +543,7 @@ enum NetworkCommand {
     GossipAnchor(Anchor),
     GossipCoin(CoinCandidate),
     GossipTx(crate::transaction::Tx),
+    GossipSharedStateDagBatch(SharedStateDagBatch),
     GossipCompactEpoch(CompactEpoch),
     ProposeAnchor {
         proposal: AnchorProposal,
@@ -1683,6 +1707,27 @@ impl RuntimeState {
         validate_anchor_proposal_against_store(&proposal, parent.as_ref(), self.db.as_ref())
             .map_err(|err| anyhow!(err))?;
         validate_anchor_proposal_author(&proposal, proposer_record)?;
+        if proposal.ordering_path == OrderingPath::DagBftSharedState {
+            if let Some(missing_batch_id) =
+                first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
+            {
+                self.queue_shared_state_proposal(
+                    proposer_record.clone(),
+                    proposal_message_id,
+                    proposal.clone(),
+                )
+                .await;
+                self.request_shared_state_dag_batch_from(proposer_record.clone(), missing_batch_id)
+                    .await?;
+                return Ok(());
+            }
+            validate_shared_state_dag_plan_for_proposal(
+                &proposal,
+                parent.as_ref(),
+                self.db.as_ref(),
+            )
+            .map_err(|err| anyhow!(err))?;
+        }
 
         let local_validator_id = {
             let identity = self.identity.read().await;
@@ -1751,6 +1796,105 @@ impl RuntimeState {
         if let Some((Some(reply), qc)) = completion {
             let _ = reply.send(Ok(qc));
         }
+        Ok(())
+    }
+
+    async fn queue_shared_state_proposal(
+        &self,
+        proposer_record: NodeRecordV2,
+        proposal_message_id: [u8; 32],
+        proposal: AnchorProposal,
+    ) {
+        let mut guard = self.pending_shared_state_proposals.lock().await;
+        guard.retain(|pending| {
+            pending.received_at.elapsed() < Duration::from_secs(PENDING_ANCHOR_TTL_SECS)
+        });
+        guard.push(PendingSharedStateProposal {
+            proposer_record,
+            proposal_message_id,
+            proposal,
+            received_at: Instant::now(),
+        });
+    }
+
+    async fn request_shared_state_dag_batch(&self, batch_id: [u8; 32]) -> Result<()> {
+        let _ = self
+            .sign_and_send_to_targets(
+                WireTopic::RequestSharedStateDagBatch,
+                encode_bytes32_body(&batch_id),
+                REQUEST_FANOUT_DEFAULT,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn request_shared_state_dag_batch_from(
+        &self,
+        record: NodeRecordV2,
+        batch_id: [u8; 32],
+    ) -> Result<()> {
+        let _ = self
+            .sign_and_send_to_record_related(
+                record,
+                WireTopic::RequestSharedStateDagBatch,
+                encode_bytes32_body(&batch_id),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn ingest_shared_state_dag_batch(&self, batch: SharedStateDagBatch) -> Result<()> {
+        if self
+            .db
+            .load_shared_state_dag_batch(&batch.batch_id)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        batch.batch.validate_against_store(self.db.as_ref())?;
+        let validator_set = load_or_compute_active_validator_set(self.db.as_ref(), batch.epoch)
+            .map_err(anyhow::Error::from)?;
+        if validator_set.validator(&batch.author).is_none() {
+            bail!("shared-state DAG batch author is not part of the active validator set");
+        }
+        if self
+            .db
+            .has_shared_state_dag_batch_author(batch.epoch, batch.round, &batch.author)?
+        {
+            let existing = self
+                .db
+                .load_shared_state_dag_round(batch.epoch, batch.round)?;
+            if existing.iter().any(|existing| {
+                existing.author == batch.author && existing.batch_id != batch.batch_id
+            }) {
+                bail!(
+                    "validator already authored a different shared-state DAG batch for this round"
+                );
+            }
+        }
+        self.db.store_shared_state_dag_batch(&batch)?;
+
+        let pending = {
+            let mut guard = self.pending_shared_state_proposals.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for pending in pending {
+            let _ = self
+                .cast_anchor_proposal_vote(
+                    &pending.proposer_record,
+                    pending.proposal_message_id,
+                    pending.proposal,
+                )
+                .await;
+        }
+
+        let next_height = self
+            .db
+            .get::<Anchor>("epoch", b"latest")?
+            .map(|anchor| anchor.num.saturating_add(1))
+            .unwrap_or(0);
+        self.process_pending_anchors(next_height).await?;
         Ok(())
     }
 
@@ -1993,6 +2137,10 @@ impl RuntimeState {
                 self.record_anchor_vote(&record, response_to_message_id, vote)
                     .await?;
             }
+            WireTopic::SharedStateDagBatch => {
+                let batch = canonical::decode_shared_state_dag_batch(&frame.body)?;
+                self.ingest_shared_state_dag_batch(batch).await?;
+            }
             WireTopic::CoinCandidate => {
                 let candidate = canonical::decode_coin_candidate(&frame.body)?;
                 match validate_coin_candidate(&candidate, &self.db) {
@@ -2012,12 +2160,41 @@ impl RuntimeState {
             }
             WireTopic::Tx => {
                 let tx = canonical::decode_tx(&frame.body)?;
-                match validate_tx(&tx, &self.db) {
-                    Ok(()) => {
-                        tx.apply(&self.db)?;
-                        let _ = self.tx_tx.send(tx);
+                let tx_id = tx.id()?;
+                if self.db.get_raw_bytes("tx", &tx_id)?.is_some() {
+                    return Ok(());
+                }
+                if matches!(tx, crate::transaction::Tx::SharedState(_)) {
+                    if self.db.load_shared_state_pending_tx(&tx_id)?.is_some() {
+                        return Ok(());
                     }
-                    Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
+                    match validate_tx(&tx, &self.db) {
+                        Ok(()) => {
+                            self.db.store_shared_state_pending_tx(&tx_id, &tx)?;
+                        }
+                        Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
+                    }
+                } else {
+                    match validate_tx(&tx, &self.db) {
+                        Ok(()) => {
+                            tx.apply(&self.db)?;
+                        }
+                        Err(err) => return Err(anyhow!("rejecting invalid tx: {err}")),
+                    }
+                }
+                let _ = self.tx_tx.send(tx);
+            }
+            WireTopic::RequestSharedStateDagBatch => {
+                let batch_id = decode_bytes32_body(&frame.body)?;
+                if let Some(batch) = self.db.load_shared_state_dag_batch(&batch_id)? {
+                    let _ = self
+                        .sign_and_send_to_peer_related(
+                            record.node_id,
+                            WireTopic::SharedStateDagBatch,
+                            canonical::encode_shared_state_dag_batch(&batch)?,
+                            Some(message_id),
+                        )
+                        .await?;
                 }
             }
             WireTopic::CompactEpoch => {
@@ -2601,6 +2778,30 @@ impl RuntimeState {
                 return Ok(());
             }
         }
+        if anchor.ordering_path == OrderingPath::DagBftSharedState {
+            let proposal = AnchorProposal {
+                num: anchor.num,
+                hash: anchor.hash,
+                parent_hash: anchor.parent_hash,
+                position: anchor.position,
+                ordering_path: anchor.ordering_path,
+                merkle_root: anchor.merkle_root,
+                coin_count: anchor.coin_count,
+                dag_round: anchor.dag_round,
+                dag_frontier: anchor.dag_frontier.clone(),
+                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+                ordered_tx_root: anchor.ordered_tx_root,
+                ordered_tx_count: anchor.ordered_tx_count,
+                validator_set: anchor.validator_set.clone(),
+            };
+            if let Some(missing_batch_id) =
+                first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
+            {
+                let _ = self.request_shared_state_dag_batch(missing_batch_id).await;
+                self.buffer_anchor(anchor).await;
+                return Ok(());
+            }
+        }
 
         match validate_anchor(&anchor, &self.db) {
             Ok(()) => {
@@ -2644,9 +2845,29 @@ impl RuntimeState {
     }
 
     async fn adopt_anchor(&self, anchor: Anchor) -> Result<()> {
-        self.db.store_validator_committee(&anchor.validator_set)?;
-        self.db.put("epoch", &anchor.num.to_le_bytes(), &anchor)?;
-        self.db.put("epoch", b"latest", &anchor)?;
+        let parent = if anchor.num == 0 {
+            None
+        } else {
+            self.db
+                .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
+        };
+        let shared_state_batch = if anchor.ordering_path == OrderingPath::DagBftSharedState {
+            Some(
+                reconstruct_shared_state_dag_plan(
+                    self.db.as_ref(),
+                    parent.as_ref(),
+                    &anchor.validator_set,
+                    anchor.dag_round,
+                )?
+                .ok_or_else(|| {
+                    anyhow!("shared-state DAG plan for finalized anchor is unavailable")
+                })?
+                .aggregate_batch,
+            )
+        } else {
+            None
+        };
+        persist_finalized_anchor(self.db.as_ref(), &anchor)?;
         metrics::EPOCH_HEIGHT.set(anchor.num as i64);
         if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
             net_log!(
@@ -2655,6 +2876,11 @@ impl RuntimeState {
                 e
             );
             let _ = self.repair_epoch_state(anchor.num).await;
+        }
+        if let Some(batch) = shared_state_batch {
+            for tx in batch.txs {
+                let _ = self.tx_tx.send(tx);
+            }
         }
         let _ = self.anchor_tx.send(anchor);
         Ok(())
@@ -2744,6 +2970,7 @@ pub async fn spawn(
         headers_tx: headers_tx.clone(),
         checkpoint_tx: checkpoint_tx.clone(),
         pending_anchor_certifications: Arc::new(AsyncMutex::new(HashMap::new())),
+        pending_shared_state_proposals: Arc::new(AsyncMutex::new(Vec::new())),
         cast_anchor_votes: Arc::new(AsyncMutex::new(HashMap::new())),
         archive_manifests: Arc::new(RwLock::new(
             persisted_archive_manifests
@@ -3030,6 +3257,14 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 .sign_and_broadcast(WireTopic::Tx, canonical::encode_tx(&tx)?)
                 .await?;
         }
+        NetworkCommand::GossipSharedStateDagBatch(batch) => {
+            state
+                .sign_and_broadcast(
+                    WireTopic::SharedStateDagBatch,
+                    canonical::encode_shared_state_dag_batch(&batch)?,
+                )
+                .await?;
+        }
         NetworkCommand::GossipCompactEpoch(compact) => {
             state
                 .sign_and_broadcast(
@@ -3173,6 +3408,33 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
 }
 
 impl Network {
+    pub fn select_pending_shared_state_batch(&self) -> Result<Option<SharedStateBatch>> {
+        select_pending_shared_state_batch(self.db.as_ref())
+    }
+
+    pub async fn submit_tx(&self, tx: &crate::transaction::Tx) -> Result<[u8; 32]> {
+        let tx_id = tx.id()?;
+        if self.db.get_raw_bytes("tx", &tx_id)?.is_some() {
+            return Ok(tx_id);
+        }
+        match tx {
+            crate::transaction::Tx::OrdinaryPrivateTransfer(_) => {
+                tx.apply(&self.db)?;
+                let _ = self.tx_tx.send(tx.clone());
+                let _ = self.command_tx.send(NetworkCommand::GossipTx(tx.clone()));
+            }
+            crate::transaction::Tx::SharedState(_) => {
+                if self.db.load_shared_state_pending_tx(&tx_id)?.is_none() {
+                    tx.validate(&self.db)?;
+                    self.db.store_shared_state_pending_tx(&tx_id, tx)?;
+                    let _ = self.tx_tx.send(tx.clone());
+                    let _ = self.command_tx.send(NetworkCommand::GossipTx(tx.clone()));
+                }
+            }
+        }
+        Ok(tx_id)
+    }
+
     pub async fn gossip_anchor(&self, anchor: &Anchor) {
         let _ = self
             .command_tx
@@ -3188,6 +3450,12 @@ impl Network {
     pub async fn gossip_tx(&self, tx: &crate::transaction::Tx) {
         let _ = self.tx_tx.send(tx.clone());
         let _ = self.command_tx.send(NetworkCommand::GossipTx(tx.clone()));
+    }
+
+    pub async fn gossip_shared_state_dag_batch(&self, batch: &SharedStateDagBatch) {
+        let _ = self
+            .command_tx
+            .send(NetworkCommand::GossipSharedStateDagBatch(batch.clone()));
     }
 
     pub async fn gossip_compact_epoch(&self, compact: CompactEpoch) {
@@ -3248,6 +3516,11 @@ impl Network {
         parent: Option<&Anchor>,
         merkle_root: [u8; 32],
         coin_count: u32,
+        dag_round: u64,
+        dag_frontier: Vec<[u8; 32]>,
+        ordered_batch_ids: Vec<[u8; 32]>,
+        ordered_tx_root: [u8; 32],
+        ordered_tx_count: u32,
         ordering_path: OrderingPath,
     ) -> Result<Anchor> {
         let position = Anchor::position_for_num(num);
@@ -3272,6 +3545,11 @@ impl Network {
             ordering_path,
             merkle_root,
             coin_count,
+            dag_round,
+            dag_frontier,
+            ordered_batch_ids,
+            ordered_tx_root,
+            ordered_tx_count,
             validator_set,
         )?;
 
@@ -3316,6 +3594,185 @@ impl Network {
         let anchor = proposal.finalize(qc)?;
         anchor.validate_against_parent(parent)?;
         Ok(anchor)
+    }
+
+    pub async fn author_local_shared_state_batch(
+        &self,
+        batch: &SharedStateBatch,
+    ) -> Result<SharedStateDagBatch> {
+        batch.validate_against_store(self.db.as_ref())?;
+        let parent = self.db.get::<Anchor>("epoch", b"latest")?;
+        let next_num = parent
+            .as_ref()
+            .map(|anchor| anchor.num.saturating_add(1))
+            .unwrap_or(0);
+        let position = Anchor::position_for_num(next_num);
+        let validator_set = match parent.as_ref() {
+            Some(parent) if parent.position.epoch == position.epoch => parent.validator_set.clone(),
+            Some(_) => load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?,
+            None => {
+                let identity = self
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                    .clone();
+                let identity = identity.read().await;
+                register_genesis_local_validator_pool(self.db.as_ref(), identity.record())?;
+                load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?
+            }
+        };
+        let local_validator_id = {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                .read()
+                .await;
+            ValidatorId::from_hot_key(&identity.record().auth_spki)
+        };
+        if validator_set.validator(&local_validator_id).is_none() {
+            bail!("local node is not part of the active validator set");
+        }
+
+        let finalized_round = shared_state_parent_round(parent.as_ref(), position.epoch);
+        let highest_quorum_round = highest_quorum_shared_state_dag_plan(
+            self.db.as_ref(),
+            parent.as_ref(),
+            &validator_set,
+        )?
+        .map(|plan| plan.round)
+        .unwrap_or(finalized_round);
+        let highest_seen_round = self
+            .db
+            .load_highest_shared_state_dag_round(position.epoch)?
+            .unwrap_or(finalized_round);
+        let target_round = if highest_seen_round > highest_quorum_round {
+            highest_quorum_round.saturating_add(1)
+        } else {
+            highest_quorum_round.saturating_add(1)
+        };
+
+        if self.db.has_shared_state_dag_batch_author(
+            position.epoch,
+            target_round,
+            &local_validator_id,
+        )? {
+            let existing = self
+                .db
+                .load_shared_state_dag_round(position.epoch, target_round)?
+                .into_iter()
+                .find(|existing| existing.author == local_validator_id)
+                .ok_or_else(|| anyhow!("shared-state DAG author index is inconsistent"))?;
+            return Ok(existing);
+        }
+
+        let parents = if target_round == 1 {
+            Vec::new()
+        } else if target_round.saturating_sub(1) == finalized_round {
+            shared_state_parent_frontier(parent.as_ref(), position.epoch)
+        } else {
+            reconstruct_shared_state_dag_plan(
+                self.db.as_ref(),
+                parent.as_ref(),
+                &validator_set,
+                target_round.saturating_sub(1),
+            )?
+            .ok_or_else(|| anyhow!("previous shared-state DAG round is not yet quorum-available"))?
+            .frontier
+        };
+
+        let dag_batch = SharedStateDagBatch::new(
+            position.epoch,
+            target_round,
+            local_validator_id,
+            parents,
+            batch.clone(),
+        )?;
+        self.db.store_shared_state_dag_batch(&dag_batch)?;
+        self.gossip_shared_state_dag_batch(&dag_batch).await;
+        Ok(dag_batch)
+    }
+
+    pub async fn finalize_available_shared_state_anchor(&self) -> Result<Option<Anchor>> {
+        let parent = self.db.get::<Anchor>("epoch", b"latest")?;
+        let next_num = parent
+            .as_ref()
+            .map(|anchor| anchor.num.saturating_add(1))
+            .unwrap_or(0);
+        let position = Anchor::position_for_num(next_num);
+        let validator_set = match parent.as_ref() {
+            Some(parent) if parent.position.epoch == position.epoch => parent.validator_set.clone(),
+            Some(_) => load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?,
+            None => {
+                let identity = self
+                    .identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                    .clone();
+                let identity = identity.read().await;
+                register_genesis_local_validator_pool(self.db.as_ref(), identity.record())?;
+                load_or_compute_active_validator_set(self.db.as_ref(), position.epoch)?
+            }
+        };
+        let local_validator_id = {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("local node identity is unavailable"))?
+                .read()
+                .await;
+            ValidatorId::from_hot_key(&identity.record().auth_spki)
+        };
+        if validator_set.leader_for(position) != local_validator_id {
+            return Ok(None);
+        }
+
+        let Some(plan) = highest_quorum_shared_state_dag_plan(
+            self.db.as_ref(),
+            parent.as_ref(),
+            &validator_set,
+        )?
+        else {
+            return Ok(None);
+        };
+        let ordered_batch_ids = plan
+            .ordered_batches
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>();
+        let anchor = self
+            .certify_local_anchor(
+                next_num,
+                parent.as_ref(),
+                [0u8; 32],
+                0,
+                plan.round,
+                plan.frontier.clone(),
+                ordered_batch_ids,
+                plan.aggregate_batch.ordered_tx_root,
+                plan.aggregate_batch.ordered_tx_count()?,
+                OrderingPath::DagBftSharedState,
+            )
+            .await?;
+        persist_finalized_anchor(self.db.as_ref(), &anchor)?;
+        let _ = self.anchor_tx.send(anchor.clone());
+        for tx in &plan.aggregate_batch.txs {
+            let _ = self.tx_tx.send(tx.clone());
+        }
+        self.gossip_anchor(&anchor).await;
+        Ok(Some(anchor))
+    }
+
+    pub async fn finalize_local_shared_state_batch(
+        &self,
+        batch: &SharedStateBatch,
+    ) -> Result<Anchor> {
+        let _ = self.author_local_shared_state_batch(batch).await?;
+        self.finalize_available_shared_state_anchor()
+            .await?
+            .ok_or_else(|| {
+                anyhow!("shared-state DAG round is not yet quorum-available for finalization")
+            })
     }
 
     pub async fn request_epoch(&self, epoch: u64) {
@@ -3933,6 +4390,7 @@ fn should_relay_topic(topic: WireTopic) -> bool {
         topic,
         WireTopic::Anchor
             | WireTopic::AnchorProposal
+            | WireTopic::SharedStateDagBatch
             | WireTopic::CoinCandidate
             | WireTopic::Tx
             | WireTopic::CompactEpoch
@@ -4081,14 +4539,349 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
             ordering_path: anchor.ordering_path,
             merkle_root: anchor.merkle_root,
             coin_count: anchor.coin_count,
+            dag_round: anchor.dag_round,
+            dag_frontier: anchor.dag_frontier.clone(),
+            ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+            ordered_tx_root: anchor.ordered_tx_root,
+            ordered_tx_count: anchor.ordered_tx_count,
             validator_set: anchor.validator_set.clone(),
         },
         parent.as_ref(),
         db,
     )?;
+    if anchor.ordering_path == OrderingPath::DagBftSharedState {
+        validate_shared_state_dag_plan_for_proposal(
+            &AnchorProposal {
+                num: anchor.num,
+                hash: anchor.hash,
+                parent_hash: anchor.parent_hash,
+                position: anchor.position,
+                ordering_path: anchor.ordering_path,
+                merkle_root: anchor.merkle_root,
+                coin_count: anchor.coin_count,
+                dag_round: anchor.dag_round,
+                dag_frontier: anchor.dag_frontier.clone(),
+                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+                ordered_tx_root: anchor.ordered_tx_root,
+                ordered_tx_count: anchor.ordered_tx_count,
+                validator_set: anchor.validator_set.clone(),
+            },
+            parent.as_ref(),
+            db,
+        )?;
+    }
     anchor
         .validate_against_parent(parent.as_ref())
         .map_err(|e| e.to_string())
+}
+
+fn shared_state_parent_round(parent: Option<&Anchor>, epoch: u64) -> u64 {
+    parent
+        .filter(|parent| parent.position.epoch == epoch)
+        .map(|parent| parent.dag_round)
+        .unwrap_or(0)
+}
+
+fn shared_state_parent_frontier(parent: Option<&Anchor>, epoch: u64) -> Vec<[u8; 32]> {
+    parent
+        .filter(|parent| parent.position.epoch == epoch)
+        .map(|parent| parent.dag_frontier.clone())
+        .unwrap_or_default()
+}
+
+fn sort_dag_batches_for_round(batches: &mut [SharedStateDagBatch]) {
+    batches.sort_by(|left, right| {
+        left.author
+            .cmp(&right.author)
+            .then(left.batch_id.cmp(&right.batch_id))
+    });
+}
+
+fn frontier_for_round(batches: &[SharedStateDagBatch]) -> Vec<[u8; 32]> {
+    let mut frontier = batches
+        .iter()
+        .map(|batch| batch.batch_id)
+        .collect::<Vec<_>>();
+    frontier.sort();
+    frontier
+}
+
+fn first_missing_shared_state_dag_batch(
+    proposal: &AnchorProposal,
+    db: &Store,
+) -> Result<Option<[u8; 32]>> {
+    let mut seen = BTreeSet::new();
+    for batch_id in proposal
+        .dag_frontier
+        .iter()
+        .chain(proposal.ordered_batch_ids.iter())
+    {
+        if !seen.insert(*batch_id) {
+            continue;
+        }
+        if db.load_shared_state_dag_batch(batch_id)?.is_none() {
+            return Ok(Some(*batch_id));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_shared_state_dag_batch_basic(
+    batch: &SharedStateDagBatch,
+    validator_set: &crate::consensus::ValidatorSet,
+    expected_parents: &[[u8; 32]],
+    db: &Store,
+) -> Result<()> {
+    batch.validate()?;
+    if batch.epoch != validator_set.epoch {
+        bail!("shared-state DAG batch epoch does not match the validator set");
+    }
+    if validator_set.validator(&batch.author).is_none() {
+        bail!("shared-state DAG batch author is not part of the active validator set");
+    }
+    if batch.parents != expected_parents {
+        bail!("shared-state DAG batch parent frontier does not match the deterministic previous round frontier");
+    }
+    if db
+        .load_shared_state_dag_batch_finalization(&batch.batch_id)?
+        .is_some()
+    {
+        bail!("shared-state DAG batch is already finalized");
+    }
+    batch.batch.validate_against_store(db)?;
+    Ok(())
+}
+
+fn reconstruct_shared_state_dag_plan(
+    db: &Store,
+    parent: Option<&Anchor>,
+    validator_set: &crate::consensus::ValidatorSet,
+    target_round: u64,
+) -> Result<Option<SharedStateDagPlan>> {
+    if target_round == 0 {
+        return Ok(None);
+    }
+
+    let epoch = validator_set.epoch;
+    let finalized_round = shared_state_parent_round(parent, epoch);
+    if target_round <= finalized_round {
+        return Ok(None);
+    }
+
+    let mut previous_frontier = shared_state_parent_frontier(parent, epoch);
+    let mut ordered_batches = Vec::new();
+
+    for round in (finalized_round + 1)..=target_round {
+        let mut round_batches = db.load_shared_state_dag_round(epoch, round)?;
+        if round_batches.is_empty() {
+            return Ok(None);
+        }
+        sort_dag_batches_for_round(&mut round_batches);
+        let expected_parents = if round == 1 {
+            Vec::new()
+        } else {
+            previous_frontier.clone()
+        };
+        let mut seen_authors = HashSet::new();
+        let mut signed_voting_power = 0u64;
+        for batch in &round_batches {
+            if !seen_authors.insert(batch.author) {
+                bail!("shared-state DAG round contains duplicate validator authors");
+            }
+            validate_shared_state_dag_batch_basic(batch, validator_set, &expected_parents, db)?;
+            let validator = validator_set
+                .validator(&batch.author)
+                .ok_or_else(|| anyhow!("missing validator for shared-state DAG batch author"))?;
+            signed_voting_power = signed_voting_power
+                .checked_add(validator.voting_power)
+                .ok_or_else(|| anyhow!("shared-state DAG round voting power overflow"))?;
+        }
+        if signed_voting_power < validator_set.quorum_threshold {
+            return Ok(None);
+        }
+        previous_frontier = frontier_for_round(&round_batches);
+        ordered_batches.extend(round_batches);
+    }
+
+    let aggregate_batch = SharedStateBatch::from_dag_batches(&ordered_batches)?;
+    if aggregate_batch.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(SharedStateDagPlan {
+        round: target_round,
+        frontier: previous_frontier,
+        ordered_batches,
+        aggregate_batch,
+    }))
+}
+
+fn highest_quorum_shared_state_dag_plan(
+    db: &Store,
+    parent: Option<&Anchor>,
+    validator_set: &crate::consensus::ValidatorSet,
+) -> Result<Option<SharedStateDagPlan>> {
+    let epoch = validator_set.epoch;
+    let finalized_round = shared_state_parent_round(parent, epoch);
+    let Some(highest_round) = db.load_highest_shared_state_dag_round(epoch)? else {
+        return Ok(None);
+    };
+    if highest_round <= finalized_round {
+        return Ok(None);
+    }
+
+    let mut best = None;
+    for round in (finalized_round + 1)..=highest_round {
+        match reconstruct_shared_state_dag_plan(db, parent, validator_set, round)? {
+            Some(plan) => best = Some(plan),
+            None => break,
+        }
+    }
+    Ok(best)
+}
+
+fn validate_shared_state_dag_plan_for_proposal(
+    proposal: &AnchorProposal,
+    parent: Option<&Anchor>,
+    db: &Store,
+) -> Result<(), String> {
+    if proposal.ordering_path != OrderingPath::DagBftSharedState {
+        return Err("shared-state DAG plan cannot be attached to a fast-path proposal".to_string());
+    }
+    let plan =
+        reconstruct_shared_state_dag_plan(db, parent, &proposal.validator_set, proposal.dag_round)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "shared-state DAG round is not locally quorum-available".to_string())?;
+    let ordered_batch_ids = plan
+        .ordered_batches
+        .iter()
+        .map(|batch| batch.batch_id)
+        .collect::<Vec<_>>();
+    if proposal.dag_frontier != plan.frontier {
+        return Err(
+            "shared-state DAG frontier does not match the locally reconstructed quorum frontier"
+                .to_string(),
+        );
+    }
+    if proposal.ordered_batch_ids != ordered_batch_ids {
+        return Err(
+            "shared-state ordered DAG batch list does not match the locally reconstructed order"
+                .to_string(),
+        );
+    }
+    if proposal.ordered_tx_root != plan.aggregate_batch.ordered_tx_root {
+        return Err(
+            "shared-state ordered tx root does not match the locally reconstructed DAG order"
+                .to_string(),
+        );
+    }
+    let ordered_tx_count = plan
+        .aggregate_batch
+        .ordered_tx_count()
+        .map_err(|e| e.to_string())?;
+    if proposal.ordered_tx_count != ordered_tx_count {
+        return Err(
+            "shared-state ordered tx count does not match the locally reconstructed DAG order"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn select_pending_shared_state_batch(db: &Store) -> Result<Option<SharedStateBatch>> {
+    let mut pending = db.load_shared_state_pending_txs()?;
+    pending.sort_by_key(|(tx_id, _)| *tx_id);
+
+    let mut selected = Vec::new();
+    let mut seen_nullifiers = HashSet::new();
+    let mut seen_conflicts = HashSet::new();
+    for (tx_id, tx) in pending {
+        if !matches!(tx, crate::transaction::Tx::SharedState(_)) {
+            let _ = db.delete_shared_state_pending_tx(&tx_id);
+            continue;
+        }
+        if db.get_raw_bytes("tx", &tx_id)?.is_some() {
+            let _ = db.delete_shared_state_pending_tx(&tx_id);
+            continue;
+        }
+        if tx.validate(db).is_err() {
+            let _ = db.delete_shared_state_pending_tx(&tx_id);
+            continue;
+        }
+        let conflict_keys = tx.shared_state_conflict_keys()?;
+        if tx
+            .nullifiers()
+            .iter()
+            .any(|nullifier| seen_nullifiers.contains(nullifier))
+            || conflict_keys.iter().any(|key| seen_conflicts.contains(key))
+        {
+            continue;
+        }
+        for nullifier in tx.nullifiers() {
+            seen_nullifiers.insert(*nullifier);
+        }
+        for conflict_key in conflict_keys {
+            seen_conflicts.insert(conflict_key);
+        }
+        selected.push(tx);
+        if selected.len() >= PROTOCOL.max_shared_state_txs_per_checkpoint as usize {
+            break;
+        }
+    }
+
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SharedStateBatch::new(selected)?))
+}
+
+fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
+    if anchor.ordering_path == OrderingPath::DagBftSharedState {
+        let parent = if anchor.num == 0 {
+            None
+        } else {
+            db.get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
+        };
+        validate_shared_state_dag_plan_for_proposal(
+            &AnchorProposal {
+                num: anchor.num,
+                hash: anchor.hash,
+                parent_hash: anchor.parent_hash,
+                position: anchor.position,
+                ordering_path: anchor.ordering_path,
+                merkle_root: anchor.merkle_root,
+                coin_count: anchor.coin_count,
+                dag_round: anchor.dag_round,
+                dag_frontier: anchor.dag_frontier.clone(),
+                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+                ordered_tx_root: anchor.ordered_tx_root,
+                ordered_tx_count: anchor.ordered_tx_count,
+                validator_set: anchor.validator_set.clone(),
+            },
+            parent.as_ref(),
+            db,
+        )
+        .map_err(|err| anyhow!(err))?;
+        let dag_batches = anchor
+            .ordered_batch_ids
+            .iter()
+            .map(|batch_id| {
+                db.load_shared_state_dag_batch(batch_id)?.ok_or_else(|| {
+                    anyhow!("shared-state DAG batch for finalized anchor is missing")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let batch = SharedStateBatch::from_dag_batches(&dag_batches)?;
+        batch.apply_finalized(db)?;
+        for batch_id in &anchor.ordered_batch_ids {
+            db.mark_shared_state_dag_batch_finalized(batch_id, anchor.num)?;
+        }
+    }
+    db.store_validator_committee(&anchor.validator_set)?;
+    db.put("epoch", &anchor.num.to_le_bytes(), anchor)?;
+    db.put("epoch", b"latest", anchor)?;
+    db.put("anchor", &anchor.hash, anchor)?;
+    Ok(())
 }
 
 fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
