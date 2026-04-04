@@ -29,6 +29,7 @@ use unchained::staking::{
 use unchained::storage::{protocol_chain_id, Store};
 use unchained::sync::SyncState;
 use unchained::transaction::{self, SharedStateAction, SharedStateBatch, SharedStateDagBatch, Tx};
+use unchained::{storage::WalletStore, wallet::Wallet};
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -68,13 +69,27 @@ fn store_anchor(store: &Store, anchor: &Anchor) -> anyhow::Result<()> {
 
 fn signed_shared_state_tx(
     store: &Store,
+    wallet: &Wallet,
     action: SharedStateAction,
     cold_key: &aws_lc_rs::unstable::signature::PqdsaKeyPair,
-) -> Tx {
+) -> anyhow::Result<Tx> {
     let signable = Tx::shared_state_signing_bytes(store.effective_chain_id(), &action)
         .expect("encode shared-state signing message");
     let signature = ml_dsa_65_sign(cold_key, &signable).expect("sign shared-state action");
-    Tx::new_shared_state(action, signature)
+    finality_support::fee_paid_shared_state_tx(store, wallet, action, signature)
+}
+
+fn build_fee_payer_wallet(
+    tempdir: &TempDir,
+    store: &Store,
+    genesis: &Anchor,
+    coin_count: u64,
+) -> anyhow::Result<Wallet> {
+    std::env::set_var("WALLET_PASSPHRASE", "pq-network-passphrase");
+    let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+    let wallet = Wallet::load_or_create_private(wallet_store)?;
+    let _ = finality_support::seed_wallet_with_coins(store, &wallet, genesis, coin_count)?;
+    Ok(wallet)
 }
 
 fn build_pending_validator_pool(
@@ -264,12 +279,14 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
+    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 2)?;
 
     let tx = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     let tx_id = net_a.submit_tx(&tx).await?;
     wait_for_condition(
         "shared-state tx propagation to node B",
@@ -448,12 +465,14 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
+    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 2)?;
 
     let tx = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     let tx_id = net_a.submit_tx(&tx).await?;
     wait_for_condition(
         "shared-state tx propagation to node B",
@@ -626,6 +645,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
+    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 4)?;
 
     let mut anchor_rx_b = net_b.anchor_subscribe();
     let mut anchor_rx_c = net_c.anchor_subscribe();
@@ -633,9 +653,10 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
     let registration = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     let registration_id = net_a.submit_tx(&registration).await?;
     let batch1 = SharedStateBatch::new(vec![registration.clone()])?;
     let dag_batch1 = SharedStateDagBatch::new(
@@ -694,6 +715,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
 
     let update = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
             validator_id: pool.validator.id,
             commission_bps: 325,
@@ -704,7 +726,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
             },
         }),
         &cold_key,
-    );
+    )?;
     let update_id = net_a.submit_tx(&update).await?;
     let batch2 = SharedStateBatch::new(vec![update.clone()])?;
     let dag_batch2 = SharedStateDagBatch::new(
@@ -898,6 +920,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
+    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 4)?;
 
     net_b.shutdown().await;
     db_b.close()?;
@@ -907,9 +930,10 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
     let registration = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     let registration_id = net_a.submit_tx(&registration).await?;
     let batch1 = SharedStateBatch::new(vec![registration.clone()])?;
     let dag_batch1 = SharedStateDagBatch::new(
@@ -931,6 +955,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
 
     let update = signed_shared_state_tx(
         db_a.as_ref(),
+        &wallet_a,
         SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
             validator_id: pool.validator.id,
             commission_bps: 325,
@@ -941,7 +966,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
             },
         }),
         &cold_key,
-    );
+    )?;
     let update_id = net_a.submit_tx(&update).await?;
     let batch2 = SharedStateBatch::new(vec![update.clone()])?;
     let dag_batch2 = SharedStateDagBatch::new(

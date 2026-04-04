@@ -899,6 +899,10 @@ fn read_ordinary_private_transfer(
 
 fn write_shared_state_tx(writer: &mut CanonicalWriter, tx: &SharedStateTx) -> Result<()> {
     write_shared_state_action(writer, &tx.action)?;
+    writer.write_bool(tx.fee_payment.is_some());
+    if let Some(fee_payment) = tx.fee_payment.as_ref() {
+        write_ordinary_private_transfer(writer, fee_payment)?;
+    }
     write_shared_state_authorization(writer, &tx.authorization)?;
     Ok(())
 }
@@ -906,6 +910,11 @@ fn write_shared_state_tx(writer: &mut CanonicalWriter, tx: &SharedStateTx) -> Re
 fn read_shared_state_tx(reader: &mut CanonicalReader<'_>) -> Result<SharedStateTx> {
     Ok(SharedStateTx {
         action: read_shared_state_action(reader)?,
+        fee_payment: if reader.read_bool()? {
+            Some(read_ordinary_private_transfer(reader)?)
+        } else {
+            None
+        },
         authorization: read_shared_state_authorization(reader)?,
     })
 }

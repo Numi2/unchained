@@ -41,6 +41,21 @@ pub struct CheckpointAccumulatorProof {
     pub receipt: Vec<u8>,
 }
 
+fn verify_supported_receipt_kind(
+    receipt: &Receipt,
+    context: &str,
+    allow_composite: bool,
+) -> Result<()> {
+    match &receipt.inner {
+        InnerReceipt::Composite(_) if allow_composite => Ok(()),
+        InnerReceipt::Succinct(_) => Ok(()),
+        InnerReceipt::Groth16(_) => bail!("{context} must be a STARK receipt"),
+        InnerReceipt::Composite(_) => bail!("{context} requires a succinct STARK receipt"),
+        InnerReceipt::Fake(_) => bail!("{context} must not be a fake receipt"),
+        _ => bail!("{context} uses an unsupported receipt format"),
+    }
+}
+
 pub fn prove_shielded_tx(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(Receipt, ProofShieldedTxJournal)> {
@@ -68,13 +83,10 @@ pub fn prove_shielded_tx(
         .build()
         .context("build zkVM executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, SHIELDED_SPEND_METHOD_ELF, &ProverOpts::succinct())
+        .prove_with_opts(env, SHIELDED_SPEND_METHOD_ELF, &ProverOpts::fast())
         .context("prove shielded transaction witness")?;
     let receipt = prove_info.receipt;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("shielded spends require a succinct STARK receipt"),
-    }
+    verify_supported_receipt_kind(&receipt, "shielded spend receipt", true)?;
     receipt
         .verify(SHIELDED_SPEND_METHOD_ID)
         .context("verify locally generated shielded receipt")?;
@@ -84,10 +96,7 @@ pub fn prove_shielded_tx(
 
 pub fn verify_shielded_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
     let receipt = receipt_from_bytes(bytes)?;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("only succinct STARK receipts are accepted"),
-    }
+    verify_supported_receipt_kind(&receipt, "shielded receipt", true)?;
     receipt
         .verify(SHIELDED_SPEND_METHOD_ID)
         .context("verify shielded receipt")?;
@@ -121,13 +130,10 @@ pub fn prove_private_delegation(
         .build()
         .context("build private delegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, PRIVATE_DELEGATION_METHOD_ELF, &ProverOpts::succinct())
+        .prove_with_opts(env, PRIVATE_DELEGATION_METHOD_ELF, &ProverOpts::fast())
         .context("prove private delegation witness")?;
     let receipt = prove_info.receipt;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("private delegation requires a succinct STARK receipt"),
-    }
+    verify_supported_receipt_kind(&receipt, "private delegation receipt", true)?;
     receipt
         .verify(PRIVATE_DELEGATION_METHOD_ID)
         .context("verify locally generated private delegation receipt")?;
@@ -139,10 +145,7 @@ pub fn verify_private_delegation_receipt_bytes(
     bytes: &[u8],
 ) -> Result<ProofPrivateDelegationJournal> {
     let receipt = receipt_from_bytes(bytes)?;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("only succinct private delegation receipts are accepted"),
-    }
+    verify_supported_receipt_kind(&receipt, "private delegation receipt", true)?;
     receipt
         .verify(PRIVATE_DELEGATION_METHOD_ID)
         .context("verify private delegation receipt")?;
@@ -176,17 +179,10 @@ pub fn prove_private_undelegation(
         .build()
         .context("build private undelegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(
-            env,
-            PRIVATE_UNDELEGATION_METHOD_ELF,
-            &ProverOpts::succinct(),
-        )
+        .prove_with_opts(env, PRIVATE_UNDELEGATION_METHOD_ELF, &ProverOpts::fast())
         .context("prove private undelegation witness")?;
     let receipt = prove_info.receipt;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("private undelegation requires a succinct STARK receipt"),
-    }
+    verify_supported_receipt_kind(&receipt, "private undelegation receipt", true)?;
     receipt
         .verify(PRIVATE_UNDELEGATION_METHOD_ID)
         .context("verify locally generated private undelegation receipt")?;
@@ -198,10 +194,7 @@ pub fn verify_private_undelegation_receipt_bytes(
     bytes: &[u8],
 ) -> Result<ProofPrivateUndelegationJournal> {
     let receipt = receipt_from_bytes(bytes)?;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("only succinct private undelegation receipts are accepted"),
-    }
+    verify_supported_receipt_kind(&receipt, "private undelegation receipt", true)?;
     receipt
         .verify(PRIVATE_UNDELEGATION_METHOD_ID)
         .context("verify private undelegation receipt")?;
@@ -235,13 +228,10 @@ pub fn prove_unbonding_claim(
         .build()
         .context("build unbonding claim executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, UNBONDING_CLAIM_METHOD_ELF, &ProverOpts::succinct())
+        .prove_with_opts(env, UNBONDING_CLAIM_METHOD_ELF, &ProverOpts::fast())
         .context("prove unbonding claim witness")?;
     let receipt = prove_info.receipt;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("unbonding claim requires a succinct STARK receipt"),
-    }
+    verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
     receipt
         .verify(UNBONDING_CLAIM_METHOD_ID)
         .context("verify locally generated unbonding claim receipt")?;
@@ -251,10 +241,7 @@ pub fn prove_unbonding_claim(
 
 pub fn verify_unbonding_claim_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
     let receipt = receipt_from_bytes(bytes)?;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("only succinct unbonding claim receipts are accepted"),
-    }
+    verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
     receipt
         .verify(UNBONDING_CLAIM_METHOD_ID)
         .context("verify unbonding claim receipt")?;
@@ -315,17 +302,10 @@ pub fn prove_checkpoint_accumulator(
             .build()
             .context("build checkpoint accumulator executor environment")?;
         let prove_info = default_prover()
-            .prove_with_opts(
-                env,
-                CHECKPOINT_ACCUMULATOR_METHOD_ELF,
-                &ProverOpts::succinct(),
-            )
+            .prove_with_opts(env, CHECKPOINT_ACCUMULATOR_METHOD_ELF, &ProverOpts::fast())
             .context("prove checkpoint accumulator step")?;
         let receipt = prove_info.receipt;
-        match &receipt.inner {
-            InnerReceipt::Succinct(_) => {}
-            _ => bail!("checkpoint accumulator requires a succinct STARK receipt"),
-        }
+        verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
         receipt
             .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
             .context("verify locally generated checkpoint accumulator receipt")?;
@@ -349,10 +329,7 @@ pub fn verify_checkpoint_accumulator_receipt_bytes(
     bytes: &[u8],
 ) -> Result<CheckpointAccumulatorJournal> {
     let receipt = receipt_from_bytes(bytes)?;
-    match &receipt.inner {
-        InnerReceipt::Succinct(_) => {}
-        _ => bail!("only succinct checkpoint accumulator receipts are accepted"),
-    }
+    verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
     receipt
         .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
         .context("verify checkpoint accumulator receipt")?;

@@ -1,14 +1,21 @@
 use aws_lc_rs::unstable::signature::PqdsaKeyPair;
 use unchained::{
+    coin::Coin,
     consensus::{
         OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys, ValidatorSet,
         ValidatorVote, VoteTarget,
     },
     crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign},
     epoch::Anchor,
+    node_control,
     node_identity::{validator_from_record, NodeIdentity},
+    proof,
     staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
-    transaction::{SharedStateBatch, SharedStateDagBatch},
+    transaction::{
+        shared_state_action_fee_amount, OrdinaryPrivateTransfer, SharedStateAction,
+        SharedStateBatch, SharedStateDagBatch, Tx,
+    },
+    wallet::Wallet,
     Store,
 };
 
@@ -284,4 +291,65 @@ impl TestCommittee {
             .expect("validate test shared-state checkpoint");
         anchor
     }
+}
+
+#[allow(dead_code)]
+pub fn seed_wallet_with_coins(
+    store: &Store,
+    wallet: &Wallet,
+    genesis: &Anchor,
+    count: u64,
+) -> anyhow::Result<Vec<Coin>> {
+    let chain_id = genesis.hash;
+    let mut coins = Vec::with_capacity(count as usize);
+    for nonce in 7..(7 + count) {
+        let candidate_id = Coin::calculate_id(&genesis.hash, nonce, &wallet.address());
+        let lock_secret = wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
+        let lock_hash =
+            unchained::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &lock_secret);
+        let coin = Coin::new_with_creator_pk_and_lock(
+            genesis.hash,
+            nonce,
+            wallet.address(),
+            wallet.public_key().clone(),
+            lock_hash,
+        );
+        store.put("coin", &coin.id, &coin)?;
+        store.put_coin_epoch(&coin.id, genesis.num)?;
+        store.put_coin_epoch_rev(genesis.num, &coin.id)?;
+        coins.push(coin);
+    }
+    Ok(coins)
+}
+
+#[allow(dead_code)]
+pub fn fee_payment_transfer_for_action(
+    store: &Store,
+    wallet: &Wallet,
+    action: &SharedStateAction,
+) -> anyhow::Result<OrdinaryPrivateTransfer> {
+    let snapshot = node_control::build_shielded_runtime_snapshot(store)?;
+    let prepared = wallet
+        .prepare_fee_payment_for_snapshot(&snapshot, shared_state_action_fee_amount(action))?;
+    let (receipt, _journal) = proof::prove_shielded_tx(prepared.witness())?;
+    let tx = prepared.tx_with_proof(proof::receipt_to_bytes(&receipt)?);
+    Ok(tx
+        .ordinary_transfer()
+        .cloned()
+        .expect("fee payment helper must produce an ordinary private transfer"))
+}
+
+#[allow(dead_code)]
+pub fn fee_paid_shared_state_tx(
+    store: &Store,
+    wallet: &Wallet,
+    action: SharedStateAction,
+    authorization_signature: Vec<u8>,
+) -> anyhow::Result<Tx> {
+    let fee_payment = fee_payment_transfer_for_action(store, wallet, &action)?;
+    Ok(Tx::new_shared_state_with_fee_payment(
+        action,
+        authorization_signature,
+        Some(fee_payment),
+    ))
 }

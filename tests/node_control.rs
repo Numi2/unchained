@@ -12,6 +12,7 @@ use unchained::{
     epoch::Anchor,
     evidence, network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
+    staking::ValidatorRewardEvent,
     storage::{Store, WalletStore},
     sync::SyncState,
 };
@@ -276,6 +277,66 @@ async fn node_control_surfaces_recent_consensus_evidence() -> Result<()> {
         status.recent_consensus_evidence[0].evidence_id,
         evidence_record.evidence_id
     );
+
+    let _ = shutdown_tx.send(());
+    server_task.await??;
+    net.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_control_surfaces_latest_anchor_reward_split() -> Result<()> {
+    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "node-control-reward-passphrase");
+    network::set_quiet_logging(true);
+
+    let tempdir = TempDir::new()?;
+    let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
+    let _wallet_db = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
+    let validator = committee
+        .validator_set_for_epoch(genesis.position.epoch)
+        .validators[0]
+        .clone();
+    db.store_validator_reward_event(&ValidatorRewardEvent {
+        anchor_hash: genesis.hash,
+        anchor_num: genesis.num,
+        validator_id: validator.id,
+        validator_voting_power: validator.voting_power,
+        total_rewarded_voting_power: validator.voting_power,
+        protocol_reward: 5,
+        fee_reward: 7,
+        gross_reward: 12,
+        commission_reward: 1,
+        share_backed_reward: 11,
+        bonded_stake_before: validator.voting_power,
+        bonded_stake_after: validator.voting_power + 12,
+        pending_commission_before: 0,
+        pending_commission_after: 1,
+        resulting_status: unchained::staking::ValidatorStatus::Active,
+        suppression_reason: None,
+    })?;
+
+    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = node_control::NodeControlServer::bind(
+        &tempdir.path().to_string_lossy(),
+        db.clone(),
+        net.clone(),
+        sync_state,
+        false,
+    )
+    .await?;
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let client = node_control::NodeControlClient::new(&tempdir.path().to_string_lossy());
+    client.ping()?;
+    let status = client.consensus_status()?;
+    assert_eq!(status.latest_anchor_protocol_reward_total, 5);
+    assert_eq!(status.latest_anchor_fee_reward_total, 7);
+    assert_eq!(status.latest_anchor_reward_events.len(), 1);
+    assert_eq!(status.latest_anchor_reward_events[0].gross_reward, 12);
 
     let _ = shutdown_tx.send(());
     server_task.await??;

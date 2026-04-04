@@ -117,7 +117,10 @@ transitional and should be removed rather than preserved.
   Ordinary private transfers, private delegation, private undelegation, and
   mature unbonding claims now carry explicit shielded fee amounts inside their
   proof-balance equations, and finalized anchors route the exact finalized fee
-  pot back into validator-pool reward settlement.
+  pot back into validator-pool reward settlement. Validator registration,
+  profile update, penalty-evidence admission, and validator reactivation now
+  also accept shielded fee-payment sidecars so control actions no longer need a
+  zero-fee exception.
 - `[ ]` Keep ordinary transfers on a native fast path without revealing extra
   sender or recipient metadata
 - `[x]` Define native transaction classes clearly: ordinary transfer vs

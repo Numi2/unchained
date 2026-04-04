@@ -20,8 +20,10 @@ use unchained::{
         ValidatorPool, ValidatorProfileUpdate, ValidatorReactivation, ValidatorRegistration,
         ValidatorStatus,
     },
+    storage::WalletStore,
     sync::SyncState,
     transaction::{PenaltyEvidenceAdmission, SharedStateAction, Tx},
+    wallet::Wallet,
     Store,
 };
 
@@ -126,13 +128,27 @@ fn build_active_validator_pool(
 
 fn signed_shared_state_tx(
     store: &Store,
+    wallet: &Wallet,
     action: SharedStateAction,
     cold_key: &aws_lc_rs::unstable::signature::PqdsaKeyPair,
-) -> Tx {
+) -> Result<Tx> {
     let signable = Tx::shared_state_signing_bytes(store.effective_chain_id(), &action)
         .expect("encode shared-state signing message");
     let signature = ml_dsa_65_sign(cold_key, &signable).expect("sign shared-state action");
-    Tx::new_shared_state(action, signature)
+    finality_support::fee_paid_shared_state_tx(store, wallet, action, signature)
+}
+
+fn build_fee_payer_wallet(
+    dir: &TempDir,
+    store: &Store,
+    genesis: &Anchor,
+    coin_count: u64,
+) -> Result<Wallet> {
+    std::env::set_var("WALLET_PASSPHRASE", "staking-transactions-passphrase");
+    let wallet_store = Arc::new(WalletStore::open(&dir.path().to_string_lossy())?);
+    let wallet = Wallet::load_or_create_private(wallet_store)?;
+    let _ = finality_support::seed_wallet_with_coins(store, &wallet, genesis, coin_count)?;
+    Ok(wallet)
 }
 
 fn build_pending_validator_pool(
@@ -255,10 +271,11 @@ fn validator_registration_transaction_updates_pools_and_future_committee() -> Re
     let store = Store::open(&dir.path().to_string_lossy())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(&store, &committee)?;
+    let wallet = build_fee_payer_wallet(&dir, &store, &genesis, 2)?;
     let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
 
     let action = SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() });
-    let tx = signed_shared_state_tx(&store, action, &cold_key);
+    let tx = signed_shared_state_tx(&store, &wallet, action, &cold_key)?;
     let tx_id = tx.apply(&store)?;
 
     assert!(store.get_raw_bytes("tx", &tx_id)?.is_some());
@@ -289,12 +306,14 @@ fn validator_profile_update_requires_cold_governance_signature() -> Result<()> {
     let store = Store::open(&dir.path().to_string_lossy())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(&store, &committee)?;
+    let wallet = build_fee_payer_wallet(&dir, &store, &genesis, 4)?;
     let (pool, cold_key) = build_pending_validator_pool(5, genesis.position.epoch + 1)?;
     let registration = signed_shared_state_tx(
         &store,
+        &wallet,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     registration.apply(&store)?;
 
     let update = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
@@ -308,10 +327,10 @@ fn validator_profile_update_requires_cold_governance_signature() -> Result<()> {
     });
 
     let wrong_key = ml_dsa_65_generate()?;
-    let invalid_tx = signed_shared_state_tx(&store, update.clone(), &wrong_key);
+    let invalid_tx = signed_shared_state_tx(&store, &wallet, update.clone(), &wrong_key)?;
     assert!(invalid_tx.apply(&store).is_err());
 
-    let valid_tx = signed_shared_state_tx(&store, update, &cold_key);
+    let valid_tx = signed_shared_state_tx(&store, &wallet, update, &cold_key)?;
     valid_tx.apply(&store)?;
     let stored = store
         .load_validator_pool(&pool.validator.id)?
@@ -345,13 +364,15 @@ async fn ordered_shared_state_batches_finalize_validator_lifecycle_updates() -> 
     let committee = finality_support::TestCommittee::from_identities(vec![identity]);
     let net = spawn_network(store.clone(), port).await?;
     let genesis = seed_genesis(store.as_ref(), &committee)?;
+    let wallet = build_fee_payer_wallet(&dir, store.as_ref(), &genesis, 4)?;
     let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
 
     let registration = signed_shared_state_tx(
         store.as_ref(),
+        &wallet,
         SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
         &cold_key,
-    );
+    )?;
     let registration_id = net.submit_tx(&registration).await?;
     assert!(store.get_raw_bytes("tx", &registration_id)?.is_none());
     assert!(store
@@ -390,7 +411,7 @@ async fn ordered_shared_state_batches_finalize_validator_lifecycle_updates() -> 
             description: Some("ordered canonical profile".to_string()),
         },
     });
-    let update_tx = signed_shared_state_tx(store.as_ref(), update, &cold_key);
+    let update_tx = signed_shared_state_tx(store.as_ref(), &wallet, update, &cold_key)?;
     let update_id = net.submit_tx(&update_tx).await?;
     assert!(store.get_raw_bytes("tx", &update_id)?.is_none());
     assert!(store.load_shared_state_pending_tx(&update_id)?.is_some());
@@ -503,12 +524,15 @@ fn liveness_fault_admission_slashes_pool_without_changing_share_ownership() -> R
         slashed_pool.validator.id
     );
 
-    let tx = Tx::new_shared_state(
+    let wallet = build_fee_payer_wallet(&dir, &store, &anchor, 2)?;
+    let tx = finality_support::fee_paid_shared_state_tx(
+        &store,
+        &wallet,
         SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission {
             evidence: SlashableEvidence::Liveness(liveness_records[0].fault.clone()),
         }),
         Vec::new(),
-    );
+    )?;
     tx.apply(&store)?;
 
     let event = store
@@ -560,6 +584,19 @@ fn repeated_liveness_faults_jail_then_reactivate_future_committee() -> Result<()
     let mut pool_c = store_pool_with_share_supply(&store, &pool_c, 250)?;
     store.store_validator_pool(&pool_a)?;
     store.store_validator_pool(&pool_b)?;
+    let genesis_anchor = finalized_fast_path_anchor(
+        epoch_anchor_num(0),
+        &ValidatorSet::new(
+            0,
+            vec![
+                pool_a.validator.clone(),
+                pool_b.validator.clone(),
+                pool_c.validator.clone(),
+            ],
+        )?,
+        vec![(pool_a.validator.id, &hot_a), (pool_b.validator.id, &hot_b)],
+    )?;
+    let wallet = build_fee_payer_wallet(&dir, &store, &genesis_anchor, 5)?;
 
     for epoch in 0..=2 {
         let validator_set = ValidatorSet::new(
@@ -585,12 +622,14 @@ fn repeated_liveness_faults_jail_then_reactivate_future_committee() -> Result<()
             assert!(cached_epoch3.validator(&pool_c.validator.id).is_some());
             store.store_validator_committee(&cached_epoch3)?;
         }
-        Tx::new_shared_state(
+        finality_support::fee_paid_shared_state_tx(
+            &store,
+            &wallet,
             SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission {
                 evidence: SlashableEvidence::Liveness(fault.fault.clone()),
             }),
             Vec::new(),
-        )
+        )?
         .apply(&store)?;
         pool_c = store
             .load_validator_pool(&pool_c.validator.id)?
@@ -620,7 +659,7 @@ fn repeated_liveness_faults_jail_then_reactivate_future_committee() -> Result<()
     let reactivation_action = SharedStateAction::ReactivateValidator(ValidatorReactivation {
         validator_id: pool_c.validator.id,
     });
-    let reactivation = signed_shared_state_tx(&store, reactivation_action, &cold_c);
+    let reactivation = signed_shared_state_tx(&store, &wallet, reactivation_action, &cold_c)?;
     reactivation.apply(&store)?;
 
     pool_c = store
@@ -668,6 +707,7 @@ fn repeated_safety_faults_retire_validator_permanently() -> Result<()> {
         ],
     )?;
     store_latest_anchor(&store, &anchor0)?;
+    let wallet = build_fee_payer_wallet(&dir, &store, &anchor0, 4)?;
     let cached_epoch1 = load_or_compute_active_validator_set(&store, 1)?;
     assert!(cached_epoch1.validator(&pool_c.validator.id).is_some());
     store.store_validator_committee(&cached_epoch1)?;
@@ -700,12 +740,14 @@ fn repeated_safety_faults_retire_validator_permanently() -> Result<()> {
 
     let first_evidence = build_evidence(1)?;
     let first_event_id = first_evidence.evidence_id()?;
-    Tx::new_shared_state(
+    finality_support::fee_paid_shared_state_tx(
+        &store,
+        &wallet,
         SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission {
             evidence: first_evidence,
         }),
         Vec::new(),
-    )
+    )?
     .apply(&store)?;
     let first_penalty = store
         .load_validator_penalty_event(&first_event_id)?
@@ -726,12 +768,14 @@ fn repeated_safety_faults_retire_validator_permanently() -> Result<()> {
 
     let second_evidence = build_evidence(2)?;
     let second_event_id = second_evidence.evidence_id()?;
-    Tx::new_shared_state(
+    finality_support::fee_paid_shared_state_tx(
+        &store,
+        &wallet,
         SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission {
             evidence: second_evidence,
         }),
         Vec::new(),
-    )
+    )?
     .apply(&store)?;
     let second_penalty = store
         .load_validator_penalty_event(&second_event_id)?
@@ -767,6 +811,7 @@ async fn ordered_penalty_evidence_batches_finalize_validator_slashing() -> Resul
         finality_support::TestCommittee::from_weighted_identities(vec![(identity.clone(), 100)]);
     let net = spawn_network(store.clone(), port).await?;
     let genesis = seed_genesis(store.as_ref(), &committee)?;
+    let wallet = build_fee_payer_wallet(&dir, store.as_ref(), &genesis, 2)?;
     let validator = committee
         .validator_set_for_epoch(genesis.position.epoch)
         .validators[0]
@@ -806,10 +851,12 @@ async fn ordered_penalty_evidence_batches_finalize_validator_slashing() -> Resul
         )?,
     ));
     let evidence_id = evidence.evidence_id()?;
-    let tx = Tx::new_shared_state(
+    let tx = finality_support::fee_paid_shared_state_tx(
+        store.as_ref(),
+        &wallet,
         SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission { evidence }),
         Vec::new(),
-    );
+    )?;
 
     let tx_id = net.submit_tx(&tx).await?;
     assert!(store.get_raw_bytes("tx", &tx_id)?.is_none());

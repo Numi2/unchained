@@ -247,8 +247,9 @@ ordered DAG/BFT path instead of letting it race the fast path.
 The remaining consensus gap is narrower: richer multi-round DAG scheduling,
 stronger end-to-end coverage for proof-heavy fast-path/fallback flows across
 multiple validators, broader liveness/accountability policy beyond the current
-deterministic equivocation-plus-missed-vote schedule, and full fee-backed
-wallet/operator coverage across every ordered transaction class.
+deterministic equivocation-plus-missed-vote schedule, and end-to-end operator
+submission flows for fee-paid governance actions beyond the new transaction and
+wallet-building primitives.
 
 Validator activation is now pulled from persisted validator-pool state rather
 than inherited indefinitely from the parent checkpoint. The staking lifecycle
@@ -291,6 +292,13 @@ their shielded proof balance equations, and finalized anchors apportion the
 exact finalized fee pot back into validator pools alongside the base protocol
 reward. Fees therefore stay private at submission time while still landing in
 the same pool-accounting reward path that drives delegation economics.
+
+The same private fee model now extends to ordered shared-state control actions.
+Validator registration, validator profile updates, penalty-evidence admission,
+and validator reactivation can carry a separate shielded fee-payment sidecar,
+and node-control status now exposes the latest finalized reward split as
+protocol reward plus fee reward rather than a single opaque total. Wallet
+history likewise records fee amounts explicitly for sent transfers.
 
 ## Build
 

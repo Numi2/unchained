@@ -123,6 +123,7 @@ pub enum SharedStateAction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedStateTx {
     pub action: SharedStateAction,
+    pub fee_payment: Option<OrdinaryPrivateTransfer>,
     pub authorization: SharedStateAuthorization,
 }
 
@@ -138,14 +139,32 @@ pub fn ordinary_private_transfer_fee_amount() -> u64 {
 
 pub fn shared_state_action_fee_amount(action: &SharedStateAction) -> u64 {
     match action {
+        SharedStateAction::RegisterValidator(_) => PROTOCOL.validator_registration_fee,
+        SharedStateAction::UpdateValidatorProfile(_) => PROTOCOL.validator_profile_update_fee,
         SharedStateAction::PrivateDelegation(_) => PROTOCOL.private_delegation_fee,
         SharedStateAction::PrivateUndelegation(_) => PROTOCOL.private_undelegation_fee,
         SharedStateAction::ClaimUnbonding(_) => PROTOCOL.unbonding_claim_fee,
+        SharedStateAction::AdmitPenaltyEvidence(_) => PROTOCOL.penalty_evidence_admission_fee,
+        SharedStateAction::ReactivateValidator(_) => PROTOCOL.validator_reactivation_fee,
+    }
+}
+
+fn shared_state_action_embedded_transfer(
+    action: &SharedStateAction,
+) -> Option<&OrdinaryPrivateTransfer> {
+    match action {
+        SharedStateAction::PrivateDelegation(delegation) => Some(&delegation.transfer),
+        SharedStateAction::PrivateUndelegation(undelegation) => Some(&undelegation.transfer),
+        SharedStateAction::ClaimUnbonding(claim) => Some(&claim.transfer),
         SharedStateAction::RegisterValidator(_)
         | SharedStateAction::UpdateValidatorProfile(_)
         | SharedStateAction::AdmitPenaltyEvidence(_)
-        | SharedStateAction::ReactivateValidator(_) => 0,
+        | SharedStateAction::ReactivateValidator(_) => None,
     }
+}
+
+fn shared_state_action_requires_fee_payment(action: &SharedStateAction) -> bool {
+    shared_state_action_embedded_transfer(action).is_none()
 }
 
 impl SharedStateBatch {
@@ -307,122 +326,138 @@ impl SharedStateBatch {
                         .ok_or_else(|| anyhow!("'fast_path_pending_tx' column family missing"))?;
                     write_batch.delete_cf(fast_path_pending_cf, &tx_id);
                 }
-                Tx::SharedState(shared) => match &shared.action {
-                    SharedStateAction::RegisterValidator(registration) => {
-                        committee_state_changed = true;
-                        pool_overlay
-                            .insert(registration.pool.validator.id.0, registration.pool.clone());
+                Tx::SharedState(shared) => {
+                    match &shared.action {
+                        SharedStateAction::RegisterValidator(registration) => {
+                            committee_state_changed = true;
+                            pool_overlay.insert(
+                                registration.pool.validator.id.0,
+                                registration.pool.clone(),
+                            );
+                        }
+                        SharedStateAction::UpdateValidatorProfile(update) => {
+                            let existing = pool_overlay
+                                .get(&update.validator_id.0)
+                                .cloned()
+                                .or_else(|| {
+                                    db.load_validator_pool(&update.validator_id).ok().flatten()
+                                })
+                                .ok_or_else(|| anyhow!("validator pool not found"))?;
+                            let updated = update.apply_to(&existing)?;
+                            pool_overlay.insert(updated.validator.id.0, updated);
+                        }
+                        SharedStateAction::PrivateDelegation(delegation) => {
+                            committee_state_changed = true;
+                            let journal = proof::verify_private_delegation_receipt_bytes(
+                                &delegation.transfer.proof,
+                            )?;
+                            let pool = pool_overlay
+                                .get(&delegation.validator_id.0)
+                                .cloned()
+                                .or_else(|| {
+                                    db.load_validator_pool(&delegation.validator_id)
+                                        .ok()
+                                        .flatten()
+                                })
+                                .ok_or_else(|| anyhow!("validator pool not found"))?;
+                            let updated_pool = pool.apply_delegation(
+                                journal.delegated_amount,
+                                journal.delegation_share_value,
+                            )?;
+                            append_shielded_transfer_to_overlay(
+                                db,
+                                &mut write_batch,
+                                &tx_id,
+                                &delegation.transfer,
+                                &mut note_tree,
+                                &mut active,
+                            )?;
+                            pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
+                        }
+                        SharedStateAction::PrivateUndelegation(undelegation) => {
+                            committee_state_changed = true;
+                            let journal = proof::verify_private_undelegation_receipt_bytes(
+                                &undelegation.transfer.proof,
+                            )?;
+                            let pool = pool_overlay
+                                .get(&undelegation.validator_id.0)
+                                .cloned()
+                                .or_else(|| {
+                                    db.load_validator_pool(&undelegation.validator_id)
+                                        .ok()
+                                        .flatten()
+                                })
+                                .ok_or_else(|| anyhow!("validator pool not found"))?;
+                            let updated_pool = pool.apply_undelegation(
+                                journal.burned_share_value,
+                                journal.gross_claim_amount,
+                                journal.current_epoch,
+                                journal.release_epoch,
+                                PROTOCOL.stake_unbonding_epochs,
+                            )?;
+                            append_shielded_transfer_to_overlay(
+                                db,
+                                &mut write_batch,
+                                &tx_id,
+                                &undelegation.transfer,
+                                &mut note_tree,
+                                &mut active,
+                            )?;
+                            pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
+                        }
+                        SharedStateAction::ClaimUnbonding(claim) => {
+                            append_shielded_transfer_to_overlay(
+                                db,
+                                &mut write_batch,
+                                &tx_id,
+                                &claim.transfer,
+                                &mut note_tree,
+                                &mut active,
+                            )?;
+                        }
+                        SharedStateAction::AdmitPenaltyEvidence(admission) => {
+                            committee_state_changed = true;
+                            let pool = load_validator_pool_from_overlay(
+                                db,
+                                &pool_overlay,
+                                &admission.evidence.validator_id(),
+                            )?;
+                            let (updated_pool, event) = resolve_penalty_event(
+                                db,
+                                applied_in_epoch,
+                                &pool,
+                                &admission.evidence,
+                            )?;
+                            write_batch.put_cf(
+                                validator_penalty_cf,
+                                &event.evidence_id,
+                                bincode::serialize(&event)
+                                    .context("serialize finalized validator penalty event")?,
+                            );
+                            pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
+                        }
+                        SharedStateAction::ReactivateValidator(reactivation) => {
+                            committee_state_changed = true;
+                            let pool = load_validator_pool_from_overlay(
+                                db,
+                                &pool_overlay,
+                                &reactivation.validator_id,
+                            )?;
+                            let updated_pool = pool.request_reactivation(applied_in_epoch)?;
+                            pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
+                        }
                     }
-                    SharedStateAction::UpdateValidatorProfile(update) => {
-                        let existing = pool_overlay
-                            .get(&update.validator_id.0)
-                            .cloned()
-                            .or_else(|| db.load_validator_pool(&update.validator_id).ok().flatten())
-                            .ok_or_else(|| anyhow!("validator pool not found"))?;
-                        let updated = update.apply_to(&existing)?;
-                        pool_overlay.insert(updated.validator.id.0, updated);
-                    }
-                    SharedStateAction::PrivateDelegation(delegation) => {
-                        committee_state_changed = true;
-                        let journal = proof::verify_private_delegation_receipt_bytes(
-                            &delegation.transfer.proof,
-                        )?;
-                        let pool = pool_overlay
-                            .get(&delegation.validator_id.0)
-                            .cloned()
-                            .or_else(|| {
-                                db.load_validator_pool(&delegation.validator_id)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .ok_or_else(|| anyhow!("validator pool not found"))?;
-                        let updated_pool = pool.apply_delegation(
-                            journal.delegated_amount,
-                            journal.delegation_share_value,
-                        )?;
+                    if let Some(fee_payment) = shared.fee_payment.as_ref() {
                         append_shielded_transfer_to_overlay(
                             db,
                             &mut write_batch,
                             &tx_id,
-                            &delegation.transfer,
-                            &mut note_tree,
-                            &mut active,
-                        )?;
-                        pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
-                    }
-                    SharedStateAction::PrivateUndelegation(undelegation) => {
-                        committee_state_changed = true;
-                        let journal = proof::verify_private_undelegation_receipt_bytes(
-                            &undelegation.transfer.proof,
-                        )?;
-                        let pool = pool_overlay
-                            .get(&undelegation.validator_id.0)
-                            .cloned()
-                            .or_else(|| {
-                                db.load_validator_pool(&undelegation.validator_id)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .ok_or_else(|| anyhow!("validator pool not found"))?;
-                        let updated_pool = pool.apply_undelegation(
-                            journal.burned_share_value,
-                            journal.gross_claim_amount,
-                            journal.current_epoch,
-                            journal.release_epoch,
-                            PROTOCOL.stake_unbonding_epochs,
-                        )?;
-                        append_shielded_transfer_to_overlay(
-                            db,
-                            &mut write_batch,
-                            &tx_id,
-                            &undelegation.transfer,
-                            &mut note_tree,
-                            &mut active,
-                        )?;
-                        pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
-                    }
-                    SharedStateAction::ClaimUnbonding(claim) => {
-                        append_shielded_transfer_to_overlay(
-                            db,
-                            &mut write_batch,
-                            &tx_id,
-                            &claim.transfer,
+                            fee_payment,
                             &mut note_tree,
                             &mut active,
                         )?;
                     }
-                    SharedStateAction::AdmitPenaltyEvidence(admission) => {
-                        committee_state_changed = true;
-                        let pool = load_validator_pool_from_overlay(
-                            db,
-                            &pool_overlay,
-                            &admission.evidence.validator_id(),
-                        )?;
-                        let (updated_pool, event) = resolve_penalty_event(
-                            db,
-                            applied_in_epoch,
-                            &pool,
-                            &admission.evidence,
-                        )?;
-                        write_batch.put_cf(
-                            validator_penalty_cf,
-                            &event.evidence_id,
-                            bincode::serialize(&event)
-                                .context("serialize finalized validator penalty event")?,
-                        );
-                        pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
-                    }
-                    SharedStateAction::ReactivateValidator(reactivation) => {
-                        committee_state_changed = true;
-                        let pool = load_validator_pool_from_overlay(
-                            db,
-                            &pool_overlay,
-                            &reactivation.validator_id,
-                        )?;
-                        let updated_pool = pool.request_reactivation(applied_in_epoch)?;
-                        pool_overlay.insert(updated_pool.validator.id.0, updated_pool);
-                    }
-                },
+                }
             }
         }
 
@@ -682,8 +717,17 @@ impl Tx {
     }
 
     pub fn new_shared_state(action: SharedStateAction, authorization_signature: Vec<u8>) -> Self {
+        Self::new_shared_state_with_fee_payment(action, authorization_signature, None)
+    }
+
+    pub fn new_shared_state_with_fee_payment(
+        action: SharedStateAction,
+        authorization_signature: Vec<u8>,
+        fee_payment: Option<OrdinaryPrivateTransfer>,
+    ) -> Self {
         Self::SharedState(SharedStateTx {
             action,
+            fee_payment,
             authorization: SharedStateAuthorization {
                 signature: authorization_signature,
             },
@@ -707,17 +751,8 @@ impl Tx {
     pub fn shielded_transfer(&self) -> Option<&OrdinaryPrivateTransfer> {
         match self {
             Self::OrdinaryPrivateTransfer(transfer) => Some(transfer),
-            Self::SharedState(shared) => match &shared.action {
-                SharedStateAction::PrivateDelegation(delegation) => Some(&delegation.transfer),
-                SharedStateAction::PrivateUndelegation(undelegation) => {
-                    Some(&undelegation.transfer)
-                }
-                SharedStateAction::ClaimUnbonding(claim) => Some(&claim.transfer),
-                SharedStateAction::RegisterValidator(_)
-                | SharedStateAction::UpdateValidatorProfile(_)
-                | SharedStateAction::AdmitPenaltyEvidence(_)
-                | SharedStateAction::ReactivateValidator(_) => None,
-            },
+            Self::SharedState(shared) => shared_state_action_embedded_transfer(&shared.action)
+                .or(shared.fee_payment.as_ref()),
         }
     }
 
@@ -854,14 +889,17 @@ impl Tx {
         Ok(())
     }
 
-    fn validate_shielded(&self, transfer: &OrdinaryPrivateTransfer, db: &Store) -> Result<()> {
+    fn validate_ordinary_transfer_against_store(
+        &self,
+        transfer: &OrdinaryPrivateTransfer,
+        db: &Store,
+        required_fee_amount: u64,
+        context: &str,
+    ) -> Result<()> {
         ensure_shielded_runtime_state(db)?;
 
         if transfer.nullifiers.is_empty() {
             bail!("shielded tx must contain at least one nullifier");
-        }
-        if transfer.outputs.is_empty() {
-            bail!("shielded tx must contain at least one output");
         }
 
         let current_epoch = current_nullifier_epoch(db)?;
@@ -887,12 +925,7 @@ impl Tx {
         if journal.note_tree_root != tree_root {
             bail!("shielded receipt note tree root mismatch");
         }
-        validate_transfer_fee(
-            transfer,
-            journal.fee_amount,
-            self.required_fee_amount(),
-            "ordinary private transfer",
-        )?;
+        validate_transfer_fee(transfer, journal.fee_amount, required_fee_amount, context)?;
         validate_transfer_against_journal(
             transfer,
             current_epoch,
@@ -901,6 +934,15 @@ impl Tx {
             &active,
             &journal.inputs,
             &journal.outputs,
+        )
+    }
+
+    fn validate_shielded(&self, transfer: &OrdinaryPrivateTransfer, db: &Store) -> Result<()> {
+        self.validate_ordinary_transfer_against_store(
+            transfer,
+            db,
+            self.required_fee_amount(),
+            "ordinary private transfer",
         )
     }
 
@@ -928,6 +970,29 @@ impl Tx {
             .ok_or_else(|| anyhow!("shared-state transactions require a finalized anchor"))?;
         let current_epoch = latest_anchor.position.epoch;
         let chain_id = db.effective_chain_id();
+        let required_fee_amount = self.required_fee_amount();
+
+        match (
+            shared_state_action_embedded_transfer(&shared.action),
+            shared.fee_payment.as_ref(),
+        ) {
+            (Some(_), Some(_)) => bail!(
+                "shared-state actions with embedded shielded transfers must not carry a separate fee-payment sidecar"
+            ),
+            (Some(_), None) => {}
+            (None, Some(fee_payment)) => {
+                self.validate_ordinary_transfer_against_store(
+                    fee_payment,
+                    db,
+                    required_fee_amount,
+                    "shared-state control action fee payment",
+                )?;
+            }
+            (None, None) if shared_state_action_requires_fee_payment(&shared.action) => {
+                bail!("shared-state control actions require a shielded fee-payment sidecar")
+            }
+            (None, None) => {}
+        }
 
         match &shared.action {
             SharedStateAction::RegisterValidator(registration) => {
@@ -1010,7 +1075,7 @@ impl Tx {
                 validate_transfer_fee(
                     &delegation.transfer,
                     journal.fee_amount,
-                    self.required_fee_amount(),
+                    required_fee_amount,
                     "private delegation",
                 )?;
 
@@ -1076,7 +1141,7 @@ impl Tx {
                 validate_transfer_fee(
                     &undelegation.transfer,
                     journal.fee_amount,
-                    self.required_fee_amount(),
+                    required_fee_amount,
                     "private undelegation",
                 )?;
 
@@ -1133,7 +1198,7 @@ impl Tx {
                 validate_transfer_fee(
                     &claim.transfer,
                     journal.fee_amount,
-                    self.required_fee_amount(),
+                    required_fee_amount,
                     "unbonding claim",
                 )?;
 
@@ -1300,6 +1365,10 @@ impl Tx {
                     bincode::serialize(&updated).context("serialize reactivated validator pool")?,
                 );
             }
+        }
+
+        if let Some(fee_payment) = shared.fee_payment.as_ref() {
+            append_shielded_transfer_to_batch(db, &mut batch, &tx_id, fee_payment)?;
         }
 
         if committee_state_changed {
@@ -1743,6 +1812,15 @@ mod tests {
         )
     }
 
+    fn control_fee_payment(seed: u8) -> OrdinaryPrivateTransfer {
+        OrdinaryPrivateTransfer {
+            nullifiers: vec![[seed; 32]],
+            outputs: vec![shielded_output(seed.wrapping_add(1))],
+            fee_amount: PROTOCOL.validator_registration_fee,
+            proof: vec![seed.wrapping_add(2)],
+        }
+    }
+
     #[test]
     fn ordinary_private_transfers_default_to_fast_path_class() {
         let tx = Tx::new(
@@ -1777,7 +1855,11 @@ mod tests {
 
     #[test]
     fn shared_state_transaction_round_trips_through_canonical_encoding() {
-        let tx = Tx::new_shared_state(registration_action(), vec![1, 2, 3, 4]);
+        let tx = Tx::new_shared_state_with_fee_payment(
+            registration_action(),
+            vec![1, 2, 3, 4],
+            Some(control_fee_payment(44)),
+        );
         let encoded = crate::canonical::encode_tx(&tx).unwrap();
         let decoded = crate::canonical::decode_tx(&encoded).unwrap();
         assert_eq!(decoded, tx);
@@ -1811,6 +1893,21 @@ mod tests {
         assert_eq!(tx.proof(), Some(transfer.proof.as_slice()));
         assert_eq!(tx.input_count(), 1);
         assert_eq!(tx.output_count(), 1);
+    }
+
+    #[test]
+    fn control_shared_state_exposes_fee_payment_transfer() {
+        let fee_payment = control_fee_payment(61);
+        let tx = Tx::new_shared_state_with_fee_payment(
+            registration_action(),
+            vec![1, 2, 3, 4],
+            Some(fee_payment.clone()),
+        );
+
+        assert_eq!(tx.nullifiers(), fee_payment.nullifiers.as_slice());
+        assert_eq!(tx.outputs(), fee_payment.outputs.as_slice());
+        assert_eq!(tx.fee_amount(), fee_payment.fee_amount);
+        assert_eq!(tx.proof(), Some(fee_payment.proof.as_slice()));
     }
 
     #[test]

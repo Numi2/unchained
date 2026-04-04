@@ -9,7 +9,7 @@ use crate::{
         CheckpointExtensionRequest, HistoricalUnspentExtension, NoteCommitmentTree,
         NullifierRootLedger,
     },
-    staking::ValidatorPool,
+    staking::{ValidatorPool, ValidatorRewardEvent},
     storage::Store,
     transaction::{self, ShieldedOutput, Tx},
 };
@@ -46,6 +46,9 @@ pub struct ConsensusStatus {
     pub latest_finalized_anchor: Option<Anchor>,
     pub active_validator_set: Option<ValidatorSet>,
     pub registered_validator_pools: Vec<ValidatorPool>,
+    pub latest_anchor_reward_events: Vec<ValidatorRewardEvent>,
+    pub latest_anchor_protocol_reward_total: u64,
+    pub latest_anchor_fee_reward_total: u64,
     pub consensus_evidence_count: usize,
     pub recent_consensus_evidence: Vec<ConsensusEvidenceRecord>,
     pub local_tip: u64,
@@ -97,6 +100,17 @@ fn build_consensus_status(
         .transpose()?
         .flatten();
     let registered_validator_pools = db.load_validator_pools()?;
+    let latest_anchor_reward_events = latest_finalized_anchor
+        .as_ref()
+        .map(|anchor| db.load_validator_reward_events_for_anchor(anchor.num))
+        .transpose()?
+        .unwrap_or_default();
+    let latest_anchor_protocol_reward_total = latest_anchor_reward_events
+        .iter()
+        .fold(0u64, |sum, event| sum.saturating_add(event.protocol_reward));
+    let latest_anchor_fee_reward_total = latest_anchor_reward_events
+        .iter()
+        .fold(0u64, |sum, event| sum.saturating_add(event.fee_reward));
     let mut consensus_evidence = db.load_consensus_evidence()?;
     let consensus_evidence_count = consensus_evidence.len();
     if consensus_evidence.len() > 16 {
@@ -126,6 +140,9 @@ fn build_consensus_status(
         latest_finalized_anchor,
         active_validator_set,
         registered_validator_pools,
+        latest_anchor_reward_events,
+        latest_anchor_protocol_reward_total,
+        latest_anchor_fee_reward_total,
         consensus_evidence_count,
         recent_consensus_evidence: consensus_evidence,
         local_tip,

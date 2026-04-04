@@ -675,6 +675,7 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
                     "epoch": record.commit_epoch,
                     "direction": if record.is_sender { "out" } else { "in" },
                     "amount": record.amount,
+                    "fee_amount": record.fee_amount,
                     "counterparty": hex::encode(record.counterparty),
                 })
             })
@@ -700,6 +701,13 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
             record.commit_epoch,
             short_hex(&record.counterparty)
         );
+        if record.fee_amount > 0 {
+            println!(
+                "  fee  {} coin{}",
+                record.fee_amount,
+                if record.fee_amount == 1 { "" } else { "s" }
+            );
+        }
         println!("  coin {}", short_hex(&record.coin_id));
         println!("  tx   {}", short_hex(&record.transfer_hash));
     }

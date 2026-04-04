@@ -1065,6 +1065,116 @@ impl Wallet {
             .ok_or_else(|| anyhow!("validator pool not found"))
     }
 
+    fn build_fee_payment_from_snapshot_with_notes(
+        &self,
+        snapshot: &ShieldedRuntimeSnapshot,
+        mut available_notes: Vec<OwnedShieldedNote>,
+        fee_amount: u64,
+    ) -> Result<PreparedShieldedTx> {
+        Self::retain_payment_notes(&mut available_notes);
+        let mut selected_notes = Vec::new();
+        let mut total_selected = 0u64;
+        for note in available_notes {
+            total_selected = total_selected.saturating_add(note.note.value);
+            selected_notes.push(note);
+            if total_selected > fee_amount {
+                break;
+            }
+        }
+        if total_selected <= fee_amount {
+            bail!(
+                "insufficient funds for shielded shared-state fee payment: need value above fee {}, available {}",
+                fee_amount,
+                total_selected
+            );
+        }
+        let total_selected = selected_notes
+            .iter()
+            .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+        let state_binding = Self::state_binding_from_snapshot(snapshot)?;
+        let current_epoch = snapshot.current_nullifier_epoch;
+        let note_tree = &snapshot.note_tree;
+        let tree_root = note_tree.root();
+        let chain_id = snapshot.chain_id;
+        let send_seed =
+            self.derive_send_seed(&self.address, 0, fee_amount, current_epoch, &selected_notes);
+
+        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
+        let mut nullifiers = Vec::with_capacity(selected_notes.len());
+        for owned in &selected_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for shared-state fee note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the shared-state fee payment");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            nullifiers.push(current_nullifier);
+            input_witnesses.push(proof::input_witness_from_local(
+                &owned.note,
+                &owned.note_key,
+                &membership_proof,
+                &owned.checkpoint,
+                owned.checkpoint_accumulator.as_ref(),
+                &current_nullifier,
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        let mut output_witnesses = Vec::new();
+        let change = total_selected.saturating_sub(fee_amount);
+        if change > 0 {
+            let change_entropy = self.derive_output_entropy(&send_seed, 0);
+            let change_receive_kem_pk =
+                self.mint_internal_receive_kem_public_key_for_chain(snapshot.chain_id)?;
+            let (change_output, change_plaintext, change_encapsulation_seed) = self
+                .build_shielded_output(
+                    self.signing_pk.clone(),
+                    change_receive_kem_pk,
+                    change,
+                    current_epoch,
+                    &change_entropy,
+                )?;
+            output_witnesses.push(proof::output_witness_from_local(
+                &change_plaintext,
+                &change_output,
+                &change_encapsulation_seed,
+            ));
+            outputs.push(change_output);
+        }
+
+        let witness = proof_core::ProofShieldedTxWitness {
+            chain_id,
+            current_epoch,
+            note_tree_root: tree_root,
+            fee_amount,
+            inputs: input_witnesses,
+            outputs: output_witnesses,
+        };
+        Ok(PreparedShieldedTx {
+            state_binding,
+            witness,
+            nullifiers,
+            outputs,
+            selected_notes,
+            recipient_address: self.address,
+            current_epoch,
+            amount: 0,
+        })
+    }
+
+    pub fn prepare_fee_payment_for_snapshot(
+        &self,
+        snapshot: &ShieldedRuntimeSnapshot,
+        fee_amount: u64,
+    ) -> Result<PreparedShieldedTx> {
+        let available_notes = self.load_owned_shielded_notes_for_snapshot(snapshot, true)?;
+        self.build_fee_payment_from_snapshot_with_notes(snapshot, available_notes, fee_amount)
+    }
+
     fn prepare_owned_checkpoint_requests(
         &self,
         notes: &[OwnedShieldedNote],
@@ -1529,6 +1639,22 @@ impl Wallet {
         Ok(notes
             .into_iter()
             .fold(0u64, |sum, note| sum.saturating_add(note.note.value)))
+    }
+
+    /// Prepares a canonical shielded transaction and witness without proving it.
+    pub async fn prepare_fee_payment(&self, fee_amount: u64) -> Result<PreparedShieldedTx> {
+        let node_state = self.current_node_state()?;
+        let snapshot = node_state.state.shielded_runtime;
+        let mut available_notes = self.load_owned_shielded_notes_for_snapshot(&snapshot, true)?;
+        Self::retain_payment_notes(&mut available_notes);
+        let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_snapshot(
+            &mut available_notes,
+            &snapshot,
+            rotation_round,
+        )
+        .await?;
+        self.build_fee_payment_from_snapshot_with_notes(&snapshot, available_notes, fee_amount)
     }
 
     /// Prepares a canonical shielded transaction and witness without proving it.
@@ -2292,6 +2418,7 @@ impl Wallet {
                 commit_epoch: record.commit_epoch,
                 is_sender: true,
                 amount: record.amount,
+                fee_amount: record.fee_amount,
                 counterparty: record.counterparty,
             });
         }
@@ -2304,6 +2431,7 @@ impl Wallet {
                     commit_epoch: owned.note.birth_epoch,
                     is_sender: false,
                     amount: owned.note.value,
+                    fee_amount: 0,
                     counterparty: [0u8; 32],
                 });
             }
@@ -2345,6 +2473,7 @@ pub struct TransactionRecord {
     pub commit_epoch: u64,
     pub is_sender: bool,
     pub amount: u64,
+    pub fee_amount: u64,
     pub counterparty: crate::crypto::Address,
 }
 
