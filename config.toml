@@ -12,6 +12,12 @@ max_peers = 133337
 # Connection timeout in seconds
 connection_timeout_secs = 300
 
+# QUIC idle timeout for established validator links
+idle_timeout_secs = 300
+
+# QUIC keep-alive interval for established validator links
+keep_alive_interval_secs = 15
+
 # Timeout for initial network sync in seconds
 sync_timeout_secs = 1800
 
@@ -46,6 +52,53 @@ seconds = 222
 [metrics]
 # Optional local observability endpoint. Must remain loopback-only.
 bind = "127.0.0.1:9100"
+
+[ingress.wallet]
+# Wallet ordinary-path submission goes through a distinct access relay and
+# submission gateway. Each field accepts a signed NodeRecordV2 string or a file
+# path containing one.
+# relay = "/path/to/access-relay.node-record"
+# gateway = "/path/to/submission-gateway.node-record"
+cover_traffic_interval_secs = 30
+envelope_size_bytes = 2097152
+submit_timeout_secs = 10
+
+[ingress.access_relay]
+# The submission gateways this relay is allowed to forward to.
+gateways = []
+rate_limit_window_secs = 60
+max_wallet_messages_per_window = 128
+envelope_size_bytes = 2097152
+submit_timeout_secs = 10
+
+[ingress.submission_gateway]
+# The access relays this gateway accepts plaintext-forward traffic from.
+allowed_relays = []
+# Optional override when the gateway is not co-located with the validator node
+# control socket. Defaults to [storage].path when omitted.
+# validator_control_base_path = "/path/to/validator/storage"
+release_window_ms = 50
+max_batch_txs = 32
+max_queue_depth = 2048
+envelope_size_bytes = 2097152
+submit_timeout_secs = 10
+
+[proof_assistant.wallet]
+# Optional remote proof-assistant record for sender-side proving and
+# checkpoint-accumulator receipt generation. The wallet keeps note selection,
+# ownership detection, and tx assembly local; the assistant only returns
+# transparent proof receipts.
+# server = "/path/to/proof-assistant.node-record"
+max_request_bytes = 33554432
+max_response_bytes = 16777216
+submit_timeout_secs = 30
+
+[proof_assistant.server]
+# Maximum accepted witness-envelope size and response size for the proof
+# assistant role.
+max_request_bytes = 33554432
+max_response_bytes = 16777216
+submit_timeout_secs = 30
 
 [orphan]
 total_cap = 32768

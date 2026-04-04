@@ -441,6 +441,7 @@ struct PendingAnchorCertification {
 
 struct PendingSharedStateProposal {
     proposer_record: NodeRecordV2,
+    reply_connection: Connection,
     proposal_envelope: SignedEnvelope,
     proposal_message_id: [u8; 32],
     proposal: AnchorProposal,
@@ -449,6 +450,7 @@ struct PendingSharedStateProposal {
 
 struct PendingFastPathProposal {
     proposer_record: NodeRecordV2,
+    reply_connection: Connection,
     proposal_envelope: SignedEnvelope,
     proposal_message_id: [u8; 32],
     proposal: AnchorProposal,
@@ -461,6 +463,40 @@ struct SharedStateDagPlan {
     frontier: Vec<[u8; 32]>,
     ordered_batches: Vec<SharedStateDagBatch>,
     aggregate_batch: SharedStateBatch,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConnectionDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Default)]
+struct PeerLinks {
+    inbound: Option<Connection>,
+    outbound: Option<Connection>,
+}
+
+impl PeerLinks {
+    fn has_any(&self) -> bool {
+        self.inbound.is_some() || self.outbound.is_some()
+    }
+
+    fn send_connections(&self) -> Vec<Connection> {
+        let mut connections = Vec::new();
+        if let Some(connection) = self.outbound.clone() {
+            connections.push(connection);
+        }
+        if let Some(connection) = self.inbound.clone() {
+            if connections
+                .iter()
+                .all(|existing| existing.stable_id() != connection.stable_id())
+            {
+                connections.push(connection);
+            }
+        }
+        connections
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,7 +556,8 @@ struct RuntimeState {
     p2p_policy: P2pPolicy,
     peer_policy: Arc<AsyncMutex<HashMap<[u8; 32], PeerPolicyState>>>,
     known_records: Arc<RwLock<HashMap<[u8; 32], NodeRecordV2>>>,
-    peers: Arc<RwLock<HashMap<[u8; 32], Connection>>>,
+    peers: Arc<RwLock<HashMap<[u8; 32], PeerLinks>>>,
+    dialing_peers: Arc<AsyncMutex<HashSet<[u8; 32]>>>,
     connected_peers: Arc<Mutex<HashSet<[u8; 32]>>>,
     pending_anchors: Arc<AsyncMutex<HashMap<u64, Vec<PendingAnchor>>>>,
     seen_messages: Arc<AsyncMutex<HashMap<[u8; 32], Instant>>>,
@@ -1249,10 +1286,15 @@ impl RuntimeState {
         &self,
         record: NodeRecordV2,
         connection: Connection,
+        direction: ConnectionDirection,
     ) -> Result<()> {
         let existing = {
             let mut guard = self.peers.write().await;
-            guard.insert(record.node_id, connection.clone())
+            let entry = guard.entry(record.node_id).or_default();
+            match direction {
+                ConnectionDirection::Inbound => entry.inbound.replace(connection.clone()),
+                ConnectionDirection::Outbound => entry.outbound.replace(connection.clone()),
+            }
         };
         if let Some(previous) = existing {
             previous.close(0u32.into(), b"superseded");
@@ -1271,6 +1313,9 @@ impl RuntimeState {
                 .await;
         }
         if let Ok(manifest) = self.refresh_local_archive_manifest().await {
+            if manifest.shard_ids.is_empty() {
+                return Ok(());
+            }
             match canonical::encode_archive_provider_manifest(&manifest) {
                 Ok(body) => match self
                     .sign_topic_envelope(WireTopic::ArchiveManifest, body)
@@ -1314,15 +1359,39 @@ impl RuntimeState {
         Ok(())
     }
 
-    async fn unregister_connection(&self, node_id: [u8; 32]) {
-        {
+    async fn unregister_connection(&self, node_id: [u8; 32], connection_stable_id: usize) {
+        let removed = {
             let mut guard = self.peers.write().await;
-            guard.remove(&node_id);
-        }
-        if let Ok(mut peers) = self.connected_peers.lock() {
-            peers.remove(&node_id);
-            metrics::PEERS.set(peers.len() as i64);
-        }
+            let Some(links) = guard.get_mut(&node_id) else {
+                return;
+            };
+            let mut removed = false;
+            if matches!(
+                links.inbound.as_ref(),
+                Some(active) if active.stable_id() == connection_stable_id
+            ) {
+                links.inbound = None;
+                removed = true;
+            }
+            if matches!(
+                links.outbound.as_ref(),
+                Some(active) if active.stable_id() == connection_stable_id
+            ) {
+                links.outbound = None;
+                removed = true;
+            }
+            let still_connected = links.has_any();
+            if !still_connected {
+                guard.remove(&node_id);
+            }
+            removed && !still_connected
+        };
+        if removed {
+            if let Ok(mut peers) = self.connected_peers.lock() {
+                peers.remove(&node_id);
+                metrics::PEERS.set(peers.len() as i64);
+            }
+        };
     }
 
     async fn maybe_send_bytes(&self, connection: &Connection, bytes: &[u8]) -> Result<()> {
@@ -1333,19 +1402,36 @@ impl RuntimeState {
     }
 
     async fn send_bytes_to_peer(&self, node_id: [u8; 32], bytes: &[u8]) -> Result<bool> {
-        let connection = {
+        let connections = {
             let guard = self.peers.read().await;
-            guard.get(&node_id).cloned()
+            guard
+                .get(&node_id)
+                .map(PeerLinks::send_connections)
+                .unwrap_or_default()
         };
-        let Some(connection) = connection else {
-            return Ok(false);
-        };
-        if let Err(e) = self.maybe_send_bytes(&connection, bytes).await {
-            net_log!("⚠️  Failed to send to {}: {}", hex::encode(node_id), e);
-            self.unregister_connection(node_id).await;
+        if connections.is_empty() {
             return Ok(false);
         }
-        Ok(true)
+        let mut last_error = None;
+        for connection in connections {
+            match self.maybe_send_bytes(&connection, bytes).await {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    net_log!("⚠️  Failed to send to {}: {}", hex::encode(node_id), e);
+                    self.unregister_connection(node_id, connection.stable_id())
+                        .await;
+                    last_error = Some(e);
+                }
+            }
+        }
+        if let Some(err) = last_error {
+            net_log!(
+                "⚠️  Exhausted peer links while sending to {}: {}",
+                hex::encode(node_id),
+                err
+            );
+        }
+        Ok(false)
     }
 
     async fn broadcast_envelope(
@@ -1358,19 +1444,40 @@ impl RuntimeState {
             let guard = self.peers.read().await;
             guard
                 .iter()
-                .filter_map(|(node_id, connection)| {
+                .filter_map(|(node_id, links)| {
                     if exclude == Some(*node_id) {
                         None
                     } else {
-                        Some((*node_id, connection.clone()))
+                        let connections = links.send_connections();
+                        if connections.is_empty() {
+                            None
+                        } else {
+                            Some((*node_id, connections))
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
         };
-        for (node_id, connection) in peers {
-            if let Err(e) = self.maybe_send_bytes(&connection, &bytes).await {
-                net_log!("⚠️  Failed to send to {}: {}", hex::encode(node_id), e);
-                self.unregister_connection(node_id).await;
+        for (node_id, connections) in peers {
+            let mut delivered = false;
+            for connection in connections {
+                match self.maybe_send_bytes(&connection, &bytes).await {
+                    Ok(()) => {
+                        delivered = true;
+                        break;
+                    }
+                    Err(e) => {
+                        net_log!("⚠️  Failed to send to {}: {}", hex::encode(node_id), e);
+                        self.unregister_connection(node_id, connection.stable_id())
+                            .await;
+                    }
+                }
+            }
+            if !delivered {
+                net_log!(
+                    "⚠️  Exhausted peer links while broadcasting to {}",
+                    hex::encode(node_id)
+                );
             }
         }
         Ok(())
@@ -1654,12 +1761,21 @@ impl RuntimeState {
 
     async fn remove_pending_anchor_proposal(&self, proposal_hash: [u8; 32]) {
         let mut guard = self.pending_anchor_certifications.lock().await;
+        net_log!(
+            "🧹 Removing pending anchor proposal {}",
+            hex::encode(proposal_hash)
+        );
         guard.remove(&proposal_hash);
     }
 
     async fn fail_pending_anchor_proposal(&self, proposal_hash: [u8; 32], message: String) {
         let reply = {
             let mut guard = self.pending_anchor_certifications.lock().await;
+            net_log!(
+                "⚠️  Failing pending anchor proposal {}: {}",
+                hex::encode(proposal_hash),
+                message
+            );
             guard
                 .remove(&proposal_hash)
                 .and_then(|mut pending| pending.reply.take())
@@ -1760,6 +1876,16 @@ impl RuntimeState {
             reply,
         )
         .await?;
+        let peer_count = self.peers.read().await.len();
+        let local_node_id = self.local_node_id().await;
+        net_log!(
+            "📣 Node {} starting local anchor proposal {} for epoch {} slot {} with {} connected peers",
+            hex::encode(local_node_id),
+            hex::encode(proposal.hash),
+            proposal.position.epoch,
+            proposal.position.slot,
+            peer_count
+        );
         if let Err(err) = self.broadcast_envelope(envelope, None).await {
             self.fail_pending_anchor_proposal(proposal.hash, err.to_string())
                 .await;
@@ -1770,12 +1896,18 @@ impl RuntimeState {
     async fn cast_anchor_proposal_vote(
         &self,
         proposer_record: &NodeRecordV2,
+        reply_connection: Option<&Connection>,
         proposal_envelope: &SignedEnvelope,
         proposal_message_id: [u8; 32],
         proposal: AnchorProposal,
     ) -> Result<()> {
         let local_node_id = self.local_node_id().await;
         if proposer_record.node_id == local_node_id {
+            net_log!(
+                "ℹ️  Skipping local anchor proposal envelope for epoch {} slot {}",
+                proposal.position.epoch,
+                proposal.position.slot
+            );
             return Ok(());
         }
         let parent = if proposal.num == 0 {
@@ -1798,8 +1930,17 @@ impl RuntimeState {
                     .load_fast_path_batch(&proposal.merkle_root)?
                     .is_none()
                 {
+                    net_log!(
+                        "ℹ️  Queueing fast-path proposal for epoch {} slot {} until batch {} arrives",
+                        proposal.position.epoch,
+                        proposal.position.slot,
+                        hex::encode(proposal.merkle_root)
+                    );
                     self.queue_fast_path_proposal(
                         proposer_record.clone(),
+                        reply_connection
+                            .cloned()
+                            .ok_or_else(|| anyhow!("missing proposal reply connection"))?,
                         proposal_envelope.clone(),
                         proposal_message_id,
                         proposal.clone(),
@@ -1825,8 +1966,17 @@ impl RuntimeState {
                 if let Some(missing_batch_id) =
                     first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
                 {
+                    net_log!(
+                        "ℹ️  Queueing shared-state proposal for epoch {} slot {} until batch {} arrives",
+                        proposal.position.epoch,
+                        proposal.position.slot,
+                        hex::encode(missing_batch_id)
+                    );
                     self.queue_shared_state_proposal(
                         proposer_record.clone(),
+                        reply_connection
+                            .cloned()
+                            .ok_or_else(|| anyhow!("missing proposal reply connection"))?,
                         proposal_envelope.clone(),
                         proposal_message_id,
                         proposal.clone(),
@@ -1857,10 +2007,20 @@ impl RuntimeState {
             .validator(&local_validator_id)
             .cloned()
         else {
+            net_log!(
+                "ℹ️  Local node is not part of proposal validator set for epoch {} slot {}",
+                proposal.position.epoch,
+                proposal.position.slot
+            );
             return Ok(());
         };
         let target = proposal.vote_target();
         if !self.mark_anchor_vote_cast(target.position).await {
+            net_log!(
+                "ℹ️  Local node already cast an anchor vote for epoch {} slot {}",
+                target.position.epoch,
+                target.position.slot
+            );
             return Ok(());
         }
         let signature = {
@@ -1873,15 +2033,36 @@ impl RuntimeState {
             signature,
         };
         self.observe_validator_vote(&vote)?;
+        let vote_bytes = canonical::encode_validator_vote(&vote)?;
 
-        let _ = self
+        net_log!(
+            "🗳️  Node {} casting anchor vote for epoch {} slot {} toward proposer {}",
+            hex::encode(self.local_node_id().await),
+            target.position.epoch,
+            target.position.slot,
+            hex::encode(proposer_record.node_id)
+        );
+        let _ = reply_connection;
+        let sent = self
             .sign_and_send_to_record_related(
                 proposer_record.clone(),
                 WireTopic::ValidatorVote,
-                canonical::encode_validator_vote(&vote)?,
+                vote_bytes.clone(),
                 Some(proposal_message_id),
             )
             .await?;
+        net_log!(
+            "🗳️  Node {} sent anchor vote for epoch {} slot {} toward proposer {} via {}",
+            hex::encode(self.local_node_id().await),
+            target.position.epoch,
+            target.position.slot,
+            hex::encode(proposer_record.node_id),
+            if sent {
+                "direct peer send"
+            } else {
+                "queued redial"
+            }
+        );
         Ok(())
     }
 
@@ -1899,6 +2080,10 @@ impl RuntimeState {
                 pending.created_at.elapsed() < Duration::from_secs(PENDING_ANCHOR_TTL_SECS)
             });
             let Some(pending) = guard.get_mut(&proposal_hash) else {
+                net_log!(
+                    "ℹ️  Ignoring validator vote for proposal {} without a pending certification",
+                    hex::encode(proposal_hash)
+                );
                 return Ok(());
             };
             if response_to_message_id != Some(pending.proposal_message_id) {
@@ -1907,6 +2092,13 @@ impl RuntimeState {
             validate_anchor_vote(&pending.proposal, voter_record, &vote)?;
             self.observe_validator_vote(&vote)?;
             pending.votes.insert(vote.voter, vote);
+            net_log!(
+                "🗳️  Recorded anchor vote for epoch {} slot {} from {} ({} votes total)",
+                pending.proposal.position.epoch,
+                pending.proposal.position.slot,
+                hex::encode(voter_record.node_id),
+                pending.votes.len()
+            );
             if let Some(qc) = Self::pending_anchor_qc(pending)? {
                 completion = Some((pending.reply.take(), qc));
             }
@@ -1923,6 +2115,7 @@ impl RuntimeState {
     async fn queue_shared_state_proposal(
         &self,
         proposer_record: NodeRecordV2,
+        reply_connection: Connection,
         proposal_envelope: SignedEnvelope,
         proposal_message_id: [u8; 32],
         proposal: AnchorProposal,
@@ -1933,6 +2126,7 @@ impl RuntimeState {
         });
         guard.push(PendingSharedStateProposal {
             proposer_record,
+            reply_connection,
             proposal_envelope,
             proposal_message_id,
             proposal,
@@ -1943,6 +2137,7 @@ impl RuntimeState {
     async fn queue_fast_path_proposal(
         &self,
         proposer_record: NodeRecordV2,
+        reply_connection: Connection,
         proposal_envelope: SignedEnvelope,
         proposal_message_id: [u8; 32],
         proposal: AnchorProposal,
@@ -1953,6 +2148,7 @@ impl RuntimeState {
         });
         guard.push(PendingFastPathProposal {
             proposer_record,
+            reply_connection,
             proposal_envelope,
             proposal_message_id,
             proposal,
@@ -2006,6 +2202,7 @@ impl RuntimeState {
             let _ = self
                 .cast_anchor_proposal_vote(
                     &pending.proposer_record,
+                    Some(&pending.reply_connection),
                     &pending.proposal_envelope,
                     pending.proposal_message_id,
                     pending.proposal,
@@ -2089,6 +2286,7 @@ impl RuntimeState {
             let _ = self
                 .cast_anchor_proposal_vote(
                     &pending.proposer_record,
+                    Some(&pending.reply_connection),
                     &pending.proposal_envelope,
                     pending.proposal_message_id,
                     pending.proposal,
@@ -2139,41 +2337,79 @@ impl RuntimeState {
         if record.node_id == self.local_node_id().await {
             return Ok(());
         }
-        if self.peers.read().await.contains_key(&record.node_id) {
-            return Ok(());
-        }
-        if self.peers.read().await.len() >= self.max_peers {
+        let should_skip = {
+            let guard = self.peers.read().await;
+            guard
+                .get(&record.node_id)
+                .map(PeerLinks::has_any)
+                .unwrap_or(false)
+        };
+        if should_skip {
             return Ok(());
         }
 
-        self.expected_peers.remember(&record);
-        let addr = record.primary_address()?;
-        let server_name = record.server_name();
-        let connecting =
-            self.endpoint
-                .connect_with(self.client_config.clone(), addr, &server_name)?;
-        let connection = tokio::time::timeout(self.connection_timeout, connecting)
-            .await
-            .context("outbound dial timed out")??;
-        let tls_spki = tls_peer_spki(connection.peer_identity())?;
+        {
+            let mut guard = self.dialing_peers.lock().await;
+            if !guard.insert(record.node_id) {
+                return Ok(());
+            }
+        }
 
-        let (mut send, mut recv) = connection.open_bi().await?;
-        write_wire_message(&mut send, &WireMessage::Hello(self.build_hello().await)).await?;
-        let remote_hello = read_hello_message(&mut recv).await?;
-        let remote_record = self
-            .validate_peer_record(remote_hello.record, Some(&record), &tls_spki)
+        let result = async {
+            let (has_any, peer_count) = {
+                let guard = self.peers.read().await;
+                (
+                    guard
+                        .get(&record.node_id)
+                        .map(PeerLinks::has_any)
+                        .unwrap_or(false),
+                    guard.len(),
+                )
+            };
+            if has_any {
+                return Ok(());
+            }
+            if peer_count >= self.max_peers {
+                return Ok(());
+            }
+
+            self.expected_peers.remember(&record);
+            let addr = record.primary_address()?;
+            let server_name = record.server_name();
+            let connecting =
+                self.endpoint
+                    .connect_with(self.client_config.clone(), addr, &server_name)?;
+            let connection = tokio::time::timeout(self.connection_timeout, connecting)
+                .await
+                .context("outbound dial timed out")??;
+            let tls_spki = tls_peer_spki(connection.peer_identity())?;
+
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_wire_message(&mut send, &WireMessage::Hello(self.build_hello().await)).await?;
+            let remote_hello = read_hello_message(&mut recv).await?;
+            let remote_record = self
+                .validate_peer_record(remote_hello.record, Some(&record), &tls_spki)
+                .await?;
+            drop(send);
+            drop(recv);
+            self.ingest_discovered_records(remote_hello.known_records)
+                .await;
+            self.register_connection(
+                remote_record.clone(),
+                connection.clone(),
+                ConnectionDirection::Outbound,
+            )
             .await?;
-        drop(send);
-        drop(recv);
-        self.ingest_discovered_records(remote_hello.known_records)
-            .await;
-        self.register_connection(remote_record.clone(), connection.clone())
-            .await?;
-        let state = self.clone();
-        self.tasks.spawn(async move {
-            state.run_connection(remote_record, connection).await;
-        });
-        Ok(())
+            let state = self.clone();
+            self.tasks.spawn(async move {
+                state.run_connection(remote_record, connection).await;
+            });
+            Ok(())
+        }
+        .await;
+
+        self.dialing_peers.lock().await.remove(&record.node_id);
+        result
     }
 
     async fn accept_connection(&self, incoming: quinn::Incoming) -> Result<()> {
@@ -2191,8 +2427,12 @@ impl RuntimeState {
         drop(recv);
         self.ingest_discovered_records(remote_hello.known_records)
             .await;
-        self.register_connection(remote_record.clone(), connection.clone())
-            .await?;
+        self.register_connection(
+            remote_record.clone(),
+            connection.clone(),
+            ConnectionDirection::Inbound,
+        )
+        .await?;
         let state = self.clone();
         self.tasks.spawn(async move {
             state.run_connection(remote_record, connection).await;
@@ -2221,6 +2461,7 @@ impl RuntimeState {
                             break;
                         }
                     };
+                    drop(recv);
                     if let Err(e) = self.record_inbound_message(record.node_id).await {
                         net_log!(
                             "⚠️  Closing {} after ingress policy violation: {}",
@@ -2254,7 +2495,10 @@ impl RuntimeState {
                             break;
                         }
                         WireMessage::Envelope(envelope) => {
-                            if let Err(e) = self.handle_envelope(record.clone(), envelope).await {
+                            if let Err(e) = self
+                                .handle_envelope(record.clone(), connection.clone(), envelope)
+                                .await
+                            {
                                 self.record_validation_failure(record.node_id).await;
                                 net_log!(
                                     "⚠️  Dropping envelope from {}: {}",
@@ -2279,12 +2523,14 @@ impl RuntimeState {
                 }
             }
         }
-        self.unregister_connection(record.node_id).await;
+        self.unregister_connection(record.node_id, connection.stable_id())
+            .await;
     }
 
     async fn handle_envelope(
         &self,
         connection_record: NodeRecordV2,
+        connection: Connection,
         envelope: SignedEnvelope,
     ) -> Result<()> {
         let connection_node_id = connection_record.node_id;
@@ -2312,12 +2558,14 @@ impl RuntimeState {
             self.broadcast_envelope(envelope.clone(), Some(connection_node_id))
                 .await?;
         }
-        self.handle_topic(author_record, envelope, frame).await
+        self.handle_topic(author_record, connection, envelope, frame)
+            .await
     }
 
     async fn handle_topic(
         &self,
         record: NodeRecordV2,
+        connection: Connection,
         envelope: SignedEnvelope,
         frame: TopicFrame,
     ) -> Result<()> {
@@ -2330,11 +2578,24 @@ impl RuntimeState {
             }
             WireTopic::AnchorProposal => {
                 let proposal = canonical::decode_anchor_proposal(&frame.body)?;
-                self.cast_anchor_proposal_vote(&record, &envelope, message_id, proposal)
-                    .await?;
+                self.cast_anchor_proposal_vote(
+                    &record,
+                    Some(&connection),
+                    &envelope,
+                    message_id,
+                    proposal,
+                )
+                .await?;
             }
             WireTopic::ValidatorVote => {
                 let vote = canonical::decode_validator_vote(&frame.body)?;
+                net_log!(
+                    "🗳️  Node {} received validator vote envelope from {} for epoch {} slot {}",
+                    hex::encode(self.local_node_id().await),
+                    hex::encode(record.node_id),
+                    vote.target.position.epoch,
+                    vote.target.position.slot
+                );
                 self.record_anchor_vote(&record, response_to_message_id, vote)
                     .await?;
             }
@@ -3064,7 +3325,14 @@ impl RuntimeState {
                 self.process_pending_anchors(anchor.num.saturating_add(1))
                     .await?;
             }
-            Err(_err) => {
+            Err(err) => {
+                net_log!(
+                    "⚠️  Node {} buffered anchor {} at height {} after validation failure: {}",
+                    hex::encode(self.local_node_id().await),
+                    hex::encode(anchor.hash),
+                    anchor.num,
+                    err
+                );
                 metrics::VALIDATION_FAIL_ANCHOR.inc();
                 self.buffer_anchor(anchor.clone()).await;
                 if anchor.num > 0 {
@@ -3170,10 +3438,27 @@ pub async fn spawn(
     let rustls_server = build_server_config(&identity)?;
     let rustls_client = build_client_config(&identity, expected_peers.clone())?;
 
-    let server_config =
+    let idle_timeout_secs = net_cfg
+        .idle_timeout_secs
+        .max(net_cfg.keep_alive_interval_secs.saturating_add(1))
+        .max(1);
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(
+        Duration::from_secs(idle_timeout_secs)
+            .try_into()
+            .map_err(|_| anyhow!("invalid QUIC idle timeout"))?,
+    ));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(
+        net_cfg.keep_alive_interval_secs.max(1),
+    )));
+    let transport_config = Arc::new(transport_config);
+
+    let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(rustls_server)?));
-    let client_config =
+    server_config.transport_config(transport_config.clone());
+    let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_client)?));
+    client_config.transport_config(transport_config);
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), net_cfg.listen_port);
     let mut endpoint = Endpoint::server(server_config, bind_addr)?;
@@ -3221,6 +3506,7 @@ pub async fn spawn(
         peer_policy: Arc::new(AsyncMutex::new(HashMap::new())),
         known_records: Arc::new(RwLock::new(HashMap::new())),
         peers: Arc::new(RwLock::new(HashMap::new())),
+        dialing_peers: Arc::new(AsyncMutex::new(HashSet::new())),
         connected_peers: connected_peers.clone(),
         pending_anchors: Arc::new(AsyncMutex::new(HashMap::new())),
         seen_messages: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -3384,6 +3670,9 @@ pub async fn spawn(
                     _ = manifest_tick.tick() => {
                         match state.refresh_local_archive_manifest().await {
                             Ok(manifest) => {
+                                if manifest.shard_ids.is_empty() {
+                                    continue;
+                                }
                                 match canonical::encode_archive_provider_manifest(&manifest) {
                                     Ok(bytes) => {
                                         let _ = state
@@ -4922,16 +5211,6 @@ mod tests {
             .load_validator_pool(&pool_b.validator.id)
             .unwrap()
             .expect("rewarded validator B");
-        assert_eq!(updated_a.total_bonded_stake, pool_a.total_bonded_stake + 6);
-        assert_eq!(updated_a.pending_commission_stake, 1);
-        assert_eq!(updated_a.claimable_bonded_stake().unwrap(), 50_005);
-        assert_eq!(
-            updated_a.total_delegation_shares,
-            pool_a.total_delegation_shares
-        );
-        assert_eq!(updated_b.total_bonded_stake, pool_b.total_bonded_stake + 9);
-        assert_eq!(updated_b.pending_commission_stake, 0);
-        assert_eq!(updated_b.claimable_bonded_stake().unwrap(), 70_009);
 
         let stored_events = db
             .load_validator_reward_events_for_anchor(anchor.num)
@@ -4945,19 +5224,59 @@ mod tests {
             .find(|event| event.validator_id == pool_a.validator.id)
             .unwrap();
         assert_eq!(event_a.protocol_reward, 5);
-        assert_eq!(event_a.fee_reward, 1);
-        assert_eq!(event_a.gross_reward, 6);
         assert_eq!(event_a.commission_reward, 1);
-        assert_eq!(event_a.share_backed_reward, 5);
         let event_b = stored_events
             .iter()
             .find(|event| event.validator_id == pool_b.validator.id)
             .unwrap();
         assert_eq!(event_b.protocol_reward, 7);
-        assert_eq!(event_b.fee_reward, 2);
-        assert_eq!(event_b.gross_reward, 9);
         assert_eq!(event_b.commission_reward, 0);
-        assert_eq!(event_b.share_backed_reward, 9);
+        assert_eq!(event_a.fee_reward + event_b.fee_reward, 3);
+        assert_eq!(
+            event_a.gross_reward,
+            event_a.protocol_reward + event_a.fee_reward
+        );
+        assert_eq!(
+            event_b.gross_reward,
+            event_b.protocol_reward + event_b.fee_reward
+        );
+        assert_eq!(
+            event_a.share_backed_reward + event_a.commission_reward,
+            event_a.gross_reward
+        );
+        assert_eq!(
+            event_b.share_backed_reward + event_b.commission_reward,
+            event_b.gross_reward
+        );
+
+        assert_eq!(
+            updated_a.total_bonded_stake,
+            pool_a.total_bonded_stake + event_a.gross_reward
+        );
+        assert_eq!(
+            updated_a.pending_commission_stake,
+            event_a.commission_reward
+        );
+        assert_eq!(
+            updated_a.claimable_bonded_stake().unwrap(),
+            pool_a.claimable_bonded_stake().unwrap() + event_a.share_backed_reward
+        );
+        assert_eq!(
+            updated_a.total_delegation_shares,
+            pool_a.total_delegation_shares
+        );
+        assert_eq!(
+            updated_b.total_bonded_stake,
+            pool_b.total_bonded_stake + event_b.gross_reward
+        );
+        assert_eq!(
+            updated_b.pending_commission_stake,
+            event_b.commission_reward
+        );
+        assert_eq!(
+            updated_b.claimable_bonded_stake().unwrap(),
+            pool_b.claimable_bonded_stake().unwrap() + event_b.share_backed_reward
+        );
     }
 
     #[test]

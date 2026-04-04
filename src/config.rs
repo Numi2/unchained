@@ -13,6 +13,10 @@ pub struct Config {
     pub metrics: Metrics,
     #[serde(default)]
     pub compact: Compact,
+    #[serde(default)]
+    pub ingress: Ingress,
+    #[serde(default)]
+    pub proof_assistant: ProofAssistant,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -30,6 +34,10 @@ pub struct Net {
     pub max_peers: u32, // maximum peer connections
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64, // connection timeout
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64, // QUIC idle timeout for established validator links
+    #[serde(default = "default_keep_alive_interval")]
+    pub keep_alive_interval_secs: u64, // QUIC keep-alive interval for established validator links
     #[serde(default)]
     pub public_ip: Option<String>,
     #[serde(default = "default_sync_timeout")]
@@ -89,6 +97,151 @@ pub struct Compact {
     pub max_missing_pct: u8,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Ingress {
+    #[serde(default)]
+    pub wallet: WalletIngress,
+    #[serde(default)]
+    pub access_relay: AccessRelay,
+    #[serde(default)]
+    pub submission_gateway: SubmissionGateway,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ProofAssistant {
+    #[serde(default)]
+    pub wallet: WalletProofAssistant,
+    #[serde(default)]
+    pub server: ProofAssistantServer,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletIngress {
+    #[serde(default)]
+    pub relay: Option<String>,
+    #[serde(default)]
+    pub gateway: Option<String>,
+    #[serde(default = "default_wallet_cover_traffic_interval_secs")]
+    pub cover_traffic_interval_secs: u64,
+    #[serde(default = "default_ingress_envelope_size_bytes")]
+    pub envelope_size_bytes: usize,
+    #[serde(default = "default_ingress_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for WalletIngress {
+    fn default() -> Self {
+        Self {
+            relay: None,
+            gateway: None,
+            cover_traffic_interval_secs: default_wallet_cover_traffic_interval_secs(),
+            envelope_size_bytes: default_ingress_envelope_size_bytes(),
+            submit_timeout_secs: default_ingress_submit_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletProofAssistant {
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default = "default_proof_assistant_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_proof_assistant_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_proof_assistant_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for WalletProofAssistant {
+    fn default() -> Self {
+        Self {
+            server: None,
+            max_request_bytes: default_proof_assistant_max_request_bytes(),
+            max_response_bytes: default_proof_assistant_max_response_bytes(),
+            submit_timeout_secs: default_proof_assistant_submit_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AccessRelay {
+    #[serde(default)]
+    pub gateways: Vec<String>,
+    #[serde(default = "default_ingress_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
+    #[serde(default = "default_ingress_max_wallet_messages_per_window")]
+    pub max_wallet_messages_per_window: u32,
+    #[serde(default = "default_ingress_envelope_size_bytes")]
+    pub envelope_size_bytes: usize,
+    #[serde(default = "default_ingress_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for AccessRelay {
+    fn default() -> Self {
+        Self {
+            gateways: Vec::new(),
+            rate_limit_window_secs: default_ingress_rate_limit_window_secs(),
+            max_wallet_messages_per_window: default_ingress_max_wallet_messages_per_window(),
+            envelope_size_bytes: default_ingress_envelope_size_bytes(),
+            submit_timeout_secs: default_ingress_submit_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SubmissionGateway {
+    #[serde(default)]
+    pub allowed_relays: Vec<String>,
+    #[serde(default)]
+    pub validator_control_base_path: Option<String>,
+    #[serde(default = "default_ingress_release_window_ms")]
+    pub release_window_ms: u64,
+    #[serde(default = "default_ingress_max_batch_txs")]
+    pub max_batch_txs: usize,
+    #[serde(default = "default_ingress_max_queue_depth")]
+    pub max_queue_depth: usize,
+    #[serde(default = "default_ingress_envelope_size_bytes")]
+    pub envelope_size_bytes: usize,
+    #[serde(default = "default_ingress_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for SubmissionGateway {
+    fn default() -> Self {
+        Self {
+            allowed_relays: Vec::new(),
+            validator_control_base_path: None,
+            release_window_ms: default_ingress_release_window_ms(),
+            max_batch_txs: default_ingress_max_batch_txs(),
+            max_queue_depth: default_ingress_max_queue_depth(),
+            envelope_size_bytes: default_ingress_envelope_size_bytes(),
+            submit_timeout_secs: default_ingress_submit_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProofAssistantServer {
+    #[serde(default = "default_proof_assistant_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_proof_assistant_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_proof_assistant_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for ProofAssistantServer {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: default_proof_assistant_max_request_bytes(),
+            max_response_bytes: default_proof_assistant_max_response_bytes(),
+            submit_timeout_secs: default_proof_assistant_submit_timeout_secs(),
+        }
+    }
+}
+
 impl Default for Compact {
     fn default() -> Self {
         Self {
@@ -113,8 +266,23 @@ fn default_max_peers() -> u32 {
 fn default_connection_timeout() -> u64 {
     30
 }
+fn default_idle_timeout() -> u64 {
+    120
+}
+fn default_keep_alive_interval() -> u64 {
+    10
+}
 fn default_sync_timeout() -> u64 {
     180
+}
+fn default_proof_assistant_max_request_bytes() -> usize {
+    32 * 1024 * 1024
+}
+fn default_proof_assistant_max_response_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn default_proof_assistant_submit_timeout_secs() -> u64 {
+    30
 }
 fn default_strict_trust() -> bool {
     true
@@ -143,6 +311,38 @@ fn default_compact_short_id_len() -> u8 {
 }
 fn default_compact_max_missing_pct() -> u8 {
     20
+}
+
+fn default_ingress_envelope_size_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn default_ingress_submit_timeout_secs() -> u64 {
+    10
+}
+
+fn default_ingress_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_ingress_max_wallet_messages_per_window() -> u32 {
+    128
+}
+
+fn default_ingress_release_window_ms() -> u64 {
+    50
+}
+
+fn default_wallet_cover_traffic_interval_secs() -> u64 {
+    30
+}
+
+fn default_ingress_max_batch_txs() -> usize {
+    32
+}
+
+fn default_ingress_max_queue_depth() -> usize {
+    2048
 }
 
 /// Read the TOML file at `p` and deserialize into `Config`.
@@ -200,9 +400,11 @@ pub fn load_from_str(text: &str) -> Result<Config> {
 fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
-    let top_allowed: HashSet<&str> = ["net", "p2p", "storage", "epoch", "metrics", "compact"]
-        .into_iter()
-        .collect();
+    let top_allowed: HashSet<&str> = [
+        "net", "p2p", "storage", "epoch", "metrics", "compact", "ingress",
+    ]
+    .into_iter()
+    .collect();
     if let Some(table) = val.as_table() {
         for (k, v) in table.iter() {
             if !top_allowed.contains(k.as_str()) {
@@ -244,6 +446,48 @@ fn warn_unknown_keys(val: &TomlValue) {
                     t,
                     &["enable", "prefill_count", "short_id_len", "max_missing_pct"],
                 ),
+                ("ingress", TomlValue::Table(t)) => {
+                    warn_unknown_keys_in(t, &["wallet", "access_relay", "submission_gateway"]);
+                    if let Some(wallet) = t.get("wallet").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            wallet,
+                            &[
+                                "relay",
+                                "gateway",
+                                "cover_traffic_interval_secs",
+                                "envelope_size_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                    if let Some(relay) = t.get("access_relay").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            relay,
+                            &[
+                                "gateways",
+                                "rate_limit_window_secs",
+                                "max_wallet_messages_per_window",
+                                "envelope_size_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                    if let Some(gateway) = t.get("submission_gateway").and_then(TomlValue::as_table)
+                    {
+                        warn_unknown_keys_in(
+                            gateway,
+                            &[
+                                "allowed_relays",
+                                "validator_control_base_path",
+                                "release_window_ms",
+                                "max_batch_txs",
+                                "max_queue_depth",
+                                "envelope_size_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                }
                 _ => {}
             }
         }

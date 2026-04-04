@@ -30,6 +30,8 @@ transitional and should be removed rather than preserved.
 - `[x]` `ARCHITECTURE.md` updated to make shielded delegated PoS, low-latency
   BFT ordering, and private delegation the source of truth
 - `[x]` `README.md` aligned to the same product and consensus direction
+- `[x]` Canonicalize PIR-native private discovery in the architecture, README,
+  and development map
 - `[x]` Ordinary fast-path payments explicitly defined as privacy-preserving,
   not a lower-privacy shortcut
 - `[x]` Network-metadata caveat addressed with a low-latency two-role ingress
@@ -121,62 +123,165 @@ transitional and should be removed rather than preserved.
   profile update, penalty-evidence admission, and validator reactivation now
   also accept shielded fee-payment sidecars so control actions no longer need a
   zero-fee exception.
-- `[ ]` Keep ordinary transfers on a native fast path without revealing extra
+- `[x]` Expose fee-paid validator control submission through canonical operator
+  tooling
+  `unchained_node` now builds cold-signed registration, profile-update,
+  reactivation, and penalty-evidence control documents from the local node
+  root, and `unchained_wallet` now submits those documents through
+  wallet-control with a private fee-payment sidecar.
+- `[x]` Add deterministic proof-fixture coverage for fee-paid control
+  submissions
+  Deterministic wallet material, deterministic internal change-key derivation,
+  stable fee-witness IDs, committed cached shielded-spend receipts for the
+  single-validator and deterministic multivalidator control witnesses, fast
+  local staking state-machine coverage, multivalidator ordered-control coverage
+  in `pq_network`, and the wallet-control end-to-end fee-paid registration flow
+  are now all wired into the routine suite. Redundant prover-heavy local
+  ordered-control copies in `staking_transactions` were removed in favor of the
+  stronger multivalidator network tests plus direct local state-machine tests.
+- `[~]` Keep ordinary transfers on a native fast path without revealing extra
   sender or recipient metadata
+  Outward payment handles now mint one-time payment-capability signing keys and
+  one-time ML-KEM receive keys, so ordinary recipients no longer expose a
+  wallet-global outward identity through payment handles. Ordinary-path
+  submission now goes through the real access-relay/submission-gateway ingress
+  path with fixed-size hybrid-encrypted envelopes and short batched release
+  windows. Wallets now emit low-rate online cover envelopes on a deterministic
+  per-wallet cadence through the same ingress path.
 - `[x]` Define native transaction classes clearly: ordinary transfer vs
   shared-state operation
-- `[ ]` Remove legacy archive-query assumptions from wallet spend and sync
+- `[x]` Remove legacy archive-query assumptions from wallet spend and sync
   flows
+  Wallet checkpoint refresh now derives historical unspent extensions locally
+  from the node-control shielded runtime snapshot instead of sending
+  requester-linked historical-extension queries through node control.
 
 ## 6. Wallet Addressability
 
 - `[~]` Recipient handles exist, but the repository still needs full alignment
   to one-time capability semantics everywhere
-- `[ ]` Enforce fresh one-time outward payment authorization keys per handle or
+  Public handles are now signed by per-handle payment-capability keys and carry
+  per-handle ML-KEM receive keys rather than the wallet-global signing key.
+  PIR-native discovery, mailbox transport, and negotiated-handle execution are
+  still open.
+- `[x]` Enforce fresh one-time outward payment authorization keys per handle or
   invoice
-- `[ ]` Ensure no wallet-global outward identity key is exposed in payment
+- `[x]` Ensure no wallet-global outward identity key is exposed in payment
   handles
-- `[ ]` Define `LocatorID`, private discovery, mailbox records, and negotiated
-  handle flows
-- `[ ]` Define direct invoice links as a first-class merchant path
-- `[ ]` Keep discovery keys, mailbox keys, payment capability keys, and wallet
-  root keys strictly separated
-- `[ ]` Remove any remaining long-lived receive-key assumptions from wallet UX
+- `[x]` Define `LocatorID`, stateless PIR-native private discovery, mailbox
+  records, and negotiated handle flows
+  The canonical design now requires stateless single-server PIR discovery with
+  fixed-size signed records, fixed-shape queries and responses, authenticated
+  snapshot manifests, and mailbox bootstrap material that is distinct from
+  payment keys.
+- `[x]` Define direct invoice links as a first-class merchant path
+- `[x]` Keep discovery keys, mailbox keys, payment capability keys, and wallet
+  root keys strictly separated at the architecture level
+  The architectural role separation is now explicit; the codebase audit and
+  implementation cleanup remain open under cryptography and key-management
+  tasks.
+- `[ ]` Define and lock the canonical discovery manifest, snapshot, and
+  row-authentication formats for PIR-native lookups
+- `[ ]` Define and lock the fixed-size discovery-record schema, padding rules,
+  and record size for small-record PIR operation
+- `[ ]` Implement locator placement into PIR snapshots using a public salted
+  fixed-fanout candidate-slot derivation with no cleartext lookup fallback
+- `[ ]` Implement the Rust PIR discovery client library for manifest fetch,
+  query generation, response verification, record decoding, and mailbox
+  bootstrap extraction
+- `[ ]` Implement the discovery directory server with snapshot builder, PIR
+  query executor, hot-swap snapshot rotation, and replica consistency checks
+- `[ ]` Implement signed snapshot publication and mirrorable discovery replicas
+  so clients can verify they are querying the intended directory snapshot
+- `[ ]` Implement mailbox transport and one-time `RecipientHandle`
+  request/response flows against PIR-fetched discovery records
+- `[ ]` Implement privacy-preserving abuse controls for discovery queries
+  using blinded rate-limit tokens or an equivalent anonymous query-budget
+  mechanism
+- `[ ]` Benchmark and tune discovery row size, snapshot cadence, and PIR
+  parameters for mobile-wallet latency and bandwidth targets
+- `[~]` Remove any remaining long-lived receive-key assumptions from wallet UX
   and storage
+  Internal self-change and staking-note outputs now derive deterministic
+  one-time internal ML-KEM receive keys from wallet secret material and the
+  transaction send seed, and outward handles now mint one-time payment
+  capability keys plus one-time ML-KEM receive keys. Discovery/mailbox UX still
+  needs the broader negotiated-handle cleanup.
 
 ## 7. Network Privacy And Ingress
 
-- `[ ]` Implement the two-role ingress model:
+- `[x]` Implement the two-role ingress model:
   `access relay` plus `submission gateway`
-- `[ ]` Enforce operator separation between access relays and submission
+- `[x]` Enforce operator separation between access relays and submission
   gateways
-- `[ ]` Use constant-size padded submission envelopes
-- `[ ]` Use short fixed release windows and micro-batched validator ingress
-- `[ ]` Add low-rate online wallet cover traffic without turning the product
+- `[x]` Use constant-size padded submission envelopes
+- `[x]` Use short fixed release windows and micro-batched validator ingress
+- `[x]` Add low-rate online wallet cover traffic without turning the product
   into a high-latency anonymity network
-- `[ ]` Remove direct wallet-to-validator submission as the ordinary path
-- `[ ]` Define relay abuse controls and rate limiting that do not destroy source
+- `[x]` Remove direct wallet-to-validator submission as the ordinary path
+- `[x]` Define relay abuse controls and rate limiting that do not destroy source
   privacy
 
 ## 8. Wallet Sync And Light Clients
 
-- `[ ]` Replace archive-receipt and requester-linked historical-query flows
+- `[x]` Replace archive-receipt and requester-linked historical-query flows
   with compact light-client sync
-- `[ ]` Define compact chain data for wallet scanning
-- `[ ]` Use fuzzy note-detection tags or an equivalent compact probabilistic
+  Wallet-side checkpoint extension refresh no longer sends requester-linked
+  historical queries; it derives the extension locally from the node snapshot.
+  Wallet observation and receive-side ownership refresh now run from a compact
+  node-control scan head plus paged deltas carrying committed genesis coins and
+  compact shielded outputs, and the wallet uses the existing `view_tag` as the
+  compact probabilistic detection tag before local trial decryption. The wallet
+  persists a compact scan cursor, so refresh no longer rereads the entire
+  compact set every time. Proving and checkpoint-refresh work now use a
+  smaller send-runtime material bundle carrying the compact head, validator
+  pools, note tree, root ledger, and archived nullifier epochs, and that same
+  material path now also runs over the real relay/gateway transport. Compact
+  sync and normal wallet prepare/prove/submit flows therefore no longer
+  require a colocated node-control socket, and sender-side proving can now be
+  offloaded to a separate remote proof-assistant role instead of requiring a
+  local prover.
+- `[x]` Define compact chain data for wallet scanning
+- `[x]` Use fuzzy note-detection tags or an equivalent compact probabilistic
   detection mechanism
-- `[ ]` Keep final ownership detection wallet-local through trial decryption or
+- `[x]` Keep final ownership detection wallet-local through trial decryption or
   equivalent local processing
-- `[ ]` Make mobile-wallet sync cheap without exposing ownership queries to the
+- `[x]` Make mobile-wallet sync cheap without exposing ownership queries to the
   network
+  Compact wallet refresh is now incremental and cursor-driven, so the wallet
+  requests bounded deltas instead of the full compact set while still keeping
+  ownership detection local. The same compact sync path now works over the
+  relay/gateway transport, so remote wallet sync no longer depends on local
+  node-control access.
 
 ## 9. Proof System
 
 - `[~]` The repository has a proving path today, but it does not match the
   target architecture
-- `[ ]` Remove dependence on the current prototype proving backend as the
+- `[x]` Define a remote proof-assistant / receipt-delivery path for sender
+  wallets
+  A distinct proof-assistant service now accepts hybrid-encrypted proof
+  witness requests and returns verified STARK receipts for ordinary shielded
+  spends, private delegation, private undelegation, unbonding claims, and
+  checkpoint accumulators, so remote/mobile wallets no longer require a local
+  prover for the canonical send path.
+- `[x]` Introduce a canonical transparent-proof object boundary across
+  transactions, wallets, ingress, and proof-assistant transport
+  Steady-state transaction, wallet, ingress, and proof-assistant flows now
+  carry statement-typed `TransparentProof` objects rather than raw backend
+  receipt bytes, and backend verification / method-ID handling is isolated to
+  `src/proof.rs`.
+- `[~]` Remove dependence on the current prototype proving backend as the
   long-term integrity anchor
-- `[ ]` Define a native transparent STARK-family proving architecture
+  Backend-specific receipt parsing and method/image identifiers are now
+  contained within `src/proof.rs`, but the underlying proving backend is still
+  the prototype engine and has not yet been replaced.
+- `[~]` Define a native transparent STARK-family proving architecture
+  The canonical proof layer now has an explicit circuit inventory for ordinary
+  transfer, private delegation, private undelegation, unbonding claim, and
+  checkpoint accumulator, each with a named public-input shape and a
+  conservative `128-bit` minimum security budget. The backend swap itself is
+  still open.
 - `[ ]` Set and document a conservative `>= 128-bit` security budget
 - `[ ]` Implement native circuits for ordinary transfer
 - `[ ]` Implement native circuits for staking flows
@@ -205,13 +310,28 @@ transitional and should be removed rather than preserved.
 
 ## 12. Config, CLI, And Operator Surface
 
-- `[ ]` Redesign config around validators, relays, gateways, and wallet
+- `[~]` Redesign config around validators, relays, gateways, and wallet
   services rather than miners and epoch PoW knobs
-- `[ ]` Redesign CLI language around validator operation and private settlement
+  Wallet ingress now has explicit `[ingress.wallet]`,
+  `[ingress.access_relay]`, and `[ingress.submission_gateway]` config sections,
+  and remote proving now has explicit `[proof_assistant.wallet]` and
+  `[proof_assistant.server]` config sections, but broader validator/product
+  cleanup is still open.
+- `[~]` Redesign CLI language around validator operation and private settlement
+  The CLI now has explicit `start-access-relay` and
+  `start-submission-gateway` / `start-proof-assistant` commands alongside
+  cold-signed validator control document flows, but broader operator-language
+  cleanup is still open.
 - `[~]` Remove legacy config keys that control PoW, epoch seconds, archive
   provider behavior, or mining workflows
-- `[ ]` Define operational ceremonies for validator hot/cold keys and ingress
+- `[~]` Define operational ceremonies for validator hot/cold keys and ingress
   operator separation
+  Runtime role separation is now enforced by distinct ingress services and
+  identity checks, but the operator ceremony docs are still missing.
+- `[ ]` Add discovery-directory operator config, PIR parameter selection, and
+  signed snapshot publication ceremonies
+- `[ ]` Add wallet/client CLI and service surfaces for locator resolution via
+  PIR and mailbox-based handle negotiation
 
 ## 13. Tests And Verification
 
@@ -232,8 +352,33 @@ transitional and should be removed rather than preserved.
   Deterministic aggregation tests now lock contention filtering, but an
   end-to-end contended ordinary-payment proof test is still missing.
 - `[~]` Add tests for private delegation and unbonding flows
-- `[ ]` Add tests for ingress role separation and metadata-handling invariants
-- `[ ]` Add tests for compact wallet sync and fuzzy detection
+- `[~]` Add tests for ingress role separation and metadata-handling invariants
+  The suite now covers fixed-size envelope round trips, role-separation
+  rejection, ordinary shielded payment ingress, and fee-paid wallet-control
+  submission through the real relay/gateway path. Scheduled cover traffic is
+  now verified to avoid transaction persistence and finalized-anchor movement.
+  Broader metadata-handling invariants are still open.
+- `[~]` Add tests for compact wallet sync and fuzzy detection
+  The suite now covers the compact wallet-state stream boundary directly:
+  note-tree-only churn changes the explicit runtime snapshot but does not
+  perturb the compact wallet-state stream, wallet-control observation rebuilds
+  correctly from the compact head-plus-delta path, and node-control now has a
+  direct cursor/paging test for compact wallet deltas. A remote-wallet ingress
+  test now also verifies compact head/delta pagination and wallet-side balance
+  recovery without a local node-control client. Remote ingress coverage now
+  also verifies ordinary-send witness preparation, private-delegation witness
+  preparation, and fee-paid validator-registration submission without a local
+  node-control client. Remote proof-assistant coverage now also verifies
+  direct wallet and wallet-control fee-paid registration submission without a
+  local prover. Broader compact detection coverage can still be expanded.
+- `[ ]` Add end-to-end tests for PIR discovery
+  Cover fixed-size manifest and row encodings, candidate-slot derivation,
+  constant-shape queries and responses, authenticated row verification,
+  mailbox bootstrap decoding, negotiated-handle completion, snapshot rotation,
+  and failure handling under stale manifests or malformed rows.
+- `[ ]` Add privacy-invariant tests for discovery abuse controls
+  Query budgeting, retries, relaying, and operator telemetry must not re-link
+  locator resolution to a wallet identity or degrade PIR query privacy.
 - `[ ]` Add proof-system tests aligned to the new native circuits
 
 ## 14. Immediate Next Steps
@@ -246,8 +391,17 @@ transitional and should be removed rather than preserved.
   proof path
 - `[x]` Define private undelegation and delayed-claim shared-state actions
 - `[x]` Define shielded staking note semantics
-- `[ ]` Define the two-role ingress wire model
-- `[ ]` Define the replacement proof architecture and circuit inventory
+- `[x]` Define the two-role ingress wire model
+- `[x]` Canonicalize stateless single-server PIR as the discovery backend for
+  `LocatorID` resolution
+- `[ ]` Define and lock the PIR-native discovery manifest, fixed-size record
+  layout, and candidate-slot derivation rules
+- `[ ]` Implement the PIR discovery client, directory server, and mailbox
+  negotiation path end to end
+- `[~]` Define the replacement proof architecture and circuit inventory
+  The canonical proof-object boundary and named circuit inventory are now in
+  place across transaction, wallet, ingress, and proof-assistant paths; the
+  replacement backend and the remaining native circuits are still open.
 
 ## 15. Explicitly Out Of Scope
 

@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Args, Parser, Subcommand};
 use qrcode::render::unicode;
 use qrcode::QrCode;
+use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
@@ -9,13 +10,20 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use crate::{
-    canonical, config, epoch, metrics, network, node_control, node_identity, protocol, storage,
-    sync, wallet, wallet_control,
+    canonical, config, epoch, ingress, metrics, network, node_control, node_identity,
+    proof_assistant, protocol, storage, sync, wallet, wallet_control,
 };
 use crate::{
+    consensus::ValidatorId,
+    evidence::SlashableEvidence,
     network::NetHandle,
+    staking::{
+        ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate, ValidatorReactivation,
+        ValidatorRegistration, ValidatorStatus,
+    },
     storage::{Store, WalletStore},
     sync::SyncState,
+    transaction::{PenaltyEvidenceAdmission, SharedStateAction, SharedStateControlDocument, Tx},
 };
 
 #[derive(Args, Clone)]
@@ -34,7 +42,7 @@ struct CommonArgs {
     version,
     about = "Unchained node runtime",
     long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and validator-facing services.",
-    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node start\n"
+    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node start\n"
 )]
 struct NodeCli {
     #[command(flatten)]
@@ -50,7 +58,7 @@ struct NodeCli {
     version,
     about = "Unchained wallet runtime",
     long_about = "Operate the Unchained shielded wallet service, mint single-use receive handles, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
-    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <RECIPIENT_HANDLE_JSON> --amount 100\n  unchained_wallet balance\n  unchained_wallet history\n"
+    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <RECIPIENT_HANDLE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -113,8 +121,22 @@ enum NodeCmd {
     },
     /// Print the local node ID and signed bootstrap record
     PeerId,
+    /// Build and cold-sign a validator registration control document
+    ValidatorRegisterDoc(ValidatorRegisterDocArgs),
+    /// Build and cold-sign a validator profile-update control document
+    ValidatorProfileDoc(ValidatorProfileDocArgs),
+    /// Build and cold-sign a validator reactivation control document
+    ValidatorReactivateDoc(ValidatorReactivateDocArgs),
+    /// Build a penalty-evidence admission control document
+    PenaltyEvidenceDoc(PenaltyEvidenceDocArgs),
     /// Start the node runtime
     Start,
+    /// Start the access relay role for ordinary-path wallet ingress
+    StartAccessRelay,
+    /// Start the submission gateway role for ordinary-path wallet ingress
+    StartSubmissionGateway,
+    /// Start the remote proof-assistant role for sender wallets
+    StartProofAssistant,
     /// Re-gossip all transactions from local DB
     ReplayTransactions,
     /// Export all anchors into a compressed snapshot file
@@ -163,6 +185,66 @@ struct HistoryArgs {
     json: bool,
 }
 
+#[derive(Args, Clone)]
+struct SubmitControlArgs {
+    #[arg(long)]
+    document: String,
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone)]
+struct ValidatorRegisterDocArgs {
+    #[arg(long)]
+    node_record: Option<String>,
+    #[arg(long)]
+    bonded_stake: u64,
+    #[arg(long)]
+    activation_epoch: u64,
+    #[arg(long)]
+    commission_bps: u16,
+    #[arg(long)]
+    display_name: String,
+    #[arg(long)]
+    website: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct ValidatorProfileDocArgs {
+    #[arg(long)]
+    validator_id: Option<String>,
+    #[arg(long)]
+    commission_bps: u16,
+    #[arg(long)]
+    display_name: String,
+    #[arg(long)]
+    website: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct ValidatorReactivateDocArgs {
+    #[arg(long)]
+    validator_id: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct PenaltyEvidenceDocArgs {
+    #[arg(long)]
+    evidence: String,
+    #[arg(long)]
+    out: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum WalletCmd {
     /// Host the local wallet control socket used by other runtimes
@@ -172,6 +254,8 @@ enum WalletCmd {
     Receive(ReceiveArgs),
     /// Send coins using a single-use receiving handle, or run a guided send flow
     Send(SendArgs),
+    /// Submit a signed fee-paid shared-state control document through the running wallet
+    SubmitControl(SubmitControlArgs),
     /// Show wallet balance and owned shielded notes
     Balance(BalanceArgs),
     /// Show wallet transaction history
@@ -275,10 +359,20 @@ fn open_wallet_store(cfg: &config::Config) -> Result<Arc<WalletStore>> {
     }
 }
 
-fn open_node_control_client(cfg: &config::Config) -> Result<node_control::NodeControlClient> {
+fn open_optional_node_control_client(
+    cfg: &config::Config,
+) -> Result<Option<node_control::NodeControlClient>> {
     let client = node_control::NodeControlClient::new(&cfg.storage.path);
-    client.ping()?;
-    Ok(client)
+    match client.ping() {
+        Ok(()) => Ok(Some(client)),
+        Err(_err)
+            if normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
+                && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some() =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn open_wallet_control_client(
@@ -315,6 +409,26 @@ fn write_compact_output(path: Option<&str>, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_json_output<T: Serialize>(label: &str, value: &T, out: Option<&str>) -> Result<()> {
+    let encoded = serde_json::to_string_pretty(value)?;
+    if let Some(path) = out {
+        std::fs::write(path, format!("{encoded}\n"))?;
+        println!("Wrote {path}");
+        println!();
+    }
+    println!("{label}");
+    println!();
+    println!("{encoded}");
+    Ok(())
+}
+
+fn load_json_document<T: DeserializeOwned>(path: &str, label: &str) -> Result<T> {
+    let bytes = std::fs::read(path)
+        .map_err(|err| anyhow!("failed to read {label} document from {path}: {err}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow!("failed to parse {label} document at {path}: {err}"))
+}
+
 fn print_compact_document(
     label: &str,
     node_id: Option<&str>,
@@ -342,6 +456,302 @@ fn parse_node_id_hex(value: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw);
     Ok(out)
+}
+
+fn parse_validator_id_hex(value: &str) -> Result<ValidatorId> {
+    Ok(ValidatorId(parse_node_id_hex(value)?))
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn normalized_config_item(value: Option<&str>) -> Option<&str> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn validator_metadata(
+    display_name: String,
+    website: Option<String>,
+    description: Option<String>,
+) -> ValidatorMetadata {
+    ValidatorMetadata {
+        display_name,
+        website,
+        description,
+    }
+}
+
+fn require_local_chain_id(cfg: &config::Config) -> Result<[u8; 32]> {
+    load_identity_chain_id(&cfg.storage.path)?.ok_or_else(|| {
+        anyhow!("local chain id is unavailable; initialize canonical chain state first")
+    })
+}
+
+fn listen_addr(cfg: &config::Config) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([0, 0, 0, 0], cfg.net.listen_port))
+}
+
+fn load_runtime_identity(cfg: &config::Config) -> Result<node_identity::NodeIdentity> {
+    node_identity::NodeIdentity::load_runtime_in_dir(
+        &cfg.storage.path,
+        protocol::CURRENT.version,
+        load_identity_chain_id(&cfg.storage.path)?,
+        published_identity_addresses(cfg),
+    )
+}
+
+fn load_validated_service_record(item: &str, label: &str) -> Result<node_identity::NodeRecordV2> {
+    let record = node_identity::load_node_record(item)
+        .map_err(|err| anyhow!("failed to load {label} node record: {err}"))?;
+    record.validate(now_unix_ms())?;
+    Ok(record)
+}
+
+fn load_ingress_record(
+    item: &str,
+    label: &str,
+    expected_chain_id: [u8; 32],
+) -> Result<node_identity::NodeRecordV2> {
+    let record = load_validated_service_record(item, label)?;
+    if record.chain_id != Some(expected_chain_id) {
+        bail!(
+            "{label} node record is bound to chain {}, expected {}",
+            record
+                .chain_id
+                .map(hex::encode)
+                .unwrap_or_else(|| "unbound".to_string()),
+            hex::encode(expected_chain_id),
+        );
+    }
+    Ok(record)
+}
+
+fn load_ingress_records(
+    items: &[String],
+    label: &str,
+    expected_chain_id: [u8; 32],
+) -> Result<Vec<node_identity::NodeRecordV2>> {
+    items
+        .iter()
+        .map(|item| load_ingress_record(item, label, expected_chain_id))
+        .collect()
+}
+
+fn build_wallet_ingress_client(
+    cfg: &config::Config,
+    expected_chain_id: Option<[u8; 32]>,
+) -> Result<Option<ingress::IngressClient>> {
+    let relay = normalized_config_item(cfg.ingress.wallet.relay.as_deref());
+    let gateway = normalized_config_item(cfg.ingress.wallet.gateway.as_deref());
+    match (relay, gateway) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => bail!(
+            "wallet ingress requires both [ingress.wallet].relay and [ingress.wallet].gateway"
+        ),
+        (Some(relay), Some(gateway)) => {
+            let relay_record = if let Some(chain_id) = expected_chain_id {
+                load_ingress_record(relay, "access relay", chain_id)?
+            } else {
+                load_validated_service_record(relay, "access relay")?
+            };
+            let gateway_record = if let Some(chain_id) = expected_chain_id {
+                load_ingress_record(gateway, "submission gateway", chain_id)?
+            } else {
+                load_validated_service_record(gateway, "submission gateway")?
+            };
+            Ok(Some(ingress::IngressClient::new(
+                relay_record,
+                gateway_record,
+                cfg.ingress.wallet.envelope_size_bytes,
+                Duration::from_secs(cfg.ingress.wallet.submit_timeout_secs),
+            )?))
+        }
+    }
+}
+
+fn build_wallet_proof_assistant_client(
+    cfg: &config::Config,
+    expected_chain_id: Option<[u8; 32]>,
+) -> Result<Option<proof_assistant::ProofAssistantClient>> {
+    let server = normalized_config_item(cfg.proof_assistant.wallet.server.as_deref());
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    let record = load_validated_service_record(server, "proof assistant")?;
+    let chain_id = record
+        .chain_id
+        .ok_or_else(|| anyhow!("proof assistant node record must be bound to a chain"))?;
+    if let Some(expected_chain_id) = expected_chain_id {
+        if chain_id != expected_chain_id {
+            bail!(
+                "proof assistant node record is bound to chain {}, expected {}",
+                hex::encode(chain_id),
+                hex::encode(expected_chain_id),
+            );
+        }
+    }
+    Ok(Some(proof_assistant::ProofAssistantClient::new(
+        record,
+        cfg.proof_assistant.wallet.max_request_bytes,
+        cfg.proof_assistant.wallet.max_response_bytes,
+        Duration::from_secs(cfg.proof_assistant.wallet.submit_timeout_secs),
+    )?))
+}
+
+fn wallet_cover_traffic_enabled(cfg: &config::Config) -> bool {
+    normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
+        && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some()
+        && cfg.ingress.wallet.cover_traffic_interval_secs > 0
+}
+
+fn access_relay_policy(cfg: &config::Config) -> ingress::AccessRelayPolicy {
+    ingress::AccessRelayPolicy {
+        rate_limit_window: Duration::from_secs(cfg.ingress.access_relay.rate_limit_window_secs),
+        max_wallet_messages_per_window: cfg.ingress.access_relay.max_wallet_messages_per_window,
+        envelope_size_bytes: cfg.ingress.access_relay.envelope_size_bytes,
+        submit_timeout: Duration::from_secs(cfg.ingress.access_relay.submit_timeout_secs),
+    }
+}
+
+fn submission_gateway_policy(cfg: &config::Config) -> ingress::SubmissionGatewayPolicy {
+    ingress::SubmissionGatewayPolicy {
+        release_window: Duration::from_millis(cfg.ingress.submission_gateway.release_window_ms),
+        max_batch_txs: cfg.ingress.submission_gateway.max_batch_txs,
+        max_queue_depth: cfg.ingress.submission_gateway.max_queue_depth,
+        envelope_size_bytes: cfg.ingress.submission_gateway.envelope_size_bytes,
+        submit_timeout: Duration::from_secs(cfg.ingress.submission_gateway.submit_timeout_secs),
+    }
+}
+
+fn proof_assistant_policy(cfg: &config::Config) -> proof_assistant::ProofAssistantPolicy {
+    proof_assistant::ProofAssistantPolicy {
+        max_request_bytes: cfg.proof_assistant.server.max_request_bytes,
+        max_response_bytes: cfg.proof_assistant.server.max_response_bytes,
+        submit_timeout: Duration::from_secs(cfg.proof_assistant.server.submit_timeout_secs),
+    }
+}
+
+fn load_operator_node_record(
+    cfg: &config::Config,
+    provided: Option<&str>,
+) -> Result<node_identity::NodeRecordV2> {
+    let record = if let Some(item) = provided {
+        node_identity::load_node_record(item)?
+    } else {
+        node_identity::load_local_runtime_record_in_dir(
+            &cfg.storage.path,
+            protocol::CURRENT.version,
+            Some(require_local_chain_id(cfg)?),
+            published_identity_addresses(cfg),
+        )?
+    };
+    record.validate(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0),
+    )?;
+    Ok(record)
+}
+
+fn sign_local_control_document(
+    cfg: &config::Config,
+    action: SharedStateAction,
+) -> Result<SharedStateControlDocument> {
+    let chain_id = require_local_chain_id(cfg)?;
+    let signable = Tx::shared_state_signing_bytes(chain_id, &action)?;
+    let signature = node_identity::sign_with_local_root_in_dir(&cfg.storage.path, &signable)?;
+    Ok(SharedStateControlDocument::new(chain_id, action, signature))
+}
+
+fn build_validator_register_document(
+    cfg: &config::Config,
+    args: &ValidatorRegisterDocArgs,
+) -> Result<SharedStateControlDocument> {
+    let record = load_operator_node_record(cfg, args.node_record.as_deref())?;
+    let chain_id = require_local_chain_id(cfg)?;
+    if record.chain_id != Some(chain_id) {
+        bail!("validator node record chain binding does not match the local chain");
+    }
+    let pool = ValidatorPool::from_node_record(
+        &record,
+        args.commission_bps,
+        args.bonded_stake,
+        args.activation_epoch,
+        ValidatorStatus::PendingActivation,
+        validator_metadata(
+            args.display_name.clone(),
+            args.website.clone(),
+            args.description.clone(),
+        ),
+    )?;
+    sign_local_control_document(
+        cfg,
+        SharedStateAction::RegisterValidator(ValidatorRegistration { pool }),
+    )
+}
+
+fn build_validator_profile_document(
+    cfg: &config::Config,
+    args: &ValidatorProfileDocArgs,
+) -> Result<SharedStateControlDocument> {
+    let validator_id = if let Some(value) = args.validator_id.as_deref() {
+        parse_validator_id_hex(value)?
+    } else {
+        let record = load_operator_node_record(cfg, None)?;
+        ValidatorId::from_hot_key(&record.auth_spki)
+    };
+    sign_local_control_document(
+        cfg,
+        SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+            validator_id,
+            commission_bps: args.commission_bps,
+            metadata: validator_metadata(
+                args.display_name.clone(),
+                args.website.clone(),
+                args.description.clone(),
+            ),
+        }),
+    )
+}
+
+fn build_validator_reactivate_document(
+    cfg: &config::Config,
+    args: &ValidatorReactivateDocArgs,
+) -> Result<SharedStateControlDocument> {
+    let validator_id = if let Some(value) = args.validator_id.as_deref() {
+        parse_validator_id_hex(value)?
+    } else {
+        let record = load_operator_node_record(cfg, None)?;
+        ValidatorId::from_hot_key(&record.auth_spki)
+    };
+    sign_local_control_document(
+        cfg,
+        SharedStateAction::ReactivateValidator(ValidatorReactivation { validator_id }),
+    )
+}
+
+fn build_penalty_evidence_document(
+    cfg: &config::Config,
+    args: &PenaltyEvidenceDocArgs,
+) -> Result<SharedStateControlDocument> {
+    let evidence: SlashableEvidence = load_json_document(&args.evidence, "slashable evidence")?;
+    Ok(SharedStateControlDocument::new(
+        require_local_chain_id(cfg)?,
+        SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission { evidence }),
+        Vec::new(),
+    ))
 }
 
 fn print_peer_id_output(cfg: &config::Config) -> Result<()> {
@@ -434,7 +844,46 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
             print_peer_id_output(cfg)?;
             Ok(true)
         }
+        NodeCmd::ValidatorRegisterDoc(args) => {
+            let document = build_validator_register_document(cfg, args)?;
+            write_json_output(
+                "Signed Shared-State Control Document",
+                &document,
+                args.out.as_deref(),
+            )?;
+            Ok(true)
+        }
+        NodeCmd::ValidatorProfileDoc(args) => {
+            let document = build_validator_profile_document(cfg, args)?;
+            write_json_output(
+                "Signed Shared-State Control Document",
+                &document,
+                args.out.as_deref(),
+            )?;
+            Ok(true)
+        }
+        NodeCmd::ValidatorReactivateDoc(args) => {
+            let document = build_validator_reactivate_document(cfg, args)?;
+            write_json_output(
+                "Signed Shared-State Control Document",
+                &document,
+                args.out.as_deref(),
+            )?;
+            Ok(true)
+        }
+        NodeCmd::PenaltyEvidenceDoc(args) => {
+            let document = build_penalty_evidence_document(cfg, args)?;
+            write_json_output(
+                "Shared-State Control Document",
+                &document,
+                args.out.as_deref(),
+            )?;
+            Ok(true)
+        }
         NodeCmd::Start
+        | NodeCmd::StartAccessRelay
+        | NodeCmd::StartSubmissionGateway
+        | NodeCmd::StartProofAssistant
         | NodeCmd::ReplayTransactions
         | NodeCmd::ExportAnchors { .. }
         | NodeCmd::ImportAnchors { .. } => Ok(false),
@@ -504,6 +953,29 @@ async fn wait_for_shutdown(signal_label: &str, runtime: NetworkRuntime) -> Resul
         }
         Err(err) => {
             eprintln!("Error waiting for shutdown signal: {err}");
+            Err(err.into())
+        }
+    }
+}
+
+async fn wait_for_service_shutdown(
+    signal_label: &str,
+    shutdown_tx: broadcast::Sender<()>,
+    service_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    println!("Press Ctrl+C to stop.");
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            println!();
+            println!("Shutdown signal received. Cleaning up {signal_label}...");
+            let _ = shutdown_tx.send(());
+            service_task.await.map_err(|err| anyhow!(err))??;
+            println!("{signal_label} stopped.");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = shutdown_tx.send(());
+            let _ = service_task.await;
             Err(err.into())
         }
     }
@@ -802,6 +1274,71 @@ pub async fn run_node_cli() -> Result<()> {
             node_control_result?;
             Ok(())
         }
+        NodeCmd::StartAccessRelay => {
+            let identity = load_runtime_identity(&cfg)?;
+            let chain_id = require_local_chain_id(&cfg)?;
+            let gateway_records = load_ingress_records(
+                &cfg.ingress.access_relay.gateways,
+                "submission gateway",
+                chain_id,
+            )?;
+            let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+            let server = ingress::AccessRelayServer::bind(
+                &identity,
+                gateway_records,
+                listen_addr(&cfg),
+                access_relay_policy(&cfg),
+            )?;
+            let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+            println!("Access relay is running.");
+            println!("Listening on port {}", cfg.net.listen_port);
+            wait_for_service_shutdown("Unchained access relay", shutdown_tx, task).await
+        }
+        NodeCmd::StartSubmissionGateway => {
+            let identity = load_runtime_identity(&cfg)?;
+            let chain_id = require_local_chain_id(&cfg)?;
+            let allowed_relays = load_ingress_records(
+                &cfg.ingress.submission_gateway.allowed_relays,
+                "access relay",
+                chain_id,
+            )?;
+            let validator_control_base_path = normalized_config_item(
+                cfg.ingress
+                    .submission_gateway
+                    .validator_control_base_path
+                    .as_deref(),
+            )
+            .unwrap_or(&cfg.storage.path);
+            let validator_client =
+                node_control::NodeControlClient::new(validator_control_base_path);
+            validator_client.ping()?;
+            let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+            let server = ingress::SubmissionGatewayServer::bind(
+                &identity,
+                allowed_relays,
+                listen_addr(&cfg),
+                validator_control_base_path,
+                submission_gateway_policy(&cfg),
+            )?;
+            let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+            println!("Submission gateway is running.");
+            println!("Listening on port {}", cfg.net.listen_port);
+            println!("Validator control base path: {validator_control_base_path}");
+            wait_for_service_shutdown("Unchained submission gateway", shutdown_tx, task).await
+        }
+        NodeCmd::StartProofAssistant => {
+            let identity = load_runtime_identity(&cfg)?;
+            let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+            let server = proof_assistant::ProofAssistantServer::bind(
+                &identity,
+                listen_addr(&cfg),
+                proof_assistant_policy(&cfg),
+            )?;
+            let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+            println!("Proof assistant is running.");
+            println!("Listening on port {}", cfg.net.listen_port);
+            wait_for_service_shutdown("Unchained proof assistant", shutdown_tx, task).await
+        }
         NodeCmd::InitRoot { .. }
         | NodeCmd::AuthPrepare { .. }
         | NodeCmd::AuthSign { .. }
@@ -809,7 +1346,11 @@ pub async fn run_node_cli() -> Result<()> {
         | NodeCmd::TrustRevoke { .. }
         | NodeCmd::TrustReplace { .. }
         | NodeCmd::TrustApprove { .. }
-        | NodeCmd::PeerId => unreachable!("handled before runtime startup"),
+        | NodeCmd::PeerId
+        | NodeCmd::ValidatorRegisterDoc(..)
+        | NodeCmd::ValidatorProfileDoc(..)
+        | NodeCmd::ValidatorReactivateDoc(..)
+        | NodeCmd::PenaltyEvidenceDoc(..) => unreachable!("handled before runtime startup"),
     }
 }
 
@@ -821,11 +1362,35 @@ pub async fn run_wallet_cli() -> Result<()> {
     match cli.cmd {
         WalletCmd::Serve => {
             let wallet_db = open_wallet_store(&cfg)?;
-            let node_client = open_node_control_client(&cfg)?;
-            let wallet = Arc::new(
-                wallet::Wallet::load_or_create_private(wallet_db.clone())?
-                    .with_node_client(node_client),
-            );
+            let node_client = open_optional_node_control_client(&cfg)?;
+            let mut wallet = wallet::Wallet::load_or_create_private(wallet_db.clone())?;
+            if let Some(node_client) = node_client.clone() {
+                wallet = wallet.with_node_client(node_client);
+            }
+            let expected_chain_id = node_client
+                .as_ref()
+                .map(node_control::NodeControlClient::chain_id)
+                .transpose()?;
+            let ingress_client = build_wallet_ingress_client(&cfg, expected_chain_id)?;
+            if let Some(ingress_client) = ingress_client.clone() {
+                wallet = wallet.with_ingress_client(ingress_client);
+            }
+            let proof_expected_chain_id = match (expected_chain_id, ingress_client.as_ref()) {
+                (Some(chain_id), _) => Some(chain_id),
+                (None, Some(ingress_client)) => Some(ingress_client.chain_id()?),
+                (None, None) => None,
+            };
+            if let Some(proof_assistant_client) =
+                build_wallet_proof_assistant_client(&cfg, proof_expected_chain_id)?
+            {
+                wallet = wallet.with_proof_assistant_client(proof_assistant_client);
+            }
+            if node_client.is_none() && !wallet.has_ingress_client() {
+                bail!(
+                    "wallet serve requires either a reachable local node control socket or configured [ingress.wallet] relay/gateway services"
+                );
+            }
+            let wallet = Arc::new(wallet);
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
             let server =
                 wallet_control::WalletControlServer::bind(&cfg.storage.path, wallet.clone())
@@ -835,10 +1400,31 @@ pub async fn run_wallet_cli() -> Result<()> {
                 .display()
                 .to_string();
             let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+            let cover_task = if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
+                let wallet = wallet.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+                let interval_secs = cfg.ingress.wallet.cover_traffic_interval_secs;
+                Some(tokio::spawn(async move {
+                    wallet
+                        .run_cover_traffic_loop(interval_secs, shutdown_rx)
+                        .await
+                }))
+            } else {
+                None
+            };
 
             println!("Wallet control socket: {socket_path}");
             println!("Wallet control capability: {capability_path}");
             println!("Wallet control runtime is running.");
+            if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
+                println!(
+                    "Wallet ingress cover cadence: {} seconds",
+                    cfg.ingress.wallet.cover_traffic_interval_secs
+                );
+            }
+            if wallet.has_proof_assistant_client() {
+                println!("Wallet remote proof assistant: enabled");
+            }
             println!("Press Ctrl+C to stop.");
 
             match signal::ctrl_c().await {
@@ -847,9 +1433,16 @@ pub async fn run_wallet_cli() -> Result<()> {
                     println!("Shutdown signal received. Cleaning up Unchained wallet...");
                     let _ = shutdown_tx.send(());
                     let server_result = server_task.await.map_err(|err| anyhow!(err))?;
+                    let cover_result = match cover_task {
+                        Some(task) => Some(task.await.map_err(|err| anyhow!(err))?),
+                        None => None,
+                    };
                     drop(wallet);
                     let wallet_close_result = wallet_db.close();
                     server_result?;
+                    if let Some(result) = cover_result {
+                        result?;
+                    }
                     wallet_close_result?;
                     println!("Unchained wallet stopped.");
                     Ok(())
@@ -857,6 +1450,9 @@ pub async fn run_wallet_cli() -> Result<()> {
                 Err(err) => {
                     let _ = shutdown_tx.send(());
                     let _ = server_task.await;
+                    if let Some(task) = cover_task {
+                        let _ = task.await;
+                    }
                     drop(wallet);
                     let _ = wallet_db.close();
                     Err(err.into())
@@ -889,6 +1485,38 @@ pub async fn run_wallet_cli() -> Result<()> {
         WalletCmd::Send(args) => {
             let client = open_wallet_control_client(&cfg).await?;
             run_send_flow(&client, &args).await?;
+            Ok(())
+        }
+        WalletCmd::SubmitControl(args) => {
+            let client = open_wallet_control_client(&cfg).await?;
+            let document: SharedStateControlDocument =
+                load_json_document(&args.document, "shared-state control")?;
+            let outcome = client.submit_shared_state_control(document).await?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "tx_id": hex::encode(outcome.tx_id),
+                        "fee_amount": outcome.fee_amount,
+                        "input_count": outcome.input_count,
+                        "output_count": outcome.output_count,
+                    })
+                );
+            } else {
+                println!("Submitted Shared-State Control Transaction");
+                println!();
+                println!("Tx ID: {}", hex::encode(outcome.tx_id));
+                println!(
+                    "Shielded fee: {} coin{} via {} input note{} and {} output note{}.",
+                    outcome.fee_amount,
+                    if outcome.fee_amount == 1 { "" } else { "s" },
+                    outcome.input_count,
+                    if outcome.input_count == 1 { "" } else { "s" },
+                    outcome.output_count,
+                    if outcome.output_count == 1 { "" } else { "s" },
+                );
+            }
             Ok(())
         }
     }

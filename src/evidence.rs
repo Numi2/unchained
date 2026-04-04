@@ -43,6 +43,8 @@ impl EnvelopeAuthor {
             chain_id: envelope.chain_id,
             root_spki: Vec::new(),
             auth_spki: self.auth_spki.clone(),
+            ingress_kem_pk: crate::crypto::TaggedKemPublicKey::zero_ml_kem_768(),
+            ingress_x25519_pk: [0u8; 32],
             addresses: vec!["0.0.0.0:0".to_string()],
             issued_unix_ms: envelope.issued_unix_ms,
             expires_unix_ms: envelope.expires_unix_ms,
@@ -772,9 +774,14 @@ mod tests {
     use crate::{
         consensus::{OrderingPath, Validator, ValidatorKeys, ValidatorSet},
         crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign},
+        proof::{TransparentProof, TransparentProofStatement},
         transaction::{SharedStateBatch, Tx},
     };
     use tempfile::TempDir;
+
+    fn dummy_proof(statement: TransparentProofStatement, seed: u8) -> TransparentProof {
+        TransparentProof::new(statement, vec![seed; 8])
+    }
 
     fn validator_set() -> (ValidatorSet, Vec<Vec<u8>>) {
         let mut hot_spkis = Vec::new();
@@ -940,7 +947,12 @@ mod tests {
             2,
             validator_set.validators[0].keys.hot_ml_dsa_65_spki.clone(),
         );
-        let tx = Tx::new(vec![[1u8; 32]], Vec::new(), 0, vec![3u8; 8]);
+        let tx = Tx::new(
+            vec![[1u8; 32]],
+            Vec::new(),
+            0,
+            dummy_proof(TransparentProofStatement::ShieldedTransfer, 3),
+        );
         let first = SharedStateDagBatch::new(
             0,
             1,
@@ -954,8 +966,13 @@ mod tests {
             1,
             validator_set.validators[0].id,
             Vec::new(),
-            SharedStateBatch::new(vec![Tx::new(vec![[2u8; 32]], Vec::new(), 0, vec![4u8; 8])])
-                .unwrap(),
+            SharedStateBatch::new(vec![Tx::new(
+                vec![[2u8; 32]],
+                Vec::new(),
+                0,
+                dummy_proof(TransparentProofStatement::ShieldedTransfer, 4),
+            )])
+            .unwrap(),
         )
         .unwrap();
 

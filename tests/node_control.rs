@@ -9,12 +9,15 @@ use tokio::time::{timeout, Duration};
 use unchained::{
     config::{Net, P2p},
     consensus::{ConsensusPosition, OrderingPath, ValidatorVote, VoteTarget},
+    crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
     evidence, network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
     staking::ValidatorRewardEvent,
     storage::{Store, WalletStore},
     sync::SyncState,
+    transaction::{self, ShieldedOutput},
+    wallet::Wallet,
 };
 
 fn pick_udp_port() -> u16 {
@@ -34,6 +37,8 @@ fn build_net(port: u16) -> Net {
         peer_exchange: true,
         max_peers: 8,
         connection_timeout_secs: 5,
+        idle_timeout_secs: 30,
+        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
         sync_timeout_secs: 3,
         banned_peer_ids: Vec::new(),
@@ -63,6 +68,13 @@ fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> R
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
     Ok(genesis)
+}
+
+fn mutate_shielded_note_tree(store: &Store, commitment: [u8; 32]) -> Result<()> {
+    let mut tree = store.load_shielded_note_tree()?.unwrap_or_default();
+    tree.append(commitment)?;
+    store.store_shielded_note_tree(&tree)?;
+    Ok(())
 }
 
 fn provision_runtime_identity(
@@ -209,6 +221,174 @@ async fn node_control_serves_consensus_status() -> Result<()> {
 
     std::fs::write(&capability_path, [0u8; 32])?;
     assert!(client.ping().is_err());
+
+    let _ = shutdown_tx.send(());
+    server_task.await??;
+    net.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_control_streams_compact_wallet_state_only() -> Result<()> {
+    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "node-control-compact-passphrase");
+    network::set_quiet_logging(true);
+
+    let tempdir = TempDir::new()?;
+    let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
+    let _wallet_db = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
+    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
+
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = node_control::NodeControlServer::bind(
+        &tempdir.path().to_string_lossy(),
+        db.clone(),
+        net.clone(),
+        sync_state,
+        false,
+    )
+    .await?;
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let client = node_control::NodeControlClient::new(&tempdir.path().to_string_lossy());
+    client.ping()?;
+    let mut state_rx = client.subscribe_state()?;
+    let initial_state = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(state) = state_rx.borrow().clone() {
+                return Ok::<_, anyhow::Error>(state);
+            }
+            state_rx.changed().await?;
+        }
+    })
+    .await??;
+    let initial_runtime = client.shielded_runtime_snapshot()?;
+
+    mutate_shielded_note_tree(db.as_ref(), [0xabu8; 32])?;
+    let advanced_runtime = client.shielded_runtime_snapshot()?;
+    assert_ne!(
+        advanced_runtime.note_tree.root(),
+        initial_runtime.note_tree.root()
+    );
+    assert!(
+        timeout(Duration::from_millis(600), state_rx.changed())
+            .await
+            .is_err(),
+        "compact wallet state stream should ignore note-tree-only changes"
+    );
+    assert_eq!(
+        client.state()?.state.compact_wallet_sync,
+        initial_state.state.compact_wallet_sync
+    );
+
+    let _ = shutdown_tx.send(());
+    server_task.await??;
+    net.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()> {
+    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "node-control-delta-passphrase");
+    network::set_quiet_logging(true);
+
+    let tempdir = TempDir::new()?;
+    let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
+    let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+    let wallet = Wallet::load_or_create_private(wallet_store)?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
+    let seeded_coins =
+        finality_support::seed_wallet_with_coin_values(db.as_ref(), &wallet, &genesis, &[11, 13])?;
+    let mut expected_coins = seeded_coins.clone();
+    expected_coins.sort_by(|a, b| a.id.cmp(&b.id));
+    transaction::ensure_shielded_runtime_state(db.as_ref())?;
+    let first_output = ShieldedOutput {
+        note_commitment: [0x11u8; 32],
+        kem_ct: [0x22u8; ML_KEM_768_CT_BYTES],
+        nonce: [0x33u8; 24],
+        view_tag: 7,
+        ciphertext: vec![0x44u8; 8],
+    };
+    let second_output = ShieldedOutput {
+        note_commitment: [0x55u8; 32],
+        kem_ct: [0x66u8; ML_KEM_768_CT_BYTES],
+        nonce: [0x77u8; 24],
+        view_tag: 9,
+        ciphertext: vec![0x88u8; 12],
+    };
+    db.store_shielded_output(&[0x01u8; 32], 0, &first_output)?;
+    db.store_shielded_output(&[0x02u8; 32], 1, &second_output)?;
+
+    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = node_control::NodeControlServer::bind(
+        &tempdir.path().to_string_lossy(),
+        db.clone(),
+        net.clone(),
+        sync_state,
+        false,
+    )
+    .await?;
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let client = node_control::NodeControlClient::new(&tempdir.path().to_string_lossy());
+    client.ping()?;
+    let head = client.compact_wallet_sync_head()?;
+    assert_eq!(head.chain_id, genesis.hash);
+    assert_eq!(head.committed_coin_count, 2);
+    assert_eq!(head.shielded_output_count, 2);
+
+    let first_delta = client.request_compact_wallet_sync_delta(0, 0, 1, 1)?;
+    assert_eq!(first_delta.head, head);
+    assert_eq!(first_delta.committed_coins.len(), 1);
+    assert_eq!(first_delta.committed_coins[0].scan_index, 0);
+    assert_eq!(first_delta.committed_coins[0].coin.id, expected_coins[0].id);
+    assert_eq!(
+        first_delta.committed_coins[0].coin.value,
+        expected_coins[0].value
+    );
+    assert_eq!(first_delta.shielded_outputs.len(), 1);
+    assert_eq!(first_delta.shielded_outputs[0].scan_index, 0);
+    assert_eq!(
+        first_delta.shielded_outputs[0].note_commitment,
+        first_output.note_commitment
+    );
+    assert_eq!(
+        first_delta.shielded_outputs[0].detection_tag,
+        first_output.view_tag
+    );
+
+    let second_delta = client.request_compact_wallet_sync_delta(1, 1, 4, 4)?;
+    assert_eq!(second_delta.head, head);
+    assert_eq!(second_delta.committed_coins.len(), 1);
+    assert_eq!(second_delta.committed_coins[0].scan_index, 1);
+    assert_eq!(
+        second_delta.committed_coins[0].coin.id,
+        expected_coins[1].id
+    );
+    assert_eq!(
+        second_delta.committed_coins[0].coin.value,
+        expected_coins[1].value
+    );
+    assert_eq!(second_delta.shielded_outputs.len(), 1);
+    assert_eq!(second_delta.shielded_outputs[0].scan_index, 1);
+    assert_eq!(
+        second_delta.shielded_outputs[0].note_commitment,
+        second_output.note_commitment
+    );
+    assert_eq!(
+        second_delta.shielded_outputs[0].detection_tag,
+        second_output.view_tag
+    );
+
+    let empty_delta = client.request_compact_wallet_sync_delta(2, 2, 4, 4)?;
+    assert_eq!(empty_delta.head, head);
+    assert!(empty_delta.committed_coins.is_empty());
+    assert!(empty_delta.shielded_outputs.is_empty());
 
     let _ = shutdown_tx.send(());
     server_task.await??;

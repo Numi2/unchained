@@ -237,6 +237,22 @@ pub fn ml_kem_768_generate() -> (MlKem768SecretKey, TaggedKemPublicKey) {
     )
 }
 
+pub fn ml_kem_768_generate_deterministic(
+    d: &[u8; 32],
+    z: &[u8; 32],
+) -> (MlKem768SecretKey, TaggedKemPublicKey) {
+    let d_seed: B32 = (*d).into();
+    let z_seed: B32 = (*z).into();
+    let (secret_key, public_key) = MlKem768::generate_deterministic(&d_seed, &z_seed);
+    let encoded = public_key.as_bytes();
+    let mut public_key_bytes = [0u8; ML_KEM_768_PK_BYTES];
+    public_key_bytes.copy_from_slice(encoded.as_slice());
+    (
+        secret_key,
+        TaggedKemPublicKey::from_ml_kem_768_array(public_key_bytes),
+    )
+}
+
 pub fn ml_kem_768_secret_key_to_bytes(sk: &MlKem768SecretKey) -> [u8; ML_KEM_768_SK_BYTES] {
     let encoded = sk.as_bytes();
     let mut out = [0u8; ML_KEM_768_SK_BYTES];

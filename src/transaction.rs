@@ -1,7 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use aws_lc_rs::signature::UnparsedPublicKey;
-use aws_lc_rs::unstable::signature::ML_DSA_65;
-use methods::CHECKPOINT_ACCUMULATOR_METHOD_ID;
+use aws_lc_rs::unstable::signature::{PqdsaKeyPair, ML_DSA_65};
 use proof_core::{ProofShieldedInputBinding, ProofShieldedOutputBinding};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
@@ -57,7 +56,7 @@ pub struct OrdinaryPrivateTransfer {
     pub nullifiers: Vec<[u8; 32]>,
     pub outputs: Vec<ShieldedOutput>,
     pub fee_amount: u64,
-    pub proof: Vec<u8>,
+    pub proof: proof::TransparentProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +124,13 @@ pub struct SharedStateTx {
     pub action: SharedStateAction,
     pub fee_payment: Option<OrdinaryPrivateTransfer>,
     pub authorization: SharedStateAuthorization,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedStateControlDocument {
+    pub chain_id: [u8; 32],
+    pub action: SharedStateAction,
+    pub authorization_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,9 +354,8 @@ impl SharedStateBatch {
                         }
                         SharedStateAction::PrivateDelegation(delegation) => {
                             committee_state_changed = true;
-                            let journal = proof::verify_private_delegation_receipt_bytes(
-                                &delegation.transfer.proof,
-                            )?;
+                            let journal =
+                                proof::verify_private_delegation_proof(&delegation.transfer.proof)?;
                             let pool = pool_overlay
                                 .get(&delegation.validator_id.0)
                                 .cloned()
@@ -376,7 +381,7 @@ impl SharedStateBatch {
                         }
                         SharedStateAction::PrivateUndelegation(undelegation) => {
                             committee_state_changed = true;
-                            let journal = proof::verify_private_undelegation_receipt_bytes(
+                            let journal = proof::verify_private_undelegation_proof(
                                 &undelegation.transfer.proof,
                             )?;
                             let pool = pool_overlay
@@ -550,7 +555,7 @@ impl FastPathBatch {
             match tx {
                 Tx::OrdinaryPrivateTransfer(transfer) => {
                     tx.validate(db)?;
-                    let journal = proof::verify_shielded_receipt_bytes(&transfer.proof)?;
+                    let journal = proof::verify_shielded_proof(&transfer.proof)?;
                     if journal.inputs.len() != transfer.nullifiers.len() {
                         bail!("fast-path transaction proof input count mismatch");
                     }
@@ -706,7 +711,7 @@ impl Tx {
         nullifiers: Vec<[u8; 32]>,
         outputs: Vec<ShieldedOutput>,
         fee_amount: u64,
-        proof: Vec<u8>,
+        proof: proof::TransparentProof,
     ) -> Self {
         Self::OrdinaryPrivateTransfer(OrdinaryPrivateTransfer {
             nullifiers,
@@ -775,9 +780,8 @@ impl Tx {
             .unwrap_or(&[])
     }
 
-    pub fn proof(&self) -> Option<&[u8]> {
-        self.shielded_transfer()
-            .map(|transfer| transfer.proof.as_slice())
+    pub fn proof(&self) -> Option<&proof::TransparentProof> {
+        self.shielded_transfer().map(|transfer| &transfer.proof)
     }
 
     pub fn fee_amount(&self) -> u64 {
@@ -915,7 +919,7 @@ impl Tx {
         }
         active.validate()?;
 
-        let journal = proof::verify_shielded_receipt_bytes(&transfer.proof)?;
+        let journal = proof::verify_shielded_proof(&transfer.proof)?;
         if journal.chain_id != chain_id {
             bail!("shielded receipt chain id mismatch");
         }
@@ -1058,8 +1062,7 @@ impl Tx {
                 }
                 active.validate()?;
 
-                let journal =
-                    proof::verify_private_delegation_receipt_bytes(&delegation.transfer.proof)?;
+                let journal = proof::verify_private_delegation_proof(&delegation.transfer.proof)?;
                 if journal.chain_id != chain_id {
                     bail!("private delegation receipt chain id mismatch");
                 }
@@ -1125,7 +1128,7 @@ impl Tx {
                 active.validate()?;
 
                 let journal =
-                    proof::verify_private_undelegation_receipt_bytes(&undelegation.transfer.proof)?;
+                    proof::verify_private_undelegation_proof(&undelegation.transfer.proof)?;
                 if journal.chain_id != chain_id {
                     bail!("private undelegation receipt chain id mismatch");
                 }
@@ -1185,7 +1188,7 @@ impl Tx {
                 }
                 active.validate()?;
 
-                let journal = proof::verify_unbonding_claim_receipt_bytes(&claim.transfer.proof)?;
+                let journal = proof::verify_unbonding_claim_proof(&claim.transfer.proof)?;
                 if journal.chain_id != chain_id {
                     bail!("unbonding claim receipt chain id mismatch");
                 }
@@ -1294,8 +1297,7 @@ impl Tx {
             }
             SharedStateAction::PrivateDelegation(delegation) => {
                 committee_state_changed = true;
-                let journal =
-                    proof::verify_private_delegation_receipt_bytes(&delegation.transfer.proof)?;
+                let journal = proof::verify_private_delegation_proof(&delegation.transfer.proof)?;
                 let pool = db
                     .load_validator_pool(&delegation.validator_id)?
                     .ok_or_else(|| anyhow!("validator pool not found"))?;
@@ -1312,7 +1314,7 @@ impl Tx {
             SharedStateAction::PrivateUndelegation(undelegation) => {
                 committee_state_changed = true;
                 let journal =
-                    proof::verify_private_undelegation_receipt_bytes(&undelegation.transfer.proof)?;
+                    proof::verify_private_undelegation_proof(&undelegation.transfer.proof)?;
                 let pool = db
                     .load_validator_pool(&undelegation.validator_id)?
                     .ok_or_else(|| anyhow!("validator pool not found"))?;
@@ -1380,6 +1382,53 @@ impl Tx {
     }
 }
 
+impl SharedStateControlDocument {
+    pub fn new(
+        chain_id: [u8; 32],
+        action: SharedStateAction,
+        authorization_signature: Vec<u8>,
+    ) -> Self {
+        Self {
+            chain_id,
+            action,
+            authorization_signature,
+        }
+    }
+
+    pub fn required_fee_amount(&self) -> u64 {
+        shared_state_action_fee_amount(&self.action)
+    }
+
+    pub fn requires_fee_payment(&self) -> bool {
+        shared_state_action_requires_fee_payment(&self.action)
+    }
+
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        Tx::shared_state_signing_bytes(self.chain_id, &self.action)
+    }
+
+    pub fn sign(self, keypair: &PqdsaKeyPair) -> Result<Self> {
+        let signature = crate::crypto::ml_dsa_65_sign(keypair, &self.signing_bytes()?)?;
+        Ok(Self {
+            authorization_signature: signature,
+            ..self
+        })
+    }
+
+    pub fn into_tx_with_fee_payment(self, fee_payment: OrdinaryPrivateTransfer) -> Result<Tx> {
+        if !self.requires_fee_payment() {
+            bail!(
+                "shared-state actions with embedded shielded transfers must not be wrapped as fee-paid control documents"
+            );
+        }
+        Ok(Tx::new_shared_state_with_fee_payment(
+            self.action,
+            self.authorization_signature,
+            Some(fee_payment),
+        ))
+    }
+}
+
 fn validate_transfer_against_journal(
     transfer: &OrdinaryPrivateTransfer,
     current_epoch: u64,
@@ -1389,6 +1438,8 @@ fn validate_transfer_against_journal(
     input_bindings: &[ProofShieldedInputBinding],
     output_bindings: &[ProofShieldedOutputBinding],
 ) -> Result<()> {
+    let empty_historical_digest =
+        proof_core::checkpoint_accumulator_historical_digest_from_pairs(&[]);
     if input_bindings.len() != transfer.nullifiers.len() {
         bail!("shielded receipt input count mismatch");
     }
@@ -1410,21 +1461,32 @@ fn validate_transfer_against_journal(
         if current_epoch > 0 && binding.historical_through_epoch != current_epoch - 1 {
             bail!("historical range does not end at the prior epoch");
         }
-        if binding.historical_from_epoch <= binding.historical_through_epoch
-            && binding.historical_accumulator_image_id != CHECKPOINT_ACCUMULATOR_METHOD_ID
+        let epoch_zero_empty_history = current_epoch == 0
+            && binding.historical_from_epoch == 0
+            && binding.historical_through_epoch == 0
+            && binding.historical_accumulator_image_id == [0u32; 8]
+            && binding.historical_root_digest == empty_historical_digest;
+        let references_historical_accumulator = !epoch_zero_empty_history
+            && binding.historical_from_epoch <= binding.historical_through_epoch;
+        if references_historical_accumulator
+            && binding.historical_accumulator_image_id != proof::checkpoint_accumulator_image_id()
         {
             bail!("historical accumulator method mismatch");
         }
-        if binding.historical_from_epoch > binding.historical_through_epoch
+        if !references_historical_accumulator
             && binding.historical_accumulator_image_id != [0u32; 8]
         {
             bail!("empty historical range must not reference an accumulator method");
         }
-        let expected_digest = historical_root_digest_for_range(
-            ledger,
-            binding.historical_from_epoch,
-            binding.historical_through_epoch,
-        )?;
+        let expected_digest = if epoch_zero_empty_history {
+            empty_historical_digest
+        } else {
+            historical_root_digest_for_range(
+                ledger,
+                binding.historical_from_epoch,
+                binding.historical_through_epoch,
+            )?
+        };
         if expected_digest != binding.historical_root_digest {
             bail!("historical nullifier root digest mismatch");
         }
@@ -1762,9 +1824,14 @@ mod tests {
     use super::*;
     use crate::{
         consensus::{Validator, ValidatorKeys},
-        crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki},
+        crypto::{ml_dsa_65_generate, ml_dsa_65_public_key, ml_dsa_65_public_key_spki},
+        proof::{TransparentProof, TransparentProofStatement},
         staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
     };
+
+    fn dummy_proof(statement: TransparentProofStatement, bytes: &[u8]) -> TransparentProof {
+        TransparentProof::new(statement, bytes.to_vec())
+    }
 
     fn registration_action() -> SharedStateAction {
         let hot_key = ml_dsa_65_generate().unwrap();
@@ -1808,7 +1875,7 @@ mod tests {
             vec![[nullifier_seed; 32]],
             vec![shielded_output(output_seed)],
             ordinary_private_transfer_fee_amount(),
-            vec![proof_seed],
+            dummy_proof(TransparentProofStatement::ShieldedTransfer, &[proof_seed]),
         )
     }
 
@@ -1817,7 +1884,10 @@ mod tests {
             nullifiers: vec![[seed; 32]],
             outputs: vec![shielded_output(seed.wrapping_add(1))],
             fee_amount: PROTOCOL.validator_registration_fee,
-            proof: vec![seed.wrapping_add(2)],
+            proof: dummy_proof(
+                TransparentProofStatement::ShieldedTransfer,
+                &[seed.wrapping_add(2)],
+            ),
         }
     }
 
@@ -1827,7 +1897,7 @@ mod tests {
             vec![[1u8; 32]],
             Vec::new(),
             ordinary_private_transfer_fee_amount(),
-            vec![7u8; 4],
+            dummy_proof(TransparentProofStatement::ShieldedTransfer, &[7u8; 4]),
         );
         assert_eq!(tx.class(), TransactionClass::OrdinaryPrivateTransfer);
         assert!(tx.is_fast_path_eligible());
@@ -1846,7 +1916,7 @@ mod tests {
             vec![[3u8; 32]],
             Vec::new(),
             ordinary_private_transfer_fee_amount(),
-            vec![1, 2, 3, 4],
+            dummy_proof(TransparentProofStatement::ShieldedTransfer, &[1, 2, 3, 4]),
         );
         let encoded = crate::canonical::encode_tx(&tx).unwrap();
         let decoded = crate::canonical::decode_tx(&encoded).unwrap();
@@ -1877,7 +1947,7 @@ mod tests {
                 ciphertext: vec![1, 2, 3],
             }],
             fee_amount: PROTOCOL.private_delegation_fee,
-            proof: vec![4, 5, 6],
+            proof: dummy_proof(TransparentProofStatement::PrivateDelegation, &[4, 5, 6]),
         };
         let tx = Tx::new_shared_state(
             SharedStateAction::PrivateDelegation(PrivateDelegation {
@@ -1890,7 +1960,7 @@ mod tests {
         assert_eq!(tx.nullifiers(), transfer.nullifiers.as_slice());
         assert_eq!(tx.outputs(), transfer.outputs.as_slice());
         assert_eq!(tx.fee_amount(), transfer.fee_amount);
-        assert_eq!(tx.proof(), Some(transfer.proof.as_slice()));
+        assert_eq!(tx.proof(), Some(&transfer.proof));
         assert_eq!(tx.input_count(), 1);
         assert_eq!(tx.output_count(), 1);
     }
@@ -1907,7 +1977,74 @@ mod tests {
         assert_eq!(tx.nullifiers(), fee_payment.nullifiers.as_slice());
         assert_eq!(tx.outputs(), fee_payment.outputs.as_slice());
         assert_eq!(tx.fee_amount(), fee_payment.fee_amount);
-        assert_eq!(tx.proof(), Some(fee_payment.proof.as_slice()));
+        assert_eq!(tx.proof(), Some(&fee_payment.proof));
+    }
+
+    #[test]
+    fn shared_state_control_document_signs_registration_with_cold_key() {
+        let hot_key = ml_dsa_65_generate().unwrap();
+        let cold_key = ml_dsa_65_generate().unwrap();
+        let action = SharedStateAction::RegisterValidator(ValidatorRegistration {
+            pool: ValidatorPool::new(
+                Validator::new(
+                    11,
+                    ValidatorKeys {
+                        hot_ml_dsa_65_spki: ml_dsa_65_public_key_spki(&hot_key).unwrap(),
+                        cold_governance_key: ml_dsa_65_public_key_spki(&cold_key).unwrap(),
+                    },
+                )
+                .unwrap(),
+                [5u8; 32],
+                100,
+                11,
+                4,
+                ValidatorStatus::PendingActivation,
+                ValidatorMetadata {
+                    display_name: "validator".to_string(),
+                    website: None,
+                    description: None,
+                },
+            )
+            .unwrap(),
+        });
+        let document = SharedStateControlDocument::new([9u8; 32], action.clone(), Vec::new())
+            .sign(&cold_key)
+            .unwrap();
+        let signing_bytes = document.signing_bytes().unwrap();
+        let cold_pk = ml_dsa_65_public_key(&cold_key);
+        cold_pk
+            .verify(&signing_bytes, &document.authorization_signature)
+            .unwrap();
+
+        let fee_payment = control_fee_payment(73);
+        let tx = document
+            .into_tx_with_fee_payment(fee_payment.clone())
+            .unwrap();
+        let shared = tx.shared_state().expect("shared-state tx");
+        assert_eq!(shared.action, action);
+        assert_eq!(shared.fee_payment.as_ref(), Some(&fee_payment));
+    }
+
+    #[test]
+    fn shared_state_control_document_rejects_signing_penalty_evidence() {
+        let key = ml_dsa_65_generate().unwrap();
+        let evidence = SlashableEvidence::Liveness(crate::evidence::LivenessFaultProof {
+            validator: ValidatorId([4u8; 32]),
+            position: crate::consensus::ConsensusPosition { epoch: 3, slot: 8 },
+            ordering_path: crate::consensus::OrderingPath::DagBftSharedState,
+            anchor_hash: [7u8; 32],
+            kind: crate::evidence::LivenessFaultKind::MissedVote,
+        });
+        let err = SharedStateControlDocument::new(
+            [1u8; 32],
+            SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission { evidence }),
+            Vec::new(),
+        )
+        .sign(&key)
+        .expect_err("penalty evidence must not accept governance signing");
+        assert!(err
+            .to_string()
+            .contains("not authorized by governance signatures"));
     }
 
     #[test]
@@ -1964,5 +2101,35 @@ mod tests {
         assert_eq!(aggregate_ids.len(), 2);
         assert_eq!(aggregate_ids[0], ordinary_a.id().expect("ordinary tx id"));
         assert_eq!(aggregate_ids[1], shared.id().expect("shared-state tx id"));
+    }
+
+    #[test]
+    fn epoch_zero_empty_history_encoding_is_accepted() {
+        let transfer = OrdinaryPrivateTransfer {
+            nullifiers: vec![[9u8; 32]],
+            outputs: vec![shielded_output(41)],
+            fee_amount: ordinary_private_transfer_fee_amount(),
+            proof: dummy_proof(TransparentProofStatement::ShieldedTransfer, &[7u8; 4]),
+        };
+        let input_bindings = vec![ProofShieldedInputBinding {
+            current_nullifier: transfer.nullifiers[0],
+            historical_from_epoch: 0,
+            historical_through_epoch: 0,
+            historical_root_digest: proof_core::checkpoint_accumulator_historical_digest_from_pairs(
+                &[],
+            ),
+            historical_accumulator_image_id: [0u32; 8],
+        }];
+        let output_bindings = vec![proof::output_binding(&transfer.outputs[0])];
+        validate_transfer_against_journal(
+            &transfer,
+            0,
+            &NoteCommitmentTree::default(),
+            &NullifierRootLedger::default(),
+            &ActiveNullifierEpoch::new(0),
+            &input_bindings,
+            &output_bindings,
+        )
+        .expect("epoch-zero empty history encoding must remain valid");
     }
 }

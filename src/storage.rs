@@ -586,6 +586,52 @@ impl Store {
         Ok(committed)
     }
 
+    pub fn count_committed_coins(&self) -> Result<u64> {
+        let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
+            return Ok(0);
+        };
+        let mut total = 0u64;
+        for epoch_num in 0..=latest.num {
+            total = total
+                .saturating_add(self.get_coin_ids_for_epoch_committed(epoch_num)?.len() as u64);
+        }
+        Ok(total)
+    }
+
+    pub fn load_committed_coin_slice(
+        &self,
+        start_index: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, crate::coin::Coin)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
+            return Ok(Vec::new());
+        };
+        let mut next_index = 0u64;
+        let mut committed = Vec::with_capacity(limit);
+        for epoch_num in 0..=latest.num {
+            let mut coin_ids = self.get_coin_ids_for_epoch_committed(epoch_num)?;
+            coin_ids.sort();
+            for coin_id in coin_ids {
+                if next_index < start_index {
+                    next_index = next_index.saturating_add(1);
+                    continue;
+                }
+                let coin = self
+                    .get::<crate::coin::Coin>("coin", &coin_id)?
+                    .ok_or_else(|| anyhow!("missing committed coin {}", hex::encode(coin_id)))?;
+                committed.push((epoch_num, coin));
+                next_index = next_index.saturating_add(1);
+                if committed.len() >= limit {
+                    return Ok(committed);
+                }
+            }
+        }
+        Ok(committed)
+    }
+
     /// Iterates over all coin candidates in the database
     pub fn iterate_coin_candidates(&self) -> Result<Vec<crate::coin::CoinCandidate>> {
         let cf = self
@@ -1456,6 +1502,22 @@ impl Store {
         }
     }
 
+    pub fn iterate_shielded_nullifier_epochs(
+        &self,
+    ) -> Result<Vec<crate::shielded::ArchivedNullifierEpoch>> {
+        let cf = self
+            .db
+            .cf_handle("shielded_nullifier_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut archived = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            archived.push(crate::canonical::decode_archived_nullifier_epoch(&value)?);
+        }
+        Ok(archived)
+    }
+
     pub fn store_shielded_root_ledger(
         &self,
         ledger: &crate::shielded::NullifierRootLedger,
@@ -1736,6 +1798,53 @@ impl Store {
             index_bytes.copy_from_slice(&key[32..]);
             let output = bincode::deserialize::<crate::transaction::ShieldedOutput>(&value)?;
             outputs.push((tx_id, u32::from_le_bytes(index_bytes), output));
+        }
+        Ok(outputs)
+    }
+
+    pub fn count_shielded_outputs(&self) -> Result<u64> {
+        let cf = self
+            .db
+            .cf_handle("shielded_output")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_output' column family missing"))?;
+        Ok(self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .count() as u64)
+    }
+
+    pub fn load_shielded_output_slice(
+        &self,
+        start_index: u64,
+        limit: usize,
+    ) -> Result<Vec<([u8; 32], u32, crate::transaction::ShieldedOutput)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cf = self
+            .db
+            .cf_handle("shielded_output")
+            .ok_or_else(|| anyhow::anyhow!("'shielded_output' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut outputs = Vec::with_capacity(limit);
+        for (position, item) in iter.enumerate() {
+            let position = position as u64;
+            if position < start_index {
+                continue;
+            }
+            let (key, value) = item?;
+            if key.len() != 36 {
+                continue;
+            }
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&key[..32]);
+            let mut index_bytes = [0u8; 4];
+            index_bytes.copy_from_slice(&key[32..]);
+            let output = bincode::deserialize::<crate::transaction::ShieldedOutput>(&value)?;
+            outputs.push((tx_id, u32::from_le_bytes(index_bytes), output));
+            if outputs.len() >= limit {
+                break;
+            }
         }
         Ok(outputs)
     }

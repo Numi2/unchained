@@ -69,6 +69,7 @@ hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, feat
 hickory-proto = "=0.25.0-alpha.4"
 hickory-client = "=0.25.0-alpha.4"
 zeroize = "1.8.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 # liboqs removed; no runtime oqs dependency
 
 [features]

@@ -41,6 +41,8 @@ It is **not** built to be:
   owned-note transfers**
 - settlement state is a **shielded note/object ledger**
 - staking is **public-validator / private-delegator**
+- locator discovery is **stateless single-server PIR** over fixed-size
+  authenticated directory records
 - transport is **hybrid `X25519MLKEM768`**
 - online validator signatures are **`ML-DSA`**
 - cold recovery and emergency governance keys are **`SLH-DSA`**
@@ -330,20 +332,83 @@ Its only job is to let wallets find the recipient's private discovery record.
 
 Wallets resolve locators through private discovery.
 
-Requirements:
+Canonical requirements:
 
+- day-one discovery is a **stateless single-server PIR** subsystem
+- no non-colluding-server assumption in the base design
+- no per-client offline preprocessing
+- no per-client server-side stored query state
 - constant-size queries
 - constant-size responses
-- PIR or equivalent private-discovery protection
 - fixed-size directory records
+- signed snapshot manifests plus authenticated fixed-size row proofs
+- no cleartext locator lookup API beside the PIR interface
 
 The privacy model is:
 
 - the directory may know a locator exists
 - the directory should not learn which locator a given sender looked up
+- mirrors, CDNs, and relays should see only PIR-shaped traffic, not cleartext
+  locator lookups
 
 Hashed low-entropy identifiers are not a privacy primitive and are not a valid
 substitute for private discovery.
+
+The canonical implementation target is a **low-communication stateless PIR**
+design in the WhisPIR class. That is the right trade for Unchained because
+discovery clients are ephemeral, discovery records are small, and the
+directory changes frequently. Unchained should not take a non-colluding-server
+or offline-preprocessing dependency for basic wallet addressability.
+
+### PIR-Native Discovery Records
+
+Discovery records must be designed for PIR from the start rather than wrapped
+around a cleartext directory later.
+
+A canonical discovery record should include:
+
+- record version and chain scope
+- locator commitment and slot-disambiguation material
+- mailbox transport suite and routing descriptor set
+- mailbox encryption or bootstrap key material
+- handle-request authentication bootstrap material
+- creation epoch, expiry, and rotation metadata
+- wallet signature and directory/operator attestation
+- reserved extension space and deterministic padding
+
+Hard rules:
+
+- a discovery record must not contain a reusable payment key
+- a discovery record must not expose a wallet-global outward identity
+- record encoding must be fixed-size at the wire layer
+- record encoding must not leak wallet class or merchant/user role through
+  variable-length fields
+
+### PIR Query Shape
+
+The discovery directory publishes a signed manifest that commits to:
+
+- dataset ID and snapshot epoch
+- row count and row size
+- locator-to-slot placement parameters and salts
+- PIR parameter set
+- authenticated row-commitment root
+- validity interval and operator signature
+
+Clients then:
+
+1. fetch the latest signed manifest
+2. derive a small fixed candidate-slot set from the `LocatorID`
+3. issue PIR queries for all candidate slots
+4. receive fixed-size rows plus fixed-size authentication proofs
+5. verify the manifest, row proofs, and record signatures locally
+6. decrypt and use the mailbox bootstrap material to request a one-time
+   `RecipientHandle`
+
+Locator placement must therefore be **PIR-native**: clients derive the small
+fixed candidate set from public manifest parameters, and collision handling
+happens inside the PIR response path. There is no cleartext “miss then retry by
+name” fallback.
 
 ### Handle Negotiation
 
@@ -491,6 +556,10 @@ The canonical model is:
 - note commitments
 - nullifiers
 - fuzzy message detection or equivalent compact wallet-side discovery tags
+
+PIR is for **locator discovery** in the addressability layer, not for ordinary
+wallet output detection. Receive-side note ownership detection remains compact
+scan plus wallet-local trial decryption.
 
 This gives Unchained the mobile-wallet property it needs:
 

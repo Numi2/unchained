@@ -5,6 +5,7 @@ use methods::{
     PRIVATE_UNDELEGATION_METHOD_ID, SHIELDED_SPEND_METHOD_ELF, SHIELDED_SPEND_METHOD_ID,
     UNBONDING_CLAIM_METHOD_ELF, UNBONDING_CLAIM_METHOD_ID,
 };
+use once_cell::sync::Lazy;
 use proof_core::{
     CheckpointAccumulatorJournal, CheckpointAccumulatorStepWitness,
     HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
@@ -23,6 +24,7 @@ use proof_core::{
 };
 use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, Receipt};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
 
 use crate::{
     crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
@@ -35,10 +37,261 @@ use crate::{
     transaction::{ShieldedOutput, ShieldedOutputPlaintext},
 };
 
+const TRANSPARENT_PROOF_VERSION: u8 = 1;
+pub const MIN_TRANSPARENT_PROOF_SECURITY_BITS: u16 = 128;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransparentProofStatement {
+    ShieldedTransfer,
+    PrivateDelegation,
+    PrivateUndelegation,
+    UnbondingClaim,
+    CheckpointAccumulator,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransparentProofFamily {
+    Stark,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransparentCircuit {
+    OrdinaryTransferV1,
+    PrivateDelegationV1,
+    PrivateUndelegationV1,
+    UnbondingClaimV1,
+    CheckpointAccumulatorV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransparentCircuitDescriptor {
+    pub circuit: TransparentCircuit,
+    pub statement: TransparentProofStatement,
+    pub proof_family: TransparentProofFamily,
+    pub target_security_bits: u16,
+    pub public_input_shape: &'static str,
+    pub name: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransparentProof {
+    pub version: u8,
+    pub statement: TransparentProofStatement,
+    pub circuit: TransparentCircuit,
+    pub seal: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAccumulatorProof {
     pub journal: CheckpointAccumulatorJournal,
-    pub receipt: Vec<u8>,
+    pub proof: TransparentProof,
+}
+
+const PROOF_FIXTURE_DIR_ENV: &str = "UNCHAINED_PROOF_FIXTURE_DIR";
+
+static VERIFIED_SHIELDED_RECEIPTS: Lazy<Mutex<HashMap<[u8; 32], ProofShieldedTxJournal>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static VERIFIED_PRIVATE_DELEGATION_RECEIPTS: Lazy<
+    Mutex<HashMap<[u8; 32], ProofPrivateDelegationJournal>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+static VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS: Lazy<
+    Mutex<HashMap<[u8; 32], ProofPrivateUndelegationJournal>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+struct PrototypeCircuitBinding {
+    method_id: [u32; 8],
+    elf: &'static [u8],
+}
+
+fn receipt_cache_key(bytes: &[u8]) -> [u8; 32] {
+    crate::crypto::blake3_hash(bytes)
+}
+
+fn prototype_circuit_binding(circuit: TransparentCircuit) -> PrototypeCircuitBinding {
+    match circuit {
+        TransparentCircuit::OrdinaryTransferV1 => PrototypeCircuitBinding {
+            method_id: SHIELDED_SPEND_METHOD_ID,
+            elf: SHIELDED_SPEND_METHOD_ELF,
+        },
+        TransparentCircuit::PrivateDelegationV1 => PrototypeCircuitBinding {
+            method_id: PRIVATE_DELEGATION_METHOD_ID,
+            elf: PRIVATE_DELEGATION_METHOD_ELF,
+        },
+        TransparentCircuit::PrivateUndelegationV1 => PrototypeCircuitBinding {
+            method_id: PRIVATE_UNDELEGATION_METHOD_ID,
+            elf: PRIVATE_UNDELEGATION_METHOD_ELF,
+        },
+        TransparentCircuit::UnbondingClaimV1 => PrototypeCircuitBinding {
+            method_id: UNBONDING_CLAIM_METHOD_ID,
+            elf: UNBONDING_CLAIM_METHOD_ELF,
+        },
+        TransparentCircuit::CheckpointAccumulatorV1 => PrototypeCircuitBinding {
+            method_id: CHECKPOINT_ACCUMULATOR_METHOD_ID,
+            elf: CHECKPOINT_ACCUMULATOR_METHOD_ELF,
+        },
+    }
+}
+
+impl TransparentProof {
+    pub fn new(statement: TransparentProofStatement, seal: Vec<u8>) -> Self {
+        let circuit = canonical_circuit_for_statement(statement);
+        Self {
+            version: TRANSPARENT_PROOF_VERSION,
+            statement,
+            circuit,
+            seal,
+        }
+    }
+
+    pub fn new_for_circuit(circuit: TransparentCircuit, seal: Vec<u8>) -> Self {
+        Self {
+            version: TRANSPARENT_PROOF_VERSION,
+            statement: transparent_circuit_descriptor(circuit).statement,
+            circuit,
+            seal,
+        }
+    }
+
+    pub fn descriptor(&self) -> TransparentCircuitDescriptor {
+        transparent_circuit_descriptor(self.circuit)
+    }
+
+    pub fn validate_metadata(&self) -> Result<()> {
+        if self.version != TRANSPARENT_PROOF_VERSION {
+            bail!("unsupported transparent proof version {}", self.version);
+        }
+        let descriptor = self.descriptor();
+        if descriptor.statement != self.statement {
+            bail!(
+                "transparent proof circuit {:?} does not match statement {:?}",
+                self.circuit,
+                self.statement
+            );
+        }
+        if descriptor.target_security_bits < MIN_TRANSPARENT_PROOF_SECURITY_BITS {
+            bail!(
+                "transparent proof circuit {:?} violates minimum security budget",
+                self.circuit
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn transparent_circuit_inventory() -> &'static [TransparentCircuit] {
+    const INVENTORY: &[TransparentCircuit] = &[
+        TransparentCircuit::OrdinaryTransferV1,
+        TransparentCircuit::PrivateDelegationV1,
+        TransparentCircuit::PrivateUndelegationV1,
+        TransparentCircuit::UnbondingClaimV1,
+        TransparentCircuit::CheckpointAccumulatorV1,
+    ];
+    INVENTORY
+}
+
+pub fn transparent_circuit_descriptor(circuit: TransparentCircuit) -> TransparentCircuitDescriptor {
+    match circuit {
+        TransparentCircuit::OrdinaryTransferV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::ShieldedTransfer,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "shielded-transfer-journal-v1",
+            name: "ordinary-transfer-v1",
+        },
+        TransparentCircuit::PrivateDelegationV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::PrivateDelegation,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "private-delegation-journal-v1",
+            name: "private-delegation-v1",
+        },
+        TransparentCircuit::PrivateUndelegationV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::PrivateUndelegation,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "private-undelegation-journal-v1",
+            name: "private-undelegation-v1",
+        },
+        TransparentCircuit::UnbondingClaimV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::UnbondingClaim,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "unbonding-claim-journal-v1",
+            name: "unbonding-claim-v1",
+        },
+        TransparentCircuit::CheckpointAccumulatorV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::CheckpointAccumulator,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "checkpoint-accumulator-journal-v1",
+            name: "checkpoint-accumulator-v1",
+        },
+    }
+}
+
+pub fn canonical_circuit_for_statement(statement: TransparentProofStatement) -> TransparentCircuit {
+    match statement {
+        TransparentProofStatement::ShieldedTransfer => TransparentCircuit::OrdinaryTransferV1,
+        TransparentProofStatement::PrivateDelegation => TransparentCircuit::PrivateDelegationV1,
+        TransparentProofStatement::PrivateUndelegation => TransparentCircuit::PrivateUndelegationV1,
+        TransparentProofStatement::UnbondingClaim => TransparentCircuit::UnbondingClaimV1,
+        TransparentProofStatement::CheckpointAccumulator => {
+            TransparentCircuit::CheckpointAccumulatorV1
+        }
+    }
+}
+
+fn proof_fixture_dir() -> Option<PathBuf> {
+    std::env::var_os(PROOF_FIXTURE_DIR_ENV).map(PathBuf::from)
+}
+
+fn shielded_receipt_fixture_path(id: &[u8; 32]) -> Option<PathBuf> {
+    proof_fixture_dir().map(|dir| {
+        dir.join("shielded-spend")
+            .join(format!("{}.bin", hex::encode(id)))
+    })
+}
+
+fn load_cached_shielded_proof_seal(id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    let Some(path) = shielded_receipt_fixture_path(id) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read(&path).with_context(|| {
+        format!("read cached shielded receipt fixture {}", path.display())
+    })?))
+}
+
+fn store_cached_shielded_proof_seal(id: &[u8; 32], bytes: &[u8]) -> Result<()> {
+    let Some(path) = shielded_receipt_fixture_path(id) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create cached shielded receipt fixture directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    if path.exists() {
+        return Ok(());
+    }
+    fs::write(&path, bytes)
+        .with_context(|| format!("write cached shielded receipt fixture {}", path.display()))
+}
+
+pub fn shielded_tx_fixture_id(witness: &ProofShieldedTxWitness) -> Result<[u8; 32]> {
+    Ok(crate::crypto::blake3_hash(
+        &bincode::serialize(witness).context("serialize shielded witness for fixture id")?,
+    ))
 }
 
 fn verify_supported_receipt_kind(
@@ -58,7 +311,15 @@ fn verify_supported_receipt_kind(
 
 pub fn prove_shielded_tx(
     witness: &ProofShieldedTxWitness,
-) -> Result<(Receipt, ProofShieldedTxJournal)> {
+) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
+    let circuit = TransparentCircuit::OrdinaryTransferV1;
+    let binding = prototype_circuit_binding(circuit);
+    let fixture_id = shielded_tx_fixture_id(witness)?;
+    if let Some(seal) = load_cached_shielded_proof_seal(&fixture_id)? {
+        let proof = TransparentProof::new_for_circuit(circuit, seal);
+        let journal = verify_shielded_proof(&proof)?;
+        return Ok((proof, journal));
+    }
     let mut builder = ExecutorEnv::builder();
     for input in &witness.inputs {
         match (
@@ -66,7 +327,7 @@ pub fn prove_shielded_tx(
             input.historical_accumulator_receipt.as_ref(),
         ) {
             (Some(accumulator), Some(bytes)) => {
-                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                let journal = verify_checkpoint_accumulator_seal_bytes(bytes)?;
                 if &journal != accumulator {
                     bail!("historical accumulator witness does not match its receipt");
                 }
@@ -83,29 +344,57 @@ pub fn prove_shielded_tx(
         .build()
         .context("build zkVM executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, SHIELDED_SPEND_METHOD_ELF, &ProverOpts::fast())
+        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
         .context("prove shielded transaction witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "shielded spend receipt", true)?;
     receipt
-        .verify(SHIELDED_SPEND_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify locally generated shielded receipt")?;
     let journal = decode_shielded_tx_journal(&receipt)?;
-    Ok((receipt, journal))
+    let proof = TransparentProof::new_for_circuit(circuit, receipt_to_seal_bytes(&receipt)?);
+    store_cached_shielded_proof_seal(&fixture_id, &proof.seal)?;
+    Ok((proof, journal))
 }
 
-pub fn verify_shielded_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
+pub fn verify_shielded_proof(proof: &TransparentProof) -> Result<ProofShieldedTxJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::ShieldedTransfer,
+        "shielded proof",
+    )?;
+    verify_shielded_seal_bytes(&proof.seal)
+}
+
+fn verify_shielded_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
+    let binding = prototype_circuit_binding(TransparentCircuit::OrdinaryTransferV1);
+    let cache_key = receipt_cache_key(bytes);
+    if let Some(journal) = VERIFIED_SHIELDED_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(journal);
+    }
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "shielded receipt", true)?;
     receipt
-        .verify(SHIELDED_SPEND_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify shielded receipt")?;
-    decode_shielded_tx_journal(&receipt)
+    let journal = decode_shielded_tx_journal(&receipt)?;
+    VERIFIED_SHIELDED_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, journal.clone());
+    Ok(journal)
 }
 
 pub fn prove_private_delegation(
     witness: &ProofPrivateDelegationWitness,
-) -> Result<(Receipt, ProofPrivateDelegationJournal)> {
+) -> Result<(TransparentProof, ProofPrivateDelegationJournal)> {
+    let circuit = TransparentCircuit::PrivateDelegationV1;
+    let binding = prototype_circuit_binding(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -113,7 +402,7 @@ pub fn prove_private_delegation(
             input.historical_accumulator_receipt.as_ref(),
         ) {
             (Some(accumulator), Some(bytes)) => {
-                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                let journal = verify_checkpoint_accumulator_seal_bytes(bytes)?;
                 if &journal != accumulator {
                     bail!("historical accumulator witness does not match its receipt");
                 }
@@ -130,31 +419,60 @@ pub fn prove_private_delegation(
         .build()
         .context("build private delegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, PRIVATE_DELEGATION_METHOD_ELF, &ProverOpts::fast())
+        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
         .context("prove private delegation witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "private delegation receipt", true)?;
     receipt
-        .verify(PRIVATE_DELEGATION_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify locally generated private delegation receipt")?;
     let journal = decode_private_delegation_journal(&receipt)?;
-    Ok((receipt, journal))
+    Ok((
+        TransparentProof::new_for_circuit(circuit, receipt_to_seal_bytes(&receipt)?),
+        journal,
+    ))
 }
 
-pub fn verify_private_delegation_receipt_bytes(
-    bytes: &[u8],
+pub fn verify_private_delegation_proof(
+    proof: &TransparentProof,
 ) -> Result<ProofPrivateDelegationJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::PrivateDelegation,
+        "private delegation proof",
+    )?;
+    verify_private_delegation_seal_bytes(&proof.seal)
+}
+
+fn verify_private_delegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateDelegationJournal> {
+    let binding = prototype_circuit_binding(TransparentCircuit::PrivateDelegationV1);
+    let cache_key = receipt_cache_key(bytes);
+    if let Some(journal) = VERIFIED_PRIVATE_DELEGATION_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(journal);
+    }
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "private delegation receipt", true)?;
     receipt
-        .verify(PRIVATE_DELEGATION_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify private delegation receipt")?;
-    decode_private_delegation_journal(&receipt)
+    let journal = decode_private_delegation_journal(&receipt)?;
+    VERIFIED_PRIVATE_DELEGATION_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, journal.clone());
+    Ok(journal)
 }
 
 pub fn prove_private_undelegation(
     witness: &ProofPrivateUndelegationWitness,
-) -> Result<(Receipt, ProofPrivateUndelegationJournal)> {
+) -> Result<(TransparentProof, ProofPrivateUndelegationJournal)> {
+    let circuit = TransparentCircuit::PrivateUndelegationV1;
+    let binding = prototype_circuit_binding(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -162,7 +480,7 @@ pub fn prove_private_undelegation(
             input.historical_accumulator_receipt.as_ref(),
         ) {
             (Some(accumulator), Some(bytes)) => {
-                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                let journal = verify_checkpoint_accumulator_seal_bytes(bytes)?;
                 if &journal != accumulator {
                     bail!("historical accumulator witness does not match its receipt");
                 }
@@ -179,31 +497,60 @@ pub fn prove_private_undelegation(
         .build()
         .context("build private undelegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, PRIVATE_UNDELEGATION_METHOD_ELF, &ProverOpts::fast())
+        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
         .context("prove private undelegation witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "private undelegation receipt", true)?;
     receipt
-        .verify(PRIVATE_UNDELEGATION_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify locally generated private undelegation receipt")?;
     let journal = decode_private_undelegation_journal(&receipt)?;
-    Ok((receipt, journal))
+    Ok((
+        TransparentProof::new_for_circuit(circuit, receipt_to_seal_bytes(&receipt)?),
+        journal,
+    ))
 }
 
-pub fn verify_private_undelegation_receipt_bytes(
-    bytes: &[u8],
+pub fn verify_private_undelegation_proof(
+    proof: &TransparentProof,
 ) -> Result<ProofPrivateUndelegationJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::PrivateUndelegation,
+        "private undelegation proof",
+    )?;
+    verify_private_undelegation_seal_bytes(&proof.seal)
+}
+
+fn verify_private_undelegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateUndelegationJournal> {
+    let binding = prototype_circuit_binding(TransparentCircuit::PrivateUndelegationV1);
+    let cache_key = receipt_cache_key(bytes);
+    if let Some(journal) = VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(journal);
+    }
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "private undelegation receipt", true)?;
     receipt
-        .verify(PRIVATE_UNDELEGATION_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify private undelegation receipt")?;
-    decode_private_undelegation_journal(&receipt)
+    let journal = decode_private_undelegation_journal(&receipt)?;
+    VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, journal.clone());
+    Ok(journal)
 }
 
 pub fn prove_unbonding_claim(
     witness: &ProofShieldedTxWitness,
-) -> Result<(Receipt, ProofShieldedTxJournal)> {
+) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
+    let circuit = TransparentCircuit::UnbondingClaimV1;
+    let binding = prototype_circuit_binding(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.inputs {
         match (
@@ -211,7 +558,7 @@ pub fn prove_unbonding_claim(
             input.historical_accumulator_receipt.as_ref(),
         ) {
             (Some(accumulator), Some(bytes)) => {
-                let journal = verify_checkpoint_accumulator_receipt_bytes(bytes)?;
+                let journal = verify_checkpoint_accumulator_seal_bytes(bytes)?;
                 if &journal != accumulator {
                     bail!("historical accumulator witness does not match its receipt");
                 }
@@ -228,28 +575,52 @@ pub fn prove_unbonding_claim(
         .build()
         .context("build unbonding claim executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, UNBONDING_CLAIM_METHOD_ELF, &ProverOpts::fast())
+        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
         .context("prove unbonding claim witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
     receipt
-        .verify(UNBONDING_CLAIM_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify locally generated unbonding claim receipt")?;
     let journal = decode_shielded_tx_journal(&receipt)?;
-    Ok((receipt, journal))
+    Ok((
+        TransparentProof::new_for_circuit(circuit, receipt_to_seal_bytes(&receipt)?),
+        journal,
+    ))
 }
 
-pub fn verify_unbonding_claim_receipt_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
+pub fn verify_unbonding_claim_proof(proof: &TransparentProof) -> Result<ProofShieldedTxJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::UnbondingClaim,
+        "unbonding claim proof",
+    )?;
+    verify_unbonding_claim_seal_bytes(&proof.seal)
+}
+
+fn verify_unbonding_claim_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
+    let binding = prototype_circuit_binding(TransparentCircuit::UnbondingClaimV1);
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
     receipt
-        .verify(UNBONDING_CLAIM_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify unbonding claim receipt")?;
     decode_shielded_tx_journal(&receipt)
 }
 
-pub fn receipt_to_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
+fn receipt_to_seal_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
     bincode::serialize(receipt).context("serialize shielded receipt")
+}
+
+pub fn proof_to_bytes(proof: &TransparentProof) -> Result<Vec<u8>> {
+    bincode::serialize(proof).context("serialize transparent proof")
+}
+
+pub fn proof_from_bytes(bytes: &[u8]) -> Result<TransparentProof> {
+    let proof: TransparentProof =
+        bincode::deserialize(bytes).context("decode transparent proof bytes")?;
+    proof.validate_metadata()?;
+    Ok(proof)
 }
 
 pub fn prove_checkpoint_accumulator(
@@ -257,6 +628,8 @@ pub fn prove_checkpoint_accumulator(
     extension: &HistoricalUnspentExtension,
     prior: Option<&CheckpointAccumulatorProof>,
 ) -> Result<CheckpointAccumulatorProof> {
+    let circuit = TransparentCircuit::CheckpointAccumulatorV1;
+    let binding = prototype_circuit_binding(circuit);
     if extension.strata.is_empty() {
         bail!("checkpoint accumulator requires a non-empty extension");
     }
@@ -280,7 +653,7 @@ pub fn prove_checkpoint_accumulator(
 
     let mut prior_journal = prior.map(|proof| proof.journal.clone());
     let mut prior_receipt = prior
-        .map(|proof| receipt_from_bytes(&proof.receipt))
+        .map(|proof| receipt_from_bytes(&proof.proof.seal))
         .transpose()?;
     let mut current_receipt = None;
     let mut current_journal = None;
@@ -292,7 +665,7 @@ pub fn prove_checkpoint_accumulator(
         }
         let env = builder
             .write(&CheckpointAccumulatorStepWitness {
-                accumulator_image_id: CHECKPOINT_ACCUMULATOR_METHOD_ID,
+                accumulator_image_id: binding.method_id,
                 note_commitment: checkpoint.note_commitment,
                 birth_epoch: checkpoint.birth_epoch,
                 prior_accumulator: prior_journal.clone(),
@@ -302,12 +675,12 @@ pub fn prove_checkpoint_accumulator(
             .build()
             .context("build checkpoint accumulator executor environment")?;
         let prove_info = default_prover()
-            .prove_with_opts(env, CHECKPOINT_ACCUMULATOR_METHOD_ELF, &ProverOpts::fast())
+            .prove_with_opts(env, binding.elf, &ProverOpts::fast())
             .context("prove checkpoint accumulator step")?;
         let receipt = prove_info.receipt;
         verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
         receipt
-            .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
+            .verify(binding.method_id)
             .context("verify locally generated checkpoint accumulator receipt")?;
         let journal = decode_checkpoint_accumulator_journal(&receipt)?;
         prior_journal = Some(journal.clone());
@@ -319,21 +692,39 @@ pub fn prove_checkpoint_accumulator(
     Ok(CheckpointAccumulatorProof {
         journal: current_journal
             .ok_or_else(|| anyhow!("missing checkpoint accumulator journal"))?,
-        receipt: receipt_to_bytes(
-            &current_receipt.ok_or_else(|| anyhow!("missing checkpoint accumulator receipt"))?,
-        )?,
+        proof: TransparentProof::new_for_circuit(
+            circuit,
+            receipt_to_seal_bytes(
+                &current_receipt
+                    .ok_or_else(|| anyhow!("missing checkpoint accumulator receipt"))?,
+            )?,
+        ),
     })
 }
 
-pub fn verify_checkpoint_accumulator_receipt_bytes(
-    bytes: &[u8],
+pub fn verify_checkpoint_accumulator_proof(
+    proof: &TransparentProof,
 ) -> Result<CheckpointAccumulatorJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::CheckpointAccumulator,
+        "checkpoint accumulator proof",
+    )?;
+    verify_checkpoint_accumulator_seal_bytes(&proof.seal)
+}
+
+fn verify_checkpoint_accumulator_seal_bytes(bytes: &[u8]) -> Result<CheckpointAccumulatorJournal> {
+    let binding = prototype_circuit_binding(TransparentCircuit::CheckpointAccumulatorV1);
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
     receipt
-        .verify(CHECKPOINT_ACCUMULATOR_METHOD_ID)
+        .verify(binding.method_id)
         .context("verify checkpoint accumulator receipt")?;
     decode_checkpoint_accumulator_journal(&receipt)
+}
+
+pub fn checkpoint_accumulator_image_id() -> [u32; 8] {
+    prototype_circuit_binding(TransparentCircuit::CheckpointAccumulatorV1).method_id
 }
 
 pub fn output_binding(output: &ShieldedOutput) -> ProofShieldedOutputBinding {
@@ -422,9 +813,28 @@ pub fn input_witness_from_local(
         membership_proof: membership_proof_to_proof(membership_proof),
         historical_checkpoint: checkpoint_to_proof(historical_checkpoint),
         historical_accumulator: historical_accumulator.map(|proof| proof.journal.clone()),
-        historical_accumulator_receipt: historical_accumulator.map(|proof| proof.receipt.clone()),
+        historical_accumulator_receipt: historical_accumulator
+            .map(|proof| proof.proof.seal.clone()),
         current_nullifier: *current_nullifier,
     }
+}
+
+fn require_transparent_statement(
+    proof: &TransparentProof,
+    expected: TransparentProofStatement,
+    context: &str,
+) -> Result<()> {
+    proof
+        .validate_metadata()
+        .with_context(|| format!("validate {context} metadata"))?;
+    if proof.statement != expected {
+        bail!(
+            "{context} statement mismatch: expected {:?}, got {:?}",
+            expected,
+            proof.statement
+        );
+    }
+    Ok(())
 }
 
 fn decode_shielded_tx_journal(receipt: &Receipt) -> Result<ProofShieldedTxJournal> {
@@ -609,5 +1019,38 @@ fn nullifier_membership_to_proof(
         nullifier: witness.nullifier,
         root: witness.root,
         proof: witness.proof.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_circuit_inventory_is_statement_consistent() {
+        for circuit in transparent_circuit_inventory() {
+            let descriptor = transparent_circuit_descriptor(*circuit);
+            assert_eq!(descriptor.circuit, *circuit);
+            assert_eq!(
+                canonical_circuit_for_statement(descriptor.statement),
+                *circuit
+            );
+            assert_eq!(descriptor.proof_family, TransparentProofFamily::Stark);
+            assert!(descriptor.target_security_bits >= MIN_TRANSPARENT_PROOF_SECURITY_BITS);
+            assert!(!descriptor.name.is_empty());
+            assert!(!descriptor.public_input_shape.is_empty());
+        }
+    }
+
+    #[test]
+    fn transparent_proof_metadata_rejects_mismatched_statement_and_circuit() {
+        let proof = TransparentProof {
+            version: TRANSPARENT_PROOF_VERSION,
+            statement: TransparentProofStatement::ShieldedTransfer,
+            circuit: TransparentCircuit::PrivateDelegationV1,
+            seal: vec![1, 2, 3],
+        };
+        let err = proof.validate_metadata().expect_err("metadata mismatch");
+        assert!(err.to_string().contains("does not match statement"));
     }
 }

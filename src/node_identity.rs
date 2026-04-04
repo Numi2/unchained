@@ -1,4 +1,5 @@
 use crate::canonical::{self, CanonicalReader, CanonicalWriter};
+use crate::crypto;
 use anyhow::{anyhow, bail, Context, Result};
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
@@ -20,10 +21,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 const NODE_ROOT_KEY_PATH: &str = "node_root.p8";
 const NODE_ROOT_INFO_PATH: &str = "node_root_public.bin";
 const NODE_AUTH_KEY_PATH: &str = "node_auth.p8";
+const NODE_INGRESS_KEM_KEY_PATH: &str = "node_ingress_mlkem.bin";
+const NODE_INGRESS_X25519_KEY_PATH: &str = "node_ingress_x25519.bin";
 const NODE_AUTH_REQUEST_PATH: &str = "node_auth_request.bin";
 const NODE_RECORD_PATH: &str = "node_record.bin";
 const NODE_RECORD_VERSION: u8 = 2;
@@ -48,6 +52,8 @@ pub struct NodeRecordV2 {
     pub chain_id: Option<[u8; 32]>,
     pub root_spki: Vec<u8>,
     pub auth_spki: Vec<u8>,
+    pub ingress_kem_pk: crypto::TaggedKemPublicKey,
+    pub ingress_x25519_pk: [u8; 32],
     pub addresses: Vec<String>,
     pub issued_unix_ms: u64,
     pub expires_unix_ms: u64,
@@ -62,6 +68,8 @@ struct NodeRecordSignableV2 {
     chain_id: Option<[u8; 32]>,
     root_spki: Vec<u8>,
     auth_spki: Vec<u8>,
+    ingress_kem_pk: crypto::TaggedKemPublicKey,
+    ingress_x25519_pk: [u8; 32],
     addresses: Vec<String>,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
@@ -97,6 +105,8 @@ pub struct NodeAuthRequestV1 {
     pub chain_id: Option<[u8; 32]>,
     pub root_spki: Vec<u8>,
     pub auth_spki: Vec<u8>,
+    pub ingress_kem_pk: crypto::TaggedKemPublicKey,
+    pub ingress_x25519_pk: [u8; 32],
     pub addresses: Vec<String>,
     pub issued_unix_ms: u64,
     pub sig: Vec<u8>,
@@ -110,6 +120,8 @@ struct NodeAuthRequestSignableV1 {
     chain_id: Option<[u8; 32]>,
     root_spki: Vec<u8>,
     auth_spki: Vec<u8>,
+    ingress_kem_pk: crypto::TaggedKemPublicKey,
+    ingress_x25519_pk: [u8; 32],
     addresses: Vec<String>,
     issued_unix_ms: u64,
 }
@@ -179,6 +191,14 @@ pub struct NodeIdentity {
     auth_key: Arc<PqdsaKeyPair>,
     certified_key: Arc<CertifiedKey>,
     record: NodeRecordV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressKeyMaterial {
+    pub kem_public: crypto::TaggedKemPublicKey,
+    pub kem_secret: [u8; crypto::ML_KEM_768_SK_BYTES],
+    pub x25519_public: [u8; 32],
+    pub x25519_secret: [u8; 32],
 }
 
 impl Debug for NodeIdentity {
@@ -459,6 +479,8 @@ impl From<NodeAuthRequestV1> for NodeAuthRequestSignableV1 {
             chain_id: value.chain_id,
             root_spki: value.root_spki,
             auth_spki: value.auth_spki,
+            ingress_kem_pk: value.ingress_kem_pk,
+            ingress_x25519_pk: value.ingress_x25519_pk,
             addresses: value.addresses,
             issued_unix_ms: value.issued_unix_ms,
         }
@@ -538,6 +560,8 @@ impl From<NodeRecordV2> for NodeRecordSignableV2 {
             chain_id: value.chain_id,
             root_spki: value.root_spki,
             auth_spki: value.auth_spki,
+            ingress_kem_pk: value.ingress_kem_pk,
+            ingress_x25519_pk: value.ingress_x25519_pk,
             addresses: value.addresses,
             issued_unix_ms: value.issued_unix_ms,
             expires_unix_ms: value.expires_unix_ms,
@@ -666,6 +690,10 @@ impl SignedEnvelope {
 }
 
 impl NodeIdentity {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn load_or_create(
         protocol_version: u32,
         chain_id: Option<[u8; 32]>,
@@ -701,6 +729,7 @@ impl NodeIdentity {
             })
             .unwrap_or(true);
         let auth = load_or_create_auth_key(&dir, should_refresh)?;
+        let ingress = load_or_create_ingress_keys(&dir, should_refresh)?;
         let auth_spki = auth
             .public_key()
             .as_der()
@@ -710,7 +739,11 @@ impl NodeIdentity {
         let needs_refresh = should_refresh
             || persisted
                 .as_ref()
-                .map(|record| record.auth_spki != auth_spki)
+                .map(|record| {
+                    record.auth_spki != auth_spki
+                        || record.ingress_kem_pk != ingress.kem_public
+                        || record.ingress_x25519_pk != ingress.x25519_public
+                })
                 .unwrap_or(true);
 
         let record = if needs_refresh {
@@ -721,6 +754,8 @@ impl NodeIdentity {
                 root_info.node_id,
                 root_info.root_spki.clone(),
                 auth_spki,
+                ingress.kem_public,
+                ingress.x25519_public,
                 addresses,
                 now,
                 now.saturating_add(NODE_RECORD_LIFETIME_MS),
@@ -767,6 +802,7 @@ impl NodeIdentity {
         }
 
         let auth = Arc::new(load_key(&auth_path)?);
+        let ingress = load_local_ingress_key_material_in_dir(&dir)?;
         let auth_spki = auth
             .public_key()
             .as_der()
@@ -779,13 +815,25 @@ impl NodeIdentity {
         if record.auth_spki != auth_spki {
             bail!("runtime auth key does not match the installed signed node record");
         }
+        if record.ingress_kem_pk != ingress.kem_public
+            || record.ingress_x25519_pk != ingress.x25519_public
+        {
+            bail!("local ingress keys do not match the installed signed node record");
+        }
         let needs_refresh = record.protocol_version != protocol_version
             || record.chain_id != chain_id
             || record.addresses != addresses
             || record.expires_unix_ms.saturating_sub(now) <= NODE_RECORD_RENEW_BEFORE_MS;
         if needs_refresh {
-            record =
-                refresh_runtime_record(&dir, &auth_spki, protocol_version, chain_id, &addresses)?;
+            record = refresh_runtime_record(
+                &dir,
+                &auth_spki,
+                &ingress.kem_public,
+                &ingress.x25519_public,
+                protocol_version,
+                chain_id,
+                &addresses,
+            )?;
         }
         if record.protocol_version != protocol_version {
             bail!(
@@ -920,6 +968,63 @@ pub fn load_local_identity_output_in_dir(
     ))
 }
 
+pub fn load_local_runtime_record_in_dir(
+    dir: impl AsRef<Path>,
+    protocol_version: u32,
+    chain_id: Option<[u8; 32]>,
+    addresses: Vec<String>,
+) -> Result<NodeRecordV2> {
+    Ok(
+        NodeIdentity::load_runtime_in_dir(dir, protocol_version, chain_id, addresses)?
+            .record()
+            .clone(),
+    )
+}
+
+pub fn load_local_ingress_key_material_in_dir(dir: impl AsRef<Path>) -> Result<IngressKeyMaterial> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let kem_secret = load_raw_secret_key(
+        &dir.join(NODE_INGRESS_KEM_KEY_PATH),
+        crypto::ML_KEM_768_SK_BYTES,
+    )?;
+    let kem_public = crypto::TaggedKemPublicKey::from_ml_kem_768_bytes(&load_raw_secret_key(
+        &dir.join(NODE_INGRESS_KEM_KEY_PATH).with_extension("pub"),
+        crypto::ML_KEM_768_PK_BYTES,
+    )?)?;
+    let x25519_secret = load_raw_secret_key(&dir.join(NODE_INGRESS_X25519_KEY_PATH), 32)?;
+    let x25519_public = load_raw_secret_key(
+        &dir.join(NODE_INGRESS_X25519_KEY_PATH).with_extension("pub"),
+        32,
+    )?;
+    Ok(IngressKeyMaterial {
+        kem_public,
+        kem_secret: kem_secret
+            .try_into()
+            .map_err(|_| anyhow!("invalid stored ingress ML-KEM secret length"))?,
+        x25519_public: x25519_public
+            .try_into()
+            .map_err(|_| anyhow!("invalid stored ingress X25519 public length"))?,
+        x25519_secret: x25519_secret
+            .try_into()
+            .map_err(|_| anyhow!("invalid stored ingress X25519 secret length"))?,
+    })
+}
+
+pub fn sign_with_local_root_in_dir(dir: impl AsRef<Path>, msg: &[u8]) -> Result<Vec<u8>> {
+    let dir = identity_dir(dir.as_ref());
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(NODE_ROOT_KEY_PATH);
+    if !path.exists() {
+        bail!(
+            "local node root key is missing at {}; run `unchained_node init-root` first",
+            path.display()
+        );
+    }
+    let root = load_key(&path)?;
+    crypto::ml_dsa_65_sign(&root, msg)
+}
+
 pub fn load_local_node_id() -> Result<String> {
     load_local_node_id_in_dir(".")
 }
@@ -976,7 +1081,8 @@ pub fn prepare_auth_request_in_dir(
     if addresses.is_empty() {
         bail!("auth request requires at least one published address");
     }
-    let auth = Arc::new(generate_key(&dir.join(NODE_AUTH_KEY_PATH))?);
+    let auth = Arc::new(load_or_create_key(&dir.join(NODE_AUTH_KEY_PATH))?);
+    let ingress = load_or_create_ingress_keys(&dir, false)?;
     let auth_spki = auth_spki_from_key(auth.as_ref())?;
     let issued_unix_ms = now_unix_ms();
     let signable = NodeAuthRequestSignableV1 {
@@ -986,6 +1092,8 @@ pub fn prepare_auth_request_in_dir(
         chain_id,
         root_spki: root_info.root_spki.clone(),
         auth_spki: auth_spki.clone(),
+        ingress_kem_pk: ingress.kem_public.clone(),
+        ingress_x25519_pk: ingress.x25519_public,
         addresses: addresses.clone(),
         issued_unix_ms,
     };
@@ -1002,6 +1110,8 @@ pub fn prepare_auth_request_in_dir(
         chain_id,
         root_spki: root_info.root_spki,
         auth_spki,
+        ingress_kem_pk: ingress.kem_public,
+        ingress_x25519_pk: ingress.x25519_public,
         addresses,
         issued_unix_ms,
         sig,
@@ -1036,6 +1146,8 @@ pub fn sign_auth_request_in_dir(
         root_info.node_id,
         root_info.root_spki,
         request.auth_spki,
+        request.ingress_kem_pk,
+        request.ingress_x25519_pk,
         request.addresses,
         issued_unix_ms,
         expires_unix_ms,
@@ -1057,6 +1169,14 @@ pub fn install_node_record_in_dir(
     let auth_spki = auth_spki_from_key(&auth)?;
     if auth_spki != record.auth_spki {
         bail!("record auth key does not match the local runtime auth key");
+    }
+    let ingress = load_local_ingress_key_material_in_dir(&dir).map_err(|_| {
+        anyhow!("missing local ingress keys; run `unchained_node auth-prepare` first")
+    })?;
+    if ingress.kem_public != record.ingress_kem_pk
+        || ingress.x25519_public != record.ingress_x25519_pk
+    {
+        bail!("record ingress keys do not match the local runtime ingress keys");
     }
     if let Ok(root_info) = load_root_info(&dir) {
         if root_info.node_id != record.node_id || root_info.root_spki != record.root_spki {
@@ -1110,16 +1230,31 @@ pub fn approve_trust_update_in_dir(dir: impl AsRef<Path>, update_source: &str) -
 }
 
 pub fn build_server_config(identity: &NodeIdentity) -> Result<rustls::ServerConfig> {
+    build_server_config_with_alpn(identity, b"unchained-pq/v2", true)
+}
+
+pub fn build_server_config_with_alpn(
+    identity: &NodeIdentity,
+    alpn: &[u8],
+    require_client_auth: bool,
+) -> Result<rustls::ServerConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
 
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(Arc::new(PqClientVerifier))
-        .with_cert_resolver(Arc::new(
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?;
+    let mut config = if require_client_auth {
+        builder
+            .with_client_cert_verifier(Arc::new(PqClientVerifier))
+            .with_cert_resolver(Arc::new(
+                rustls::server::AlwaysResolvesServerRawPublicKeys::new(identity.certified_key()),
+            ))
+    } else {
+        builder.with_no_client_auth().with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(identity.certified_key()),
-        ));
-    config.alpn_protocols = vec![b"unchained-pq/v2".to_vec()];
+        ))
+    };
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 
@@ -1127,17 +1262,29 @@ pub fn build_client_config(
     identity: &NodeIdentity,
     expected_peers: Arc<ExpectedPeerStore>,
 ) -> Result<rustls::ClientConfig> {
+    build_client_config_with_alpn(Some(identity), expected_peers, b"unchained-pq/v2")
+}
+
+pub fn build_client_config_with_alpn(
+    identity: Option<&NodeIdentity>,
+    expected_peers: Arc<ExpectedPeerStore>,
+    alpn: &[u8],
+) -> Result<rustls::ClientConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
 
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PqServerVerifier { expected_peers }))
-        .with_client_cert_resolver(Arc::new(
+        .with_custom_certificate_verifier(Arc::new(PqServerVerifier { expected_peers }));
+    let mut config = if let Some(identity) = identity {
+        builder.with_client_cert_resolver(Arc::new(
             rustls::client::AlwaysResolvesClientRawPublicKeys::new(identity.certified_key()),
-        ));
-    config.alpn_protocols = vec![b"unchained-pq/v2".to_vec()];
+        ))
+    } else {
+        builder.with_no_client_auth()
+    };
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 
@@ -1179,6 +1326,8 @@ fn load_persisted_record(dir: &Path) -> Result<NodeRecordV2> {
 fn refresh_runtime_record(
     dir: &Path,
     auth_spki: &[u8],
+    ingress_kem_pk: &crypto::TaggedKemPublicKey,
+    ingress_x25519_pk: &[u8; 32],
     protocol_version: u32,
     chain_id: Option<[u8; 32]>,
     addresses: &[String],
@@ -1200,6 +1349,8 @@ fn refresh_runtime_record(
         root_info.node_id,
         root_info.root_spki,
         auth_spki.to_vec(),
+        ingress_kem_pk.clone(),
+        *ingress_x25519_pk,
         addresses.to_vec(),
         now,
         now.saturating_add(NODE_RECORD_LIFETIME_MS),
@@ -1272,6 +1423,48 @@ fn load_or_create_auth_key(dir: &Path, rotate: bool) -> Result<Arc<PqdsaKeyPair>
     Ok(Arc::new(key))
 }
 
+fn load_or_create_ingress_keys(dir: &Path, rotate: bool) -> Result<IngressKeyMaterial> {
+    let kem_secret_path = dir.join(NODE_INGRESS_KEM_KEY_PATH);
+    let kem_public_path = dir.join(NODE_INGRESS_KEM_KEY_PATH).with_extension("pub");
+    let x25519_secret_path = dir.join(NODE_INGRESS_X25519_KEY_PATH);
+    let x25519_public_path = dir.join(NODE_INGRESS_X25519_KEY_PATH).with_extension("pub");
+
+    let regenerate = rotate
+        || !kem_secret_path.exists()
+        || !kem_public_path.exists()
+        || !x25519_secret_path.exists()
+        || !x25519_public_path.exists();
+    if regenerate {
+        let (kem_secret_key, kem_public_key) = crypto::ml_kem_768_generate();
+        let kem_secret = crypto::ml_kem_768_secret_key_to_bytes(&kem_secret_key);
+        let kem_public = crypto::TaggedKemPublicKey::from_ml_kem_768_array(kem_public_key.bytes);
+        let x25519_secret = X25519StaticSecret::random_from_rng(OsRng);
+        let x25519_public = X25519PublicKey::from(&x25519_secret);
+        fs::write(&kem_secret_path, kem_secret)?;
+        set_private_permissions(&kem_secret_path)?;
+        fs::write(&kem_public_path, kem_public.bytes)?;
+        set_private_permissions(&kem_public_path)?;
+        fs::write(&x25519_secret_path, x25519_secret.to_bytes())?;
+        set_private_permissions(&x25519_secret_path)?;
+        fs::write(&x25519_public_path, x25519_public.as_bytes())?;
+        set_private_permissions(&x25519_public_path)?;
+    }
+    load_local_ingress_key_material_in_dir(dir)
+}
+
+fn load_raw_secret_key(path: &Path, expected_len: usize) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read key {}", path.display()))?;
+    if bytes.len() != expected_len {
+        bail!(
+            "key {} has length {}, expected {}",
+            path.display(),
+            bytes.len(),
+            expected_len
+        );
+    }
+    Ok(bytes)
+}
+
 fn set_private_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1319,6 +1512,8 @@ fn sign_node_record(
     node_id: [u8; 32],
     root_spki: Vec<u8>,
     auth_spki: Vec<u8>,
+    ingress_kem_pk: crypto::TaggedKemPublicKey,
+    ingress_x25519_pk: [u8; 32],
     addresses: Vec<String>,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
@@ -1330,6 +1525,8 @@ fn sign_node_record(
         chain_id,
         root_spki: root_spki.clone(),
         auth_spki: auth_spki.clone(),
+        ingress_kem_pk: ingress_kem_pk.clone(),
+        ingress_x25519_pk,
         addresses: addresses.clone(),
         issued_unix_ms,
         expires_unix_ms,
@@ -1347,6 +1544,8 @@ fn sign_node_record(
         chain_id,
         root_spki,
         auth_spki,
+        ingress_kem_pk,
+        ingress_x25519_pk,
         addresses,
         issued_unix_ms,
         expires_unix_ms,
@@ -1370,6 +1569,8 @@ fn record_signable_bytes(signable: &NodeRecordSignableV2) -> Result<Vec<u8>> {
     write_option_fixed32(&mut writer, &signable.chain_id);
     writer.write_bytes(&signable.root_spki)?;
     writer.write_bytes(&signable.auth_spki)?;
+    canonical::write_tagged_kem_public_key(&mut writer, &signable.ingress_kem_pk);
+    writer.write_fixed(&signable.ingress_x25519_pk);
     writer.write_vec(&signable.addresses, |writer, address| {
         writer.write_string(address)
     })?;
@@ -1415,6 +1616,8 @@ fn auth_request_signable_bytes(signable: &NodeAuthRequestSignableV1) -> Result<V
     write_option_fixed32(&mut writer, &signable.chain_id);
     writer.write_bytes(&signable.root_spki)?;
     writer.write_bytes(&signable.auth_spki)?;
+    canonical::write_tagged_kem_public_key(&mut writer, &signable.ingress_kem_pk);
+    writer.write_fixed(&signable.ingress_x25519_pk);
     writer.write_vec(&signable.addresses, |writer, address| {
         writer.write_string(address)
     })?;
@@ -1521,6 +1724,8 @@ fn encode_auth_request(request: &NodeAuthRequestV1) -> Result<Vec<u8>> {
     write_option_fixed32(&mut writer, &request.chain_id);
     writer.write_bytes(&request.root_spki)?;
     writer.write_bytes(&request.auth_spki)?;
+    canonical::write_tagged_kem_public_key(&mut writer, &request.ingress_kem_pk);
+    writer.write_fixed(&request.ingress_x25519_pk);
     writer.write_vec(&request.addresses, |writer, address| {
         writer.write_string(address)
     })?;
@@ -1538,6 +1743,8 @@ fn decode_auth_request(bytes: &[u8]) -> Result<NodeAuthRequestV1> {
         chain_id: read_option_fixed32(&mut reader)?,
         root_spki: reader.read_bytes()?,
         auth_spki: reader.read_bytes()?,
+        ingress_kem_pk: canonical::read_tagged_kem_public_key(&mut reader)?,
+        ingress_x25519_pk: reader.read_fixed()?,
         addresses: reader.read_vec(|reader| reader.read_string())?,
         issued_unix_ms: reader.read_u64()?,
         sig: reader.read_bytes()?,
@@ -1557,6 +1764,10 @@ pub fn load_trust_update(item: &str) -> Result<TrustUpdateV1> {
         return TrustUpdateV1::decode_compact(text.trim());
     }
     TrustUpdateV1::decode_compact(trimmed)
+}
+
+pub fn load_node_record(item: &str) -> Result<NodeRecordV2> {
+    load_node_record_item(item)
 }
 
 fn load_root_info_item(item: &str) -> Result<NodeRootInfoV1> {

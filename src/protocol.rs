@@ -47,7 +47,7 @@ pub const CURRENT: ProtocolRules = ProtocolRules {
     slots_per_epoch: 256,
     slot_duration_ms: 250,
     fast_path_timeout_ms: 450,
-    dag_bft_timeout_ms: 1_200,
+    dag_bft_timeout_ms: 10_000,
     stake_unbonding_epochs: 32,
     equivocation_slash_bps: 2_500,
     equivocation_jail_epochs: 8,

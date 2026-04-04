@@ -23,6 +23,7 @@ use crate::{
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
     },
+    proof::{TransparentCircuit, TransparentProof, TransparentProofStatement},
     shielded::{
         ArchiveCustodyCommitment, ArchiveOperatorScorecard, ArchiveProviderManifest,
         ArchiveReplicaAttestation, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
@@ -497,6 +498,19 @@ fn read_validator_pool(reader: &mut CanonicalReader<'_>) -> Result<ValidatorPool
     Ok(pool)
 }
 
+pub fn encode_validator_pool(pool: &ValidatorPool) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    write_validator_pool(&mut writer, pool)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_validator_pool(bytes: &[u8]) -> Result<ValidatorPool> {
+    let mut reader = CanonicalReader::new(bytes);
+    let pool = read_validator_pool(&mut reader)?;
+    reader.finish()?;
+    Ok(pool)
+}
+
 fn write_validator_registration(
     writer: &mut CanonicalWriter,
     registration: &ValidatorRegistration,
@@ -869,6 +883,55 @@ fn read_shared_state_authorization(
     })
 }
 
+pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
+    proof.validate_metadata()?;
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(proof.version);
+    writer.write_u8(match proof.statement {
+        TransparentProofStatement::ShieldedTransfer => 0,
+        TransparentProofStatement::PrivateDelegation => 1,
+        TransparentProofStatement::PrivateUndelegation => 2,
+        TransparentProofStatement::UnbondingClaim => 3,
+        TransparentProofStatement::CheckpointAccumulator => 4,
+    });
+    writer.write_u8(match proof.circuit {
+        TransparentCircuit::OrdinaryTransferV1 => 0,
+        TransparentCircuit::PrivateDelegationV1 => 1,
+        TransparentCircuit::PrivateUndelegationV1 => 2,
+        TransparentCircuit::UnbondingClaimV1 => 3,
+        TransparentCircuit::CheckpointAccumulatorV1 => 4,
+    });
+    writer.write_bytes(&proof.seal)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
+    let mut reader = CanonicalReader::new(bytes);
+    let proof = TransparentProof {
+        version: reader.read_u8()?,
+        statement: match reader.read_u8()? {
+            0 => TransparentProofStatement::ShieldedTransfer,
+            1 => TransparentProofStatement::PrivateDelegation,
+            2 => TransparentProofStatement::PrivateUndelegation,
+            3 => TransparentProofStatement::UnbondingClaim,
+            4 => TransparentProofStatement::CheckpointAccumulator,
+            other => bail!("unsupported transparent proof statement {}", other),
+        },
+        circuit: match reader.read_u8()? {
+            0 => TransparentCircuit::OrdinaryTransferV1,
+            1 => TransparentCircuit::PrivateDelegationV1,
+            2 => TransparentCircuit::PrivateUndelegationV1,
+            3 => TransparentCircuit::UnbondingClaimV1,
+            4 => TransparentCircuit::CheckpointAccumulatorV1,
+            other => bail!("unsupported transparent proof circuit {}", other),
+        },
+        seal: reader.read_bytes()?,
+    };
+    reader.finish()?;
+    proof.validate_metadata()?;
+    Ok(proof)
+}
+
 fn write_ordinary_private_transfer(
     writer: &mut CanonicalWriter,
     transfer: &OrdinaryPrivateTransfer,
@@ -882,7 +945,7 @@ fn write_ordinary_private_transfer(
         Ok(())
     })?;
     writer.write_u64(transfer.fee_amount);
-    writer.write_bytes(&transfer.proof)?;
+    writer.write_bytes(&encode_transparent_proof(&transfer.proof)?)?;
     Ok(())
 }
 
@@ -893,7 +956,7 @@ fn read_ordinary_private_transfer(
         nullifiers: reader.read_vec(|reader| reader.read_fixed())?,
         outputs: reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?,
         fee_amount: reader.read_u64()?,
-        proof: reader.read_bytes()?,
+        proof: decode_transparent_proof(&reader.read_bytes()?)?,
     })
 }
 
@@ -1683,6 +1746,8 @@ pub fn encode_node_record(record: &NodeRecordV2) -> Result<Vec<u8>> {
     write_option_fixed32(&mut writer, &record.chain_id);
     writer.write_bytes(&record.root_spki)?;
     writer.write_bytes(&record.auth_spki)?;
+    write_tagged_kem_public_key(&mut writer, &record.ingress_kem_pk);
+    writer.write_fixed(&record.ingress_x25519_pk);
     writer.write_vec(&record.addresses, |writer, address| {
         writer.write_string(address)
     })?;
@@ -1701,6 +1766,8 @@ pub fn decode_node_record(bytes: &[u8]) -> Result<NodeRecordV2> {
         chain_id: read_option_fixed32(&mut reader)?,
         root_spki: reader.read_bytes()?,
         auth_spki: reader.read_bytes()?,
+        ingress_kem_pk: read_tagged_kem_public_key(&mut reader)?,
+        ingress_x25519_pk: reader.read_fixed()?,
         addresses: reader.read_vec(|reader| reader.read_string())?,
         issued_unix_ms: reader.read_u64()?,
         expires_unix_ms: reader.read_u64()?,

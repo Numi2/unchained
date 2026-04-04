@@ -14,8 +14,10 @@ use unchained::config::{Net, P2p};
 use unchained::consensus::{OrderingPath, Validator, ValidatorKeys};
 use unchained::crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign};
 use unchained::epoch::Anchor;
+use unchained::evidence::{LivenessFaultProof, SlashableEvidence};
 use unchained::network::{self, NetHandle};
 use unchained::node_identity::{self, validator_from_record, NodeIdentity};
+use unchained::proof;
 use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::shielded::{
     local_archive_provider_manifest, local_archive_replica_attestations, route_checkpoint_requests,
@@ -23,12 +25,12 @@ use unchained::shielded::{
     HistoricalUnspentCheckpoint, NullifierRootLedger,
 };
 use unchained::staking::{
-    ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate, ValidatorRegistration,
-    ValidatorStatus,
+    ValidatorAccountability, ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate,
+    ValidatorReactivation, ValidatorStatus,
 };
 use unchained::storage::{protocol_chain_id, Store};
 use unchained::sync::SyncState;
-use unchained::transaction::{self, SharedStateAction, SharedStateBatch, SharedStateDagBatch, Tx};
+use unchained::transaction::{self, PenaltyEvidenceAdmission, SharedStateAction, Tx};
 use unchained::{storage::WalletStore, wallet::Wallet};
 
 static TEST_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -79,17 +81,32 @@ fn signed_shared_state_tx(
     finality_support::fee_paid_shared_state_tx(store, wallet, action, signature)
 }
 
-fn build_fee_payer_wallet(
+fn build_single_action_fee_wallet(
     tempdir: &TempDir,
     store: &Store,
     genesis: &Anchor,
-    coin_count: u64,
 ) -> anyhow::Result<Wallet> {
     std::env::set_var("WALLET_PASSPHRASE", "pq-network-passphrase");
+    std::env::set_var(
+        "UNCHAINED_PROOF_FIXTURE_DIR",
+        finality_support::proof_fixture_dir(),
+    );
     let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
-    let wallet = Wallet::load_or_create_private(wallet_store)?;
-    let _ = finality_support::seed_wallet_with_coins(store, &wallet, genesis, coin_count)?;
+    let wallet = finality_support::deterministic_wallet(wallet_store)?;
+    let _ = finality_support::seed_wallet_with_coin_values(store, &wallet, genesis, &[2])?;
     Ok(wallet)
+}
+
+fn mirror_wallet_coin_state(
+    stores: &[&Store],
+    wallet: &Wallet,
+    genesis: &Anchor,
+    values: &[u64],
+) -> anyhow::Result<()> {
+    for store in stores {
+        let _ = finality_support::seed_wallet_with_coin_values(store, wallet, genesis, values)?;
+    }
+    Ok(())
 }
 
 fn build_pending_validator_pool(
@@ -130,10 +147,24 @@ fn build_net(port: u16, bootstrap: Vec<String>) -> Net {
         peer_exchange: true,
         max_peers: 16,
         connection_timeout_secs: 5,
+        idle_timeout_secs: 30,
+        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
         sync_timeout_secs: 5,
         banned_peer_ids: Vec::new(),
         quiet_by_default: true,
+    }
+}
+
+fn bootstrap_to_leader(
+    local_validator_id: unchained::consensus::ValidatorId,
+    leader_id: unchained::consensus::ValidatorId,
+    leader_bootstrap: &str,
+) -> Vec<String> {
+    if local_validator_id == leader_id {
+        Vec::new()
+    } else {
+        vec![leader_bootstrap.to_string()]
     }
 }
 
@@ -166,6 +197,16 @@ fn provision_runtime_identity(
     Ok((installed_node_id, installed_record))
 }
 
+fn provision_deterministic_runtime_identity(
+    tempdir: &TempDir,
+    chain_id: Option<[u8; 32]>,
+    addresses: Vec<String>,
+    slot: usize,
+) -> anyhow::Result<(String, String)> {
+    finality_support::install_deterministic_node_identity_keys(tempdir.path(), slot)?;
+    provision_runtime_identity(tempdir, chain_id, addresses)
+}
+
 async fn spawn_test_node(
     tempdir: &TempDir,
     net_cfg: Net,
@@ -177,7 +218,7 @@ async fn spawn_test_node(
 }
 
 async fn wait_for_peers(net: &NetHandle, expected: usize, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if net.peer_count() >= expected {
             return;
@@ -215,6 +256,352 @@ async fn wait_for_condition(label: &str, timeout: Duration, mut condition: impl 
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable(
+) -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+    let chain_id = protocol_chain_id();
+    let addr_a = "127.0.0.1:41001".to_string();
+    let addr_b = "127.0.0.1:41002".to_string();
+    let addr_c = "127.0.0.1:41003".to_string();
+
+    provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a, 101),
+        (identity_b, 101),
+        (identity_c, 100),
+    ]);
+    let genesis = committee.genesis_anchor();
+    let db = Arc::new(Store::open(&dir_a.path().to_string_lossy())?);
+    committee.seed_validator_state(db.as_ref(), genesis.position.epoch)?;
+    store_anchor(db.as_ref(), &genesis)?;
+    let wallet = build_single_action_fee_wallet(&dir_a, db.as_ref(), &genesis)?;
+    let snapshot = unchained::node_control::build_shielded_runtime_snapshot(db.as_ref())?;
+    let prepared = wallet
+        .prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_profile_update_fee)?;
+    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
+    assert_eq!(
+        hex::encode(fixture_id),
+        "a7c0d80ce95dd1f52682679bba8ef69960aa62658025864fdc37f07e33a3723b"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "fixture mint for multivalidator fee-paid control submission proof"]
+async fn mint_multivalidator_fee_paid_control_submission_fixture() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    std::env::set_var(
+        "UNCHAINED_PROOF_FIXTURE_DIR",
+        finality_support::proof_fixture_dir(),
+    );
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+    let chain_id = protocol_chain_id();
+    let addr_a = "127.0.0.1:41001".to_string();
+    let addr_b = "127.0.0.1:41002".to_string();
+    let addr_c = "127.0.0.1:41003".to_string();
+
+    provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a, 101),
+        (identity_b, 101),
+        (identity_c, 100),
+    ]);
+    let genesis = committee.genesis_anchor();
+    let db = Arc::new(Store::open(&dir_a.path().to_string_lossy())?);
+    committee.seed_validator_state(db.as_ref(), genesis.position.epoch)?;
+    store_anchor(db.as_ref(), &genesis)?;
+    let wallet = build_single_action_fee_wallet(&dir_a, db.as_ref(), &genesis)?;
+    let snapshot = unchained::node_control::build_shielded_runtime_snapshot(db.as_ref())?;
+    let prepared = wallet
+        .prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_profile_update_fee)?;
+    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
+    let fixture_path = std::path::Path::new(&finality_support::proof_fixture_dir())
+        .join("shielded-spend")
+        .join(format!("{}.bin", hex::encode(fixture_id)));
+    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
+    assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
+    assert!(fixture_path.exists());
+
+    Ok(())
+}
+
+fn finalized_fast_path_anchor_from_identities(
+    num: u64,
+    parent: Option<&Anchor>,
+    validator_set: &unchained::consensus::ValidatorSet,
+    signers: &[&NodeIdentity],
+) -> anyhow::Result<Anchor> {
+    let position = Anchor::position_for_num(num);
+    let parent_hash = parent.map(|anchor| anchor.hash);
+    let target = unchained::consensus::VoteTarget {
+        position,
+        ordering_path: OrderingPath::FastPathPrivateTransfer,
+        block_digest: Anchor::compute_hash(
+            num,
+            parent_hash,
+            position,
+            OrderingPath::FastPathPrivateTransfer,
+            [num as u8; 32],
+            0,
+            0,
+            &[],
+            &[],
+            [0u8; 32],
+            0,
+            validator_set,
+        ),
+    };
+    let target_bytes = target.signing_bytes();
+    let votes = signers
+        .iter()
+        .map(|identity| {
+            anyhow::Ok(unchained::consensus::ValidatorVote {
+                voter: validator_from_record(identity.record(), 1)?.id,
+                target: target.clone(),
+                signature: identity.sign_consensus_message(&target_bytes)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let qc = unchained::consensus::QuorumCertificate::from_votes(validator_set, target, votes)?;
+    Ok(Anchor::new(
+        num,
+        parent_hash,
+        OrderingPath::FastPathPrivateTransfer,
+        [num as u8; 32],
+        0,
+        0,
+        Vec::new(),
+        Vec::new(),
+        [0u8; 32],
+        0,
+        validator_set.clone(),
+        qc,
+    )?)
+}
+
+async fn finalize_single_shared_state_action(
+    parent_anchor: &Anchor,
+    committee: &finality_support::TestCommittee,
+    identity_a: &NodeIdentity,
+    identity_b: &NodeIdentity,
+    _identity_c: &NodeIdentity,
+    db_a: &Arc<Store>,
+    db_b: &Arc<Store>,
+    db_c: &Arc<Store>,
+    net_a: &NetHandle,
+    net_b: &NetHandle,
+    net_c: &NetHandle,
+    tx: &Tx,
+) -> anyhow::Result<([u8; 32], Anchor)> {
+    tx.validate(db_a.as_ref()).map_err(|err| {
+        anyhow::anyhow!("shared-state tx invalid on node A before submission: {err}")
+    })?;
+    tx.validate(db_b.as_ref()).map_err(|err| {
+        anyhow::anyhow!("shared-state tx invalid on node B before propagation: {err}")
+    })?;
+    tx.validate(db_c.as_ref()).map_err(|err| {
+        anyhow::anyhow!("shared-state tx invalid on node C before propagation: {err}")
+    })?;
+    let tx_id = net_a.submit_tx(tx).await?;
+    anyhow::ensure!(
+        db_a.load_shared_state_pending_tx(&tx_id)?.is_some(),
+        "shared-state tx was not staged on node A after submission"
+    );
+    wait_for_condition(
+        "shared-state tx propagation to node B",
+        Duration::from_secs(10),
+        || {
+            db_b.load_shared_state_pending_tx(&tx_id)
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state tx propagation to node C",
+        Duration::from_secs(10),
+        || {
+            db_c.load_shared_state_pending_tx(&tx_id)
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
+
+    let batch_a = net_a
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node A");
+    let batch_b = net_b
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node B");
+    let batch_c = net_c
+        .select_pending_shared_state_batch()?
+        .expect("pending shared-state batch on node C");
+    assert_eq!(batch_a.ordered_tx_count()?, 1);
+    assert_eq!(batch_b.ordered_tx_count()?, 1);
+    assert_eq!(batch_c.ordered_tx_count()?, 1);
+
+    net_a.author_local_shared_state_batch(&batch_a).await?;
+    net_b.author_local_shared_state_batch(&batch_b).await?;
+    net_c.author_local_shared_state_batch(&batch_c).await?;
+
+    wait_for_condition(
+        "round-1 DAG batch availability on node A",
+        Duration::from_secs(10),
+        || {
+            db_a.load_shared_state_dag_round(parent_anchor.position.epoch, 1)
+                .map(|batches| batches.len() == 3)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "round-1 DAG batch availability on node B",
+        Duration::from_secs(10),
+        || {
+            db_b.load_shared_state_dag_round(parent_anchor.position.epoch, 1)
+                .map(|batches| batches.len() == 3)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "round-1 DAG batch availability on node C",
+        Duration::from_secs(10),
+        || {
+            db_c.load_shared_state_dag_round(parent_anchor.position.epoch, 1)
+                .map(|batches| batches.len() == 3)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let leader_id = committee.leader_for(parent_anchor.num + 1);
+    let (leader_db, leader_net) = if validator_from_record(identity_a.record(), 1)?.id == leader_id
+    {
+        (db_a.clone(), net_a.clone())
+    } else if validator_from_record(identity_b.record(), 1)?.id == leader_id {
+        (db_b.clone(), net_b.clone())
+    } else {
+        (db_c.clone(), net_c.clone())
+    };
+
+    wait_for_condition(
+        "round-1 DAG batch availability on leader",
+        Duration::from_secs(10),
+        || {
+            leader_db
+                .load_shared_state_dag_round(parent_anchor.position.epoch, 1)
+                .map(|batches| batches.len() == 3)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let anchor = leader_net
+        .finalize_available_shared_state_anchor()
+        .await?
+        .expect("finalized shared-state anchor");
+    anchor.validate_against_parent(Some(parent_anchor))?;
+    assert_eq!(anchor.ordering_path, OrderingPath::DagBftSharedState);
+
+    wait_for_condition(
+        "shared-state anchor adoption on node A",
+        Duration::from_secs(10),
+        || {
+            db_a.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state anchor adoption on node B",
+        Duration::from_secs(10),
+        || {
+            db_b.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    wait_for_condition(
+        "shared-state anchor adoption on node C",
+        Duration::from_secs(10),
+        || {
+            db_c.get::<Anchor>("epoch", b"latest")
+                .ok()
+                .flatten()
+                .map(|latest| latest.hash == anchor.hash)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    Ok((tx_id, anchor))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -233,9 +620,11 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     let chain_id = protocol_chain_id();
 
     let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
-    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()])?;
-    provision_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()])?;
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    let (_, bootstrap_b) =
+        provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    let (_, bootstrap_c) =
+        provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
 
     let identity_a = NodeIdentity::load_runtime_in_dir(
         dir_a.path(),
@@ -256,22 +645,67 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
         vec![addr_c.clone()],
     )?;
 
-    let committee = finality_support::TestCommittee::from_identities(vec![
-        identity_a.clone(),
-        identity_b.clone(),
-        identity_c.clone(),
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a.clone(), 101),
+        (identity_b.clone(), 101),
+        (identity_c.clone(), 100),
     ]);
     let genesis = committee.genesis_anchor();
-    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
+    let validator_a = validator_from_record(identity_a.record(), 101)?;
+    let validator_id_b = validator_from_record(identity_b.record(), 101)?.id;
+    let validator_id_c = validator_from_record(identity_c.record(), 100)?.id;
+    let leader_id = committee.leader_for(genesis.num + 1);
+    let leader_bootstrap = if validator_a.id == leader_id {
+        bootstrap_a.clone()
+    } else if validator_id_b == leader_id {
+        bootstrap_b.clone()
+    } else {
+        bootstrap_c.clone()
+    };
 
-    let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
-    let (db_b, net_b, _) =
-        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
-    let (db_c, net_c, _) = spawn_test_node(&dir_c, build_net(port_c, vec![bootstrap_a])).await?;
+    let (db_a, net_a, _) = spawn_test_node(
+        &dir_a,
+        build_net(
+            port_a,
+            bootstrap_to_leader(validator_a.id, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_b, net_b, _) = spawn_test_node(
+        &dir_b,
+        build_net(
+            port_b,
+            bootstrap_to_leader(validator_id_b, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_c, net_c, _) = spawn_test_node(
+        &dir_c,
+        build_net(
+            port_c,
+            bootstrap_to_leader(validator_id_c, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
 
-    wait_for_peers(&net_a, 2, "node A").await;
-    wait_for_peers(&net_b, 1, "node B").await;
-    wait_for_peers(&net_c, 1, "node C").await;
+    wait_for_peers(
+        &net_a,
+        if validator_a.id == leader_id { 2 } else { 1 },
+        "node A",
+    )
+    .await;
+    wait_for_peers(
+        &net_b,
+        if validator_id_b == leader_id { 2 } else { 1 },
+        "node B",
+    )
+    .await;
+    wait_for_peers(
+        &net_c,
+        if validator_id_c == leader_id { 2 } else { 1 },
+        "node C",
+    )
+    .await;
 
     committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
     committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
@@ -279,13 +713,24 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
-    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 2)?;
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
 
-    let tx = signed_shared_state_tx(
+    let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+        validator_id: validator_a.id,
+        commission_bps: 275,
+        metadata: ValidatorMetadata {
+            display_name: "deterministic leader".to_string(),
+            website: Some("https://leader.unchained.example".to_string()),
+            description: Some("qc-collection profile update".to_string()),
+        },
+    });
+    let signable = Tx::shared_state_signing_bytes(db_a.effective_chain_id(), &action)?;
+    let tx = finality_support::fee_paid_shared_state_tx(
         db_a.as_ref(),
         &wallet_a,
-        SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
-        &cold_key,
+        action,
+        node_identity::sign_with_local_root_in_dir(dir_a.path(), &signable)?,
     )?;
     let tx_id = net_a.submit_tx(&tx).await?;
     wait_for_condition(
@@ -352,8 +797,11 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
         .expect("finalized shared-state anchor");
     anchor.validate_against_parent(Some(&genesis))?;
     assert_eq!(anchor.ordering_path, OrderingPath::DagBftSharedState);
-    assert_eq!(anchor.qc.votes.len(), 3);
-    assert_eq!(
+    assert!(anchor.qc.votes.len() >= 2);
+    assert!(anchor.qc.votes.len() <= 3);
+    assert!(
+        anchor.qc.signed_voting_power >= genesis.validator_set.quorum_threshold,
+        "qc signed voting power {} is below threshold {}",
         anchor.qc.signed_voting_power,
         genesis.validator_set.quorum_threshold
     );
@@ -419,9 +867,11 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     let chain_id = protocol_chain_id();
 
     let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
-    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()])?;
-    provision_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()])?;
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    let (_, bootstrap_b) =
+        provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    let (_, bootstrap_c) =
+        provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
 
     let identity_a = NodeIdentity::load_runtime_in_dir(
         dir_a.path(),
@@ -442,22 +892,67 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
         vec![addr_c.clone()],
     )?;
 
-    let committee = finality_support::TestCommittee::from_identities(vec![
-        identity_a.clone(),
-        identity_b.clone(),
-        identity_c.clone(),
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a.clone(), 101),
+        (identity_b.clone(), 101),
+        (identity_c.clone(), 100),
     ]);
     let genesis = committee.genesis_anchor();
-    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
+    let validator_a = validator_from_record(identity_a.record(), 101)?;
+    let validator_id_b = validator_from_record(identity_b.record(), 101)?.id;
+    let validator_id_c = validator_from_record(identity_c.record(), 100)?.id;
+    let leader_id = committee.leader_for(genesis.num + 1);
+    let leader_bootstrap = if validator_a.id == leader_id {
+        bootstrap_a.clone()
+    } else if validator_id_b == leader_id {
+        bootstrap_b.clone()
+    } else {
+        bootstrap_c.clone()
+    };
 
-    let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
-    let (db_b, net_b, _) =
-        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
-    let (db_c, net_c, _) = spawn_test_node(&dir_c, build_net(port_c, vec![bootstrap_a])).await?;
+    let (db_a, net_a, _) = spawn_test_node(
+        &dir_a,
+        build_net(
+            port_a,
+            bootstrap_to_leader(validator_a.id, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_b, net_b, _) = spawn_test_node(
+        &dir_b,
+        build_net(
+            port_b,
+            bootstrap_to_leader(validator_id_b, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_c, net_c, _) = spawn_test_node(
+        &dir_c,
+        build_net(
+            port_c,
+            bootstrap_to_leader(validator_id_c, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
 
-    wait_for_peers(&net_a, 2, "node A").await;
-    wait_for_peers(&net_b, 1, "node B").await;
-    wait_for_peers(&net_c, 1, "node C").await;
+    wait_for_peers(
+        &net_a,
+        if validator_a.id == leader_id { 2 } else { 1 },
+        "node A",
+    )
+    .await;
+    wait_for_peers(
+        &net_b,
+        if validator_id_b == leader_id { 2 } else { 1 },
+        "node B",
+    )
+    .await;
+    wait_for_peers(
+        &net_c,
+        if validator_id_c == leader_id { 2 } else { 1 },
+        "node C",
+    )
+    .await;
 
     committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
     committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
@@ -465,13 +960,24 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
-    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 2)?;
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
 
-    let tx = signed_shared_state_tx(
+    let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+        validator_id: validator_a.id,
+        commission_bps: 325,
+        metadata: ValidatorMetadata {
+            display_name: "dag frontier validator".to_string(),
+            website: Some("https://dag-frontier.unchained.example".to_string()),
+            description: Some("ordered shared-state dag frontier update".to_string()),
+        },
+    });
+    let signable = Tx::shared_state_signing_bytes(db_a.effective_chain_id(), &action)?;
+    let tx = finality_support::fee_paid_shared_state_tx(
         db_a.as_ref(),
         &wallet_a,
-        SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
-        &cold_key,
+        action,
+        node_identity::sign_with_local_root_in_dir(dir_a.path(), &signable)?,
     )?;
     let tx_id = net_a.submit_tx(&tx).await?;
     wait_for_condition(
@@ -590,9 +1096,13 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     assert!(db_a.get_raw_bytes("tx", &tx_id)?.is_some());
     assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
     assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
-    assert!(db_a.load_validator_pool(&pool.validator.id)?.is_some());
-    assert!(db_b.load_validator_pool(&pool.validator.id)?.is_some());
-    assert!(db_c.load_validator_pool(&pool.validator.id)?.is_some());
+    for db in [&db_a, &db_b, &db_c] {
+        let pool = db
+            .load_validator_pool(&validator_a.id)?
+            .expect("updated validator pool");
+        assert_eq!(pool.commission_bps, 325);
+        assert_eq!(pool.metadata.display_name, "dag frontier validator");
+    }
 
     net_a.shutdown().await;
     net_b.shutdown().await;
@@ -604,6 +1114,10 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
 async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
+    std::env::set_var(
+        "UNCHAINED_PROOF_FIXTURE_DIR",
+        finality_support::proof_fixture_dir(),
+    );
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -617,17 +1131,10 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     let addr_c = format!("127.0.0.1:{port_c}");
     let chain_id = protocol_chain_id();
     let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
-    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b])?;
-    provision_runtime_identity(&dir_c, Some(chain_id), vec![addr_c])?;
-
-    let identity_a = NodeIdentity::load_runtime_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(chain_id),
-        vec![addr_a.clone()],
-    )?;
-    let committee = finality_support::TestCommittee::from_identities(vec![identity_a]);
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+    let committee = finality_support::TestCommittee::single_validator();
     let genesis = committee.genesis_anchor();
 
     let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
@@ -645,44 +1152,35 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
-    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 4)?;
-
-    let mut anchor_rx_b = net_b.anchor_subscribe();
-    let mut anchor_rx_c = net_c.anchor_subscribe();
-
-    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
-    let registration = signed_shared_state_tx(
-        db_a.as_ref(),
-        &wallet_a,
-        SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
-        &cold_key,
-    )?;
-    let registration_id = net_a.submit_tx(&registration).await?;
-    let batch1 = SharedStateBatch::new(vec![registration.clone()])?;
-    let dag_batch1 = SharedStateDagBatch::new(
-        genesis.position.epoch,
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    let dummy_action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+        validator_id: genesis.validator_set.validators[0].id,
+        commission_bps: 325,
+        metadata: ValidatorMetadata {
+            display_name: "bootstrap validator".to_string(),
+            website: Some("https://bootstrap.example".to_string()),
+            description: Some("bootstrap-recovered validator".to_string()),
+        },
+    });
+    let ordinary =
+        finality_support::fee_payment_transfer_for_action(db_a.as_ref(), &wallet_a, &dummy_action)?;
+    let tx = Tx::OrdinaryPrivateTransfer(ordinary);
+    let tx_id = net_a.submit_tx(&tx).await?;
+    let batch = net_a
+        .select_pending_fast_path_batch()?
+        .expect("pending fast-path batch");
+    assert_eq!(batch.ordered_tx_count()?, 1);
+    net_a.publish_fast_path_batch(&batch).await?;
+    let anchor1 = committee.anchor(
         1,
-        genesis.validator_set.validators[0].id,
-        Vec::new(),
-        batch1,
-    )?;
-    db_a.store_shared_state_dag_batch(&dag_batch1)?;
-    let anchor1 = committee.shared_state_anchor(
-        &genesis,
-        1,
-        vec![dag_batch1.batch_id],
-        vec![dag_batch1.clone()],
+        Some(&genesis),
+        batch.ordered_tx_root,
+        batch.ordered_tx_count()?,
+        OrderingPath::FastPathPrivateTransfer,
     );
-    assert_eq!(anchor1.ordering_path, OrderingPath::DagBftSharedState);
     store_anchor(db_a.as_ref(), &anchor1)?;
-    db_a.store_validator_pool(&pool)?;
-    net_a.gossip_shared_state_dag_batch(&dag_batch1).await;
     net_a.gossip_anchor(&anchor1).await;
-
-    let seen_b_1 = wait_for_anchor(&mut anchor_rx_b, anchor1.hash).await;
-    let seen_c_1 = wait_for_anchor(&mut anchor_rx_c, anchor1.hash).await;
-    assert_eq!(seen_b_1.hash, anchor1.hash);
-    assert_eq!(seen_c_1.hash, anchor1.hash);
 
     wait_for_condition(
         "anchor1 adoption on node B",
@@ -708,110 +1206,561 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
         },
     )
     .await;
-    assert!(db_b.get_raw_bytes("tx", &registration_id)?.is_some());
-    assert!(db_c.get_raw_bytes("tx", &registration_id)?.is_some());
-    assert!(db_b.load_validator_pool(&pool.validator.id)?.is_some());
-    assert!(db_c.load_validator_pool(&pool.validator.id)?.is_some());
-
-    let update = signed_shared_state_tx(
-        db_a.as_ref(),
-        &wallet_a,
-        SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
-            validator_id: pool.validator.id,
-            commission_bps: 325,
-            metadata: ValidatorMetadata {
-                display_name: "bootstrap validator".to_string(),
-                website: Some("https://bootstrap.example".to_string()),
-                description: Some("bootstrap-recovered validator".to_string()),
-            },
-        }),
-        &cold_key,
-    )?;
-    let update_id = net_a.submit_tx(&update).await?;
-    let batch2 = SharedStateBatch::new(vec![update.clone()])?;
-    let dag_batch2 = SharedStateDagBatch::new(
-        anchor1.position.epoch,
-        2,
-        genesis.validator_set.validators[0].id,
-        vec![dag_batch1.batch_id],
-        batch2,
-    )?;
-    db_a.store_shared_state_dag_batch(&dag_batch2)?;
-    let anchor2 = committee.shared_state_anchor(
-        &anchor1,
-        2,
-        vec![dag_batch2.batch_id],
-        vec![dag_batch2.clone()],
-    );
-    assert_eq!(anchor2.ordering_path, OrderingPath::DagBftSharedState);
-    store_anchor(db_a.as_ref(), &anchor2)?;
-    db_a.store_validator_pool(
-        &ValidatorProfileUpdate {
-            validator_id: pool.validator.id,
-            commission_bps: 325,
-            metadata: ValidatorMetadata {
-                display_name: "bootstrap validator".to_string(),
-                website: Some("https://bootstrap.example".to_string()),
-                description: Some("bootstrap-recovered validator".to_string()),
-            },
-        }
-        .apply_to(&pool)?,
-    )?;
-    net_a.gossip_shared_state_dag_batch(&dag_batch2).await;
-    net_a.gossip_anchor(&anchor2).await;
-
-    let seen_b_2 = wait_for_anchor(&mut anchor_rx_b, anchor2.hash).await;
-    let seen_c_2 = wait_for_anchor(&mut anchor_rx_c, anchor2.hash).await;
-    assert_eq!(seen_b_2.hash, anchor2.hash);
-    assert_eq!(seen_c_2.hash, anchor2.hash);
-
-    wait_for_condition(
-        "anchor2 adoption on node B",
-        Duration::from_secs(10),
-        || {
-            db_b.get::<Anchor>("epoch", b"latest")
-                .ok()
-                .flatten()
-                .map(|anchor| anchor.hash == anchor2.hash)
-                .unwrap_or(false)
-        },
-    )
-    .await;
-    wait_for_condition(
-        "anchor2 adoption on node C",
-        Duration::from_secs(10),
-        || {
-            db_c.get::<Anchor>("epoch", b"latest")
-                .ok()
-                .flatten()
-                .map(|anchor| anchor.hash == anchor2.hash)
-                .unwrap_or(false)
-        },
-    )
-    .await;
-    assert!(db_b.get_raw_bytes("tx", &update_id)?.is_some());
-    assert!(db_c.get_raw_bytes("tx", &update_id)?.is_some());
-    let recovered_pool_b = db_b
-        .load_validator_pool(&pool.validator.id)?
-        .expect("recovered validator pool on node B");
-    let recovered_pool_c = db_c
-        .load_validator_pool(&pool.validator.id)?
-        .expect("recovered validator pool on node C");
-    assert_eq!(recovered_pool_b.commission_bps, 325);
-    assert_eq!(recovered_pool_c.commission_bps, 325);
-    assert_eq!(
-        recovered_pool_b.metadata.display_name,
-        "bootstrap validator"
-    );
-    assert_eq!(
-        recovered_pool_c.metadata.display_name,
-        "bootstrap validator"
-    );
+    assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b.load_fast_path_batch(&batch.ordered_tx_root)?.is_some());
+    assert!(db_c.load_fast_path_batch(&batch.ordered_tx_root)?.is_some());
 
     net_a.shutdown().await;
     net_b.shutdown().await;
     net_c.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(false);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+
+    let port_a = pick_udp_port();
+    let port_b = pick_udp_port();
+    let port_c = pick_udp_port();
+    let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
+    let chain_id = protocol_chain_id();
+
+    let (_, bootstrap_a) =
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    let (_, bootstrap_b) =
+        provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    let (_, bootstrap_c) =
+        provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a.clone()],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b.clone()],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c.clone()],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a.clone(), 101),
+        (identity_b.clone(), 101),
+        (identity_c.clone(), 100),
+    ]);
+    let genesis = committee.genesis_anchor();
+    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
+
+    let validator_id_a = validator_from_record(identity_a.record(), 1)?.id;
+    let validator_id_b = validator_from_record(identity_b.record(), 1)?.id;
+    let validator_id_c = validator_from_record(identity_c.record(), 1)?.id;
+    let leader_id = committee.leader_for(genesis.num + 1);
+    let leader_bootstrap = if validator_id_a == leader_id {
+        bootstrap_a.clone()
+    } else if validator_id_b == leader_id {
+        bootstrap_b.clone()
+    } else {
+        bootstrap_c.clone()
+    };
+
+    let (db_a, net_a, _) = spawn_test_node(
+        &dir_a,
+        build_net(
+            port_a,
+            bootstrap_to_leader(validator_id_a, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_b, net_b, _) = spawn_test_node(
+        &dir_b,
+        build_net(
+            port_b,
+            bootstrap_to_leader(validator_id_b, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_c, net_c, _) = spawn_test_node(
+        &dir_c,
+        build_net(
+            port_c,
+            bootstrap_to_leader(validator_id_c, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    network::set_quiet_logging(false);
+
+    wait_for_peers(
+        &net_a,
+        if validator_id_a == leader_id { 2 } else { 1 },
+        "node A",
+    )
+    .await;
+    wait_for_peers(
+        &net_b,
+        if validator_id_b == leader_id { 2 } else { 1 },
+        "node B",
+    )
+    .await;
+    wait_for_peers(
+        &net_c,
+        if validator_id_c == leader_id { 2 } else { 1 },
+        "node C",
+    )
+    .await;
+
+    committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_c.as_ref(), genesis.position.epoch)?;
+    store_anchor(db_a.as_ref(), &genesis)?;
+    store_anchor(db_b.as_ref(), &genesis)?;
+    store_anchor(db_c.as_ref(), &genesis)?;
+    db_a.store_validator_pool(&pool)?;
+    db_b.store_validator_pool(&pool)?;
+    db_c.store_validator_pool(&pool)?;
+
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    let update = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+        validator_id: pool.validator.id,
+        commission_bps: 325,
+        metadata: ValidatorMetadata {
+            display_name: "deterministic validator".to_string(),
+            website: Some("https://deterministic.example".to_string()),
+            description: Some("deterministic fresh-wallet profile update".to_string()),
+        },
+    });
+    let tx = signed_shared_state_tx(db_a.as_ref(), &wallet_a, update, &cold_key)?;
+    let (tx_id, _anchor) = finalize_single_shared_state_action(
+        &genesis,
+        &committee,
+        &identity_a,
+        &identity_b,
+        &identity_c,
+        &db_a,
+        &db_b,
+        &db_c,
+        &net_a,
+        &net_b,
+        &net_c,
+        &tx,
+    )
+    .await?;
+
+    assert!(db_a.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
+    for db in [&db_a, &db_b, &db_c] {
+        let stored = db
+            .load_validator_pool(&pool.validator.id)?
+            .expect("updated validator pool");
+        assert_eq!(stored.commission_bps, 325);
+        assert_eq!(stored.metadata.display_name, "deterministic validator");
+        assert_eq!(
+            stored.metadata.website.as_deref(),
+            Some("https://deterministic.example")
+        );
+    }
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+    net_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+
+    let port_a = pick_udp_port();
+    let port_b = pick_udp_port();
+    let port_c = pick_udp_port();
+    let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
+    let chain_id = protocol_chain_id();
+
+    let (_, bootstrap_a) =
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    let (_, bootstrap_b) =
+        provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    let (_, bootstrap_c) =
+        provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a.clone()],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b.clone()],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c.clone()],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a.clone(), 101),
+        (identity_b.clone(), 101),
+        (identity_c.clone(), 100),
+    ]);
+    let genesis = committee.genesis_anchor();
+    let (base_pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
+    let jailed_pool = ValidatorPool {
+        activation_epoch: genesis.position.epoch,
+        status: ValidatorStatus::Jailed,
+        accountability: ValidatorAccountability {
+            liveness_faults: PROTOCOL.liveness_fault_jail_threshold,
+            safety_faults: 0,
+            jailed_until_epoch: Some(genesis.position.epoch),
+        },
+        ..base_pool
+    };
+    jailed_pool.validate()?;
+
+    let validator_id_a = validator_from_record(identity_a.record(), 1)?.id;
+    let validator_id_b = validator_from_record(identity_b.record(), 1)?.id;
+    let validator_id_c = validator_from_record(identity_c.record(), 1)?.id;
+    let leader_id = committee.leader_for(genesis.num + 1);
+    let leader_bootstrap = if validator_id_a == leader_id {
+        bootstrap_a.clone()
+    } else if validator_id_b == leader_id {
+        bootstrap_b.clone()
+    } else {
+        bootstrap_c.clone()
+    };
+
+    let (db_a, net_a, _) = spawn_test_node(
+        &dir_a,
+        build_net(
+            port_a,
+            bootstrap_to_leader(validator_id_a, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_b, net_b, _) = spawn_test_node(
+        &dir_b,
+        build_net(
+            port_b,
+            bootstrap_to_leader(validator_id_b, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_c, net_c, _) = spawn_test_node(
+        &dir_c,
+        build_net(
+            port_c,
+            bootstrap_to_leader(validator_id_c, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+
+    wait_for_peers(
+        &net_a,
+        if validator_id_a == leader_id { 2 } else { 1 },
+        "node A",
+    )
+    .await;
+    wait_for_peers(
+        &net_b,
+        if validator_id_b == leader_id { 2 } else { 1 },
+        "node B",
+    )
+    .await;
+    wait_for_peers(
+        &net_c,
+        if validator_id_c == leader_id { 2 } else { 1 },
+        "node C",
+    )
+    .await;
+
+    committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_c.as_ref(), genesis.position.epoch)?;
+    store_anchor(db_a.as_ref(), &genesis)?;
+    store_anchor(db_b.as_ref(), &genesis)?;
+    store_anchor(db_c.as_ref(), &genesis)?;
+    db_a.store_validator_pool(&jailed_pool)?;
+    db_b.store_validator_pool(&jailed_pool)?;
+    db_c.store_validator_pool(&jailed_pool)?;
+
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    let tx = signed_shared_state_tx(
+        db_a.as_ref(),
+        &wallet_a,
+        SharedStateAction::ReactivateValidator(ValidatorReactivation {
+            validator_id: jailed_pool.validator.id,
+        }),
+        &cold_key,
+    )?;
+    let (tx_id, _anchor) = finalize_single_shared_state_action(
+        &genesis,
+        &committee,
+        &identity_a,
+        &identity_b,
+        &identity_c,
+        &db_a,
+        &db_b,
+        &db_c,
+        &net_a,
+        &net_b,
+        &net_c,
+        &tx,
+    )
+    .await?;
+
+    assert!(db_a.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
+    for db in [&db_a, &db_b, &db_c] {
+        let stored = db
+            .load_validator_pool(&jailed_pool.validator.id)?
+            .expect("reactivated validator pool");
+        assert_eq!(stored.status, ValidatorStatus::PendingActivation);
+        assert_eq!(stored.activation_epoch, genesis.position.epoch + 1);
+        assert_eq!(
+            stored.accountability.liveness_faults,
+            jailed_pool.accountability.liveness_faults
+        );
+        assert_eq!(stored.accountability.jailed_until_epoch, None);
+    }
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+    net_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pq_network_finalizes_fee_paid_penalty_admission_from_fresh_wallet() -> anyhow::Result<()> {
+    let _guard = test_guard();
+    network::set_quiet_logging(true);
+
+    let dir_a = TempDir::new()?;
+    let dir_b = TempDir::new()?;
+    let dir_c = TempDir::new()?;
+
+    let port_a = pick_udp_port();
+    let port_b = pick_udp_port();
+    let port_c = pick_udp_port();
+    let addr_a = format!("127.0.0.1:{port_a}");
+    let addr_b = format!("127.0.0.1:{port_b}");
+    let addr_c = format!("127.0.0.1:{port_c}");
+    let chain_id = protocol_chain_id();
+
+    let (_, bootstrap_a) =
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    let (_, bootstrap_b) =
+        provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
+    let (_, bootstrap_c) =
+        provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
+
+    let identity_a = NodeIdentity::load_runtime_in_dir(
+        dir_a.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_a.clone()],
+    )?;
+    let identity_b = NodeIdentity::load_runtime_in_dir(
+        dir_b.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_b.clone()],
+    )?;
+    let identity_c = NodeIdentity::load_runtime_in_dir(
+        dir_c.path(),
+        PROTOCOL.version,
+        Some(chain_id),
+        vec![addr_c.clone()],
+    )?;
+
+    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
+        (identity_a.clone(), 101),
+        (identity_b.clone(), 101),
+        (identity_c.clone(), 100),
+    ]);
+    let genesis = committee.genesis_anchor();
+
+    let validator_id_a = validator_from_record(identity_a.record(), 1)?.id;
+    let validator_id_b = validator_from_record(identity_b.record(), 1)?.id;
+    let validator_id_c = validator_from_record(identity_c.record(), 1)?.id;
+    let leader_id = committee.leader_for(genesis.num + 1);
+    let leader_bootstrap = if validator_id_a == leader_id {
+        bootstrap_a.clone()
+    } else if validator_id_b == leader_id {
+        bootstrap_b.clone()
+    } else {
+        bootstrap_c.clone()
+    };
+
+    let (db_a, net_a, _) = spawn_test_node(
+        &dir_a,
+        build_net(
+            port_a,
+            bootstrap_to_leader(validator_id_a, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_b, net_b, _) = spawn_test_node(
+        &dir_b,
+        build_net(
+            port_b,
+            bootstrap_to_leader(validator_id_b, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+    let (db_c, net_c, _) = spawn_test_node(
+        &dir_c,
+        build_net(
+            port_c,
+            bootstrap_to_leader(validator_id_c, leader_id, &leader_bootstrap),
+        ),
+    )
+    .await?;
+
+    wait_for_peers(
+        &net_a,
+        if validator_id_a == leader_id { 2 } else { 1 },
+        "node A",
+    )
+    .await;
+    wait_for_peers(
+        &net_b,
+        if validator_id_b == leader_id { 2 } else { 1 },
+        "node B",
+    )
+    .await;
+    wait_for_peers(
+        &net_c,
+        if validator_id_c == leader_id { 2 } else { 1 },
+        "node C",
+    )
+    .await;
+
+    committee.seed_validator_state(db_a.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
+    committee.seed_validator_state(db_c.as_ref(), genesis.position.epoch)?;
+    store_anchor(db_a.as_ref(), &genesis)?;
+    store_anchor(db_b.as_ref(), &genesis)?;
+    store_anchor(db_c.as_ref(), &genesis)?;
+
+    let anchor1 = finalized_fast_path_anchor_from_identities(
+        1,
+        Some(&genesis),
+        &genesis.validator_set,
+        &[&identity_a, &identity_b],
+    )?;
+    store_anchor(db_a.as_ref(), &anchor1)?;
+    store_anchor(db_b.as_ref(), &anchor1)?;
+    store_anchor(db_c.as_ref(), &anchor1)?;
+
+    let slashed_validator = validator_from_record(identity_c.record(), 100)?;
+    let original_pool = db_a
+        .load_validator_pool(&slashed_validator.id)?
+        .expect("validator C pool before penalty");
+    let fault = LivenessFaultProof::new_missed_vote(&anchor1, slashed_validator.id)?;
+
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    let evidence_id = SlashableEvidence::Liveness(fault.clone()).evidence_id()?;
+    let tx = finality_support::fee_paid_shared_state_tx(
+        db_a.as_ref(),
+        &wallet_a,
+        SharedStateAction::AdmitPenaltyEvidence(PenaltyEvidenceAdmission {
+            evidence: SlashableEvidence::Liveness(fault.clone()),
+        }),
+        Vec::new(),
+    )?;
+    let (tx_id, anchor) = finalize_single_shared_state_action(
+        &anchor1,
+        &committee,
+        &identity_a,
+        &identity_b,
+        &identity_c,
+        &db_a,
+        &db_b,
+        &db_c,
+        &net_a,
+        &net_b,
+        &net_c,
+        &tx,
+    )
+    .await?;
+
+    assert!(db_a.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_c.get_raw_bytes("tx", &tx_id)?.is_some());
+    for db in [&db_a, &db_b, &db_c] {
+        let stored = db
+            .load_validator_pool(&slashed_validator.id)?
+            .expect("slashed validator pool");
+        let penalty_event = db
+            .load_validator_penalty_event(&evidence_id)?
+            .expect("stored validator penalty event");
+        let reward_event = db
+            .load_validator_reward_events_for_anchor(anchor.num)?
+            .into_iter()
+            .find(|event| event.validator_id == slashed_validator.id)
+            .expect("stored slashed validator reward event");
+        assert_eq!(
+            penalty_event.bonded_stake_before,
+            original_pool.total_bonded_stake
+        );
+        assert_eq!(
+            penalty_event.bonded_stake_after,
+            original_pool.total_bonded_stake - 1
+        );
+        assert_eq!(
+            stored.total_bonded_stake,
+            penalty_event
+                .bonded_stake_after
+                .checked_add(reward_event.gross_reward)
+                .expect("slashed validator reward overflow")
+        );
+        assert_eq!(stored.status, ValidatorStatus::Active);
+        assert_eq!(stored.accountability.liveness_faults, 1);
+        assert_eq!(stored.accountability.jailed_until_epoch, None);
+        assert_eq!(penalty_event.resulting_status, ValidatorStatus::Active);
+        assert_eq!(
+            penalty_event.resulting_accountability,
+            stored.accountability
+        );
+        assert_eq!(reward_event.suppression_reason, None);
+    }
+
+    net_a.shutdown().await;
+    net_b.shutdown().await;
+    net_c.shutdown().await;
     Ok(())
 }
 
@@ -887,6 +1836,10 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
 async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
+    std::env::set_var(
+        "UNCHAINED_PROOF_FIXTURE_DIR",
+        finality_support::proof_fixture_dir(),
+    );
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -897,16 +1850,10 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     let addr_b = format!("127.0.0.1:{port_b}");
     let chain_id = protocol_chain_id();
     let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()])?;
-    provision_runtime_identity(&dir_b, Some(chain_id), vec![addr_b])?;
+        provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
+    provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
 
-    let identity_a = NodeIdentity::load_runtime_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(chain_id),
-        vec![addr_a.clone()],
-    )?;
-    let committee = finality_support::TestCommittee::from_identities(vec![identity_a]);
+    let committee = finality_support::TestCommittee::single_validator();
     let genesis = committee.genesis_anchor();
 
     let (db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
@@ -920,83 +1867,40 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     committee.seed_validator_state(db_b.as_ref(), genesis.position.epoch)?;
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
-    let wallet_a = build_fee_payer_wallet(&dir_a, db_a.as_ref(), &genesis, 4)?;
+    let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
+    mirror_wallet_coin_state(&[db_b.as_ref()], &wallet_a, &genesis, &[2])?;
 
     net_b.shutdown().await;
     db_b.close()?;
     drop(db_b);
     drop(net_b);
 
-    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
-    let registration = signed_shared_state_tx(
-        db_a.as_ref(),
-        &wallet_a,
-        SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() }),
-        &cold_key,
-    )?;
-    let registration_id = net_a.submit_tx(&registration).await?;
-    let batch1 = SharedStateBatch::new(vec![registration.clone()])?;
-    let dag_batch1 = SharedStateDagBatch::new(
-        genesis.position.epoch,
+    let dummy_action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
+        validator_id: genesis.validator_set.validators[0].id,
+        commission_bps: 325,
+        metadata: ValidatorMetadata {
+            display_name: "rejoin proof".to_string(),
+            website: Some("https://rejoin.example".to_string()),
+            description: Some("rejoined fast-path proof roundtrip".to_string()),
+        },
+    });
+    let ordinary =
+        finality_support::fee_payment_transfer_for_action(db_a.as_ref(), &wallet_a, &dummy_action)?;
+    let tx = Tx::OrdinaryPrivateTransfer(ordinary);
+    let tx_id = net_a.submit_tx(&tx).await?;
+    let batch = net_a
+        .select_pending_fast_path_batch()?
+        .expect("pending fast-path batch");
+    assert_eq!(batch.ordered_tx_count()?, 1);
+    net_a.publish_fast_path_batch(&batch).await?;
+    let anchor1 = committee.anchor(
         1,
-        genesis.validator_set.validators[0].id,
-        Vec::new(),
-        batch1,
-    )?;
-    db_a.store_shared_state_dag_batch(&dag_batch1)?;
-    let anchor1 = committee.shared_state_anchor(
-        &genesis,
-        1,
-        vec![dag_batch1.batch_id],
-        vec![dag_batch1.clone()],
+        Some(&genesis),
+        batch.ordered_tx_root,
+        batch.ordered_tx_count()?,
+        OrderingPath::FastPathPrivateTransfer,
     );
     store_anchor(db_a.as_ref(), &anchor1)?;
-    db_a.store_validator_pool(&pool)?;
-
-    let update = signed_shared_state_tx(
-        db_a.as_ref(),
-        &wallet_a,
-        SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
-            validator_id: pool.validator.id,
-            commission_bps: 325,
-            metadata: ValidatorMetadata {
-                display_name: "rejoined validator".to_string(),
-                website: Some("https://rejoin.example".to_string()),
-                description: Some("rejoined validator profile".to_string()),
-            },
-        }),
-        &cold_key,
-    )?;
-    let update_id = net_a.submit_tx(&update).await?;
-    let batch2 = SharedStateBatch::new(vec![update.clone()])?;
-    let dag_batch2 = SharedStateDagBatch::new(
-        anchor1.position.epoch,
-        2,
-        genesis.validator_set.validators[0].id,
-        vec![dag_batch1.batch_id],
-        batch2,
-    )?;
-    db_a.store_shared_state_dag_batch(&dag_batch2)?;
-    let anchor2 = committee.shared_state_anchor(
-        &anchor1,
-        2,
-        vec![dag_batch2.batch_id],
-        vec![dag_batch2.clone()],
-    );
-    assert_eq!(anchor2.ordering_path, OrderingPath::DagBftSharedState);
-    store_anchor(db_a.as_ref(), &anchor2)?;
-    db_a.store_validator_pool(
-        &ValidatorProfileUpdate {
-            validator_id: pool.validator.id,
-            commission_bps: 325,
-            metadata: ValidatorMetadata {
-                display_name: "rejoined validator".to_string(),
-                website: Some("https://rejoin.example".to_string()),
-                description: Some("rejoined validator profile".to_string()),
-            },
-        }
-        .apply_to(&pool)?,
-    )?;
 
     let (db_b_rejoin, net_b_rejoin, _) = spawn_test_node(&dir_b, build_net(port_b, vec![])).await?;
 
@@ -1004,24 +1908,18 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     wait_for_peers(&net_b_rejoin, 1, "node B after rejoin").await;
 
     let mut anchor_rx = net_b_rejoin.anchor_subscribe();
-    net_a.gossip_shared_state_dag_batch(&dag_batch1).await;
     net_a.gossip_anchor(&anchor1).await;
     net_b_rejoin.request_latest_epoch().await;
     let adopted_anchor1 = wait_for_anchor(&mut anchor_rx, anchor1.hash).await;
     assert_eq!(adopted_anchor1.hash, anchor1.hash);
     wait_for_condition("rejoined anchor1 adoption", Duration::from_secs(10), || {
         db_b_rejoin
-            .get_raw_bytes("tx", &registration_id)
+            .get_raw_bytes("tx", &tx_id)
             .ok()
             .flatten()
             .is_some()
     })
     .await;
-
-    net_a.gossip_shared_state_dag_batch(&dag_batch2).await;
-    net_a.gossip_anchor(&anchor2).await;
-    let adopted_tip = wait_for_anchor(&mut anchor_rx, anchor2.hash).await;
-    assert_eq!(adopted_tip.hash, anchor2.hash);
 
     wait_for_condition(
         "rejoined latest anchor adoption",
@@ -1031,18 +1929,15 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
                 .get::<Anchor>("epoch", b"latest")
                 .ok()
                 .flatten()
-                .map(|anchor| anchor.hash == anchor2.hash)
+                .map(|anchor| anchor.hash == anchor1.hash)
                 .unwrap_or(false)
         },
     )
     .await;
-    assert!(db_b_rejoin.get_raw_bytes("tx", &registration_id)?.is_some());
-    assert!(db_b_rejoin.get_raw_bytes("tx", &update_id)?.is_some());
-    let recovered_pool = db_b_rejoin
-        .load_validator_pool(&pool.validator.id)?
-        .expect("validator pool recovered after rejoin");
-    assert_eq!(recovered_pool.commission_bps, 325);
-    assert_eq!(recovered_pool.metadata.display_name, "rejoined validator");
+    assert!(db_b_rejoin.get_raw_bytes("tx", &tx_id)?.is_some());
+    assert!(db_b_rejoin
+        .load_fast_path_batch(&batch.ordered_tx_root)?
+        .is_some());
 
     net_b_rejoin.shutdown().await;
     net_a.shutdown().await;

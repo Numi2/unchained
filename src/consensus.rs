@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(DEFAULT_SLOTS_PER_EPOCH, 256);
         assert_eq!(DEFAULT_SLOT_DURATION_MS, 250);
         assert_eq!(FAST_PATH_TIMEOUT_MS, 450);
-        assert_eq!(DAG_BFT_TIMEOUT_MS, 1_200);
+        assert_eq!(DAG_BFT_TIMEOUT_MS, 10_000);
         assert_eq!(MAX_COINS_PER_CHECKPOINT, 111);
     }
 

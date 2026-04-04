@@ -9,6 +9,7 @@ The canonical design is:
 - Mysticeti-class DAG BFT ordering
 - fast-path finality for ordinary private payments
 - private delegation and staking
+- stateless PIR-native private discovery for `LocatorID` resolution
 - hybrid `X25519MLKEM768` transport
 - `ML-DSA` hot-path validator signatures
 - `SLH-DSA` cold recovery and governance keys
@@ -115,6 +116,13 @@ Wallet UX is built around:
 3. one-time `RecipientHandle` negotiation
 4. direct invoice links for merchant-style flows
 
+From day one, private discovery is implemented as a **stateless PIR service**.
+The discovery directory stores **fixed-size signed discovery records** and
+answers only PIR-shaped queries, so it can help a sender resolve a short
+locator without learning which locator was looked up. Discovery returns
+mailbox bootstrap material, not a reusable payment key, and the wallet then
+negotiates a fresh one-time `RecipientHandle`.
+
 The sender never needs to see large PQ key material, and the ledger never needs
 to see a reusable outward identity.
 
@@ -139,6 +147,8 @@ first-seen leakage without mixnet-scale latency.
 
 Wallet sync is based on compact chain data plus fuzzy note-detection tags and
 local trial decryption, not requester-linked archive queries.
+PIR is used for **addressability lookup**, not for ordinary receive-side note
+scanning.
 
 ### Cryptography
 
@@ -246,10 +256,8 @@ ordered DAG/BFT path instead of letting it race the fast path.
 
 The remaining consensus gap is narrower: richer multi-round DAG scheduling,
 stronger end-to-end coverage for proof-heavy fast-path/fallback flows across
-multiple validators, broader liveness/accountability policy beyond the current
-deterministic equivocation-plus-missed-vote schedule, and end-to-end operator
-submission flows for fee-paid governance actions beyond the new transaction and
-wallet-building primitives.
+multiple validators, and broader liveness/accountability policy beyond the
+current deterministic equivocation-plus-missed-vote schedule.
 
 Validator activation is now pulled from persisted validator-pool state rather
 than inherited indefinitely from the parent checkpoint. The staking lifecycle
@@ -299,6 +307,83 @@ and validator reactivation can carry a separate shielded fee-payment sidecar,
 and node-control status now exposes the latest finalized reward split as
 protocol reward plus fee reward rather than a single opaque total. Wallet
 history likewise records fee amounts explicitly for sent transfers.
+
+Internal self-change and staking-note outputs now use deterministic one-time
+ML-KEM receive keys derived from wallet secret material plus the transaction
+send seed rather than random long-lived internal receive-key minting. That
+keeps self-addressed outputs private without relying on mutable wallet-global
+receive-key state.
+
+The operator path for those control actions is now explicit. `unchained_node`
+can build cold-signed validator registration, profile-update, reactivation, and
+penalty-evidence control documents using the canonical local node root as the
+validator cold-governance key, and `unchained_wallet` can submit those
+documents through wallet-control with a private fee sidecar instead of relying
+on a local zero-fee exception.
+
+The fee-paid control-path test harness is now deterministic as well. Fresh
+single-action staking tests can seed a single high-value genesis note, internal
+change keys are derived deterministically, the single-validator and
+deterministic multivalidator shielded fee witnesses now have committed cached
+transparent receipts, and fresh fee-paid staking-control tests can execute
+without re-proving those witnesses on every run. Routine verification now uses
+fast local staking state-machine tests for accountability and pool-state
+transitions, multivalidator ordered-control coverage in `pq_network`, and the
+wallet-control end-to-end fee-paid registration flow. The validator transport
+path also carries explicit QUIC keep-alive and idle-timeout policy instead of
+relying on library defaults.
+
+Outward payment handles are now true one-time capability documents. Each minted
+handle carries a fresh payment-capability signing key plus a fresh ML-KEM
+receive key, and the wallet-global signing identity is no longer exposed or
+reused across outward payment handles.
+
+Wallet checkpoint refresh also no longer depends on requester-linked historical
+extension queries through node control. The wallet now derives historical
+unspent extensions locally from the current shielded archive/runtime material.
+Separately, ordinary wallet observation now runs from a compact node-control
+scan head plus paged deltas. The wallet persists a compact scan cursor,
+requests only the next bounded range of committed genesis coins and compact
+shielded outputs, uses the existing `view_tag` as the probabilistic detection
+tag, and keeps final ownership detection wallet-local through trial
+decryption. The same compact head/delta protocol now also runs over the
+role-separated relay/gateway transport, so compact wallet refresh no longer
+requires a colocated node-control socket. Sender-side proving and checkpoint
+refresh now use a smaller send-runtime material bundle carrying the compact
+head, validator pools, note-tree root state, root ledger, and archived
+nullifier epochs over either node control or relay/gateway ingress, so normal
+wallet prepare/prove/submit flows no longer depend on a local node-control
+socket either. Sender-side proving can now also be offloaded to a distinct
+`unchained_node start-proof-assistant` role over a separate hybrid-encrypted
+transport, so remote/mobile wallets no longer need a colocated prover to build
+ordinary sends, private staking flows, shared-state fee payments, or
+checkpoint-accumulator receipts. The heavyweight full shielded runtime snapshot
+remains only as an explicit local/test utility.
+
+Those send, staking, ingress, and proof-assistant paths now also use a
+canonical `TransparentProof` object with an explicit statement kind instead of
+passing raw backend receipt bytes through transaction and wallet state. Receipt
+decoding, backend method/image identifiers, and prototype-proof cache
+serialization now live behind `src/proof.rs`, which keeps the steady-state
+protocol and wallet model stable while the proving backend is replaced.
+
+That proof boundary now carries an explicit canonical circuit inventory as
+well: ordinary transfer, private delegation, private undelegation, unbonding
+claim, and checkpoint accumulator are named circuit slots with a conservative
+`128-bit` minimum security budget and explicit public-input shapes. The
+prototype backend is still internal to `src/proof.rs`, but the rest of the
+system now reasons about circuit identity rather than backend method constants.
+
+Ordinary-path submission now runs through the real two-role ingress boundary.
+`unchained_node start-access-relay` and `unchained_node start-submission-gateway`
+host distinct ingress roles, `unchained_wallet serve` submits through configured
+relay/gateway records instead of direct validator submission, and the ingress
+wire path uses hybrid X25519+ML-KEM768 sealing, fixed-size padded envelopes,
+short release windows, and micro-batched validator ingress. While the wallet is
+online, `unchained_wallet serve` now also emits low-rate cover envelopes on a
+deterministic per-wallet cadence through the same relay/gateway path; the
+submission gateway drops those covers before validator admission so they add
+metadata noise without polluting consensus state.
 
 ## Build
 
