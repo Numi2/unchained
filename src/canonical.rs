@@ -23,7 +23,9 @@ use crate::{
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
     },
-    proof::{TransparentCircuit, TransparentProof, TransparentProofStatement},
+    proof::{
+        TransparentCircuit, TransparentProof, TransparentProofBackend, TransparentProofStatement,
+    },
     shielded::{
         ArchiveCustodyCommitment, ArchiveOperatorScorecard, ArchiveProviderManifest,
         ArchiveReplicaAttestation, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
@@ -901,6 +903,9 @@ pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
         TransparentCircuit::UnbondingClaimV1 => 3,
         TransparentCircuit::CheckpointAccumulatorV1 => 4,
     });
+    writer.write_u8(match proof.backend {
+        TransparentProofBackend::PrototypeRisc0StarkV1 => 0,
+    });
     writer.write_bytes(&proof.seal)?;
     Ok(writer.into_vec())
 }
@@ -924,6 +929,10 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             3 => TransparentCircuit::UnbondingClaimV1,
             4 => TransparentCircuit::CheckpointAccumulatorV1,
             other => bail!("unsupported transparent proof circuit {}", other),
+        },
+        backend: match reader.read_u8()? {
+            0 => TransparentProofBackend::PrototypeRisc0StarkV1,
+            other => bail!("unsupported transparent proof backend {}", other),
         },
         seal: reader.read_bytes()?,
     };

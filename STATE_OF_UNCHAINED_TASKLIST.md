@@ -274,14 +274,19 @@ transitional and should be removed rather than preserved.
 - `[~]` Remove dependence on the current prototype proving backend as the
   long-term integrity anchor
   Backend-specific receipt parsing and method/image identifiers are now
-  contained within `src/proof.rs`, but the underlying proving backend is still
-  the prototype engine and has not yet been replaced.
+  contained within `src/proof.rs`, the canonical proof model now carries
+  explicit backend identity, and the proof assistant now advertises backend
+  capabilities and supported circuits. Proof routing now also runs through a
+  canonical per-circuit backend policy instead of direct method wiring, but
+  the underlying proving backend is still the prototype engine and has not yet
+  been replaced.
 - `[~]` Define a native transparent STARK-family proving architecture
   The canonical proof layer now has an explicit circuit inventory for ordinary
   transfer, private delegation, private undelegation, unbonding claim, and
   checkpoint accumulator, each with a named public-input shape and a
-  conservative `128-bit` minimum security budget. The backend swap itself is
-  still open.
+  conservative `128-bit` minimum security budget. Proofs and proof-assistant
+  transport now also carry explicit backend identity and capability manifests.
+  The backend swap itself is still open.
 - `[ ]` Set and document a conservative `>= 128-bit` security budget
 - `[ ]` Implement native circuits for ordinary transfer
 - `[ ]` Implement native circuits for staking flows
@@ -380,6 +385,8 @@ transitional and should be removed rather than preserved.
   Query budgeting, retries, relaying, and operator telemetry must not re-link
   locator resolution to a wallet identity or degrade PIR query privacy.
 - `[ ]` Add proof-system tests aligned to the new native circuits
+  The suite now includes canonical circuit-inventory and proof-assistant
+  capability-manifest coverage, but native-circuit proof tests are still open.
 
 ## 14. Immediate Next Steps
 

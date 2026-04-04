@@ -19,7 +19,7 @@ use proof_core::{
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::Endpoint;
 use rand::RngCore;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -39,6 +39,9 @@ const PROOF_ASSISTANT_KEEP_ALIVE_SECS: u64 = 5;
 const PROOF_ASSISTANT_HEADER_BYTES: usize = 1 + 32 + 32 + ML_KEM_768_CT_BYTES + 24;
 
 enum ProofAssistantRequest {
+    Capabilities {
+        request_id: [u8; 32],
+    },
     ShieldedTx {
         request_id: [u8; 32],
         witness: Vec<u8>,
@@ -64,6 +67,10 @@ enum ProofAssistantRequest {
 }
 
 enum ProofAssistantResponse {
+    Capabilities {
+        request_id: [u8; 32],
+        capabilities: Vec<u8>,
+    },
     Proof {
         request_id: [u8; 32],
         proof: Vec<u8>,
@@ -78,6 +85,7 @@ enum ProofAssistantResponse {
 pub struct ProofAssistantClient {
     endpoint: Arc<Endpoint>,
     server_record: NodeRecordV2,
+    capabilities_cache: Arc<Mutex<Option<proof::TransparentProverCapabilities>>>,
     submit_timeout: Duration,
     max_request_bytes: usize,
     max_response_bytes: usize,
@@ -130,6 +138,7 @@ impl ProofAssistantClient {
         Ok(Self {
             endpoint: Arc::new(endpoint),
             server_record,
+            capabilities_cache: Arc::new(Mutex::new(None)),
             submit_timeout,
             max_request_bytes,
             max_response_bytes,
@@ -142,10 +151,71 @@ impl ProofAssistantClient {
             .ok_or_else(|| anyhow!("proof assistant node record must be bound to a chain"))
     }
 
+    pub async fn capabilities(&self) -> Result<proof::TransparentProverCapabilities> {
+        if let Some(cached) = self
+            .capabilities_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(cached);
+        }
+        let request_id = random_request_id();
+        let response = self
+            .exchange_request(ProofAssistantRequest::Capabilities { request_id })
+            .await?;
+        let capabilities = match response {
+            ProofAssistantResponse::Capabilities {
+                request_id: echoed_request_id,
+                capabilities,
+            } => {
+                if echoed_request_id != request_id {
+                    bail!("proof assistant capability request_id mismatch");
+                }
+                let capabilities: proof::TransparentProverCapabilities =
+                    bincode::deserialize(&capabilities)
+                        .context("decode proof assistant capabilities")?;
+                capabilities.validate()?;
+                capabilities
+            }
+            ProofAssistantResponse::Error {
+                request_id: echoed_request_id,
+                message,
+            } => {
+                if echoed_request_id != request_id {
+                    bail!("proof assistant capability request_id mismatch");
+                }
+                bail!("proof assistant capability discovery failed: {message}");
+            }
+            ProofAssistantResponse::Proof { .. } => {
+                bail!("proof assistant returned a proof to a capabilities request")
+            }
+        };
+        *self
+            .capabilities_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(capabilities.clone());
+        Ok(capabilities)
+    }
+
+    async fn ensure_supports(&self, circuit: proof::TransparentCircuit) -> Result<()> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.supports_circuit(circuit) {
+            bail!(
+                "proof assistant backend {:?} does not support circuit {:?}",
+                capabilities.backend,
+                circuit
+            );
+        }
+        Ok(())
+    }
+
     pub async fn prove_shielded_tx(
         &self,
         witness: &ProofShieldedTxWitness,
     ) -> Result<proof::TransparentProof> {
+        self.ensure_supports(proof::TransparentCircuit::OrdinaryTransferV1)
+            .await?;
         let request_id = random_request_id();
         let witness_bytes = bincode::serialize(witness)
             .context("serialize shielded tx witness for proof assistant")?;
@@ -164,6 +234,8 @@ impl ProofAssistantClient {
         &self,
         witness: &ProofPrivateDelegationWitness,
     ) -> Result<proof::TransparentProof> {
+        self.ensure_supports(proof::TransparentCircuit::PrivateDelegationV1)
+            .await?;
         let request_id = random_request_id();
         let witness_bytes = bincode::serialize(witness)
             .context("serialize private delegation witness for proof assistant")?;
@@ -182,6 +254,8 @@ impl ProofAssistantClient {
         &self,
         witness: &ProofPrivateUndelegationWitness,
     ) -> Result<proof::TransparentProof> {
+        self.ensure_supports(proof::TransparentCircuit::PrivateUndelegationV1)
+            .await?;
         let request_id = random_request_id();
         let witness_bytes = bincode::serialize(witness)
             .context("serialize private undelegation witness for proof assistant")?;
@@ -200,6 +274,8 @@ impl ProofAssistantClient {
         &self,
         witness: &ProofShieldedTxWitness,
     ) -> Result<proof::TransparentProof> {
+        self.ensure_supports(proof::TransparentCircuit::UnbondingClaimV1)
+            .await?;
         let request_id = random_request_id();
         let witness_bytes = bincode::serialize(witness)
             .context("serialize unbonding claim witness for proof assistant")?;
@@ -220,6 +296,8 @@ impl ProofAssistantClient {
         extension: &HistoricalUnspentExtension,
         prior: Option<&proof::CheckpointAccumulatorProof>,
     ) -> Result<proof::CheckpointAccumulatorProof> {
+        self.ensure_supports(proof::TransparentCircuit::CheckpointAccumulatorV1)
+            .await?;
         let request_id = random_request_id();
         let checkpoint_bytes = bincode::serialize(checkpoint)
             .context("serialize checkpoint accumulator checkpoint for proof assistant")?;
@@ -253,6 +331,15 @@ impl ProofAssistantClient {
         label: &str,
     ) -> Result<proof::TransparentProof> {
         match response {
+            ProofAssistantResponse::Capabilities {
+                request_id: echoed_request_id,
+                ..
+            } => {
+                if echoed_request_id != request_id {
+                    bail!("proof assistant {label} request_id mismatch");
+                }
+                bail!("proof assistant returned capabilities to a proof request");
+            }
             ProofAssistantResponse::Proof {
                 request_id: echoed_request_id,
                 proof,
@@ -398,6 +485,14 @@ impl ProofAssistantServer {
 fn handle_request_blocking(request: ProofAssistantRequest) -> Result<ProofAssistantResponse> {
     let request_id = request.request_id();
     let result: Result<ProofAssistantResponse> = match request {
+        ProofAssistantRequest::Capabilities { request_id } => {
+            let capabilities = bincode::serialize(&proof::current_prover_capabilities())
+                .context("serialize proof assistant capabilities")?;
+            Ok(ProofAssistantResponse::Capabilities {
+                request_id,
+                capabilities,
+            })
+        }
         ProofAssistantRequest::ShieldedTx {
             request_id,
             witness,
@@ -489,7 +584,8 @@ fn random_request_id() -> [u8; 32] {
 impl ProofAssistantRequest {
     fn request_id(&self) -> [u8; 32] {
         match self {
-            ProofAssistantRequest::ShieldedTx { request_id, .. }
+            ProofAssistantRequest::Capabilities { request_id }
+            | ProofAssistantRequest::ShieldedTx { request_id, .. }
             | ProofAssistantRequest::PrivateDelegation { request_id, .. }
             | ProofAssistantRequest::PrivateUndelegation { request_id, .. }
             | ProofAssistantRequest::UnbondingClaim { request_id, .. }
@@ -597,6 +693,10 @@ fn encode_request(request: &ProofAssistantRequest) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(PROOF_ASSISTANT_REQUEST_VERSION);
     match request {
+        ProofAssistantRequest::Capabilities { request_id } => {
+            writer.write_u8(0);
+            writer.write_fixed(request_id);
+        }
         ProofAssistantRequest::ShieldedTx {
             request_id,
             witness,
@@ -655,6 +755,9 @@ fn decode_request(bytes: &[u8]) -> Result<ProofAssistantRequest> {
         bail!("unsupported proof assistant request version {}", version);
     }
     let request = match reader.read_u8()? {
+        0 => ProofAssistantRequest::Capabilities {
+            request_id: reader.read_fixed()?,
+        },
         1 => ProofAssistantRequest::ShieldedTx {
             request_id: reader.read_fixed()?,
             witness: reader.read_bytes()?,
@@ -697,6 +800,14 @@ fn encode_response(response: &ProofAssistantResponse) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u8(PROOF_ASSISTANT_RESPONSE_VERSION);
     match response {
+        ProofAssistantResponse::Capabilities {
+            request_id,
+            capabilities,
+        } => {
+            writer.write_u8(0);
+            writer.write_fixed(request_id);
+            writer.write_bytes(capabilities)?;
+        }
         ProofAssistantResponse::Proof { request_id, proof } => {
             writer.write_u8(1);
             writer.write_fixed(request_id);
@@ -721,6 +832,10 @@ fn decode_response(bytes: &[u8]) -> Result<ProofAssistantResponse> {
         bail!("unsupported proof assistant response version {}", version);
     }
     let response = match reader.read_u8()? {
+        0 => ProofAssistantResponse::Capabilities {
+            request_id: reader.read_fixed()?,
+            capabilities: reader.read_bytes()?,
+        },
         1 => ProofAssistantResponse::Proof {
             request_id: reader.read_fixed()?,
             proof: reader.read_bytes()?,

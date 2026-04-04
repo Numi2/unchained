@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 use unchained::{
     coin::Coin,
     config::{Net, P2p},
+    discovery,
     epoch::Anchor,
     network, node_control, node_identity, proof,
     protocol::CURRENT as PROTOCOL,
@@ -228,6 +229,141 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Result<()> {
+    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-discovery-passphrase");
+    network::set_quiet_logging(true);
+
+    let wallet_dir = TempDir::new()?;
+    let discovery_dir = TempDir::new()?;
+    let base_path = wallet_dir.path().to_string_lossy().to_string();
+    let db = Arc::new(Store::open(&base_path)?);
+    let wallet_store = Arc::new(WalletStore::open(&base_path)?);
+    let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(db.as_ref(), &committee)?;
+    let _coin = seed_sender_coin(db.as_ref(), &wallet, &genesis)?;
+
+    let net = spawn_network(&wallet_dir, db.clone(), &genesis).await?;
+    let sync_state = Arc::new(Mutex::new(SyncState::default()));
+    let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel::<()>(1);
+    let node_server = node_control::NodeControlServer::bind(
+        &base_path,
+        db.clone(),
+        net.clone(),
+        sync_state,
+        false,
+    )
+    .await?;
+    let node_server_task = tokio::spawn(async move { node_server.serve(node_shutdown_rx).await });
+    let node_client = node_control::NodeControlClient::new(&base_path);
+    node_client.ping()?;
+
+    let discovery_port = pick_udp_port();
+    let discovery_address = format!("127.0.0.1:{discovery_port}");
+    provision_runtime_identity(&discovery_dir, genesis.hash, discovery_address.clone())?;
+    let discovery_identity = node_identity::NodeIdentity::load_runtime_in_dir(
+        discovery_dir.path(),
+        PROTOCOL.version,
+        Some(genesis.hash),
+        vec![discovery_address.clone()],
+    )?;
+    let discovery_state_path = discovery::discovery_state_path(
+        &base_path,
+        Some(
+            &discovery_dir
+                .path()
+                .join("discovery_state")
+                .to_string_lossy()
+                .to_string(),
+        ),
+    );
+    let (discovery_shutdown_tx, discovery_shutdown_rx) = broadcast::channel::<()>(1);
+    let discovery_server = discovery::DiscoveryServer::bind(
+        &discovery_identity,
+        std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, discovery_port)),
+        &discovery_state_path,
+        discovery::DiscoveryPolicy::default(),
+    )?;
+    let discovery_server_task =
+        tokio::spawn(async move { discovery_server.serve(discovery_shutdown_rx).await });
+    let discovery_record = node_identity::load_local_runtime_record_in_dir(
+        discovery_dir.path(),
+        PROTOCOL.version,
+        Some(genesis.hash),
+        vec![discovery_address],
+    )?;
+    let discovery_client = discovery::DiscoveryClient::new(
+        discovery_record,
+        4 * 1024 * 1024,
+        32 * 1024 * 1024,
+        std::time::Duration::from_secs(10),
+    )?;
+
+    let wallet = Arc::new(
+        wallet
+            .with_node_client(node_client)
+            .with_discovery_client(discovery_client.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = WalletControlServer::bind(&base_path, wallet.clone()).await?;
+    let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+    let client = WalletControlClient::new(&base_path);
+    client.ping().await?;
+    let locator = client.receive_locator().await?;
+    let record = discovery_client.resolve_locator(&locator).await?;
+    assert_eq!(record.chain_id, genesis.hash);
+    assert_eq!(record.locator_id, discovery::parse_locator(&locator)?);
+
+    let (response_sk, response_pk) = unchained::crypto::ml_kem_768_generate();
+    let response_sk = unchained::crypto::ml_kem_768_secret_key_to_bytes(&response_sk);
+    let response_slot_id = [22u8; 32];
+    let response_auth_token = [23u8; 32];
+    let request = discovery::HandleRequestPlaintext {
+        version: 1,
+        chain_id: genesis.hash,
+        locator_id: record.locator_id,
+        request_id: [21u8; 32],
+        response_slot_id,
+        response_auth_token,
+        response_kem_pk: response_pk,
+        requested_amount: 1,
+        issued_unix_ms: 1,
+        expires_unix_ms: u64::MAX,
+    };
+    let envelope = discovery::seal_handle_request(&request, &record.mailbox_kem_pk)?;
+    let _request_id = discovery_client
+        .post_mailbox_request(
+            record.mailbox_id,
+            response_slot_id,
+            response_auth_token,
+            envelope,
+        )
+        .await?;
+    assert_eq!(wallet.service_discovery_mailbox_once().await?, 1);
+    let response_envelope = discovery_client
+        .poll_handle_response(response_slot_id, response_auth_token)
+        .await?
+        .expect("handle response");
+    let response = discovery::open_handle_response(&response_envelope, &response_sk)?;
+    assert_eq!(response.request_id, request.request_id);
+    let handle_json = serde_json::to_string(&response.handle)?;
+    let (_address, _signing_pk, _kem_pk) = Wallet::parse_address(&handle_json)?;
+
+    let _ = shutdown_tx.send(());
+    server_task.await??;
+    let _ = discovery_shutdown_tx.send(());
+    discovery_server_task.await??;
+    let _ = node_shutdown_tx.send(());
+    node_server_task.await??;
+    net.shutdown().await;
+    drop(wallet);
+    wallet_store.close()?;
+    db.close()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
     network::set_quiet_logging(true);
@@ -372,6 +508,23 @@ async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_
     drop(wallet);
     wallet_store.close()?;
     db.close()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()> {
+    network::set_quiet_logging(true);
+    let tempdir = TempDir::new()?;
+    let proof_assistant =
+        finality_support::spawn_test_proof_assistant(tempdir.path(), [9u8; 32]).await?;
+
+    let capabilities = proof_assistant.client.capabilities().await?;
+    assert_eq!(capabilities, proof::current_prover_capabilities());
+    for circuit in proof::transparent_circuit_inventory() {
+        assert!(capabilities.supports_circuit(*circuit));
+    }
+
+    proof_assistant.shutdown().await?;
     Ok(())
 }
 

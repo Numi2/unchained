@@ -374,6 +374,19 @@ claim, and checkpoint accumulator are named circuit slots with a conservative
 prototype backend is still internal to `src/proof.rs`, but the rest of the
 system now reasons about circuit identity rather than backend method constants.
 
+The proof layer now also carries explicit backend identity and capability
+manifests. Canonical proofs include their backend, circuit, and statement
+metadata, and the remote proof assistant can advertise the exact backend and
+supported circuit inventory before serving witness requests. That keeps the
+wallet and transport model stable while the first native transparent backend is
+introduced behind the same interface.
+
+Backend selection is now also routed through a canonical per-circuit backend
+policy inside `src/proof.rs` rather than hard-coded directly into every
+prove/verify path. The current policy still maps every supported circuit to the
+prototype backend, but swapping in the first native backend no longer requires
+rewiring wallet, assistant, or transaction logic.
+
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`
 host distinct ingress roles, `unchained_wallet serve` submits through configured

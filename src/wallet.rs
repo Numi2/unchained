@@ -5,6 +5,9 @@ use crate::{
         self, Address, TaggedKemPublicKey, TaggedSigningPublicKey, ML_KEM_768_CT_BYTES,
         ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES,
     },
+    discovery::{
+        self, DiscoveryClient, DiscoveryRecord, HandleRequestPlaintext, HandleResponsePlaintext,
+    },
     ingress::IngressClient,
     node_control::{
         CompactCommittedCoin, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
@@ -26,7 +29,7 @@ use serde_big_array::BigArray;
 use tokio::sync::broadcast;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipientHandle {
     pub chain_id: [u8; 32],
     pub signing_pk: TaggedSigningPublicKey,
@@ -146,9 +149,21 @@ pub struct Wallet {
     node_client: Option<NodeControlClient>,
     ingress_client: Option<IngressClient>,
     proof_assistant_client: Option<ProofAssistantClient>,
+    discovery_client: Option<DiscoveryClient>,
+    signing_key_pkcs8: Vec<u8>,
     signing_pk: TaggedSigningPublicKey,
     lock_seed: [u8; 32],
     address: Address,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryMailboxMaterial {
+    locator: String,
+    locator_id: [u8; 32],
+    mailbox_id: [u8; 32],
+    mailbox_auth_token: [u8; 32],
+    mailbox_kem_sk: [u8; ML_KEM_768_SK_BYTES],
+    mailbox_kem_pk: TaggedKemPublicKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,12 +591,29 @@ impl Wallet {
         self
     }
 
+    pub fn with_discovery_client(mut self, discovery_client: DiscoveryClient) -> Self {
+        self.discovery_client = Some(discovery_client);
+        self
+    }
+
     pub fn has_ingress_client(&self) -> bool {
         self.ingress_client.is_some()
     }
 
     pub fn has_proof_assistant_client(&self) -> bool {
         self.proof_assistant_client.is_some()
+    }
+
+    pub fn has_discovery_client(&self) -> bool {
+        self.discovery_client.is_some()
+    }
+
+    fn require_discovery_client(&self) -> Result<&DiscoveryClient> {
+        self.discovery_client.as_ref().ok_or_else(|| {
+            anyhow!(
+                "wallet requires a discovery service; configure [discovery.wallet].server and restart `unchained_wallet serve`"
+            )
+        })
     }
 
     fn effective_chain_id(&self) -> Result<[u8; 32]> {
@@ -594,7 +626,12 @@ impl Wallet {
         if let Some(proof_assistant_client) = &self.proof_assistant_client {
             return proof_assistant_client.chain_id();
         }
-        bail!("wallet requires node control, ingress, or a proof assistant for chain binding")
+        if let Some(discovery_client) = &self.discovery_client {
+            return discovery_client.chain_id();
+        }
+        bail!(
+            "wallet requires node control, ingress, proof assistant, or discovery for chain binding"
+        )
     }
 
     async fn wallet_send_runtime_material_async(&self) -> Result<WalletSendRuntimeMaterial> {
@@ -835,6 +872,8 @@ impl Wallet {
                 node_client: None,
                 ingress_client: None,
                 proof_assistant_client: None,
+                discovery_client: None,
+                signing_key_pkcs8: secrets.signing_key_pkcs8,
                 signing_pk: signing_pk.clone(),
                 lock_seed: secrets.lock_seed,
                 address: crypto::address_from_pk(&signing_pk),
@@ -887,6 +926,8 @@ impl Wallet {
             node_client: None,
             ingress_client: None,
             proof_assistant_client: None,
+            discovery_client: None,
+            signing_key_pkcs8: secrets.signing_key_pkcs8,
             signing_pk,
             lock_seed,
             address,
@@ -911,6 +952,8 @@ impl Wallet {
             node_client: None,
             ingress_client: None,
             proof_assistant_client: None,
+            discovery_client: None,
+            signing_key_pkcs8: signing_key_pkcs8.to_vec(),
             signing_pk: signing_pk.clone(),
             lock_seed,
             address: crypto::address_from_pk(&signing_pk),
@@ -1055,6 +1098,89 @@ impl Wallet {
     // ---------------------------------------------------------------------
     // Single-use receive handles
     // ---------------------------------------------------------------------
+    fn looks_like_recipient_handle_document(value: &str) -> bool {
+        let trimmed = value.trim();
+        trimmed.starts_with('{') && trimmed.ends_with('}')
+    }
+
+    fn validate_recipient_handle_document_for_chain(
+        handle: &RecipientHandle,
+        chain_id: [u8; 32],
+    ) -> Result<()> {
+        if handle.chain_id != chain_id {
+            bail!("recipient handle chain_id mismatch");
+        }
+        if handle.expires_unix_ms <= handle.issued_unix_ms {
+            bail!("recipient handle expiration must be after issuance");
+        }
+        if Self::now_unix_ms() >= handle.expires_unix_ms {
+            bail!("recipient handle has expired");
+        }
+        let msg = canonical::encode_recipient_handle_signable(
+            &handle.chain_id,
+            &handle.signing_pk,
+            &handle.receive_key_id,
+            &handle.kem_pk,
+            handle.issued_unix_ms,
+            handle.expires_unix_ms,
+        )?;
+        handle.signing_pk.verify(&msg, &handle.sig)?;
+        Ok(())
+    }
+
+    fn discovery_mailbox_material_for_chain(
+        &self,
+        chain_id: [u8; 32],
+    ) -> Result<DiscoveryMailboxMaterial> {
+        let locator = discovery::locator_from_signing_pk(&self.signing_pk);
+        let locator_id = discovery::parse_locator(&locator)?;
+        let mailbox_id = discovery::mailbox_id_for_locator(&chain_id, &locator_id);
+        let mailbox_auth_token =
+            discovery::mailbox_auth_token(&self.lock_seed, &chain_id, &locator_id);
+        let (mailbox_kem_sk, mailbox_kem_pk) =
+            discovery::derive_mailbox_kem_keypair(&self.lock_seed, &self.address, &chain_id);
+        Ok(DiscoveryMailboxMaterial {
+            locator,
+            locator_id,
+            mailbox_id,
+            mailbox_auth_token,
+            mailbox_kem_sk,
+            mailbox_kem_pk,
+        })
+    }
+
+    fn discovery_record_for_chain(
+        &self,
+        chain_id: [u8; 32],
+        record_ttl: Duration,
+    ) -> Result<(DiscoveryMailboxMaterial, DiscoveryRecord)> {
+        let material = self.discovery_mailbox_material_for_chain(chain_id)?;
+        let (_locator, locator_id, mailbox_id, record) = discovery::build_signed_discovery_record(
+            &self.signing_key_pkcs8,
+            &self.signing_pk,
+            chain_id,
+            material.mailbox_kem_pk.clone(),
+            record_ttl,
+        )?;
+        if locator_id != material.locator_id || mailbox_id != material.mailbox_id {
+            bail!("discovery record derivation mismatch");
+        }
+        Ok((material, record))
+    }
+
+    pub fn locator(&self) -> String {
+        discovery::locator_from_signing_pk(&self.signing_pk)
+    }
+
+    pub async fn publish_locator(&self, record_ttl: Duration) -> Result<String> {
+        let chain_id = self.effective_chain_id()?;
+        let (material, record) = self.discovery_record_for_chain(chain_id, record_ttl)?;
+        self.require_discovery_client()?
+            .publish_record(&record, &material.mailbox_auth_token)
+            .await?;
+        Ok(material.locator)
+    }
+
     pub fn export_address(&self) -> Result<String> {
         self.export_address_for_chain(self.effective_chain_id()?)
     }
@@ -1125,26 +1251,12 @@ impl Wallet {
 
     fn parse_recipient_handle_document(handle_str: &str) -> Result<RecipientHandle> {
         let trimmed = handle_str.trim();
-        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        if !Self::looks_like_recipient_handle_document(trimmed) {
             bail!("recipient handle must be a signed JSON document");
         }
         let handle: RecipientHandle =
             serde_json::from_str(trimmed).context("invalid recipient handle JSON")?;
-        if handle.expires_unix_ms <= handle.issued_unix_ms {
-            bail!("recipient handle expiration must be after issuance");
-        }
-        if Self::now_unix_ms() >= handle.expires_unix_ms {
-            bail!("recipient handle has expired");
-        }
-        let msg = canonical::encode_recipient_handle_signable(
-            &handle.chain_id,
-            &handle.signing_pk,
-            &handle.receive_key_id,
-            &handle.kem_pk,
-            handle.issued_unix_ms,
-            handle.expires_unix_ms,
-        )?;
-        handle.signing_pk.verify(&msg, &handle.sig)?;
+        Self::validate_recipient_handle_document_for_chain(&handle, handle.chain_id)?;
         Ok(handle)
     }
 
@@ -2960,9 +3072,146 @@ impl Wallet {
         self.submit_prepared_shielded_send(prepared, proof).await
     }
 
-    /// Simple wrapper: pay using a recipient handle.
+    pub async fn send_to_locator(&self, locator: &str, amount: u64) -> Result<SendOutcome> {
+        let discovery_client = self.require_discovery_client()?;
+        let record = discovery_client.resolve_locator(locator).await?;
+        let chain_id = self.effective_chain_id()?;
+        let mut response_slot_id = [0u8; 32];
+        OsRng.fill_bytes(&mut response_slot_id);
+        let response_auth_token = discovery::response_slot_auth_token();
+        let mut request_id = [0u8; 32];
+        OsRng.fill_bytes(&mut request_id);
+        let (response_kem_sk, response_kem_pk) = crypto::ml_kem_768_generate();
+        let response_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&response_kem_sk);
+        let request = HandleRequestPlaintext {
+            version: 1,
+            chain_id,
+            locator_id: record.locator_id,
+            request_id,
+            response_slot_id,
+            response_auth_token,
+            response_kem_pk,
+            requested_amount: amount,
+            issued_unix_ms: Self::now_unix_ms(),
+            expires_unix_ms: Self::now_unix_ms().saturating_add(5 * 60 * 1000),
+        };
+        let envelope = discovery::seal_handle_request(&request, &record.mailbox_kem_pk)?;
+        let _ = discovery_client
+            .post_mailbox_request(
+                record.mailbox_id,
+                response_slot_id,
+                response_auth_token,
+                envelope,
+            )
+            .await?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                bail!("locator resolution timed out waiting for recipient handle");
+            }
+            if let Some(response_envelope) = discovery_client
+                .poll_handle_response(response_slot_id, response_auth_token)
+                .await?
+            {
+                let response =
+                    discovery::open_handle_response(&response_envelope, &response_kem_sk)?;
+                if response.chain_id != chain_id {
+                    bail!("locator response chain_id mismatch");
+                }
+                if response.locator_id != record.locator_id {
+                    bail!("locator response locator_id mismatch");
+                }
+                if response.request_id != request.request_id {
+                    bail!("locator response request_id mismatch");
+                }
+                Self::validate_recipient_handle_document_for_chain(&response.handle, chain_id)?;
+                let handle_json =
+                    serde_json::to_string(&response.handle).context("serialize resolved handle")?;
+                return self.send_to_recipient_handle(&handle_json, amount).await;
+            }
+            time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    pub async fn service_discovery_mailbox_once(&self) -> Result<usize> {
+        let chain_id = self.effective_chain_id()?;
+        let material = self.discovery_mailbox_material_for_chain(chain_id)?;
+        let discovery_client = self.require_discovery_client()?;
+        let messages = discovery_client
+            .poll_mailbox(material.mailbox_id, material.mailbox_auth_token, 32)
+            .await?;
+        for message in &messages {
+            let request =
+                discovery::open_handle_request(&message.envelope, &material.mailbox_kem_sk)
+                    .context("open discovery mailbox request")?;
+            if request.chain_id != chain_id || request.locator_id != material.locator_id {
+                continue;
+            }
+            if Self::now_unix_ms() >= request.expires_unix_ms {
+                continue;
+            }
+            let handle_json = self.export_address_for_chain(chain_id)?;
+            let handle: RecipientHandle =
+                serde_json::from_str(&handle_json).context("decode minted handle")?;
+            let response = HandleResponsePlaintext {
+                version: 1,
+                chain_id,
+                locator_id: material.locator_id,
+                request_id: request.request_id,
+                handle,
+                issued_unix_ms: Self::now_unix_ms(),
+            };
+            let response_envelope =
+                discovery::seal_handle_response(&response, &request.response_kem_pk)?;
+            discovery_client
+                .post_handle_response(
+                    request.response_slot_id,
+                    request.response_auth_token,
+                    response_envelope,
+                )
+                .await?;
+        }
+        Ok(messages.len())
+    }
+
+    pub async fn run_discovery_loop(
+        &self,
+        publish_interval: Duration,
+        poll_interval: Duration,
+        record_ttl: Duration,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> Result<()> {
+        let mut publish_tick = time::interval(publish_interval);
+        let mut poll_tick = time::interval(poll_interval);
+        publish_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        self.publish_locator(record_ttl).await?;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                _ = publish_tick.tick() => {
+                    if let Err(err) = self.publish_locator(record_ttl).await {
+                        eprintln!("discovery publish failed: {err}");
+                    }
+                }
+                _ = poll_tick.tick() => {
+                    if let Err(err) = self.service_discovery_mailbox_once().await {
+                        eprintln!("discovery mailbox service failed: {err}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Simple wrapper: pay using a recipient handle or locator.
     pub async fn pay(&self, to: &str, amount: u64) -> Result<SendOutcome> {
-        self.send_to_recipient_handle(to, amount).await
+        if Self::looks_like_recipient_handle_document(to) {
+            self.send_to_recipient_handle(to, amount).await
+        } else {
+            self.send_to_locator(to, amount).await
+        }
     }
 
     pub async fn delegate_to_validator(

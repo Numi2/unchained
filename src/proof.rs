@@ -55,6 +55,16 @@ pub enum TransparentProofFamily {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransparentProofBackend {
+    PrototypeRisc0StarkV1,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransparentSealEncoding {
+    BincodeRisc0Receipt,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransparentCircuit {
     OrdinaryTransferV1,
     PrivateDelegationV1,
@@ -73,11 +83,30 @@ pub struct TransparentCircuitDescriptor {
     pub name: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransparentBackendDescriptor {
+    pub backend: TransparentProofBackend,
+    pub proof_family: TransparentProofFamily,
+    pub target_security_bits: u16,
+    pub seal_encoding: TransparentSealEncoding,
+    pub name: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransparentProverCapabilities {
+    pub backend: TransparentProofBackend,
+    pub proof_family: TransparentProofFamily,
+    pub target_security_bits: u16,
+    pub seal_encoding: TransparentSealEncoding,
+    pub supported_circuits: Vec<TransparentCircuit>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransparentProof {
     pub version: u8,
     pub statement: TransparentProofStatement,
     pub circuit: TransparentCircuit,
+    pub backend: TransparentProofBackend,
     pub seal: Vec<u8>,
 }
 
@@ -98,7 +127,7 @@ static VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS: Lazy<
     Mutex<HashMap<[u8; 32], ProofPrivateUndelegationJournal>>,
 > = Lazy::new(|| Mutex::new(HashMap::new()));
 
-struct PrototypeCircuitBinding {
+struct TransparentBackendBinding {
     method_id: [u32; 8],
     elf: &'static [u8],
 }
@@ -107,47 +136,99 @@ fn receipt_cache_key(bytes: &[u8]) -> [u8; 32] {
     crate::crypto::blake3_hash(bytes)
 }
 
-fn prototype_circuit_binding(circuit: TransparentCircuit) -> PrototypeCircuitBinding {
-    match circuit {
-        TransparentCircuit::OrdinaryTransferV1 => PrototypeCircuitBinding {
+fn configured_backend_for_circuit(_circuit: TransparentCircuit) -> TransparentProofBackend {
+    TransparentProofBackend::PrototypeRisc0StarkV1
+}
+
+fn transparent_backend_binding(
+    circuit: TransparentCircuit,
+    backend: TransparentProofBackend,
+) -> Result<TransparentBackendBinding> {
+    let binding = match (circuit, backend) {
+        (
+            TransparentCircuit::OrdinaryTransferV1,
+            TransparentProofBackend::PrototypeRisc0StarkV1,
+        ) => TransparentBackendBinding {
             method_id: SHIELDED_SPEND_METHOD_ID,
             elf: SHIELDED_SPEND_METHOD_ELF,
         },
-        TransparentCircuit::PrivateDelegationV1 => PrototypeCircuitBinding {
+        (
+            TransparentCircuit::PrivateDelegationV1,
+            TransparentProofBackend::PrototypeRisc0StarkV1,
+        ) => TransparentBackendBinding {
             method_id: PRIVATE_DELEGATION_METHOD_ID,
             elf: PRIVATE_DELEGATION_METHOD_ELF,
         },
-        TransparentCircuit::PrivateUndelegationV1 => PrototypeCircuitBinding {
+        (
+            TransparentCircuit::PrivateUndelegationV1,
+            TransparentProofBackend::PrototypeRisc0StarkV1,
+        ) => TransparentBackendBinding {
             method_id: PRIVATE_UNDELEGATION_METHOD_ID,
             elf: PRIVATE_UNDELEGATION_METHOD_ELF,
         },
-        TransparentCircuit::UnbondingClaimV1 => PrototypeCircuitBinding {
-            method_id: UNBONDING_CLAIM_METHOD_ID,
-            elf: UNBONDING_CLAIM_METHOD_ELF,
-        },
-        TransparentCircuit::CheckpointAccumulatorV1 => PrototypeCircuitBinding {
+        (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) => {
+            TransparentBackendBinding {
+                method_id: UNBONDING_CLAIM_METHOD_ID,
+                elf: UNBONDING_CLAIM_METHOD_ELF,
+            }
+        }
+        (
+            TransparentCircuit::CheckpointAccumulatorV1,
+            TransparentProofBackend::PrototypeRisc0StarkV1,
+        ) => TransparentBackendBinding {
             method_id: CHECKPOINT_ACCUMULATOR_METHOD_ID,
             elf: CHECKPOINT_ACCUMULATOR_METHOD_ELF,
         },
+    };
+    Ok(binding)
+}
+
+fn configured_backend_binding(circuit: TransparentCircuit) -> Result<TransparentBackendBinding> {
+    transparent_backend_binding(circuit, configured_backend_for_circuit(circuit))
+}
+
+fn backend_binding_for_proof(proof: &TransparentProof) -> Result<TransparentBackendBinding> {
+    let binding = transparent_backend_binding(proof.circuit, proof.backend)?;
+    let configured_backend = configured_backend_for_circuit(proof.circuit);
+    if configured_backend != proof.backend {
+        bail!(
+            "transparent proof circuit {:?} was produced by backend {:?}, but canonical backend is {:?}",
+            proof.circuit,
+            proof.backend,
+            configured_backend
+        );
     }
+    Ok(binding)
+}
+
+fn supported_circuits_for_backend(backend: TransparentProofBackend) -> Vec<TransparentCircuit> {
+    transparent_circuit_inventory()
+        .iter()
+        .copied()
+        .filter(|circuit| configured_backend_for_circuit(*circuit) == backend)
+        .collect()
 }
 
 impl TransparentProof {
     pub fn new(statement: TransparentProofStatement, seal: Vec<u8>) -> Self {
         let circuit = canonical_circuit_for_statement(statement);
+        let backend = configured_backend_for_circuit(circuit);
         Self {
             version: TRANSPARENT_PROOF_VERSION,
             statement,
             circuit,
+            backend,
             seal,
         }
     }
 
     pub fn new_for_circuit(circuit: TransparentCircuit, seal: Vec<u8>) -> Self {
+        let backend = configured_backend_for_circuit(circuit);
         Self {
             version: TRANSPARENT_PROOF_VERSION,
             statement: transparent_circuit_descriptor(circuit).statement,
             circuit,
+            backend,
             seal,
         }
     }
@@ -161,11 +242,25 @@ impl TransparentProof {
             bail!("unsupported transparent proof version {}", self.version);
         }
         let descriptor = self.descriptor();
+        let backend = transparent_backend_descriptor(self.backend);
         if descriptor.statement != self.statement {
             bail!(
                 "transparent proof circuit {:?} does not match statement {:?}",
                 self.circuit,
                 self.statement
+            );
+        }
+        if descriptor.proof_family != backend.proof_family {
+            bail!(
+                "transparent proof backend {:?} does not match proof family {:?}",
+                self.backend,
+                descriptor.proof_family
+            );
+        }
+        if backend.target_security_bits < MIN_TRANSPARENT_PROOF_SECURITY_BITS {
+            bail!(
+                "transparent proof backend {:?} violates minimum security budget",
+                self.backend
             );
         }
         if descriptor.target_security_bits < MIN_TRANSPARENT_PROOF_SECURITY_BITS {
@@ -187,6 +282,31 @@ pub fn transparent_circuit_inventory() -> &'static [TransparentCircuit] {
         TransparentCircuit::CheckpointAccumulatorV1,
     ];
     INVENTORY
+}
+
+pub fn transparent_backend_descriptor(
+    backend: TransparentProofBackend,
+) -> TransparentBackendDescriptor {
+    match backend {
+        TransparentProofBackend::PrototypeRisc0StarkV1 => TransparentBackendDescriptor {
+            backend,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            seal_encoding: TransparentSealEncoding::BincodeRisc0Receipt,
+            name: "prototype-risc0-stark-v1",
+        },
+    }
+}
+
+pub fn current_prover_capabilities() -> TransparentProverCapabilities {
+    let descriptor = transparent_backend_descriptor(TransparentProofBackend::PrototypeRisc0StarkV1);
+    TransparentProverCapabilities {
+        backend: descriptor.backend,
+        proof_family: descriptor.proof_family,
+        target_security_bits: descriptor.target_security_bits,
+        seal_encoding: descriptor.seal_encoding,
+        supported_circuits: supported_circuits_for_backend(descriptor.backend),
+    }
 }
 
 pub fn transparent_circuit_descriptor(circuit: TransparentCircuit) -> TransparentCircuitDescriptor {
@@ -231,6 +351,44 @@ pub fn transparent_circuit_descriptor(circuit: TransparentCircuit) -> Transparen
             public_input_shape: "checkpoint-accumulator-journal-v1",
             name: "checkpoint-accumulator-v1",
         },
+    }
+}
+
+impl TransparentProverCapabilities {
+    pub fn supports_circuit(&self, circuit: TransparentCircuit) -> bool {
+        self.supported_circuits.contains(&circuit)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let descriptor = transparent_backend_descriptor(self.backend);
+        if descriptor.proof_family != self.proof_family {
+            bail!(
+                "transparent prover backend {:?} does not match proof family {:?}",
+                self.backend,
+                self.proof_family
+            );
+        }
+        if descriptor.seal_encoding != self.seal_encoding {
+            bail!(
+                "transparent prover backend {:?} does not match seal encoding {:?}",
+                self.backend,
+                self.seal_encoding
+            );
+        }
+        if self.target_security_bits < MIN_TRANSPARENT_PROOF_SECURITY_BITS {
+            bail!("transparent prover capability budget is below canonical minimum");
+        }
+        for circuit in &self.supported_circuits {
+            let circuit_descriptor = transparent_circuit_descriptor(*circuit);
+            if circuit_descriptor.proof_family != self.proof_family {
+                bail!(
+                    "transparent prover backend {:?} cannot serve circuit {:?}",
+                    self.backend,
+                    circuit
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -313,7 +471,7 @@ pub fn prove_shielded_tx(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
     let circuit = TransparentCircuit::OrdinaryTransferV1;
-    let binding = prototype_circuit_binding(circuit);
+    let binding = configured_backend_binding(circuit)?;
     let fixture_id = shielded_tx_fixture_id(witness)?;
     if let Some(seal) = load_cached_shielded_proof_seal(&fixture_id)? {
         let proof = TransparentProof::new_for_circuit(circuit, seal);
@@ -363,11 +521,12 @@ pub fn verify_shielded_proof(proof: &TransparentProof) -> Result<ProofShieldedTx
         TransparentProofStatement::ShieldedTransfer,
         "shielded proof",
     )?;
+    let _ = backend_binding_for_proof(proof)?;
     verify_shielded_seal_bytes(&proof.seal)
 }
 
 fn verify_shielded_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
-    let binding = prototype_circuit_binding(TransparentCircuit::OrdinaryTransferV1);
+    let binding = configured_backend_binding(TransparentCircuit::OrdinaryTransferV1)?;
     let cache_key = receipt_cache_key(bytes);
     if let Some(journal) = VERIFIED_SHIELDED_RECEIPTS
         .lock()
@@ -394,7 +553,7 @@ pub fn prove_private_delegation(
     witness: &ProofPrivateDelegationWitness,
 ) -> Result<(TransparentProof, ProofPrivateDelegationJournal)> {
     let circuit = TransparentCircuit::PrivateDelegationV1;
-    let binding = prototype_circuit_binding(circuit);
+    let binding = configured_backend_binding(circuit)?;
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -441,11 +600,12 @@ pub fn verify_private_delegation_proof(
         TransparentProofStatement::PrivateDelegation,
         "private delegation proof",
     )?;
+    let _ = backend_binding_for_proof(proof)?;
     verify_private_delegation_seal_bytes(&proof.seal)
 }
 
 fn verify_private_delegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateDelegationJournal> {
-    let binding = prototype_circuit_binding(TransparentCircuit::PrivateDelegationV1);
+    let binding = configured_backend_binding(TransparentCircuit::PrivateDelegationV1)?;
     let cache_key = receipt_cache_key(bytes);
     if let Some(journal) = VERIFIED_PRIVATE_DELEGATION_RECEIPTS
         .lock()
@@ -472,7 +632,7 @@ pub fn prove_private_undelegation(
     witness: &ProofPrivateUndelegationWitness,
 ) -> Result<(TransparentProof, ProofPrivateUndelegationJournal)> {
     let circuit = TransparentCircuit::PrivateUndelegationV1;
-    let binding = prototype_circuit_binding(circuit);
+    let binding = configured_backend_binding(circuit)?;
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -519,11 +679,12 @@ pub fn verify_private_undelegation_proof(
         TransparentProofStatement::PrivateUndelegation,
         "private undelegation proof",
     )?;
+    let _ = backend_binding_for_proof(proof)?;
     verify_private_undelegation_seal_bytes(&proof.seal)
 }
 
 fn verify_private_undelegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateUndelegationJournal> {
-    let binding = prototype_circuit_binding(TransparentCircuit::PrivateUndelegationV1);
+    let binding = configured_backend_binding(TransparentCircuit::PrivateUndelegationV1)?;
     let cache_key = receipt_cache_key(bytes);
     if let Some(journal) = VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS
         .lock()
@@ -550,7 +711,7 @@ pub fn prove_unbonding_claim(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
     let circuit = TransparentCircuit::UnbondingClaimV1;
-    let binding = prototype_circuit_binding(circuit);
+    let binding = configured_backend_binding(circuit)?;
     let mut builder = ExecutorEnv::builder();
     for input in &witness.inputs {
         match (
@@ -595,11 +756,12 @@ pub fn verify_unbonding_claim_proof(proof: &TransparentProof) -> Result<ProofShi
         TransparentProofStatement::UnbondingClaim,
         "unbonding claim proof",
     )?;
+    let _ = backend_binding_for_proof(proof)?;
     verify_unbonding_claim_seal_bytes(&proof.seal)
 }
 
 fn verify_unbonding_claim_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
-    let binding = prototype_circuit_binding(TransparentCircuit::UnbondingClaimV1);
+    let binding = configured_backend_binding(TransparentCircuit::UnbondingClaimV1)?;
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
     receipt
@@ -629,7 +791,7 @@ pub fn prove_checkpoint_accumulator(
     prior: Option<&CheckpointAccumulatorProof>,
 ) -> Result<CheckpointAccumulatorProof> {
     let circuit = TransparentCircuit::CheckpointAccumulatorV1;
-    let binding = prototype_circuit_binding(circuit);
+    let binding = configured_backend_binding(circuit)?;
     if extension.strata.is_empty() {
         bail!("checkpoint accumulator requires a non-empty extension");
     }
@@ -710,11 +872,12 @@ pub fn verify_checkpoint_accumulator_proof(
         TransparentProofStatement::CheckpointAccumulator,
         "checkpoint accumulator proof",
     )?;
+    let _ = backend_binding_for_proof(proof)?;
     verify_checkpoint_accumulator_seal_bytes(&proof.seal)
 }
 
 fn verify_checkpoint_accumulator_seal_bytes(bytes: &[u8]) -> Result<CheckpointAccumulatorJournal> {
-    let binding = prototype_circuit_binding(TransparentCircuit::CheckpointAccumulatorV1);
+    let binding = configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)?;
     let receipt = receipt_from_bytes(bytes)?;
     verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
     receipt
@@ -724,7 +887,9 @@ fn verify_checkpoint_accumulator_seal_bytes(bytes: &[u8]) -> Result<CheckpointAc
 }
 
 pub fn checkpoint_accumulator_image_id() -> [u32; 8] {
-    prototype_circuit_binding(TransparentCircuit::CheckpointAccumulatorV1).method_id
+    configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)
+        .expect("configured checkpoint accumulator backend binding")
+        .method_id
 }
 
 pub fn output_binding(output: &ShieldedOutput) -> ProofShieldedOutputBinding {
@@ -1043,14 +1208,51 @@ mod tests {
     }
 
     #[test]
+    fn current_prover_capabilities_cover_canonical_inventory() {
+        let capabilities = current_prover_capabilities();
+        capabilities.validate().expect("valid capabilities");
+        assert_eq!(
+            capabilities.backend,
+            TransparentProofBackend::PrototypeRisc0StarkV1
+        );
+        assert_eq!(capabilities.proof_family, TransparentProofFamily::Stark);
+        assert_eq!(
+            capabilities.supported_circuits,
+            transparent_circuit_inventory().to_vec()
+        );
+        for circuit in transparent_circuit_inventory() {
+            assert!(capabilities.supports_circuit(*circuit));
+        }
+    }
+
+    #[test]
     fn transparent_proof_metadata_rejects_mismatched_statement_and_circuit() {
         let proof = TransparentProof {
             version: TRANSPARENT_PROOF_VERSION,
             statement: TransparentProofStatement::ShieldedTransfer,
             circuit: TransparentCircuit::PrivateDelegationV1,
+            backend: TransparentProofBackend::PrototypeRisc0StarkV1,
             seal: vec![1, 2, 3],
         };
         let err = proof.validate_metadata().expect_err("metadata mismatch");
         assert!(err.to_string().contains("does not match statement"));
+    }
+
+    #[test]
+    fn transparent_proof_metadata_accepts_current_backend_binding() {
+        let mut capabilities = current_prover_capabilities();
+        capabilities.proof_family = TransparentProofFamily::Stark;
+        capabilities
+            .validate()
+            .expect("valid prototype capabilities");
+
+        let proof = TransparentProof {
+            version: TRANSPARENT_PROOF_VERSION,
+            statement: TransparentProofStatement::ShieldedTransfer,
+            circuit: TransparentCircuit::OrdinaryTransferV1,
+            backend: TransparentProofBackend::PrototypeRisc0StarkV1,
+            seal: vec![1],
+        };
+        proof.validate_metadata().expect("valid proof");
     }
 }

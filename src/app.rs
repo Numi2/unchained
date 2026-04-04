@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use crate::{
-    canonical, config, epoch, ingress, metrics, network, node_control, node_identity,
+    canonical, config, discovery, epoch, ingress, metrics, network, node_control, node_identity,
     proof_assistant, protocol, storage, sync, wallet, wallet_control,
 };
 use crate::{
@@ -57,8 +57,8 @@ struct NodeCli {
     author,
     version,
     about = "Unchained wallet runtime",
-    long_about = "Operate the Unchained shielded wallet service, mint single-use receive handles, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start `unchained_node start`, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
-    after_help = "Examples:\n  unchained_node start\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <RECIPIENT_HANDLE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
+    long_about = "Operate the Unchained shielded wallet service, publish a PIR-resolvable receive locator, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start the required network services, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
+    after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <LOCATOR_OR_RECIPIENT_HANDLE> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -137,6 +137,8 @@ enum NodeCmd {
     StartSubmissionGateway,
     /// Start the remote proof-assistant role for sender wallets
     StartProofAssistant,
+    /// Start the PIR-backed discovery and mailbox service
+    StartDiscovery,
     /// Re-gossip all transactions from local DB
     ReplayTransactions,
     /// Export all anchors into a compressed snapshot file
@@ -249,10 +251,10 @@ struct PenaltyEvidenceDocArgs {
 enum WalletCmd {
     /// Host the local wallet control socket used by other runtimes
     Serve,
-    /// Mint a single-use receiving handle
+    /// Publish and print the PIR-resolvable receive locator
     #[command(alias = "address")]
     Receive(ReceiveArgs),
-    /// Send coins using a single-use receiving handle, or run a guided send flow
+    /// Send coins using a receive locator or a single-use recipient handle
     Send(SendArgs),
     /// Submit a signed fee-paid shared-state control document through the running wallet
     SubmitControl(SubmitControlArgs),
@@ -609,6 +611,35 @@ fn build_wallet_proof_assistant_client(
     )?))
 }
 
+fn build_wallet_discovery_client(
+    cfg: &config::Config,
+    expected_chain_id: Option<[u8; 32]>,
+) -> Result<Option<discovery::DiscoveryClient>> {
+    let server = normalized_config_item(cfg.discovery.wallet.server.as_deref());
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    let record = load_validated_service_record(server, "discovery")?;
+    let chain_id = record
+        .chain_id
+        .ok_or_else(|| anyhow!("discovery node record must be bound to a chain"))?;
+    if let Some(expected_chain_id) = expected_chain_id {
+        if chain_id != expected_chain_id {
+            bail!(
+                "discovery node record is bound to chain {}, expected {}",
+                hex::encode(chain_id),
+                hex::encode(expected_chain_id),
+            );
+        }
+    }
+    Ok(Some(discovery::DiscoveryClient::new(
+        record,
+        cfg.discovery.wallet.max_request_bytes,
+        cfg.discovery.wallet.max_response_bytes,
+        Duration::from_secs(cfg.discovery.wallet.submit_timeout_secs),
+    )?))
+}
+
 fn wallet_cover_traffic_enabled(cfg: &config::Config) -> bool {
     normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
         && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some()
@@ -639,6 +670,18 @@ fn proof_assistant_policy(cfg: &config::Config) -> proof_assistant::ProofAssista
         max_request_bytes: cfg.proof_assistant.server.max_request_bytes,
         max_response_bytes: cfg.proof_assistant.server.max_response_bytes,
         submit_timeout: Duration::from_secs(cfg.proof_assistant.server.submit_timeout_secs),
+    }
+}
+
+fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
+    discovery::DiscoveryPolicy {
+        record_ttl: Duration::from_secs(cfg.discovery.server.record_ttl_secs),
+        submit_timeout: Duration::from_secs(cfg.discovery.server.submit_timeout_secs),
+        max_request_bytes: cfg.discovery.server.max_request_bytes,
+        max_response_bytes: cfg.discovery.server.max_response_bytes,
+        max_pending_requests: cfg.discovery.server.max_pending_requests,
+        max_pending_responses: cfg.discovery.server.max_pending_responses,
+        pir_arity: cfg.discovery.server.pir_arity,
     }
 }
 
@@ -884,6 +927,7 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
         | NodeCmd::StartAccessRelay
         | NodeCmd::StartSubmissionGateway
         | NodeCmd::StartProofAssistant
+        | NodeCmd::StartDiscovery
         | NodeCmd::ReplayTransactions
         | NodeCmd::ExportAnchors { .. }
         | NodeCmd::ImportAnchors { .. } => Ok(false),
@@ -991,7 +1035,7 @@ async fn run_send_flow(
     }
     let to_raw = match &args.to {
         Some(to) => to.clone(),
-        None => prompt_line("Single-use receive handle: ")?,
+        None => prompt_line("Recipient locator or single-use handle: ")?,
     };
     let to = load_receiver_code(&to_raw)?;
     if to.is_empty() {
@@ -1061,9 +1105,9 @@ async fn run_send_flow(
 }
 
 fn print_receive_output(handle: &str, args: &ReceiveArgs) -> Result<()> {
-    let address = handle.to_string();
+    let locator = handle.to_string();
     let copied = if args.copy {
-        copy_to_clipboard(&address).is_ok()
+        copy_to_clipboard(&locator).is_ok()
     } else {
         false
     };
@@ -1072,7 +1116,7 @@ fn print_receive_output(handle: &str, args: &ReceiveArgs) -> Result<()> {
         println!(
             "{}",
             serde_json::json!({
-                "address": address,
+                "locator": locator,
                 "copied": copied,
             })
         );
@@ -1080,15 +1124,15 @@ fn print_receive_output(handle: &str, args: &ReceiveArgs) -> Result<()> {
     }
 
     if args.plain {
-        println!("{address}");
+        println!("{locator}");
         return Ok(());
     }
 
     println!("Receive");
     println!();
-    println!("{address}");
+    println!("{locator}");
     println!();
-    if let Err(err) = print_qr_to_terminal(&address) {
+    if let Err(err) = print_qr_to_terminal(&locator) {
         eprintln!("QR unavailable: {err}");
     }
     if args.copy {
@@ -1339,6 +1383,25 @@ pub async fn run_node_cli() -> Result<()> {
             println!("Listening on port {}", cfg.net.listen_port);
             wait_for_service_shutdown("Unchained proof assistant", shutdown_tx, task).await
         }
+        NodeCmd::StartDiscovery => {
+            let identity = load_runtime_identity(&cfg)?;
+            let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+            let state_path = discovery::discovery_state_path(
+                &cfg.storage.path,
+                cfg.discovery.server.state_path.as_deref(),
+            );
+            let server = discovery::DiscoveryServer::bind(
+                &identity,
+                listen_addr(&cfg),
+                &state_path,
+                discovery_policy(&cfg),
+            )?;
+            let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+            println!("Discovery service is running.");
+            println!("Listening on port {}", cfg.net.listen_port);
+            println!("Discovery state path: {state_path}");
+            wait_for_service_shutdown("Unchained discovery service", shutdown_tx, task).await
+        }
         NodeCmd::InitRoot { .. }
         | NodeCmd::AuthPrepare { .. }
         | NodeCmd::AuthSign { .. }
@@ -1385,6 +1448,11 @@ pub async fn run_wallet_cli() -> Result<()> {
             {
                 wallet = wallet.with_proof_assistant_client(proof_assistant_client);
             }
+            if let Some(discovery_client) =
+                build_wallet_discovery_client(&cfg, proof_expected_chain_id)?
+            {
+                wallet = wallet.with_discovery_client(discovery_client);
+            }
             if node_client.is_none() && !wallet.has_ingress_client() {
                 bail!(
                     "wallet serve requires either a reachable local node control socket or configured [ingress.wallet] relay/gateway services"
@@ -1412,6 +1480,29 @@ pub async fn run_wallet_cli() -> Result<()> {
             } else {
                 None
             };
+            let discovery_task = if wallet.has_discovery_client() {
+                let wallet = wallet.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+                let publish_interval =
+                    Duration::from_secs(cfg.discovery.wallet.publish_interval_secs.max(1));
+                let poll_interval =
+                    Duration::from_secs(cfg.discovery.wallet.poll_interval_secs.max(1));
+                let record_ttl = publish_interval
+                    .checked_mul(3)
+                    .unwrap_or(publish_interval + publish_interval + publish_interval);
+                Some(tokio::spawn(async move {
+                    wallet
+                        .run_discovery_loop(
+                            publish_interval,
+                            poll_interval,
+                            record_ttl.max(Duration::from_secs(600)),
+                            shutdown_rx,
+                        )
+                        .await
+                }))
+            } else {
+                None
+            };
 
             println!("Wallet control socket: {socket_path}");
             println!("Wallet control capability: {capability_path}");
@@ -1425,6 +1516,9 @@ pub async fn run_wallet_cli() -> Result<()> {
             if wallet.has_proof_assistant_client() {
                 println!("Wallet remote proof assistant: enabled");
             }
+            if wallet.has_discovery_client() {
+                println!("Wallet discovery locator: {}", wallet.locator());
+            }
             println!("Press Ctrl+C to stop.");
 
             match signal::ctrl_c().await {
@@ -1437,10 +1531,17 @@ pub async fn run_wallet_cli() -> Result<()> {
                         Some(task) => Some(task.await.map_err(|err| anyhow!(err))?),
                         None => None,
                     };
+                    let discovery_result = match discovery_task {
+                        Some(task) => Some(task.await.map_err(|err| anyhow!(err))?),
+                        None => None,
+                    };
                     drop(wallet);
                     let wallet_close_result = wallet_db.close();
                     server_result?;
                     if let Some(result) = cover_result {
+                        result?;
+                    }
+                    if let Some(result) = discovery_result {
                         result?;
                     }
                     wallet_close_result?;
@@ -1453,6 +1554,9 @@ pub async fn run_wallet_cli() -> Result<()> {
                     if let Some(task) = cover_task {
                         let _ = task.await;
                     }
+                    if let Some(task) = discovery_task {
+                        let _ = task.await;
+                    }
                     drop(wallet);
                     let _ = wallet_db.close();
                     Err(err.into())
@@ -1461,8 +1565,8 @@ pub async fn run_wallet_cli() -> Result<()> {
         }
         WalletCmd::Receive(args) => {
             let client = open_wallet_control_client(&cfg).await?;
-            let handle = client.mint_receive_handle().await?;
-            print_receive_output(&handle, &args)?;
+            let locator = client.receive_locator().await?;
+            print_receive_output(&locator, &args)?;
             Ok(())
         }
         WalletCmd::Balance(args) => {

@@ -17,6 +17,8 @@ pub struct Config {
     pub ingress: Ingress,
     #[serde(default)]
     pub proof_assistant: ProofAssistant,
+    #[serde(default)]
+    pub discovery: Discovery,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -115,6 +117,14 @@ pub struct ProofAssistant {
     pub server: ProofAssistantServer,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Discovery {
+    #[serde(default)]
+    pub wallet: WalletDiscovery,
+    #[serde(default)]
+    pub server: DiscoveryServer,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct WalletIngress {
     #[serde(default)]
@@ -160,6 +170,35 @@ impl Default for WalletProofAssistant {
             max_request_bytes: default_proof_assistant_max_request_bytes(),
             max_response_bytes: default_proof_assistant_max_response_bytes(),
             submit_timeout_secs: default_proof_assistant_submit_timeout_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalletDiscovery {
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default = "default_discovery_publish_interval_secs")]
+    pub publish_interval_secs: u64,
+    #[serde(default = "default_discovery_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_discovery_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_discovery_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_discovery_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for WalletDiscovery {
+    fn default() -> Self {
+        Self {
+            server: None,
+            publish_interval_secs: default_discovery_publish_interval_secs(),
+            poll_interval_secs: default_discovery_poll_interval_secs(),
+            max_request_bytes: default_discovery_max_request_bytes(),
+            max_response_bytes: default_discovery_max_response_bytes(),
+            submit_timeout_secs: default_discovery_submit_timeout_secs(),
         }
     }
 }
@@ -242,6 +281,41 @@ impl Default for ProofAssistantServer {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct DiscoveryServer {
+    #[serde(default)]
+    pub state_path: Option<String>,
+    #[serde(default = "default_discovery_record_ttl_secs")]
+    pub record_ttl_secs: u64,
+    #[serde(default = "default_discovery_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_discovery_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_discovery_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+    #[serde(default = "default_discovery_max_pending_requests")]
+    pub max_pending_requests: usize,
+    #[serde(default = "default_discovery_max_pending_responses")]
+    pub max_pending_responses: usize,
+    #[serde(default = "default_discovery_pir_arity")]
+    pub pir_arity: u32,
+}
+
+impl Default for DiscoveryServer {
+    fn default() -> Self {
+        Self {
+            state_path: None,
+            record_ttl_secs: default_discovery_record_ttl_secs(),
+            max_request_bytes: default_discovery_max_request_bytes(),
+            max_response_bytes: default_discovery_max_response_bytes(),
+            submit_timeout_secs: default_discovery_submit_timeout_secs(),
+            max_pending_requests: default_discovery_max_pending_requests(),
+            max_pending_responses: default_discovery_max_pending_responses(),
+            pir_arity: default_discovery_pir_arity(),
+        }
+    }
+}
+
 impl Default for Compact {
     fn default() -> Self {
         Self {
@@ -283,6 +357,33 @@ fn default_proof_assistant_max_response_bytes() -> usize {
 }
 fn default_proof_assistant_submit_timeout_secs() -> u64 {
     30
+}
+fn default_discovery_publish_interval_secs() -> u64 {
+    300
+}
+fn default_discovery_poll_interval_secs() -> u64 {
+    5
+}
+fn default_discovery_record_ttl_secs() -> u64 {
+    3600
+}
+fn default_discovery_max_request_bytes() -> usize {
+    4 * 1024 * 1024
+}
+fn default_discovery_max_response_bytes() -> usize {
+    32 * 1024 * 1024
+}
+fn default_discovery_submit_timeout_secs() -> u64 {
+    10
+}
+fn default_discovery_max_pending_requests() -> usize {
+    4096
+}
+fn default_discovery_max_pending_responses() -> usize {
+    4096
+}
+fn default_discovery_pir_arity() -> u32 {
+    4
 }
 fn default_strict_trust() -> bool {
     true
@@ -401,7 +502,15 @@ fn warn_unknown_keys(val: &TomlValue) {
     // Known sections and keys
     use std::collections::HashSet;
     let top_allowed: HashSet<&str> = [
-        "net", "p2p", "storage", "epoch", "metrics", "compact", "ingress",
+        "net",
+        "p2p",
+        "storage",
+        "epoch",
+        "metrics",
+        "compact",
+        "ingress",
+        "proof_assistant",
+        "discovery",
     ]
     .into_iter()
     .collect();
@@ -484,6 +593,61 @@ fn warn_unknown_keys(val: &TomlValue) {
                                 "max_queue_depth",
                                 "envelope_size_bytes",
                                 "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                }
+                ("proof_assistant", TomlValue::Table(t)) => {
+                    warn_unknown_keys_in(t, &["wallet", "server"]);
+                    if let Some(wallet) = t.get("wallet").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            wallet,
+                            &[
+                                "server",
+                                "max_request_bytes",
+                                "max_response_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                    if let Some(server) = t.get("server").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            server,
+                            &[
+                                "max_request_bytes",
+                                "max_response_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                }
+                ("discovery", TomlValue::Table(t)) => {
+                    warn_unknown_keys_in(t, &["wallet", "server"]);
+                    if let Some(wallet) = t.get("wallet").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            wallet,
+                            &[
+                                "server",
+                                "publish_interval_secs",
+                                "poll_interval_secs",
+                                "max_request_bytes",
+                                "max_response_bytes",
+                                "submit_timeout_secs",
+                            ],
+                        );
+                    }
+                    if let Some(server) = t.get("server").and_then(TomlValue::as_table) {
+                        warn_unknown_keys_in(
+                            server,
+                            &[
+                                "state_path",
+                                "record_ttl_secs",
+                                "max_request_bytes",
+                                "max_response_bytes",
+                                "submit_timeout_secs",
+                                "max_pending_requests",
+                                "max_pending_responses",
+                                "pir_arity",
                             ],
                         );
                     }

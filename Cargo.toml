@@ -64,6 +64,7 @@ hyper = { version = "0.14", features = ["full"] }
 risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std", "prove", "disable-dev-mode"] }
 methods = { path = "methods" }
 proof-core = { path = "proof-core" }
+chalamet_pir = "0.6.0"
 
 hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, features = ["tokio-runtime"] }
 hickory-proto = "=0.25.0-alpha.4"

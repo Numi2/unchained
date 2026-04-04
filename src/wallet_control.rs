@@ -31,6 +31,7 @@ pub enum WalletControlRequest {
     Ping,
     SubscribeState,
     ForceSync,
+    ReceiveLocator,
     MintReceiveHandle,
     DeriveGenesisLockSecret {
         coin_id: [u8; 32],
@@ -49,6 +50,7 @@ pub enum WalletControlRequest {
 pub enum WalletControlResponse {
     Pong,
     Synced,
+    Locator { locator: String },
     ReceiveHandle { handle: String },
     GenesisLockSecret { secret: [u8; 32] },
     Sent { outcome: SendOutcome },
@@ -188,6 +190,13 @@ impl WalletControlClient {
         match self.call(WalletControlRequest::MintReceiveHandle).await? {
             WalletControlResponse::ReceiveHandle { handle } => Ok(handle),
             other => bail!("unexpected wallet control receive-handle response: {other:?}"),
+        }
+    }
+
+    pub async fn receive_locator(&self) -> Result<String> {
+        match self.call(WalletControlRequest::ReceiveLocator).await? {
+            WalletControlResponse::Locator { locator } => Ok(locator),
+            other => bail!("unexpected wallet control locator response: {other:?}"),
         }
     }
 
@@ -482,11 +491,14 @@ impl WalletControlService {
         self.wallet.export_address()
     }
 
+    async fn receive_locator(&self) -> Result<String> {
+        let _guard = self.op_lock.lock().await;
+        self.wallet.publish_locator(Duration::from_secs(3600)).await
+    }
+
     async fn send(&self, recipient_handle: String, amount: u64) -> Result<SendOutcome> {
         let _guard = self.op_lock.lock().await;
-        self.wallet
-            .send_to_recipient_handle(&recipient_handle, amount)
-            .await
+        self.wallet.pay(&recipient_handle, amount).await
     }
 
     async fn submit_shared_state_control(
@@ -727,6 +739,9 @@ async fn handle_request(
                 let _ = state_refresh_tx.send(());
                 Ok(WalletControlResponse::Synced)
             }
+            WalletControlRequest::ReceiveLocator => Ok(WalletControlResponse::Locator {
+                locator: service.receive_locator().await?,
+            }),
             WalletControlRequest::MintReceiveHandle => Ok(WalletControlResponse::ReceiveHandle {
                 handle: service.mint_receive_handle().await?,
             }),
