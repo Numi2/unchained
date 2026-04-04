@@ -402,7 +402,7 @@ async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> 
     let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
     assert_eq!(
         hex::encode(fixture_id),
-        "37e79586d0327c93cb173ed1c42abde48907cf15ea393359adb9342579e08075"
+        "71f17d493d661275fb9086bef0121afcbc74a334e6e85de46f19453d2a3cd11e"
     );
 
     drop(wallet);

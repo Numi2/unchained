@@ -421,15 +421,32 @@ manifests. Canonical proofs include their backend, circuit, and statement
 metadata, and the remote proof assistant can advertise the exact backend and
 supported circuit inventory before serving witness requests. Canonical proof
 metadata also treats seal bytes as opaque adapter output rather than naming a
-specific receipt serialization format. That keeps the wallet and transport
-model stable while the first native transparent backend is introduced behind
-the same interface.
+specific receipt serialization format, and each proof now commits to a
+backend-agnostic statement digest of the decoded public journal. That keeps
+the wallet and transport model stable while the first native transparent
+backend is introduced behind the same interface.
 
 Backend selection is now also routed through a canonical per-circuit backend
 policy inside `src/proof.rs` rather than hard-coded directly into every
 prove/verify path. The current policy still maps every supported circuit to the
 prototype backend, but swapping in the first native backend no longer requires
 rewiring wallet, assistant, or transaction logic.
+
+Proof-facing transfer commitments have also started moving onto the native
+backend’s actual primitive stack. `proof-core` and the shielded runtime now
+route note-key commitments, note commitments, evolving nullifiers, Merkle
+parents, and checkpoint/history transcript digests through an algebraic
+proof-hash adapter rather than raw BLAKE3 calls at the circuit boundary.
+Ordinary transfer proving now prepares an explicit `native_transfer` scaffold
+with separated public inputs, private witness material, envelope bindings, and
+trace sizing before dispatching to the current prototype backend. Ordinary
+transfer inputs are also no longer shaped around hidden checkpoint-accumulator
+receipts: the wallet now builds deterministic full-history extension witnesses
+from genesis for each spent note, and transfer journals no longer expose an
+accumulator verifier-key binding just to support recursive zkVM assumptions.
+The remaining gap is the real one: replacing the adapter-local zkVM execution
+with an actual native STARK AIR/prover over that direct history witness model
+and pulling ciphertext/KEM checks out of that critical path.
 
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`

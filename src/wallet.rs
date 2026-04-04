@@ -75,6 +75,8 @@ const RECEIVE_KEY_ID_DOMAIN: &str = "unchained-wallet-receive-key-id-v1";
 const INTERNAL_RECEIVE_KEY_DOMAIN: &str = "unchained-wallet-internal-receive-key-v1";
 const LOCAL_ARCHIVE_PROVIDER_DOMAIN: &str = "unchained-wallet-local-archive-provider-v1";
 const LOCAL_EXTENSION_BLINDING_DOMAIN: &str = "unchained-wallet-local-extension-blinding-v1";
+const LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN: &str =
+    "unchained-wallet-local-extension-request-blinding-v1";
 const COMPACT_WALLET_SYNC_CURSOR_KEY: &[u8] = b"compact_wallet_sync_cursor";
 const COMPACT_WALLET_SYNC_MAX_COINS_PER_REQUEST: u32 = 512;
 const COMPACT_WALLET_SYNC_MAX_OUTPUTS_PER_REQUEST: u32 = 2048;
@@ -834,6 +836,19 @@ impl Wallet {
         hasher.update(chain_id);
         hasher.update(&rotation_round.to_le_bytes());
         hasher.update(request_binding);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn local_extension_request_blinding(
+        chain_id: &[u8; 32],
+        current_epoch: u64,
+        note_commitment: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher =
+            blake3::Hasher::new_derive_key(LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN);
+        hasher.update(chain_id);
+        hasher.update(&current_epoch.to_le_bytes());
+        hasher.update(note_commitment);
         *hasher.finalize().as_bytes()
     }
 
@@ -2018,6 +2033,99 @@ impl Wallet {
             .ok_or_else(|| anyhow!("missing aggregated local historical extension"))
     }
 
+    fn build_full_history_input_witnesses(
+        &self,
+        selected_notes: &[OwnedShieldedNote],
+        note_tree: &shielded::NoteCommitmentTree,
+        tree_root: [u8; 32],
+        chain_id: [u8; 32],
+        current_epoch: u64,
+        root_ledger: &shielded::NullifierRootLedger,
+        archived_nullifier_epochs: &[shielded::ArchivedNullifierEpoch],
+        rotation_round: u64,
+    ) -> Result<(Vec<proof_core::ProofShieldedInputWitness>, Vec<[u8; 32]>)> {
+        let mut membership_proofs = Vec::with_capacity(selected_notes.len());
+        let mut genesis_checkpoints = Vec::with_capacity(selected_notes.len());
+        let mut nullifiers = Vec::with_capacity(selected_notes.len());
+        let mut requests = Vec::with_capacity(selected_notes.len());
+
+        for owned in selected_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the spend");
+            }
+            if current_epoch < owned.note.birth_epoch {
+                bail!("current epoch predates owned shielded note birth epoch");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            let genesis_checkpoint = shielded::HistoricalUnspentCheckpoint::genesis(
+                owned.note.commitment,
+                owned.note.birth_epoch,
+            );
+            let mut queries = Vec::new();
+            if current_epoch > owned.note.birth_epoch {
+                for epoch in owned.note.birth_epoch..=current_epoch - 1 {
+                    let nullifier =
+                        owned
+                            .note
+                            .derive_evolving_nullifier(&owned.note_key, &chain_id, epoch)?;
+                    queries.push(shielded::EvolvingNullifierQuery { epoch, nullifier });
+                }
+            }
+            membership_proofs.push(membership_proof);
+            genesis_checkpoints.push(genesis_checkpoint.clone());
+            nullifiers.push(current_nullifier);
+            requests.push(shielded::CheckpointExtensionRequest::new(
+                genesis_checkpoint,
+                queries,
+                Self::local_extension_request_blinding(
+                    &chain_id,
+                    current_epoch,
+                    &owned.note.commitment,
+                ),
+            ));
+        }
+
+        let extensions = self.build_local_historical_extensions_from_runtime(
+            chain_id,
+            root_ledger,
+            archived_nullifier_epochs,
+            &requests,
+            rotation_round,
+        )?;
+        if extensions.len() != selected_notes.len() {
+            bail!("historical extension count mismatch");
+        }
+
+        let input_witnesses = selected_notes
+            .iter()
+            .zip(membership_proofs.iter())
+            .zip(genesis_checkpoints.iter())
+            .zip(extensions.iter())
+            .zip(nullifiers.iter())
+            .map(
+                |((((owned, membership_proof), genesis_checkpoint), extension), current_nullifier)| {
+                    proof::input_witness_from_local(
+                        &owned.note,
+                        &owned.note_key,
+                        membership_proof,
+                        genesis_checkpoint,
+                        Some(extension),
+                        None,
+                        current_nullifier,
+                    )
+                },
+            )
+            .collect();
+
+        Ok((input_witnesses, nullifiers))
+    }
+
     async fn refresh_owned_shielded_checkpoints_with_runtime(
         &self,
         notes: &mut [OwnedShieldedNote],
@@ -2106,29 +2214,16 @@ impl Wallet {
         let send_seed =
             self.derive_send_seed(&self.address, 0, fee_amount, current_epoch, &selected_notes);
 
-        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
-        let mut nullifiers = Vec::with_capacity(selected_notes.len());
-        for owned in &selected_notes {
-            let membership_proof = note_tree
-                .prove_membership(&owned.note.commitment)
-                .ok_or_else(|| anyhow!("missing membership proof for shared-state fee note"))?;
-            if membership_proof.root != tree_root {
-                bail!("shielded note tree changed while building the shared-state fee payment");
-            }
-            let current_nullifier =
-                owned
-                    .note
-                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
-            nullifiers.push(current_nullifier);
-            input_witnesses.push(proof::input_witness_from_local(
-                &owned.note,
-                &owned.note_key,
-                &membership_proof,
-                &owned.checkpoint,
-                owned.checkpoint_accumulator.as_ref(),
-                &current_nullifier,
-            ));
-        }
+        let (input_witnesses, nullifiers) = self.build_full_history_input_witnesses(
+            &selected_notes,
+            note_tree,
+            tree_root,
+            chain_id,
+            current_epoch,
+            &snapshot.root_ledger,
+            &snapshot.archived_nullifier_epochs,
+            0,
+        )?;
 
         let mut outputs = Vec::new();
         let mut output_witnesses = Vec::new();
@@ -2715,29 +2810,16 @@ impl Wallet {
             &selected_notes,
         );
 
-        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
-        let mut nullifiers = Vec::with_capacity(selected_notes.len());
-        for owned in &selected_notes {
-            let membership_proof = note_tree
-                .prove_membership(&owned.note.commitment)
-                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
-            if membership_proof.root != tree_root {
-                bail!("shielded note tree changed while building the spend");
-            }
-            let current_nullifier =
-                owned
-                    .note
-                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
-            nullifiers.push(current_nullifier);
-            input_witnesses.push(proof::input_witness_from_local(
-                &owned.note,
-                &owned.note_key,
-                &membership_proof,
-                &owned.checkpoint,
-                owned.checkpoint_accumulator.as_ref(),
-                &current_nullifier,
-            ));
-        }
+        let (input_witnesses, nullifiers) = self.build_full_history_input_witnesses(
+            &selected_notes,
+            note_tree,
+            tree_root,
+            chain_id,
+            current_epoch,
+            &material.root_ledger,
+            &material.archived_nullifier_epochs,
+            rotation_round,
+        )?;
 
         let mut outputs = Vec::new();
         let mut output_witnesses = Vec::new();
@@ -2866,29 +2948,16 @@ impl Wallet {
             &selected_notes,
         );
 
-        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
-        let mut nullifiers = Vec::with_capacity(selected_notes.len());
-        for owned in &selected_notes {
-            let membership_proof = note_tree
-                .prove_membership(&owned.note.commitment)
-                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
-            if membership_proof.root != tree_root {
-                bail!("shielded note tree changed while building the spend");
-            }
-            let current_nullifier =
-                owned
-                    .note
-                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
-            nullifiers.push(current_nullifier);
-            input_witnesses.push(proof::input_witness_from_local(
-                &owned.note,
-                &owned.note_key,
-                &membership_proof,
-                &owned.checkpoint,
-                owned.checkpoint_accumulator.as_ref(),
-                &current_nullifier,
-            ));
-        }
+        let (input_witnesses, nullifiers) = self.build_full_history_input_witnesses(
+            &selected_notes,
+            note_tree,
+            tree_root,
+            chain_id,
+            current_epoch,
+            &material.root_ledger,
+            &material.archived_nullifier_epochs,
+            rotation_round,
+        )?;
 
         let mut outputs = Vec::new();
         let mut output_witnesses = Vec::new();
@@ -3034,6 +3103,7 @@ impl Wallet {
                 &owned.note_key,
                 &membership_proof,
                 &owned.checkpoint,
+                None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
             ));
@@ -3203,6 +3273,7 @@ impl Wallet {
                 &owned.note_key,
                 &membership_proof,
                 &owned.checkpoint,
+                None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
             ));
@@ -3355,6 +3426,7 @@ impl Wallet {
                 &owned.note_key,
                 &membership_proof,
                 &owned.checkpoint,
+                None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
             ));

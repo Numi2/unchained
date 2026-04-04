@@ -1458,28 +1458,22 @@ fn validate_transfer_against_journal(
         if active.contains(&binding.current_nullifier) {
             bail!("current nullifier already exists in the active epoch");
         }
-        if current_epoch > 0 && binding.historical_through_epoch != current_epoch - 1 {
+        let expected_historical_through_epoch = if current_epoch == 0 {
+            0
+        } else {
+            current_epoch - 1
+        };
+        if binding.historical_through_epoch != expected_historical_through_epoch {
             bail!("historical range does not end at the prior epoch");
         }
-        let epoch_zero_empty_history = current_epoch == 0
-            && binding.historical_from_epoch == 0
-            && binding.historical_through_epoch == 0
-            && binding.historical_accumulator_verifier_key_commitment == [0u8; 32]
-            && binding.historical_root_digest == empty_historical_digest;
-        let references_historical_accumulator = !epoch_zero_empty_history
-            && binding.historical_from_epoch <= binding.historical_through_epoch;
-        if references_historical_accumulator
-            && binding.historical_accumulator_verifier_key_commitment
-                != proof::checkpoint_accumulator_verifier_key_commitment()
-        {
-            bail!("historical accumulator verifier key mismatch");
+        if current_epoch == 0 && binding.historical_from_epoch != 0 {
+            bail!("epoch-zero empty history must start at epoch 0");
         }
-        if !references_historical_accumulator
-            && binding.historical_accumulator_verifier_key_commitment != [0u8; 32]
-        {
-            bail!("empty historical range must not reference an accumulator verifier key");
-        }
-        let expected_digest = if epoch_zero_empty_history {
+        let empty_history = binding.historical_from_epoch > binding.historical_through_epoch
+            || (current_epoch == 0
+                && binding.historical_from_epoch == 0
+                && binding.historical_through_epoch == 0);
+        let expected_digest = if empty_history {
             empty_historical_digest
         } else {
             historical_root_digest_for_range(
@@ -2119,7 +2113,6 @@ mod tests {
             historical_root_digest: proof_core::checkpoint_accumulator_historical_digest_from_pairs(
                 &[],
             ),
-            historical_accumulator_verifier_key_commitment: [0u8; 32],
         }];
         let output_bindings = vec![proof::output_binding(&transfer.outputs[0])];
         validate_transfer_against_journal(

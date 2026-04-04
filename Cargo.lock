@@ -3463,6 +3463,8 @@ dependencies = [
  "chacha20poly1305",
  "ml-kem",
  "serde",
+ "winter-crypto",
+ "winter-math",
 ]
 
 [[package]]
@@ -5917,6 +5919,33 @@ checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winter-crypto"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cdb247bc142438798edb04067ab72a22cf815f57abbd7b78a6fa986fc101db8"
+dependencies = [
+ "blake3",
+ "sha3",
+ "winter-math",
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-math"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aecfb48ee6a8b4746392c8ff31e33e62df8528a3b5628c5af27b92b14aef1ea"
+dependencies = [
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-utils"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9951263ef5317740cd0f49e618db00c72fabb70b75756ea26c4d5efe462c04dd"
 
 [[package]]
 name = "wit-bindgen-rt"

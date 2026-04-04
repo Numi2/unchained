@@ -7,6 +7,12 @@ use ml_kem::{EncapsulateDeterministic, Encoded, EncodedSizeUser, KemCore, MlKem7
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+mod proof_hash;
+pub use proof_hash::{
+    merkle_parent_hash, nullifier_membership_witness_digest, proof_hash_bytes,
+    proof_hash_domain_parts,
+};
+
 pub const SHIELDED_NOTE_VERSION: u8 = 1;
 pub const SHIELDED_CHECKPOINT_VERSION: u8 = 1;
 pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
@@ -19,6 +25,8 @@ type MlKem768Ciphertext = ml_kem::Ciphertext<MlKem768>;
 type MlKem768SharedKey = ml_kem::SharedKey<MlKem768>;
 
 const NOTE_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-note-key-v1";
+const OWNER_SIGNING_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-owner-signing-key-v1";
+const OWNER_KEM_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-owner-kem-key-v1";
 const NOTE_COMMIT_DOMAIN: &str = "unchained-shielded-note-commit-v1";
 const NOTE_LEAF_DOMAIN: &str = "unchained-shielded-note-leaf-v1";
 const NULLIFIER_DOMAIN: &str = "unchained-shielded-evolving-nullifier-v1";
@@ -121,6 +129,8 @@ pub struct ProofShieldedNote {
     pub value: u64,
     pub birth_epoch: u64,
     pub owner_address: [u8; 32],
+    pub owner_signing_key_commitment: [u8; 32],
+    pub owner_kem_key_commitment: [u8; 32],
     pub owner_signing_pk: Vec<u8>,
     pub owner_kem_pk: Vec<u8>,
     pub rho: [u8; 32],
@@ -265,6 +275,7 @@ pub struct ProofShieldedInputWitness {
     pub note_key: [u8; 32],
     pub membership_proof: NoteMembershipProof,
     pub historical_checkpoint: HistoricalUnspentCheckpoint,
+    pub historical_extension: Option<HistoricalUnspentExtension>,
     pub historical_accumulator: Option<CheckpointAccumulatorJournal>,
     pub historical_accumulator_verifier_hint: Option<[u32; 8]>,
     pub historical_accumulator_receipt: Option<Vec<u8>>,
@@ -294,7 +305,6 @@ pub struct ProofShieldedInputBinding {
     pub historical_from_epoch: u64,
     pub historical_through_epoch: u64,
     pub historical_root_digest: [u8; 32],
-    pub historical_accumulator_verifier_key_commitment: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +371,82 @@ pub struct ProofPrivateUndelegationJournal {
     pub release_epoch: u64,
 }
 
+fn validate_input_history(
+    input: &ProofShieldedInputWitness,
+    current_epoch: u64,
+) -> Result<(u64, u64, [u8; 32])> {
+    let genesis_checkpoint =
+        HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
+    let empty_historical_digest = checkpoint_accumulator_historical_digest_from_pairs(&[]);
+    let historical_from_epoch = input.note.birth_epoch;
+    let historical_through_epoch = if current_epoch == 0 && input.note.birth_epoch == 0 {
+        0
+    } else {
+        current_epoch.saturating_sub(1)
+    };
+
+    let historical_root_digest = match (
+        input.historical_extension.as_ref(),
+        input.historical_accumulator.as_ref(),
+    ) {
+        (Some(_), Some(_)) => bail!("historical witness cannot mix extensions and accumulators"),
+        (Some(extension), None) => {
+            if input.historical_accumulator_verifier_hint.is_some() {
+                bail!("unexpected historical accumulator verifier hint");
+            }
+            if input.historical_accumulator_receipt.is_some() {
+                bail!("unexpected historical accumulator receipt");
+            }
+            if current_epoch == input.note.birth_epoch && !extension.strata.is_empty() {
+                bail!("historical extension must be empty at the note birth epoch");
+            }
+            let extended_checkpoint = input.historical_checkpoint.apply_extension(extension)?;
+            if extended_checkpoint.covered_through_epoch != historical_through_epoch {
+                bail!("historical extension does not cover all prior epochs");
+            }
+            extension.historical_root_digest
+        }
+        (None, Some(accumulator)) => {
+            if input
+                .historical_accumulator_receipt
+                .as_ref()
+                .map_or(true, Vec::is_empty)
+            {
+                bail!("historical accumulator receipt is missing");
+            }
+            if input.historical_accumulator_verifier_hint.is_none() {
+                bail!("historical accumulator verifier hint is missing");
+            }
+            accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
+            if accumulator.covered_through_epoch != historical_through_epoch {
+                bail!("historical checkpoint does not cover all prior epochs");
+            }
+            accumulator.historical_root_digest
+        }
+        (None, None) => {
+            if input.historical_accumulator_verifier_hint.is_some() {
+                bail!("unexpected historical accumulator verifier hint");
+            }
+            if input.historical_accumulator_receipt.is_some() {
+                bail!("unexpected historical accumulator receipt");
+            }
+            if current_epoch != input.note.birth_epoch {
+                bail!("historical witness missing");
+            }
+            if input.historical_checkpoint != genesis_checkpoint {
+                bail!("historical checkpoint mismatch");
+            }
+            empty_historical_digest
+        }
+    };
+
+    Ok((
+        historical_from_epoch,
+        historical_through_epoch,
+        historical_root_digest,
+    ))
+}
+
 pub fn validate_shielded_tx_witness(
     witness: &ProofShieldedTxWitness,
 ) -> Result<ProofShieldedTxJournal> {
@@ -403,56 +489,8 @@ pub fn validate_shielded_tx_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let genesis_checkpoint =
-            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
-        let (
-            historical_from_epoch,
-            historical_through_epoch,
-            historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
-        ) = match &input.historical_accumulator {
-            Some(accumulator) => {
-                if input
-                    .historical_accumulator_receipt
-                    .as_ref()
-                    .map_or(true, Vec::is_empty)
-                {
-                    bail!("historical accumulator receipt is missing");
-                }
-                if input.historical_accumulator_verifier_hint.is_none() {
-                    bail!("historical accumulator verifier hint is missing");
-                }
-                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
-                if witness.current_epoch == 0
-                    || accumulator.covered_through_epoch != witness.current_epoch - 1
-                {
-                    bail!("historical checkpoint does not cover all prior epochs");
-                }
-                (
-                    input.note.birth_epoch,
-                    accumulator.covered_through_epoch,
-                    accumulator.historical_root_digest,
-                    accumulator.accumulator_verifier_key_commitment,
-                )
-            }
-            None => {
-                if input.historical_accumulator_verifier_hint.is_some() {
-                    bail!("unexpected historical accumulator verifier hint");
-                }
-                if witness.current_epoch != input.note.birth_epoch {
-                    bail!("historical accumulator proof missing");
-                }
-                if input.historical_checkpoint != genesis_checkpoint {
-                    bail!("historical checkpoint mismatch");
-                }
-                (
-                    input.note.birth_epoch,
-                    input.historical_checkpoint.covered_through_epoch,
-                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u8; 32],
-                )
-            }
-        };
+        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
+            validate_input_history(input, witness.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.chain_id,
@@ -467,7 +505,6 @@ pub fn validate_shielded_tx_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -572,56 +609,8 @@ pub fn validate_private_delegation_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let genesis_checkpoint =
-            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
-        let (
-            historical_from_epoch,
-            historical_through_epoch,
-            historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
-        ) = match &input.historical_accumulator {
-            Some(accumulator) => {
-                if input
-                    .historical_accumulator_receipt
-                    .as_ref()
-                    .map_or(true, Vec::is_empty)
-                {
-                    bail!("historical accumulator receipt is missing");
-                }
-                if input.historical_accumulator_verifier_hint.is_none() {
-                    bail!("historical accumulator verifier hint is missing");
-                }
-                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
-                if witness.shielded.current_epoch == 0
-                    || accumulator.covered_through_epoch != witness.shielded.current_epoch - 1
-                {
-                    bail!("historical checkpoint does not cover all prior epochs");
-                }
-                (
-                    input.note.birth_epoch,
-                    accumulator.covered_through_epoch,
-                    accumulator.historical_root_digest,
-                    accumulator.accumulator_verifier_key_commitment,
-                )
-            }
-            None => {
-                if input.historical_accumulator_verifier_hint.is_some() {
-                    bail!("unexpected historical accumulator verifier hint");
-                }
-                if witness.shielded.current_epoch != input.note.birth_epoch {
-                    bail!("historical accumulator proof missing");
-                }
-                if input.historical_checkpoint != genesis_checkpoint {
-                    bail!("historical checkpoint mismatch");
-                }
-                (
-                    input.note.birth_epoch,
-                    input.historical_checkpoint.covered_through_epoch,
-                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u8; 32],
-                )
-            }
-        };
+        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
+            validate_input_history(input, witness.shielded.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.shielded.chain_id,
@@ -636,7 +625,6 @@ pub fn validate_private_delegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -774,56 +762,8 @@ pub fn validate_private_undelegation_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let genesis_checkpoint =
-            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
-        let (
-            historical_from_epoch,
-            historical_through_epoch,
-            historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
-        ) = match &input.historical_accumulator {
-            Some(accumulator) => {
-                if input
-                    .historical_accumulator_receipt
-                    .as_ref()
-                    .map_or(true, Vec::is_empty)
-                {
-                    bail!("historical accumulator receipt is missing");
-                }
-                if input.historical_accumulator_verifier_hint.is_none() {
-                    bail!("historical accumulator verifier hint is missing");
-                }
-                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
-                if witness.shielded.current_epoch == 0
-                    || accumulator.covered_through_epoch != witness.shielded.current_epoch - 1
-                {
-                    bail!("historical checkpoint does not cover all prior epochs");
-                }
-                (
-                    input.note.birth_epoch,
-                    accumulator.covered_through_epoch,
-                    accumulator.historical_root_digest,
-                    accumulator.accumulator_verifier_key_commitment,
-                )
-            }
-            None => {
-                if input.historical_accumulator_verifier_hint.is_some() {
-                    bail!("unexpected historical accumulator verifier hint");
-                }
-                if witness.shielded.current_epoch != input.note.birth_epoch {
-                    bail!("historical accumulator proof missing");
-                }
-                if input.historical_checkpoint != genesis_checkpoint {
-                    bail!("historical checkpoint mismatch");
-                }
-                (
-                    input.note.birth_epoch,
-                    input.historical_checkpoint.covered_through_epoch,
-                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u8; 32],
-                )
-            }
-        };
+        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
+            validate_input_history(input, witness.shielded.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.shielded.chain_id,
@@ -838,7 +778,6 @@ pub fn validate_private_undelegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -978,56 +917,8 @@ pub fn validate_unbonding_claim_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let genesis_checkpoint =
-            HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
-        let (
-            historical_from_epoch,
-            historical_through_epoch,
-            historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
-        ) = match &input.historical_accumulator {
-            Some(accumulator) => {
-                if input
-                    .historical_accumulator_receipt
-                    .as_ref()
-                    .map_or(true, Vec::is_empty)
-                {
-                    bail!("historical accumulator receipt is missing");
-                }
-                if input.historical_accumulator_verifier_hint.is_none() {
-                    bail!("historical accumulator verifier hint is missing");
-                }
-                accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
-                if witness.current_epoch == 0
-                    || accumulator.covered_through_epoch != witness.current_epoch - 1
-                {
-                    bail!("historical checkpoint does not cover all prior epochs");
-                }
-                (
-                    input.note.birth_epoch,
-                    accumulator.covered_through_epoch,
-                    accumulator.historical_root_digest,
-                    accumulator.accumulator_verifier_key_commitment,
-                )
-            }
-            None => {
-                if input.historical_accumulator_verifier_hint.is_some() {
-                    bail!("unexpected historical accumulator verifier hint");
-                }
-                if witness.current_epoch != input.note.birth_epoch {
-                    bail!("historical accumulator proof missing");
-                }
-                if input.historical_checkpoint != genesis_checkpoint {
-                    bail!("historical checkpoint mismatch");
-                }
-                (
-                    input.note.birth_epoch,
-                    input.historical_checkpoint.covered_through_epoch,
-                    checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u8; 32],
-                )
-            }
-        };
+        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
+            validate_input_history(input, witness.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.chain_id,
@@ -1042,7 +933,6 @@ pub fn validate_unbonding_claim_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -1102,14 +992,21 @@ impl ProofShieldedNote {
         if address_from_bytes(&self.owner_signing_pk) != self.owner_address {
             bail!("owner address does not match the signing key");
         }
+        if owner_signing_key_commitment(&self.owner_signing_pk) != self.owner_signing_key_commitment
+        {
+            bail!("owner signing key commitment mismatch");
+        }
+        if owner_kem_key_commitment(&self.owner_kem_pk) != self.owner_kem_key_commitment {
+            bail!("owner KEM key commitment mismatch");
+        }
         let expected = compute_note_commitment(
             self.version,
             &self.kind,
             self.value,
             self.birth_epoch,
             &self.owner_address,
-            &self.owner_signing_pk,
-            &self.owner_kem_pk,
+            &self.owner_signing_key_commitment,
+            &self.owner_kem_key_commitment,
             &self.rho,
             &self.note_randomizer,
             &self.note_key_commitment,
@@ -1201,14 +1098,41 @@ impl NullifierNonMembershipProof {
     }
 
     pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key("unchained-shielded-absence-proof-v1");
-        hasher.update(&self.epoch.to_le_bytes());
-        hasher.update(&self.queried_nullifier);
-        hasher.update(&self.root);
-        hasher.update(&self.set_size.to_le_bytes());
-        hash_optional_membership(&mut hasher, &self.predecessor);
-        hash_optional_membership(&mut hasher, &self.successor);
-        *hasher.finalize().as_bytes()
+        let predecessor_digest = self
+            .predecessor
+            .as_ref()
+            .map(|witness| {
+                nullifier_membership_witness_digest(
+                    &witness.nullifier,
+                    &witness.root,
+                    &witness.proof,
+                )
+            })
+            .unwrap_or([0u8; 32]);
+        let successor_digest = self
+            .successor
+            .as_ref()
+            .map(|witness| {
+                nullifier_membership_witness_digest(
+                    &witness.nullifier,
+                    &witness.root,
+                    &witness.proof,
+                )
+            })
+            .unwrap_or([0u8; 32]);
+        proof_hash_domain_parts(
+            "unchained-shielded-absence-proof-v1",
+            &[
+                &self.epoch.to_le_bytes(),
+                self.queried_nullifier.as_slice(),
+                self.root.as_slice(),
+                &self.set_size.to_le_bytes(),
+                &[u8::from(self.predecessor.is_some())],
+                predecessor_digest.as_slice(),
+                &[u8::from(self.successor.is_some())],
+                successor_digest.as_slice(),
+            ],
+        )
     }
 }
 
@@ -1632,22 +1556,32 @@ impl HistoricalUnspentStratum {
 }
 
 pub fn note_key_commitment(note_key: &[u8; 32]) -> [u8; 32] {
-    *blake3::Hasher::new_derive_key(NOTE_KEY_COMMIT_DOMAIN)
-        .update(note_key)
-        .finalize()
-        .as_bytes()
+    proof_hash_bytes(NOTE_KEY_COMMIT_DOMAIN, note_key)
+}
+
+pub fn owner_signing_key_commitment(owner_signing_pk: &[u8]) -> [u8; 32] {
+    proof_hash_bytes(OWNER_SIGNING_KEY_COMMIT_DOMAIN, owner_signing_pk)
+}
+
+pub fn owner_kem_key_commitment(owner_kem_pk: &[u8]) -> [u8; 32] {
+    proof_hash_bytes(OWNER_KEM_KEY_COMMIT_DOMAIN, owner_kem_pk)
 }
 
 pub fn public_output_digest(output: &ProofShieldedOutput) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(OUTPUT_BINDING_DOMAIN);
-    hasher.update(&output.note_commitment);
-    hasher.update(&(output.kem_ct.len() as u32).to_le_bytes());
-    hasher.update(&output.kem_ct);
-    hasher.update(&output.nonce);
-    hasher.update(&[output.view_tag]);
-    hasher.update(&(output.ciphertext.len() as u32).to_le_bytes());
-    hasher.update(&output.ciphertext);
-    *hasher.finalize().as_bytes()
+    let kem_ct_len = (output.kem_ct.len() as u32).to_le_bytes();
+    let ciphertext_len = (output.ciphertext.len() as u32).to_le_bytes();
+    proof_hash_domain_parts(
+        OUTPUT_BINDING_DOMAIN,
+        &[
+            output.note_commitment.as_slice(),
+            &kem_ct_len,
+            output.kem_ct.as_slice(),
+            output.nonce.as_slice(),
+            &[output.view_tag],
+            &ciphertext_len,
+            output.ciphertext.as_slice(),
+        ],
+    )
 }
 
 fn verify_public_output_encryption(output: &ProofShieldedOutputWitness) -> Result<()> {
@@ -1715,13 +1649,13 @@ pub fn historical_root_digest(records: &[HistoricalAbsenceRecord]) -> [u8; 32] {
 }
 
 pub fn historical_root_digest_from_pairs(pairs: &[(u64, [u8; 32])]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(HISTORICAL_ROOT_DIGEST_DOMAIN);
-    hasher.update(&(pairs.len() as u32).to_le_bytes());
+    let mut encoded = Vec::with_capacity(4 + pairs.len() * 40);
+    encoded.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
     for (epoch, root) in pairs {
-        hasher.update(&epoch.to_le_bytes());
-        hasher.update(root);
+        encoded.extend_from_slice(&epoch.to_le_bytes());
+        encoded.extend_from_slice(root);
     }
-    *hasher.finalize().as_bytes()
+    proof_hash_bytes(HISTORICAL_ROOT_DIGEST_DOMAIN, &encoded)
 }
 
 pub fn checkpoint_accumulator_historical_digest_from_pairs(pairs: &[(u64, [u8; 32])]) -> [u8; 32] {
@@ -1735,11 +1669,10 @@ pub fn checkpoint_accumulator_historical_digest_append(
     epoch: u64,
     root: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_HISTORICAL_DOMAIN);
-    hasher.update(prior_digest);
-    hasher.update(&epoch.to_le_bytes());
-    hasher.update(root);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_ACCUMULATOR_HISTORICAL_DOMAIN,
+        &[prior_digest.as_slice(), &epoch.to_le_bytes(), root.as_slice()],
+    )
 }
 
 pub fn checkpoint_accumulator_stratum_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
@@ -1754,10 +1687,10 @@ pub fn checkpoint_accumulator_stratum_root_append(
     prior_root: &[u8; 32],
     stratum_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN);
-    hasher.update(prior_root);
-    hasher.update(stratum_digest);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN,
+        &[prior_root.as_slice(), stratum_digest.as_slice()],
+    )
 }
 
 pub fn checkpoint_accumulator_root(
@@ -1767,14 +1700,18 @@ pub fn checkpoint_accumulator_root(
     historical_root_digest: &[u8; 32],
     stratum_commitment_root: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN);
-    hasher.update(&checkpoint_base_root(note_commitment, birth_epoch));
-    hasher.update(note_commitment);
-    hasher.update(&birth_epoch.to_le_bytes());
-    hasher.update(&covered_through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(stratum_commitment_root);
-    *hasher.finalize().as_bytes()
+    let base_root = checkpoint_base_root(note_commitment, birth_epoch);
+    proof_hash_domain_parts(
+        CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN,
+        &[
+            base_root.as_slice(),
+            note_commitment.as_slice(),
+            &birth_epoch.to_le_bytes(),
+            &covered_through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            stratum_commitment_root.as_slice(),
+        ],
+    )
 }
 
 fn verify_merkle_proof(leaf_hash: &[u8; 32], proof: &[([u8; 32], bool)], root: &[u8; 32]) -> bool {
@@ -1783,15 +1720,11 @@ fn verify_merkle_proof(leaf_hash: &[u8; 32], proof: &[([u8; 32], bool)], root: &
     }
     let mut computed = *leaf_hash;
     for (sibling, sibling_is_left) in proof {
-        let mut hasher = blake3::Hasher::new();
-        if *sibling_is_left {
-            hasher.update(sibling);
-            hasher.update(&computed);
+        computed = if *sibling_is_left {
+            merkle_parent_hash(sibling, &computed)
         } else {
-            hasher.update(&computed);
-            hasher.update(sibling);
-        }
-        computed = *hasher.finalize().as_bytes();
+            merkle_parent_hash(&computed, sibling)
+        };
     }
     &computed == root
 }
@@ -1802,24 +1735,28 @@ fn compute_note_commitment(
     value: u64,
     birth_epoch: u64,
     owner_address: &[u8; 32],
-    owner_signing_pk: &[u8],
-    owner_kem_pk: &[u8],
+    owner_signing_key_commitment: &[u8; 32],
+    owner_kem_key_commitment: &[u8; 32],
     rho: &[u8; 32],
     note_randomizer: &[u8; 32],
     note_key_commitment: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NOTE_COMMIT_DOMAIN);
-    hasher.update(&[version]);
-    hasher.update(&kind.commitment_bytes());
-    hasher.update(&value.to_le_bytes());
-    hasher.update(&birth_epoch.to_le_bytes());
-    hasher.update(owner_address);
-    hasher.update(owner_signing_pk);
-    hasher.update(owner_kem_pk);
-    hasher.update(rho);
-    hasher.update(note_randomizer);
-    hasher.update(note_key_commitment);
-    *hasher.finalize().as_bytes()
+    let kind_commitment = kind.commitment_bytes();
+    proof_hash_domain_parts(
+        NOTE_COMMIT_DOMAIN,
+        &[
+            &[version],
+            kind_commitment.as_slice(),
+            &value.to_le_bytes(),
+            &birth_epoch.to_le_bytes(),
+            owner_address.as_slice(),
+            owner_signing_key_commitment.as_slice(),
+            owner_kem_key_commitment.as_slice(),
+            rho.as_slice(),
+            note_randomizer.as_slice(),
+            note_key_commitment.as_slice(),
+        ],
+    )
 }
 
 fn address_from_bytes(bytes: &[u8]) -> [u8; 32] {
@@ -1835,38 +1772,37 @@ fn evolving_nullifier(
     chain_id: &[u8; 32],
     epoch: u64,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NULLIFIER_DOMAIN);
-    hasher.update(note_key);
-    hasher.update(rho);
-    hasher.update(chain_id);
-    hasher.update(&epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        NULLIFIER_DOMAIN,
+        &[
+            note_key.as_slice(),
+            rho.as_slice(),
+            chain_id.as_slice(),
+            &epoch.to_le_bytes(),
+        ],
+    )
 }
 
 fn note_leaf_hash(note_commitment: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NOTE_LEAF_DOMAIN);
-    hasher.update(note_commitment);
-    *hasher.finalize().as_bytes()
+    proof_hash_bytes(NOTE_LEAF_DOMAIN, note_commitment)
 }
 
 fn nullifier_leaf_hash(nullifier: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NULLIFIER_LEAF_DOMAIN);
-    hasher.update(nullifier);
-    *hasher.finalize().as_bytes()
+    proof_hash_bytes(NULLIFIER_LEAF_DOMAIN, nullifier)
 }
 
 fn checkpoint_base_root(note_commitment: &[u8; 32], birth_epoch: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_BASE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&birth_epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_BASE_DOMAIN,
+        &[note_commitment.as_slice(), &birth_epoch.to_le_bytes()],
+    )
 }
 
 fn checkpoint_segment_base_root(note_commitment: &[u8; 32], from_epoch: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_BASE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_SEGMENT_BASE_DOMAIN,
+        &[note_commitment.as_slice(), &from_epoch.to_le_bytes()],
+    )
 }
 
 fn checkpoint_service_root(
@@ -1875,12 +1811,15 @@ fn checkpoint_service_root(
     nullifier: &[u8; 32],
     proof_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SERVICE_DOMAIN);
-    hasher.update(prior_root);
-    hasher.update(&epoch.to_le_bytes());
-    hasher.update(nullifier);
-    hasher.update(proof_digest);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_SERVICE_DOMAIN,
+        &[
+            prior_root.as_slice(),
+            &epoch.to_le_bytes(),
+            nullifier.as_slice(),
+            proof_digest.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_segment_service_root(
@@ -1912,13 +1851,16 @@ fn rerandomized_segment_root(
     historical_root_digest: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_RERANDOMIZE_DOMAIN);
-    hasher.update(service_root);
-    hasher.update(provider_id);
-    hasher.update(provider_manifest_digest);
-    hasher.update(historical_root_digest);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_RERANDOMIZE_DOMAIN,
+        &[
+            service_root.as_slice(),
+            provider_id.as_slice(),
+            provider_manifest_digest.as_slice(),
+            historical_root_digest.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_segment_commitment_digest(
@@ -1930,24 +1872,28 @@ fn checkpoint_segment_commitment_digest(
     segment_transcript_root: &[u8; 32],
     record_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_COMMIT_DOMAIN);
-    hasher.update(provider_id);
-    hasher.update(provider_manifest_digest);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_transcript_root);
-    hasher.update(&record_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_SEGMENT_COMMIT_DOMAIN,
+        &[
+            provider_id.as_slice(),
+            provider_manifest_digest.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_transcript_root.as_slice(),
+            &record_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_segment_commitment_root(segment_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_COMMIT_DOMAIN);
-    hasher.update(&(segment_digests.len() as u32).to_le_bytes());
+    let digest_count = (segment_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + segment_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in segment_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(CHECKPOINT_SEGMENT_COMMIT_DOMAIN, &parts)
 }
 
 fn checkpoint_packet_commitment_digest(
@@ -1958,23 +1904,27 @@ fn checkpoint_packet_commitment_digest(
     packet_transcript_root: &[u8; 32],
     segment_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_commitment_root);
-    hasher.update(packet_transcript_root);
-    hasher.update(&segment_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_PACKET_COMMIT_DOMAIN,
+        &[
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_commitment_root.as_slice(),
+            packet_transcript_root.as_slice(),
+            &segment_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_packet_commitment_root(packet_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
-    hasher.update(&(packet_digests.len() as u32).to_le_bytes());
+    let digest_count = (packet_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + packet_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in packet_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(CHECKPOINT_PACKET_COMMIT_DOMAIN, &parts)
 }
 
 fn accumulated_packet_root(
@@ -1985,14 +1935,17 @@ fn accumulated_packet_root(
     segment_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_ACCUMULATE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_PACKET_ACCUMULATE_DOMAIN,
+        &[
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_stratum_commitment_digest(
@@ -2003,23 +1956,27 @@ fn checkpoint_stratum_commitment_digest(
     stratum_transcript_root: &[u8; 32],
     packet_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
-    hasher.update(stratum_transcript_root);
-    hasher.update(&packet_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_STRATUM_COMMIT_DOMAIN,
+        &[
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            packet_commitment_root.as_slice(),
+            stratum_transcript_root.as_slice(),
+            &packet_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_stratum_commitment_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
-    hasher.update(&(stratum_digests.len() as u32).to_le_bytes());
+    let digest_count = (stratum_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + stratum_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in stratum_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(CHECKPOINT_STRATUM_COMMIT_DOMAIN, &parts)
 }
 
 fn accumulated_stratum_root(
@@ -2030,14 +1987,17 @@ fn accumulated_stratum_root(
     packet_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_hash_domain_parts(
+        CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN,
+        &[
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            packet_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn accumulated_checkpoint_root(
@@ -2049,36 +2009,18 @@ fn accumulated_checkpoint_root(
     stratum_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN);
-    hasher.update(prior_transcript_root);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(stratum_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
-}
-
-fn hash_optional_membership(
-    hasher: &mut blake3::Hasher,
-    witness: &Option<NullifierMembershipWitness>,
-) {
-    match witness {
-        Some(witness) => {
-            hasher.update(&[1u8]);
-            hasher.update(&witness.nullifier);
-            hasher.update(&witness.root);
-            hasher.update(&(witness.proof.len() as u32).to_le_bytes());
-            for (hash, sibling_is_left) in &witness.proof {
-                hasher.update(hash);
-                hasher.update(&[*sibling_is_left as u8]);
-            }
-        }
-        None => {
-            hasher.update(&[0u8]);
-        }
-    }
+    proof_hash_domain_parts(
+        CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN,
+        &[
+            prior_transcript_root.as_slice(),
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            stratum_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -2097,6 +2039,8 @@ mod tests {
         let (_, owner_kem_pk) = MlKem768::generate_deterministic(&kem_d, &kem_z);
         let owner_kem_pk = owner_kem_pk.as_bytes().to_vec();
         let owner_address = address_from_bytes(&owner_signing_pk);
+        let owner_signing_key_commitment = owner_signing_key_commitment(&owner_signing_pk);
+        let owner_kem_key_commitment = owner_kem_key_commitment(&owner_kem_pk);
         let note_key = [seed.wrapping_add(3); 32];
         let rho = [seed.wrapping_add(4); 32];
         let note_randomizer = [seed.wrapping_add(5); 32];
@@ -2107,8 +2051,8 @@ mod tests {
             value,
             birth_epoch,
             &owner_address,
-            &owner_signing_pk,
-            &owner_kem_pk,
+            &owner_signing_key_commitment,
+            &owner_kem_key_commitment,
             &rho,
             &note_randomizer,
             &note_key_commitment,
@@ -2120,6 +2064,8 @@ mod tests {
                 value,
                 birth_epoch,
                 owner_address,
+                owner_signing_key_commitment,
+                owner_kem_key_commitment,
                 owner_signing_pk,
                 owner_kem_pk,
                 rho,
@@ -2380,6 +2326,7 @@ mod tests {
                     note_key: input_note_key,
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
+                    historical_extension: None,
                     historical_accumulator: Some(accumulator.clone()),
                     historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
@@ -2418,16 +2365,58 @@ mod tests {
             accumulator.historical_root_digest
         );
         assert_eq!(
-            journal.inputs[0].historical_accumulator_verifier_key_commitment,
-            accumulator.accumulator_verifier_key_commitment
-        );
-        assert_eq!(
             journal.outputs[0].note_commitment,
             witness.outputs[0].public_output.note_commitment
         );
         assert_eq!(
             journal.outputs[0].public_output_digest,
             public_output_digest(&witness.outputs[0].public_output)
+        );
+    }
+
+    #[test]
+    fn extension_backed_witness_yields_public_journal_bindings() {
+        let chain_id = [7u8; 32];
+        let current_epoch = 2;
+        let (input_note, input_note_key) = sample_note(11, 7, 1);
+        let membership_proof = single_leaf_membership(&input_note);
+        let checkpoint = HistoricalUnspentCheckpoint::genesis(input_note.commitment, 1);
+        let extension = extend_checkpoint(
+            &input_note,
+            &input_note_key,
+            &chain_id,
+            &checkpoint,
+            current_epoch - 1,
+        );
+        let current_nullifier = input_note
+            .derive_evolving_nullifier(&input_note_key, &chain_id, current_epoch)
+            .expect("derive current nullifier");
+        let output = sample_output_witness(44, 6, current_epoch);
+        let witness = ProofShieldedTxWitness {
+            chain_id,
+            current_epoch,
+            note_tree_root: membership_proof.root,
+            fee_amount: 1,
+            inputs: vec![ProofShieldedInputWitness {
+                note: input_note,
+                note_key: input_note_key,
+                membership_proof,
+                historical_checkpoint: checkpoint,
+                historical_extension: Some(extension.clone()),
+                historical_accumulator: None,
+                historical_accumulator_verifier_hint: None,
+                historical_accumulator_receipt: None,
+                current_nullifier,
+            }],
+            outputs: vec![output],
+        };
+
+        let journal = validate_shielded_tx_witness(&witness).expect("valid extension witness");
+        assert_eq!(journal.inputs[0].historical_from_epoch, 1);
+        assert_eq!(journal.inputs[0].historical_through_epoch, current_epoch - 1);
+        assert_eq!(
+            journal.inputs[0].historical_root_digest,
+            extension.historical_root_digest
         );
     }
 
@@ -2502,6 +2491,7 @@ mod tests {
                     note_key: input_note_key,
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
+                    historical_extension: None,
                     historical_accumulator: Some(accumulator),
                     historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
@@ -2579,6 +2569,7 @@ mod tests {
                     note_key: input_note_key,
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
+                    historical_extension: None,
                     historical_accumulator: Some(accumulator),
                     historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
@@ -2633,6 +2624,7 @@ mod tests {
                     input_commitment,
                     current_epoch,
                 ),
+                historical_extension: None,
                 historical_accumulator: None,
                 historical_accumulator_verifier_hint: None,
                 historical_accumulator_receipt: None,

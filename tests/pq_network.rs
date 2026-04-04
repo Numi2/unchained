@@ -309,7 +309,7 @@ async fn deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable(
     let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
     assert_eq!(
         hex::encode(fixture_id),
-        "a7c0d80ce95dd1f52682679bba8ef69960aa62658025864fdc37f07e33a3723b"
+        "f1e522879e8df1ff55a6b78d43b37ef6aea02f0cce2bb905d06bbb77cd2e5695"
     );
 
     Ok(())

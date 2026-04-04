@@ -906,6 +906,7 @@ pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
     writer.write_u8(match proof.backend {
         TransparentProofBackend::PrototypeRisc0StarkV1 => 0,
     });
+    writer.write_fixed(&proof.statement_digest);
     writer.write_bytes(&proof.seal)?;
     Ok(writer.into_vec())
 }
@@ -934,6 +935,7 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             0 => TransparentProofBackend::PrototypeRisc0StarkV1,
             other => bail!("unsupported transparent proof backend {}", other),
         },
+        statement_digest: reader.read_fixed()?,
         seal: reader.read_bytes()?,
     };
     reader.finish()?;
@@ -1928,6 +1930,8 @@ pub fn encode_shielded_note(note: &ShieldedNote) -> Result<Vec<u8>> {
     writer.write_u64(note.value);
     writer.write_u64(note.birth_epoch);
     write_address(&mut writer, &note.owner_address);
+    writer.write_fixed(&note.owner_signing_key_commitment);
+    writer.write_fixed(&note.owner_kem_key_commitment);
     write_tagged_signing_public_key(&mut writer, &note.owner_signing_pk);
     write_tagged_kem_public_key(&mut writer, &note.owner_kem_pk);
     writer.write_fixed(&note.rho);
@@ -1945,6 +1949,8 @@ pub fn decode_shielded_note(bytes: &[u8]) -> Result<ShieldedNote> {
         value: reader.read_u64()?,
         birth_epoch: reader.read_u64()?,
         owner_address: read_address(&mut reader)?,
+        owner_signing_key_commitment: reader.read_fixed()?,
+        owner_kem_key_commitment: reader.read_fixed()?,
         owner_signing_pk: read_tagged_signing_public_key(&mut reader)?,
         owner_kem_pk: read_tagged_kem_public_key(&mut reader)?,
         rho: reader.read_fixed()?,

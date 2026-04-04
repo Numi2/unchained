@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     coin::Coin,
     crypto::{Address, TaggedKemPublicKey, TaggedSigningPublicKey},
-    epoch::MerkleTree,
 };
 
 pub const SHIELDED_NOTE_VERSION: u8 = 1;
@@ -15,6 +14,8 @@ pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
 pub const SHIELDED_ACTIVE_NULLIFIER_VERSION: u8 = 1;
 
 const NOTE_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-note-key-v1";
+const OWNER_SIGNING_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-owner-signing-key-v1";
+const OWNER_KEM_KEY_COMMIT_DOMAIN: &str = "unchained-shielded-owner-kem-key-v1";
 const NOTE_COMMIT_DOMAIN: &str = "unchained-shielded-note-commit-v1";
 const NOTE_LEAF_DOMAIN: &str = "unchained-shielded-note-leaf-v1";
 const NULLIFIER_DOMAIN: &str = "unchained-shielded-evolving-nullifier-v1";
@@ -123,6 +124,8 @@ pub struct ShieldedNote {
     pub value: u64,
     pub birth_epoch: u64,
     pub owner_address: Address,
+    pub owner_signing_key_commitment: [u8; 32],
+    pub owner_kem_key_commitment: [u8; 32],
     pub owner_signing_pk: TaggedSigningPublicKey,
     pub owner_kem_pk: TaggedKemPublicKey,
     pub rho: [u8; 32],
@@ -505,6 +508,8 @@ impl ShieldedNote {
         note_randomizer: [u8; 32],
     ) -> Self {
         let owner_address = owner_signing_pk.address();
+        let owner_signing_key_commitment = owner_signing_key_commitment(&owner_signing_pk);
+        let owner_kem_key_commitment = owner_kem_key_commitment(&owner_kem_pk);
         let note_key_commitment = note_key_commitment(&note_key);
         let commitment = compute_note_commitment(
             SHIELDED_NOTE_VERSION,
@@ -512,8 +517,8 @@ impl ShieldedNote {
             value,
             birth_epoch,
             &owner_address,
-            &owner_signing_pk,
-            &owner_kem_pk,
+            &owner_signing_key_commitment,
+            &owner_kem_key_commitment,
             &rho,
             &note_randomizer,
             &note_key_commitment,
@@ -524,6 +529,8 @@ impl ShieldedNote {
             value,
             birth_epoch,
             owner_address,
+            owner_signing_key_commitment,
+            owner_kem_key_commitment,
             owner_signing_pk,
             owner_kem_pk,
             rho,
@@ -540,14 +547,21 @@ impl ShieldedNote {
         if self.owner_signing_pk.address() != self.owner_address {
             bail!("shielded note owner address does not match signing key");
         }
+        if owner_signing_key_commitment(&self.owner_signing_pk) != self.owner_signing_key_commitment
+        {
+            bail!("shielded note owner signing key commitment mismatch");
+        }
+        if owner_kem_key_commitment(&self.owner_kem_pk) != self.owner_kem_key_commitment {
+            bail!("shielded note owner KEM key commitment mismatch");
+        }
         let expected = compute_note_commitment(
             self.version,
             &self.kind,
             self.value,
             self.birth_epoch,
             &self.owner_address,
-            &self.owner_signing_pk,
-            &self.owner_kem_pk,
+            &self.owner_signing_key_commitment,
+            &self.owner_kem_key_commitment,
             &self.rho,
             &self.note_randomizer,
             &self.note_key_commitment,
@@ -666,7 +680,7 @@ impl NoteCommitmentTree {
 
 impl NoteMembershipProof {
     pub fn verify(&self) -> bool {
-        MerkleTree::verify_proof(
+        verify_merkle_proof(
             &note_leaf_hash(&self.note_commitment),
             &self.proof,
             &self.root,
@@ -776,7 +790,7 @@ impl ArchivedNullifierEpoch {
 
 impl NullifierMembershipWitness {
     pub fn verify(&self) -> bool {
-        MerkleTree::verify_proof(
+        verify_merkle_proof(
             &nullifier_leaf_hash(&self.nullifier),
             &self.proof,
             &self.root,
@@ -827,14 +841,41 @@ impl NullifierNonMembershipProof {
     }
 
     pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key("unchained-shielded-absence-proof-v1");
-        hasher.update(&self.epoch.to_le_bytes());
-        hasher.update(&self.queried_nullifier);
-        hasher.update(&self.root);
-        hasher.update(&self.set_size.to_le_bytes());
-        hash_optional_membership(&mut hasher, &self.predecessor);
-        hash_optional_membership(&mut hasher, &self.successor);
-        *hasher.finalize().as_bytes()
+        let predecessor_digest = self
+            .predecessor
+            .as_ref()
+            .map(|witness| {
+                proof_core::nullifier_membership_witness_digest(
+                    &witness.nullifier,
+                    &witness.root,
+                    &witness.proof,
+                )
+            })
+            .unwrap_or([0u8; 32]);
+        let successor_digest = self
+            .successor
+            .as_ref()
+            .map(|witness| {
+                proof_core::nullifier_membership_witness_digest(
+                    &witness.nullifier,
+                    &witness.root,
+                    &witness.proof,
+                )
+            })
+            .unwrap_or([0u8; 32]);
+        proof_core::proof_hash_domain_parts(
+            "unchained-shielded-absence-proof-v1",
+            &[
+                &self.epoch.to_le_bytes(),
+                self.queried_nullifier.as_slice(),
+                self.root.as_slice(),
+                &self.set_size.to_le_bytes(),
+                &[u8::from(self.predecessor.is_some())],
+                predecessor_digest.as_slice(),
+                &[u8::from(self.successor.is_some())],
+                successor_digest.as_slice(),
+            ],
+        )
     }
 }
 
@@ -3125,10 +3166,15 @@ impl ActiveNullifierEpoch {
 }
 
 pub fn note_key_commitment(note_key: &[u8; 32]) -> [u8; 32] {
-    *blake3::Hasher::new_derive_key(NOTE_KEY_COMMIT_DOMAIN)
-        .update(note_key)
-        .finalize()
-        .as_bytes()
+    proof_core::proof_hash_bytes(NOTE_KEY_COMMIT_DOMAIN, note_key)
+}
+
+pub fn owner_signing_key_commitment(owner_signing_pk: &TaggedSigningPublicKey) -> [u8; 32] {
+    proof_core::proof_hash_bytes(OWNER_SIGNING_KEY_COMMIT_DOMAIN, owner_signing_pk.bytes.as_slice())
+}
+
+pub fn owner_kem_key_commitment(owner_kem_pk: &TaggedKemPublicKey) -> [u8; 32] {
+    proof_core::proof_hash_bytes(OWNER_KEM_KEY_COMMIT_DOMAIN, owner_kem_pk.bytes.as_slice())
 }
 
 pub fn evolving_nullifier(
@@ -3137,24 +3183,23 @@ pub fn evolving_nullifier(
     chain_id: &[u8; 32],
     epoch: u64,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NULLIFIER_DOMAIN);
-    hasher.update(note_key);
-    hasher.update(rho);
-    hasher.update(chain_id);
-    hasher.update(&epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        NULLIFIER_DOMAIN,
+        &[
+            note_key.as_slice(),
+            rho.as_slice(),
+            chain_id.as_slice(),
+            &epoch.to_le_bytes(),
+        ],
+    )
 }
 
 pub fn note_leaf_hash(note_commitment: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NOTE_LEAF_DOMAIN);
-    hasher.update(note_commitment);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_bytes(NOTE_LEAF_DOMAIN, note_commitment)
 }
 
 pub fn nullifier_leaf_hash(nullifier: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NULLIFIER_LEAF_DOMAIN);
-    hasher.update(nullifier);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_bytes(NULLIFIER_LEAF_DOMAIN, nullifier)
 }
 
 fn compute_note_commitment(
@@ -3163,38 +3208,42 @@ fn compute_note_commitment(
     value: u64,
     birth_epoch: u64,
     owner_address: &Address,
-    owner_signing_pk: &TaggedSigningPublicKey,
-    owner_kem_pk: &TaggedKemPublicKey,
+    owner_signing_key_commitment: &[u8; 32],
+    owner_kem_key_commitment: &[u8; 32],
     rho: &[u8; 32],
     note_randomizer: &[u8; 32],
     note_key_commitment: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(NOTE_COMMIT_DOMAIN);
-    hasher.update(&[version]);
-    hasher.update(&kind.commitment_bytes());
-    hasher.update(&value.to_le_bytes());
-    hasher.update(&birth_epoch.to_le_bytes());
-    hasher.update(owner_address);
-    hasher.update(&owner_signing_pk.bytes);
-    hasher.update(&owner_kem_pk.bytes);
-    hasher.update(rho);
-    hasher.update(note_randomizer);
-    hasher.update(note_key_commitment);
-    *hasher.finalize().as_bytes()
+    let kind_commitment = kind.commitment_bytes();
+    proof_core::proof_hash_domain_parts(
+        NOTE_COMMIT_DOMAIN,
+        &[
+            &[version],
+            kind_commitment.as_slice(),
+            &value.to_le_bytes(),
+            &birth_epoch.to_le_bytes(),
+            owner_address.as_slice(),
+            owner_signing_key_commitment.as_slice(),
+            owner_kem_key_commitment.as_slice(),
+            rho.as_slice(),
+            note_randomizer.as_slice(),
+            note_key_commitment.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_base_root(note_commitment: &[u8; 32], birth_epoch: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_BASE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&birth_epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_BASE_DOMAIN,
+        &[note_commitment.as_slice(), &birth_epoch.to_le_bytes()],
+    )
 }
 
 fn checkpoint_segment_base_root(note_commitment: &[u8; 32], from_epoch: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_BASE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_SEGMENT_BASE_DOMAIN,
+        &[note_commitment.as_slice(), &from_epoch.to_le_bytes()],
+    )
 }
 
 fn checkpoint_service_root(
@@ -3203,12 +3252,15 @@ fn checkpoint_service_root(
     nullifier: &[u8; 32],
     proof_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SERVICE_DOMAIN);
-    hasher.update(prior_root);
-    hasher.update(&epoch.to_le_bytes());
-    hasher.update(nullifier);
-    hasher.update(proof_digest);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_SERVICE_DOMAIN,
+        &[
+            prior_root.as_slice(),
+            &epoch.to_le_bytes(),
+            nullifier.as_slice(),
+            proof_digest.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_segment_service_root(
@@ -3240,13 +3292,16 @@ fn rerandomized_segment_root(
     historical_root_digest: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_RERANDOMIZE_DOMAIN);
-    hasher.update(service_root);
-    hasher.update(provider_id);
-    hasher.update(provider_manifest_digest);
-    hasher.update(historical_root_digest);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_RERANDOMIZE_DOMAIN,
+        &[
+            service_root.as_slice(),
+            provider_id.as_slice(),
+            provider_manifest_digest.as_slice(),
+            historical_root_digest.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_segment_commitment_digest(
@@ -3258,24 +3313,28 @@ fn checkpoint_segment_commitment_digest(
     segment_transcript_root: &[u8; 32],
     record_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_COMMIT_DOMAIN);
-    hasher.update(provider_id);
-    hasher.update(provider_manifest_digest);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_transcript_root);
-    hasher.update(&record_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_SEGMENT_COMMIT_DOMAIN,
+        &[
+            provider_id.as_slice(),
+            provider_manifest_digest.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_transcript_root.as_slice(),
+            &record_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_segment_commitment_root(segment_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_SEGMENT_COMMIT_DOMAIN);
-    hasher.update(&(segment_digests.len() as u32).to_le_bytes());
+    let digest_count = (segment_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + segment_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in segment_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(CHECKPOINT_SEGMENT_COMMIT_DOMAIN, &parts)
 }
 
 fn checkpoint_packet_commitment_digest(
@@ -3286,23 +3345,27 @@ fn checkpoint_packet_commitment_digest(
     packet_transcript_root: &[u8; 32],
     segment_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_commitment_root);
-    hasher.update(packet_transcript_root);
-    hasher.update(&segment_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_PACKET_COMMIT_DOMAIN,
+        &[
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_commitment_root.as_slice(),
+            packet_transcript_root.as_slice(),
+            &segment_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_packet_commitment_root(packet_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_COMMIT_DOMAIN);
-    hasher.update(&(packet_digests.len() as u32).to_le_bytes());
+    let digest_count = (packet_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + packet_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in packet_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(CHECKPOINT_PACKET_COMMIT_DOMAIN, &parts)
 }
 
 fn accumulated_packet_root(
@@ -3313,14 +3376,17 @@ fn accumulated_packet_root(
     segment_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_PACKET_ACCUMULATE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(segment_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_PACKET_ACCUMULATE_DOMAIN,
+        &[
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            segment_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn checkpoint_stratum_commitment_digest(
@@ -3331,23 +3397,27 @@ fn checkpoint_stratum_commitment_digest(
     stratum_transcript_root: &[u8; 32],
     packet_count: u32,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
-    hasher.update(stratum_transcript_root);
-    hasher.update(&packet_count.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_STRATUM_COMMIT_DOMAIN,
+        &[
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            packet_commitment_root.as_slice(),
+            stratum_transcript_root.as_slice(),
+            &packet_count.to_le_bytes(),
+        ],
+    )
 }
 
 fn checkpoint_stratum_commitment_root(stratum_digests: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_COMMIT_DOMAIN);
-    hasher.update(&(stratum_digests.len() as u32).to_le_bytes());
+    let digest_count = (stratum_digests.len() as u32).to_le_bytes();
+    let mut parts = Vec::with_capacity(1 + stratum_digests.len());
+    parts.push(digest_count.as_slice());
     for digest in stratum_digests {
-        hasher.update(digest);
+        parts.push(digest.as_slice());
     }
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(CHECKPOINT_STRATUM_COMMIT_DOMAIN, &parts)
 }
 
 fn accumulated_stratum_root(
@@ -3358,14 +3428,17 @@ fn accumulated_stratum_root(
     packet_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(packet_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_STRATUM_ACCUMULATE_DOMAIN,
+        &[
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            packet_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn accumulated_checkpoint_root(
@@ -3377,15 +3450,18 @@ fn accumulated_checkpoint_root(
     stratum_commitment_root: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN);
-    hasher.update(prior_transcript_root);
-    hasher.update(note_commitment);
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    hasher.update(historical_root_digest);
-    hasher.update(stratum_commitment_root);
-    hasher.update(blinding);
-    *hasher.finalize().as_bytes()
+    proof_core::proof_hash_domain_parts(
+        CHECKPOINT_EXTENSION_ACCUMULATE_DOMAIN,
+        &[
+            prior_transcript_root.as_slice(),
+            note_commitment.as_slice(),
+            &from_epoch.to_le_bytes(),
+            &through_epoch.to_le_bytes(),
+            historical_root_digest.as_slice(),
+            stratum_commitment_root.as_slice(),
+            blinding.as_slice(),
+        ],
+    )
 }
 
 fn archive_shard_digest(shard_id: u64, epoch_roots: &[(u64, [u8; 32])]) -> [u8; 32] {
@@ -4031,32 +4107,19 @@ impl ArchiveAvailabilityCertificate {
     }
 }
 
-fn hash_optional_membership(
-    hasher: &mut blake3::Hasher,
-    witness: &Option<NullifierMembershipWitness>,
-) {
-    match witness {
-        Some(witness) => {
-            hasher.update(&[1]);
-            hasher.update(&witness.nullifier);
-            hasher.update(&witness.root);
-            hasher.update(&(witness.proof.len() as u32).to_le_bytes());
-            for (hash, sibling_is_left) in &witness.proof {
-                hasher.update(hash);
-                hasher.update(&[*sibling_is_left as u8]);
-            }
-        }
-        None => {
-            hasher.update(&[0]);
-        }
+fn verify_merkle_proof(leaf_hash: &[u8; 32], proof: &[([u8; 32], bool)], root: &[u8; 32]) -> bool {
+    if proof.len() > 64 {
+        return false;
     }
-}
-
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(left);
-    hasher.update(right);
-    *hasher.finalize().as_bytes()
+    let mut computed = *leaf_hash;
+    for (sibling, sibling_is_left) in proof {
+        computed = if *sibling_is_left {
+            proof_core::merkle_parent_hash(sibling, &computed)
+        } else {
+            proof_core::merkle_parent_hash(&computed, sibling)
+        };
+    }
+    &computed == root
 }
 
 fn build_merkle_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
@@ -4069,7 +4132,7 @@ fn build_merkle_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
         let mut next = Vec::with_capacity(current.len().div_ceil(2));
         for pair in current.chunks(2) {
             let right = pair.get(1).unwrap_or(&pair[0]);
-            next.push(hash_pair(&pair[0], right));
+            next.push(proof_core::merkle_parent_hash(&pair[0], right));
         }
         levels.push(next);
     }
@@ -4095,7 +4158,7 @@ fn push_merkle_leaf(levels: &mut Vec<Vec<[u8; 32]>>, leaf: [u8; 32]) {
             .get(left_index + 1)
             .copied()
             .unwrap_or(left);
-        let parent = hash_pair(&left, &right);
+        let parent = proof_core::merkle_parent_hash(&left, &right);
         if levels[level_index + 1].len() == parent_index {
             levels[level_index + 1].push(parent);
         } else {
@@ -4160,7 +4223,7 @@ fn validate_leaf_levels(leaves: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> Result
         }
         for (parent_index, pair) in current.chunks(2).enumerate() {
             let right = pair.get(1).unwrap_or(&pair[0]);
-            let expected = hash_pair(&pair[0], right);
+            let expected = proof_core::merkle_parent_hash(&pair[0], right);
             if next[parent_index] != expected {
                 bail!("invalid merkle parent hash");
             }
