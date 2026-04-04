@@ -3170,7 +3170,10 @@ pub fn note_key_commitment(note_key: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn owner_signing_key_commitment(owner_signing_pk: &TaggedSigningPublicKey) -> [u8; 32] {
-    proof_core::proof_hash_bytes(OWNER_SIGNING_KEY_COMMIT_DOMAIN, owner_signing_pk.bytes.as_slice())
+    proof_core::proof_hash_bytes(
+        OWNER_SIGNING_KEY_COMMIT_DOMAIN,
+        owner_signing_pk.bytes.as_slice(),
+    )
 }
 
 pub fn owner_kem_key_commitment(owner_kem_pk: &TaggedKemPublicKey) -> [u8; 32] {

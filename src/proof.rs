@@ -42,10 +42,8 @@ use native_transfer::OrdinaryTransferBackend;
 
 const TRANSPARENT_PROOF_VERSION: u8 = 1;
 pub const MIN_TRANSPARENT_PROOF_SECURITY_BITS: u16 = 128;
-const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str =
-    "unchained-transparent-verifier-key-v1";
-const TRANSPARENT_STATEMENT_DIGEST_DOMAIN: &str =
-    "unchained-transparent-statement-digest-v1";
+const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str = "unchained-transparent-verifier-key-v1";
+const TRANSPARENT_STATEMENT_DIGEST_DOMAIN: &str = "unchained-transparent-statement-digest-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransparentProofStatement {
@@ -181,9 +179,13 @@ fn transparent_backend_binding(
         (
             TransparentCircuit::PrivateUndelegationV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => backend_binding(PRIVATE_UNDELEGATION_METHOD_ID, PRIVATE_UNDELEGATION_METHOD_ELF),
-        (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) =>
-            backend_binding(UNBONDING_CLAIM_METHOD_ID, UNBONDING_CLAIM_METHOD_ELF),
+        ) => backend_binding(
+            PRIVATE_UNDELEGATION_METHOD_ID,
+            PRIVATE_UNDELEGATION_METHOD_ELF,
+        ),
+        (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) => {
+            backend_binding(UNBONDING_CLAIM_METHOD_ID, UNBONDING_CLAIM_METHOD_ELF)
+        }
         (
             TransparentCircuit::CheckpointAccumulatorV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
@@ -962,7 +964,8 @@ pub fn prove_checkpoint_accumulator(
         current_receipt = Some(receipt);
     }
 
-    let journal = current_journal.ok_or_else(|| anyhow!("missing checkpoint accumulator journal"))?;
+    let journal =
+        current_journal.ok_or_else(|| anyhow!("missing checkpoint accumulator journal"))?;
     Ok(CheckpointAccumulatorProof {
         proof: TransparentProof::new_for_circuit_with_digest(
             circuit,
@@ -1531,8 +1534,9 @@ mod tests {
         let transfer =
             shielded_journal_statement_digest(TransparentCircuit::OrdinaryTransferV1, &journal)
                 .expect("transfer digest");
-        let claim = shielded_journal_statement_digest(TransparentCircuit::UnbondingClaimV1, &journal)
-            .expect("claim digest");
+        let claim =
+            shielded_journal_statement_digest(TransparentCircuit::UnbondingClaimV1, &journal)
+                .expect("claim digest");
         assert_ne!(transfer, claim);
     }
 

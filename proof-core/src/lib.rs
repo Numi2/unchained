@@ -1671,7 +1671,11 @@ pub fn checkpoint_accumulator_historical_digest_append(
 ) -> [u8; 32] {
     proof_hash_domain_parts(
         CHECKPOINT_ACCUMULATOR_HISTORICAL_DOMAIN,
-        &[prior_digest.as_slice(), &epoch.to_le_bytes(), root.as_slice()],
+        &[
+            prior_digest.as_slice(),
+            &epoch.to_le_bytes(),
+            root.as_slice(),
+        ],
     )
 }
 
@@ -2413,7 +2417,10 @@ mod tests {
 
         let journal = validate_shielded_tx_witness(&witness).expect("valid extension witness");
         assert_eq!(journal.inputs[0].historical_from_epoch, 1);
-        assert_eq!(journal.inputs[0].historical_through_epoch, current_epoch - 1);
+        assert_eq!(
+            journal.inputs[0].historical_through_epoch,
+            current_epoch - 1
+        );
         assert_eq!(
             journal.inputs[0].historical_root_digest,
             extension.historical_root_digest

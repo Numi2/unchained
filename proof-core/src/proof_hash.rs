@@ -3,8 +3,7 @@ use winter_math::fields::f64::BaseElement;
 
 const PROOF_HASH_TAG_DOMAIN: &str = "unchained-proof-hash-parts-v1";
 const MERKLE_NODE_DOMAIN: &str = "unchained-shielded-merkle-node-v1";
-const NULLIFIER_MEMBERSHIP_WITNESS_DOMAIN: &str =
-    "unchained-shielded-membership-witness-v1";
+const NULLIFIER_MEMBERSHIP_WITNESS_DOMAIN: &str = "unchained-shielded-membership-witness-v1";
 
 pub fn proof_hash_bytes(domain: &str, bytes: &[u8]) -> [u8; 32] {
     proof_hash_domain_parts(domain, &[bytes])

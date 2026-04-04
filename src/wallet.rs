@@ -844,8 +844,7 @@ impl Wallet {
         current_epoch: u64,
         note_commitment: &[u8; 32],
     ) -> [u8; 32] {
-        let mut hasher =
-            blake3::Hasher::new_derive_key(LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN);
+        let mut hasher = blake3::Hasher::new_derive_key(LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN);
         hasher.update(chain_id);
         hasher.update(&current_epoch.to_le_bytes());
         hasher.update(note_commitment);
@@ -2109,7 +2108,10 @@ impl Wallet {
             .zip(extensions.iter())
             .zip(nullifiers.iter())
             .map(
-                |((((owned, membership_proof), genesis_checkpoint), extension), current_nullifier)| {
+                |(
+                    (((owned, membership_proof), genesis_checkpoint), extension),
+                    current_nullifier,
+                )| {
                     proof::input_witness_from_local(
                         &owned.note,
                         &owned.note_key,
