@@ -311,8 +311,9 @@ Instead, wallets use a separate addressability layer built around:
 
 1. `LocatorID`
 2. private discovery
-3. one-time payment capability negotiation
-4. direct invoice links
+3. offline receive descriptors for ordinary private transfers
+4. one-time payment capability negotiation for policy-bound receive flows
+5. direct invoice links
 
 ### Locator
 
@@ -408,11 +409,38 @@ Locator indexing must therefore be **PIR-native**: the signed manifest carries
 the exact index parameters, and clients query the directory only through the
 PIR path. There is no cleartext “miss then retry by name” fallback.
 
+### Offline Receive Descriptor
+
+Discovery records should carry a signed **offline receive descriptor** for the
+ordinary `Class A` payment path.
+
+That descriptor binds:
+
+- chain
+- locator
+- owner discovery identity
+- offline scan `ML-KEM` public key
+- descriptor binding bytes
+- coarse asset policy
+- policy flags
+- issuance and expiry
+
+Ordinary locator payments use that descriptor directly:
+
+- the sender resolves the discovery record through PIR
+- the sender constructs the ordinary shielded output immediately
+- the receiver later detects and decrypts the note through compact scan plus
+  local trial decryption
+
+This gives Unchained the asynchronous payment property it needs for ordinary
+wallet-to-wallet sends without exposing a reusable public payment address.
+
 ### Handle Negotiation
 
-Discovery yields encrypted mailbox material, not a reusable payment key.
+Discovery also yields encrypted mailbox material.
 
-The sender requests a one-time handle.
+Mailbox negotiation is retained for receive flows that need a one-time explicit
+authorization object rather than a plain ordinary transfer.
 
 The receiver returns a **single-use `RecipientHandle`** that binds:
 
@@ -439,10 +467,14 @@ Unchained supports pre-minted invoice links.
 
 That gives the system two clean UX modes:
 
-- `wallet-to-wallet mode`: locator, private discovery, negotiated handle
+- `ordinary wallet-to-wallet mode`: locator, private discovery, offline receive
+  descriptor
+- `policy-bound wallet-to-wallet mode`: locator, private discovery, negotiated
+  handle
 - `merchant mode`: QR or link already contains a one-time `RecipientHandle`
 
-This avoids making every payment depend on live bilateral negotiation.
+This avoids making ordinary payments depend on live bilateral negotiation while
+preserving one-time explicit authorization for flows that need it.
 
 ## 4. Network Privacy Model
 

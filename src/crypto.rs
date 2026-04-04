@@ -26,12 +26,8 @@ pub const ML_KEM_768_CT_BYTES: usize = 1088;
 pub const ML_KEM_768_PK_BYTES: usize = 1184;
 pub const ML_KEM_768_SK_BYTES: usize = 2400;
 
-/// Size of opaque one-time public key bytes used in V3 signatureless transfers.
-/// This is intentionally fixed independently of the wallet signing API and aligned
-/// with the currently supported ML-DSA-65 public-key width.
 pub const OTP_PK_BYTES: usize = ML_DSA_65_PK_BYTES;
 
-/// A 32-byte address, derived from a BLAKE3 hash of a signing public key.
 pub type Address = [u8; 32];
 
 pub type MlKem768SecretKey = <MlKem768 as KemCore>::DecapsulationKey;
@@ -510,7 +506,6 @@ pub fn derive_next_lock_secret(
     *h.finalize().as_bytes()
 }
 
-/// Derive the next lock preimage including an out-of-band note binding.
 pub fn derive_next_lock_secret_with_note(
     shared: &[u8],
     ml_kem_ct_bytes: &[u8],
@@ -536,7 +531,6 @@ pub fn derive_next_lock_secret_with_note(
     *h.finalize().as_bytes()
 }
 
-/// Derive a stable 32-byte key from an ML-KEM shared secret.
 #[inline]
 fn derive_kem_shared_key32(shared_secret: &[u8]) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
@@ -549,7 +543,6 @@ fn derive_kem_shared_key32(shared_secret: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Perform an ML-KEM-768 KEM encapsulation. Returns (ciphertext, aead_key32).
 pub fn kem_encapsulate_to_ml_kem(
     pk: &TaggedKemPublicKey,
 ) -> Result<([u8; ML_KEM_768_CT_BYTES], [u8; 32])> {
@@ -587,7 +580,6 @@ pub fn ml_kem_768_decapsulate(
     Ok(derive_kem_shared_key32(shared_secret.as_slice()))
 }
 
-/// Derive the genesis lock secret deterministically from a dedicated wallet lock seed.
 pub fn derive_genesis_lock_secret(
     lock_seed: &[u8; 32],
     coin_id: &[u8; 32],
@@ -601,7 +593,6 @@ pub fn derive_genesis_lock_secret(
     *h.finalize().as_bytes()
 }
 
-/// Deterministic commitment identifier derived from receiver commitment fields.
 pub fn commitment_id_v1(
     one_time_pk: &[u8; OTP_PK_BYTES],
     ml_kem_ct: &[u8; ML_KEM_768_CT_BYTES],

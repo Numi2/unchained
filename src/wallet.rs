@@ -5,9 +5,7 @@ use crate::{
         self, Address, TaggedKemPublicKey, TaggedSigningPublicKey, ML_KEM_768_CT_BYTES,
         ML_KEM_768_PK_BYTES, ML_KEM_768_SK_BYTES,
     },
-    discovery::{
-        self, DiscoveryClient, DiscoveryRecord, HandleRequestPlaintext, HandleResponsePlaintext,
-    },
+    discovery::{self, DiscoveryClient, DiscoveryRecord, HandleResponsePlaintext},
     ingress::IngressClient,
     node_control::{
         CompactCommittedCoin, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
@@ -70,6 +68,7 @@ const SHIELDED_STORE_DOMAIN: &str = "unchained-wallet-shielded-store-v1";
 const SHIELDED_SEND_SEED_DOMAIN: &str = "unchained-wallet-shielded-send-seed-v1";
 const SHIELDED_OUTPUT_ENTROPY_DOMAIN: &str = "unchained-wallet-shielded-output-entropy-v1";
 const RECEIVE_KEY_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const OFFLINE_DESCRIPTOR_ROTATION_WINDOW_DIVISOR: u64 = 2;
 const RECEIVE_KEY_ID_DOMAIN: &str = "unchained-wallet-receive-key-id-v1";
 const INTERNAL_RECEIVE_KEY_DOMAIN: &str = "unchained-wallet-internal-receive-key-v1";
 const LOCAL_ARCHIVE_PROVIDER_DOMAIN: &str = "unchained-wallet-local-archive-provider-v1";
@@ -118,12 +117,25 @@ struct CompactWalletScanCursor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum ReceiveKeyModeRecord {
+    FixedOwner {
+        owner_signing_pk: TaggedSigningPublicKey,
+    },
+    OfflineDescriptor {
+        #[serde(with = "BigArray")]
+        descriptor_binding: [u8; 32],
+        asset_policy: discovery::OfflineReceiveAssetPolicy,
+        policy_flags: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ReceiveKeyRecord {
     #[serde(with = "BigArray")]
     pub key_id: [u8; 32],
     #[serde(with = "BigArray")]
     pub chain_id: [u8; 32],
-    pub owner_signing_pk: TaggedSigningPublicKey,
+    pub mode: ReceiveKeyModeRecord,
     #[serde(with = "BigArray")]
     pub kem_sk: [u8; ML_KEM_768_SK_BYTES],
     #[serde(with = "BigArray")]
@@ -133,9 +145,16 @@ struct ReceiveKeyRecord {
 }
 
 #[derive(Debug, Clone)]
+enum WalletReceiveKeyMode {
+    FixedOwner(TaggedSigningPublicKey),
+    OfflineDescriptor { descriptor_binding: [u8; 32] },
+}
+
+#[derive(Debug, Clone)]
 struct WalletReceiveKeyMaterial {
     key_id: [u8; 32],
-    owner_signing_pk: TaggedSigningPublicKey,
+    chain_id: [u8; 32],
+    mode: WalletReceiveKeyMode,
     kem_pk: TaggedKemPublicKey,
     #[allow(dead_code)]
     issued_unix_ms: u64,
@@ -332,7 +351,17 @@ impl Wallet {
     fn receive_key_record_to_material(record: &ReceiveKeyRecord) -> WalletReceiveKeyMaterial {
         WalletReceiveKeyMaterial {
             key_id: record.key_id,
-            owner_signing_pk: record.owner_signing_pk.clone(),
+            chain_id: record.chain_id,
+            mode: match &record.mode {
+                ReceiveKeyModeRecord::FixedOwner { owner_signing_pk } => {
+                    WalletReceiveKeyMode::FixedOwner(owner_signing_pk.clone())
+                }
+                ReceiveKeyModeRecord::OfflineDescriptor {
+                    descriptor_binding, ..
+                } => WalletReceiveKeyMode::OfflineDescriptor {
+                    descriptor_binding: *descriptor_binding,
+                },
+            },
             kem_pk: TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk),
             issued_unix_ms: record.issued_unix_ms,
             expires_unix_ms: record.expires_unix_ms,
@@ -412,7 +441,9 @@ impl Wallet {
             ReceiveKeyRecord {
                 key_id,
                 chain_id,
-                owner_signing_pk: handle_signing_pk,
+                mode: ReceiveKeyModeRecord::FixedOwner {
+                    owner_signing_pk: handle_signing_pk,
+                },
                 kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&kem_sk),
                 kem_pk: kem_pk.bytes,
                 issued_unix_ms,
@@ -427,10 +458,16 @@ impl Wallet {
         record: &ReceiveKeyRecord,
         handle_signing_key: &PqdsaKeyPair,
     ) -> Result<RecipientHandle> {
+        let owner_signing_pk = match &record.mode {
+            ReceiveKeyModeRecord::FixedOwner { owner_signing_pk } => owner_signing_pk,
+            ReceiveKeyModeRecord::OfflineDescriptor { .. } => {
+                bail!("offline receive descriptor key cannot be serialized as a recipient handle")
+            }
+        };
         let kem_pk = TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk);
         let msg = canonical::encode_recipient_handle_signable(
             &chain_id,
-            &record.owner_signing_pk,
+            owner_signing_pk,
             &record.key_id,
             &kem_pk,
             record.issued_unix_ms,
@@ -439,7 +476,7 @@ impl Wallet {
         let sig = crypto::ml_dsa_65_sign(handle_signing_key, &msg)?;
         Ok(RecipientHandle {
             chain_id,
-            signing_pk: record.owner_signing_pk.clone(),
+            signing_pk: owner_signing_pk.clone(),
             receive_key_id: record.key_id,
             kem_pk,
             issued_unix_ms: record.issued_unix_ms,
@@ -453,7 +490,10 @@ impl Wallet {
         let expired = self
             .iterate_receive_key_records(store)?
             .into_iter()
-            .filter(|record| now_unix_ms >= record.expires_unix_ms)
+            .filter(|record| {
+                matches!(record.mode, ReceiveKeyModeRecord::FixedOwner { .. })
+                    && now_unix_ms >= record.expires_unix_ms
+            })
             .map(|record| record.key_id)
             .collect::<Vec<_>>();
         for key_id in expired {
@@ -508,7 +548,10 @@ impl Wallet {
         let mut materials = self
             .iterate_receive_key_records(store)?
             .into_iter()
-            .filter(|record| now_unix_ms < record.expires_unix_ms)
+            .filter(|record| {
+                matches!(record.mode, ReceiveKeyModeRecord::OfflineDescriptor { .. })
+                    || now_unix_ms < record.expires_unix_ms
+            })
             .map(|record| Self::receive_key_record_to_material(&record))
             .collect::<Vec<_>>();
         materials.sort_by(|left, right| {
@@ -547,7 +590,9 @@ impl Wallet {
         ReceiveKeyRecord {
             key_id,
             chain_id,
-            owner_signing_pk: self.signing_pk.clone(),
+            mode: ReceiveKeyModeRecord::FixedOwner {
+                owner_signing_pk: self.signing_pk.clone(),
+            },
             kem_sk: crypto::ml_kem_768_secret_key_to_bytes(&kem_sk),
             kem_pk: kem_pk.bytes,
             issued_unix_ms,
@@ -1149,17 +1194,130 @@ impl Wallet {
         })
     }
 
+    fn mint_offline_receive_material_for_chain(
+        &self,
+        store: &WalletStore,
+        chain_id: [u8; 32],
+        record_ttl: Duration,
+    ) -> Result<discovery::OfflineReceiveDescriptor> {
+        let (scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let scan_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&scan_kem_sk);
+        let descriptor = discovery::build_signed_offline_receive_descriptor(
+            &self.signing_key_pkcs8,
+            &self.signing_pk,
+            chain_id,
+            scan_kem_pk.clone(),
+            discovery::OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            record_ttl,
+        )?;
+        let key_id =
+            Self::derive_receive_key_id(&chain_id, &scan_kem_pk, descriptor.issued_unix_ms);
+        let scan_key_record = ReceiveKeyRecord {
+            key_id,
+            chain_id,
+            mode: ReceiveKeyModeRecord::OfflineDescriptor {
+                descriptor_binding: descriptor.descriptor_binding,
+                asset_policy: descriptor.asset_policy.clone(),
+                policy_flags: descriptor.policy_flags,
+            },
+            kem_sk: scan_kem_sk,
+            kem_pk: scan_kem_pk.bytes,
+            issued_unix_ms: descriptor.issued_unix_ms,
+            expires_unix_ms: descriptor.expires_unix_ms,
+        };
+        self.store_receive_key_record(store, &scan_key_record)?;
+        Ok(descriptor)
+    }
+
+    fn active_offline_receive_record_for_chain(
+        &self,
+        store: &WalletStore,
+        chain_id: [u8; 32],
+        minimum_remaining_ms: u64,
+    ) -> Result<Option<ReceiveKeyRecord>> {
+        let now_unix_ms = Self::now_unix_ms();
+        Ok(self
+            .iterate_receive_key_records(store)?
+            .into_iter()
+            .filter(|record| {
+                if record.chain_id != chain_id {
+                    return false;
+                }
+                match record.mode {
+                    ReceiveKeyModeRecord::OfflineDescriptor { .. } => {
+                        now_unix_ms < record.expires_unix_ms
+                            && record.expires_unix_ms.saturating_sub(now_unix_ms)
+                                >= minimum_remaining_ms
+                    }
+                    ReceiveKeyModeRecord::FixedOwner { .. } => false,
+                }
+            })
+            .max_by(|left, right| {
+                left.issued_unix_ms
+                    .cmp(&right.issued_unix_ms)
+                    .then(left.key_id.cmp(&right.key_id))
+            }))
+    }
+
+    fn offline_receive_descriptor_from_record(
+        &self,
+        record: &ReceiveKeyRecord,
+    ) -> Result<discovery::OfflineReceiveDescriptor> {
+        let (descriptor_binding, asset_policy, policy_flags) = match &record.mode {
+            ReceiveKeyModeRecord::OfflineDescriptor {
+                descriptor_binding,
+                asset_policy,
+                policy_flags,
+            } => (*descriptor_binding, asset_policy.clone(), *policy_flags),
+            ReceiveKeyModeRecord::FixedOwner { .. } => {
+                bail!("fixed-owner receive key cannot be reconstructed as an offline descriptor");
+            }
+        };
+        let descriptor = discovery::sign_offline_receive_descriptor(
+            &self.signing_key_pkcs8,
+            &self.signing_pk,
+            record.chain_id,
+            TaggedKemPublicKey::from_ml_kem_768_array(record.kem_pk),
+            asset_policy,
+            policy_flags,
+            record.issued_unix_ms,
+            record.expires_unix_ms,
+        )?;
+        if descriptor.descriptor_binding != descriptor_binding {
+            bail!("offline receive descriptor binding mismatch for stored receive key");
+        }
+        Ok(descriptor)
+    }
+
     fn discovery_record_for_chain(
         &self,
         chain_id: [u8; 32],
         record_ttl: Duration,
     ) -> Result<(DiscoveryMailboxMaterial, DiscoveryRecord)> {
+        let wallet_store = self.wallet_store()?;
         let material = self.discovery_mailbox_material_for_chain(chain_id)?;
+        let rotation_window_ms = (record_ttl.as_millis() as u64)
+            .saturating_div(OFFLINE_DESCRIPTOR_ROTATION_WINDOW_DIVISOR)
+            .max(1);
+        let offline_receive = match self.active_offline_receive_record_for_chain(
+            wallet_store.as_ref(),
+            chain_id,
+            rotation_window_ms,
+        )? {
+            Some(record) => self.offline_receive_descriptor_from_record(&record)?,
+            None => self.mint_offline_receive_material_for_chain(
+                wallet_store.as_ref(),
+                chain_id,
+                record_ttl,
+            )?,
+        };
         let (_locator, locator_id, mailbox_id, record) = discovery::build_signed_discovery_record(
             &self.signing_key_pkcs8,
             &self.signing_pk,
             chain_id,
             material.mailbox_kem_pk.clone(),
+            offline_receive,
             record_ttl,
         )?;
         if locator_id != material.locator_id || mailbox_id != material.mailbox_id {
@@ -1329,10 +1487,30 @@ impl Wallet {
             if decoded.note.commitment != *note_commitment {
                 bail!("shielded output plaintext commitment mismatch");
             }
-            if decoded.note.owner_signing_pk != material.owner_signing_pk
-                || decoded.note.owner_kem_pk != material.kem_pk
-            {
+            if decoded.note.owner_kem_pk != material.kem_pk {
                 continue;
+            }
+            match &material.mode {
+                WalletReceiveKeyMode::FixedOwner(owner_signing_pk) => {
+                    if decoded.note.owner_signing_pk != *owner_signing_pk {
+                        continue;
+                    }
+                }
+                WalletReceiveKeyMode::OfflineDescriptor { descriptor_binding } => {
+                    if !decoded.note.kind.is_payment() {
+                        continue;
+                    }
+                    let expected_owner_signing_pk = Self::offline_receive_owner_signing_pk(
+                        &shared,
+                        descriptor_binding,
+                        kem_ct,
+                        decoded.note.value,
+                        &material.chain_id,
+                    );
+                    if decoded.note.owner_signing_pk != expected_owner_signing_pk {
+                        continue;
+                    }
+                }
             }
             if shielded::note_key_commitment(&decoded.note_key) != decoded.note.note_key_commitment
             {
@@ -2030,6 +2208,30 @@ impl Wallet {
         *hasher.finalize().as_bytes()
     }
 
+    fn offline_receive_value_tag(value: u64) -> [u8; 15] {
+        let mut tag = [0u8; 15];
+        tag[..7].copy_from_slice(b"payment");
+        tag[7..15].copy_from_slice(&value.to_le_bytes());
+        tag
+    }
+
+    fn offline_receive_owner_signing_pk(
+        shared: &[u8; 32],
+        descriptor_binding: &[u8; 32],
+        kem_ct: &[u8; ML_KEM_768_CT_BYTES],
+        value: u64,
+        chain_id: &[u8; 32],
+    ) -> TaggedSigningPublicKey {
+        let seed = crypto::stealth_seed_v3(
+            shared,
+            descriptor_binding,
+            kem_ct,
+            &Self::offline_receive_value_tag(value),
+            chain_id,
+        );
+        TaggedSigningPublicKey::from_ml_dsa_65_array(crypto::derive_one_time_pk_bytes(seed))
+    }
+
     fn derive_output_entropy(
         &self,
         send_seed: &[u8; 32],
@@ -2118,6 +2320,63 @@ impl Wallet {
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&entropy.nonce), payload_bytes.as_ref())
             .map_err(|e| anyhow!("failed to encrypt shielded output: {}", e))?;
+        Ok((
+            ShieldedOutput {
+                note_commitment: note.commitment,
+                kem_ct,
+                nonce: entropy.nonce,
+                view_tag: crypto::view_tag(&shared),
+                ciphertext,
+            },
+            payload,
+            entropy.encapsulation_seed,
+        ))
+    }
+
+    fn build_offline_shielded_output(
+        &self,
+        descriptor: &discovery::OfflineReceiveDescriptor,
+        value: u64,
+        birth_epoch: u64,
+        entropy: &ShieldedOutputEntropy,
+    ) -> Result<(
+        ShieldedOutput,
+        ShieldedOutputPlaintext,
+        [u8; proof_core::SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN],
+    )> {
+        let (kem_ct, shared) = descriptor
+            .scan_kem_pk
+            .encapsulate_deterministic(&entropy.encapsulation_seed)?;
+        let owner_signing_pk = Self::offline_receive_owner_signing_pk(
+            &shared,
+            &descriptor.descriptor_binding,
+            &kem_ct,
+            value,
+            &descriptor.chain_id,
+        );
+        let note = shielded::ShieldedNote::new_with_kind(
+            shielded::ShieldedNoteKind::Payment,
+            value,
+            birth_epoch,
+            owner_signing_pk,
+            descriptor.scan_kem_pk.clone(),
+            entropy.note_key,
+            entropy.rho,
+            entropy.note_randomizer,
+        );
+        let checkpoint =
+            shielded::HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch);
+        let payload = ShieldedOutputPlaintext {
+            note: note.clone(),
+            note_key: entropy.note_key,
+            checkpoint,
+        };
+        let payload_bytes = bincode::serialize(&proof::output_plaintext_to_proof(&payload))
+            .map_err(|err| anyhow!("failed to encode offline shielded output payload: {err}"))?;
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&shared));
+        let ciphertext = cipher
+            .encrypt(XNonce::from_slice(&entropy.nonce), payload_bytes.as_ref())
+            .map_err(|e| anyhow!("failed to encrypt offline shielded output: {}", e))?;
         Ok((
             ShieldedOutput {
                 note_commitment: note.commitment,
@@ -2349,6 +2608,156 @@ impl Wallet {
             .build_shielded_output(
                 recipient_signing_pk,
                 receiver_kem_pk,
+                amount,
+                current_epoch,
+                &recipient_entropy,
+            )?;
+        output_witnesses.push(proof::output_witness_from_local(
+            &recipient_plaintext,
+            &recipient_output,
+            &recipient_encapsulation_seed,
+        ));
+        outputs.push(recipient_output);
+
+        let change = total_selected.saturating_sub(required_total);
+        if change > 0 {
+            let change_entropy = self.derive_output_entropy(&send_seed, 1);
+            let change_receive_kem_pk = self.mint_internal_receive_kem_public_key_for_chain(
+                material.compact_wallet_sync.chain_id,
+                &send_seed,
+                1,
+                b"payment-change",
+            )?;
+            let (change_output, change_plaintext, change_encapsulation_seed) = self
+                .build_shielded_output(
+                    self.signing_pk.clone(),
+                    change_receive_kem_pk,
+                    change,
+                    current_epoch,
+                    &change_entropy,
+                )?;
+            output_witnesses.push(proof::output_witness_from_local(
+                &change_plaintext,
+                &change_output,
+                &change_encapsulation_seed,
+            ));
+            outputs.push(change_output);
+        }
+
+        let witness = proof_core::ProofShieldedTxWitness {
+            chain_id,
+            current_epoch,
+            note_tree_root: tree_root,
+            fee_amount,
+            inputs: input_witnesses,
+            outputs: output_witnesses,
+        };
+        Ok(PreparedShieldedTx {
+            state_binding,
+            witness,
+            nullifiers,
+            outputs,
+            selected_notes,
+            recipient_address,
+            current_epoch,
+            amount,
+        })
+    }
+
+    async fn prepare_locator_send(
+        &self,
+        record: &DiscoveryRecord,
+        amount: u64,
+    ) -> Result<PreparedShieldedTx> {
+        let material = self.wallet_send_runtime_material_async().await?;
+        if record.chain_id != material.compact_wallet_sync.chain_id {
+            bail!("locator discovery record chain_id mismatch");
+        }
+        let recipient_address = record.owner_signing_pk.address();
+        let mut available_notes =
+            self.load_owned_shielded_notes_for_send_material(&material, true)?;
+        Self::retain_payment_notes(&mut available_notes);
+        let rotation_round = self.next_shielded_sync_round(self.wallet_store()?.as_ref())?;
+        self.refresh_owned_shielded_checkpoints_with_runtime(
+            &mut available_notes,
+            material.compact_wallet_sync.chain_id,
+            material.compact_wallet_sync.current_nullifier_epoch,
+            &material.root_ledger,
+            &material.archived_nullifier_epochs,
+            rotation_round,
+        )
+        .await?;
+        let fee_amount = crate::transaction::ordinary_private_transfer_fee_amount();
+        let required_total = amount
+            .checked_add(fee_amount)
+            .ok_or_else(|| anyhow!("ordinary private transfer total exceeds u64"))?;
+        let selected_notes = {
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            for note in available_notes {
+                total = total.saturating_add(note.note.value);
+                selected.push(note);
+                if total >= required_total {
+                    break;
+                }
+            }
+            if total < required_total {
+                bail!(
+                    "Insufficient funds: requested {} plus fee {}, available {}",
+                    amount,
+                    fee_amount,
+                    total
+                );
+            }
+            selected
+        };
+        let total_selected = selected_notes
+            .iter()
+            .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+
+        let state_binding = Self::state_binding_from_send_material(&material)?;
+        let current_epoch = material.compact_wallet_sync.current_nullifier_epoch;
+        let note_tree = &material.note_tree;
+        let tree_root = note_tree.root();
+        let chain_id = material.compact_wallet_sync.chain_id;
+        let send_seed = self.derive_send_seed(
+            &recipient_address,
+            amount,
+            fee_amount,
+            current_epoch,
+            &selected_notes,
+        );
+
+        let mut input_witnesses = Vec::with_capacity(selected_notes.len());
+        let mut nullifiers = Vec::with_capacity(selected_notes.len());
+        for owned in &selected_notes {
+            let membership_proof = note_tree
+                .prove_membership(&owned.note.commitment)
+                .ok_or_else(|| anyhow!("missing membership proof for owned shielded note"))?;
+            if membership_proof.root != tree_root {
+                bail!("shielded note tree changed while building the spend");
+            }
+            let current_nullifier =
+                owned
+                    .note
+                    .derive_evolving_nullifier(&owned.note_key, &chain_id, current_epoch)?;
+            nullifiers.push(current_nullifier);
+            input_witnesses.push(proof::input_witness_from_local(
+                &owned.note,
+                &owned.note_key,
+                &membership_proof,
+                &owned.checkpoint,
+                owned.checkpoint_accumulator.as_ref(),
+                &current_nullifier,
+            ));
+        }
+
+        let mut outputs = Vec::new();
+        let mut output_witnesses = Vec::new();
+        let recipient_entropy = self.derive_output_entropy(&send_seed, 0);
+        let (recipient_output, recipient_plaintext, recipient_encapsulation_seed) = self
+            .build_offline_shielded_output(
+                &record.offline_receive,
                 amount,
                 current_epoch,
                 &recipient_entropy,
@@ -3061,63 +3470,9 @@ impl Wallet {
     pub async fn send_to_locator(&self, locator: &str, amount: u64) -> Result<SendOutcome> {
         let discovery_client = self.require_discovery_client()?;
         let record = discovery_client.resolve_locator(locator).await?;
-        let chain_id = self.effective_chain_id()?;
-        let mut response_slot_id = [0u8; 32];
-        OsRng.fill_bytes(&mut response_slot_id);
-        let response_auth_token = discovery::response_slot_auth_token();
-        let mut request_id = [0u8; 32];
-        OsRng.fill_bytes(&mut request_id);
-        let (response_kem_sk, response_kem_pk) = crypto::ml_kem_768_generate();
-        let response_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&response_kem_sk);
-        let request = HandleRequestPlaintext {
-            version: 1,
-            chain_id,
-            locator_id: record.locator_id,
-            request_id,
-            response_slot_id,
-            response_auth_token,
-            response_kem_pk,
-            requested_amount: amount,
-            issued_unix_ms: Self::now_unix_ms(),
-            expires_unix_ms: Self::now_unix_ms().saturating_add(5 * 60 * 1000),
-        };
-        let envelope = discovery::seal_handle_request(&request, &record.mailbox_kem_pk)?;
-        let _ = discovery_client
-            .post_mailbox_request(
-                record.mailbox_id,
-                response_slot_id,
-                response_auth_token,
-                envelope,
-            )
-            .await?;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                bail!("locator resolution timed out waiting for recipient handle");
-            }
-            if let Some(response_envelope) = discovery_client
-                .poll_handle_response(response_slot_id, response_auth_token)
-                .await?
-            {
-                let response =
-                    discovery::open_handle_response(&response_envelope, &response_kem_sk)?;
-                if response.chain_id != chain_id {
-                    bail!("locator response chain_id mismatch");
-                }
-                if response.locator_id != record.locator_id {
-                    bail!("locator response locator_id mismatch");
-                }
-                if response.request_id != request.request_id {
-                    bail!("locator response request_id mismatch");
-                }
-                Self::validate_recipient_handle_document_for_chain(&response.handle, chain_id)?;
-                let handle_json =
-                    serde_json::to_string(&response.handle).context("serialize resolved handle")?;
-                return self.send_to_invoice(&handle_json, amount).await;
-            }
-            time::sleep(Duration::from_secs(1)).await;
-        }
+        let prepared = self.prepare_locator_send(&record, amount).await?;
+        let proof = self.prove_shielded_tx_proof(prepared.witness()).await?;
+        self.submit_prepared_shielded_send(prepared, proof).await
     }
 
     pub async fn service_discovery_mailbox_once(&self) -> Result<usize> {
@@ -3481,6 +3836,89 @@ mod tests {
         assert!(wallet
             .load_receive_key_record(wallet_store.as_ref(), &rotated_doc.receive_key_id)?
             .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_receive_outputs_decrypt_via_descriptor_binding() -> Result<()> {
+        let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
+        let sender_dir = TempDir::new()?;
+        let receiver_dir = TempDir::new()?;
+        let sender_store = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
+        let receiver_store = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
+        let sender = Wallet::load_or_create_private(sender_store)?;
+        let receiver = Wallet::load_or_create_private(receiver_store.clone())?;
+        let chain_id = [11u8; 32];
+
+        let descriptor = receiver.mint_offline_receive_material_for_chain(
+            receiver_store.as_ref(),
+            chain_id,
+            Duration::from_secs(60),
+        )?;
+        let recipient_address = receiver.public_key().address();
+        let send_seed = sender.derive_send_seed(&recipient_address, 42, 0, 7, &[]);
+        let entropy = sender.derive_output_entropy(&send_seed, 0);
+        let (output, plaintext, _) =
+            sender.build_offline_shielded_output(&descriptor, 42, 7, &entropy)?;
+
+        let (decrypted, _receive_key_id) = receiver
+            .decrypt_shielded_output(&output)?
+            .ok_or_else(|| anyhow!("receiver failed to decrypt offline receive output"))?;
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(decrypted.note.owner_kem_pk, descriptor.scan_kem_pk);
+        assert_ne!(
+            decrypted.note.owner_signing_pk,
+            receiver.public_key().clone()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_records_reuse_fresh_offline_descriptors_and_rotate_near_expiry() -> Result<()> {
+        let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
+        let tempdir = TempDir::new()?;
+        let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
+        let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
+        let chain_id = [13u8; 32];
+        let record_ttl = Duration::from_secs(60);
+
+        let (_mailbox_material, first_record) =
+            wallet.discovery_record_for_chain(chain_id, record_ttl)?;
+        let initial_receive_keys = wallet.iterate_receive_key_records(wallet_store.as_ref())?;
+        assert_eq!(initial_receive_keys.len(), 1);
+
+        let (_mailbox_material, second_record) =
+            wallet.discovery_record_for_chain(chain_id, record_ttl)?;
+        let reused_receive_keys = wallet.iterate_receive_key_records(wallet_store.as_ref())?;
+        assert_eq!(reused_receive_keys.len(), 1);
+        assert_eq!(
+            first_record.offline_receive.scan_kem_pk,
+            second_record.offline_receive.scan_kem_pk
+        );
+        assert_eq!(
+            first_record.offline_receive.descriptor_binding,
+            second_record.offline_receive.descriptor_binding
+        );
+
+        let mut expiring_record = reused_receive_keys
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("missing offline receive key record"))?;
+        expiring_record.expires_unix_ms = Wallet::now_unix_ms().saturating_add(10);
+        wallet.store_receive_key_record(wallet_store.as_ref(), &expiring_record)?;
+
+        let (_mailbox_material, rotated_record) =
+            wallet.discovery_record_for_chain(chain_id, record_ttl)?;
+        let rotated_receive_keys = wallet.iterate_receive_key_records(wallet_store.as_ref())?;
+        assert_eq!(rotated_receive_keys.len(), 2);
+        assert_ne!(
+            second_record.offline_receive.scan_kem_pk,
+            rotated_record.offline_receive.scan_kem_pk
+        );
+        assert_ne!(
+            second_record.offline_receive.descriptor_binding,
+            rotated_record.offline_receive.descriptor_binding
+        );
         Ok(())
     }
 

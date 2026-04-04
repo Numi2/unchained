@@ -39,10 +39,13 @@ const DISCOVERY_REQUEST_VERSION: u8 = 1;
 const DISCOVERY_RESPONSE_VERSION: u8 = 1;
 const DISCOVERY_MANIFEST_VERSION: u8 = 1;
 const DISCOVERY_RECORD_VERSION: u8 = 1;
+const DISCOVERY_OFFLINE_RECEIVE_VERSION: u8 = 1;
 const DISCOVERY_MAILBOX_REQUEST_VERSION: u8 = 1;
 const DISCOVERY_MAILBOX_RESPONSE_VERSION: u8 = 1;
 const DISCOVERY_LOCATOR_PREFIX: &str = "uc1";
 const DISCOVERY_RECORD_DOMAIN: &str = "unchained-discovery-record-v1";
+const DISCOVERY_OFFLINE_RECEIVE_DOMAIN: &str = "unchained-offline-receive-descriptor-v1";
+const DISCOVERY_OFFLINE_RECEIVE_BINDING_DOMAIN: &str = "unchained-offline-receive-binding-v1";
 const DISCOVERY_LOCATOR_DOMAIN: &str = "unchained-discovery-locator-v1";
 const DISCOVERY_MAILBOX_ID_DOMAIN: &str = "unchained-discovery-mailbox-id-v1";
 const DISCOVERY_MAILBOX_AUTH_DOMAIN: &str = "unchained-discovery-mailbox-auth-v1";
@@ -75,6 +78,28 @@ pub struct DiscoveryRecord {
     pub owner_signing_pk: TaggedSigningPublicKey,
     pub mailbox_id: [u8; 32],
     pub mailbox_kem_pk: TaggedKemPublicKey,
+    pub offline_receive: OfflineReceiveDescriptor,
+    pub issued_unix_ms: u64,
+    pub expires_unix_ms: u64,
+    pub sig: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReceiveAssetPolicy {
+    BaseAssetOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OfflineReceiveDescriptor {
+    pub version: u8,
+    pub chain_id: [u8; 32],
+    pub locator_id: [u8; 32],
+    pub owner_signing_pk: TaggedSigningPublicKey,
+    pub scan_kem_pk: TaggedKemPublicKey,
+    pub descriptor_binding: [u8; 32],
+    pub asset_policy: OfflineReceiveAssetPolicy,
+    pub policy_flags: u64,
     pub issued_unix_ms: u64,
     pub expires_unix_ms: u64,
     pub sig: Vec<u8>,
@@ -304,9 +329,69 @@ impl DiscoveryRecord {
             &self.owner_signing_pk,
             &self.mailbox_id,
             &self.mailbox_kem_pk,
+            &self.offline_receive,
             self.issued_unix_ms,
             self.expires_unix_ms,
         )?;
+        self.owner_signing_pk.verify(&signable, &self.sig)?;
+        self.offline_receive.validate(
+            expected_locator_id,
+            expected_chain_id,
+            &self.owner_signing_pk,
+        )?;
+        if self.offline_receive.expires_unix_ms > self.expires_unix_ms {
+            bail!("offline receive descriptor must be bounded by the discovery record lifetime");
+        }
+        Ok(())
+    }
+}
+
+impl OfflineReceiveDescriptor {
+    pub fn validate(
+        &self,
+        expected_locator_id: &[u8; 32],
+        expected_chain_id: &[u8; 32],
+        expected_owner_signing_pk: &TaggedSigningPublicKey,
+    ) -> Result<()> {
+        if self.version != DISCOVERY_OFFLINE_RECEIVE_VERSION {
+            bail!(
+                "unsupported offline receive descriptor version {}",
+                self.version
+            );
+        }
+        if &self.chain_id != expected_chain_id {
+            bail!("offline receive descriptor chain_id mismatch");
+        }
+        if &self.locator_id != expected_locator_id {
+            bail!("offline receive descriptor locator_id mismatch");
+        }
+        if &self.owner_signing_pk != expected_owner_signing_pk {
+            bail!("offline receive descriptor owner key mismatch");
+        }
+        if self.expires_unix_ms <= self.issued_unix_ms {
+            bail!("offline receive descriptor expiration must be after issuance");
+        }
+        if now_unix_ms() >= self.expires_unix_ms {
+            bail!("offline receive descriptor has expired");
+        }
+        let derived = locator_id_from_signing_pk(&self.owner_signing_pk);
+        if derived != self.locator_id {
+            bail!("offline receive descriptor owner key does not match locator");
+        }
+        let expected_binding = offline_receive_descriptor_binding(
+            &self.chain_id,
+            &self.locator_id,
+            &self.owner_signing_pk,
+            &self.scan_kem_pk,
+            self.asset_policy,
+            self.policy_flags,
+            self.issued_unix_ms,
+            self.expires_unix_ms,
+        )?;
+        if self.descriptor_binding != expected_binding {
+            bail!("offline receive descriptor binding mismatch");
+        }
+        let signable = encode_offline_receive_descriptor_signable(self)?;
         self.owner_signing_pk.verify(&signable, &self.sig)?;
         Ok(())
     }
@@ -1332,25 +1417,213 @@ pub fn derive_mailbox_kem_keypair(
     (crypto::ml_kem_768_secret_key_to_bytes(&sk), pk)
 }
 
+fn offline_receive_asset_policy_id(policy: OfflineReceiveAssetPolicy) -> u8 {
+    match policy {
+        OfflineReceiveAssetPolicy::BaseAssetOnly => 0,
+    }
+}
+
+fn offline_receive_asset_policy_from_id(id: u8) -> Result<OfflineReceiveAssetPolicy> {
+    match id {
+        0 => Ok(OfflineReceiveAssetPolicy::BaseAssetOnly),
+        other => bail!("unsupported offline receive asset policy {}", other),
+    }
+}
+
+fn encode_offline_receive_descriptor_binding_material(
+    chain_id: &[u8; 32],
+    locator_id: &[u8; 32],
+    owner_signing_pk: &TaggedSigningPublicKey,
+    scan_kem_pk: &TaggedKemPublicKey,
+    asset_policy: OfflineReceiveAssetPolicy,
+    policy_flags: u64,
+    issued_unix_ms: u64,
+    expires_unix_ms: u64,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_fixed(chain_id);
+    writer.write_fixed(locator_id);
+    write_tagged_signing_public_key(&mut writer, owner_signing_pk);
+    write_tagged_kem_public_key(&mut writer, scan_kem_pk);
+    writer.write_u8(offline_receive_asset_policy_id(asset_policy));
+    writer.write_u64(policy_flags);
+    writer.write_u64(issued_unix_ms);
+    writer.write_u64(expires_unix_ms);
+    Ok(writer.into_vec())
+}
+
+pub fn offline_receive_descriptor_binding(
+    chain_id: &[u8; 32],
+    locator_id: &[u8; 32],
+    owner_signing_pk: &TaggedSigningPublicKey,
+    scan_kem_pk: &TaggedKemPublicKey,
+    asset_policy: OfflineReceiveAssetPolicy,
+    policy_flags: u64,
+    issued_unix_ms: u64,
+    expires_unix_ms: u64,
+) -> Result<[u8; 32]> {
+    let material = encode_offline_receive_descriptor_binding_material(
+        chain_id,
+        locator_id,
+        owner_signing_pk,
+        scan_kem_pk,
+        asset_policy,
+        policy_flags,
+        issued_unix_ms,
+        expires_unix_ms,
+    )?;
+    let mut hasher = blake3::Hasher::new_derive_key(DISCOVERY_OFFLINE_RECEIVE_BINDING_DOMAIN);
+    hasher.update(&material);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn encode_offline_receive_descriptor_without_sig(
+    descriptor: &OfflineReceiveDescriptor,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(descriptor.version);
+    writer.write_fixed(&descriptor.chain_id);
+    writer.write_fixed(&descriptor.locator_id);
+    write_tagged_signing_public_key(&mut writer, &descriptor.owner_signing_pk);
+    write_tagged_kem_public_key(&mut writer, &descriptor.scan_kem_pk);
+    writer.write_fixed(&descriptor.descriptor_binding);
+    writer.write_u8(offline_receive_asset_policy_id(descriptor.asset_policy));
+    writer.write_u64(descriptor.policy_flags);
+    writer.write_u64(descriptor.issued_unix_ms);
+    writer.write_u64(descriptor.expires_unix_ms);
+    Ok(writer.into_vec())
+}
+
+fn encode_offline_receive_descriptor_signable(
+    descriptor: &OfflineReceiveDescriptor,
+) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(DISCOVERY_OFFLINE_RECEIVE_DOMAIN.as_bytes())?;
+    writer.write_bytes(&encode_offline_receive_descriptor_without_sig(descriptor)?)?;
+    Ok(writer.into_vec())
+}
+
+fn encode_offline_receive_descriptor(descriptor: &OfflineReceiveDescriptor) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(&encode_offline_receive_descriptor_without_sig(descriptor)?)?;
+    writer.write_bytes(&descriptor.sig)?;
+    Ok(writer.into_vec())
+}
+
+fn decode_offline_receive_descriptor(bytes: &[u8]) -> Result<OfflineReceiveDescriptor> {
+    let mut reader = CanonicalReader::new(bytes);
+    let body = reader.read_bytes()?;
+    let sig = reader.read_bytes()?;
+    reader.finish()?;
+
+    let mut body_reader = CanonicalReader::new(&body);
+    let descriptor = OfflineReceiveDescriptor {
+        version: body_reader.read_u8()?,
+        chain_id: body_reader.read_fixed()?,
+        locator_id: body_reader.read_fixed()?,
+        owner_signing_pk: read_tagged_signing_public_key(&mut body_reader)?,
+        scan_kem_pk: read_tagged_kem_public_key(&mut body_reader)?,
+        descriptor_binding: body_reader.read_fixed()?,
+        asset_policy: offline_receive_asset_policy_from_id(body_reader.read_u8()?)?,
+        policy_flags: body_reader.read_u64()?,
+        issued_unix_ms: body_reader.read_u64()?,
+        expires_unix_ms: body_reader.read_u64()?,
+        sig,
+    };
+    body_reader.finish()?;
+    Ok(descriptor)
+}
+
+pub fn build_signed_offline_receive_descriptor(
+    signing_key_pkcs8: &[u8],
+    signing_pk: &TaggedSigningPublicKey,
+    chain_id: [u8; 32],
+    scan_kem_pk: TaggedKemPublicKey,
+    asset_policy: OfflineReceiveAssetPolicy,
+    policy_flags: u64,
+    descriptor_ttl: Duration,
+) -> Result<OfflineReceiveDescriptor> {
+    let issued_unix_ms = now_unix_ms();
+    let expires_unix_ms = issued_unix_ms.saturating_add(descriptor_ttl.as_millis() as u64);
+    sign_offline_receive_descriptor(
+        signing_key_pkcs8,
+        signing_pk,
+        chain_id,
+        scan_kem_pk,
+        asset_policy,
+        policy_flags,
+        issued_unix_ms,
+        expires_unix_ms,
+    )
+}
+
+pub fn sign_offline_receive_descriptor(
+    signing_key_pkcs8: &[u8],
+    signing_pk: &TaggedSigningPublicKey,
+    chain_id: [u8; 32],
+    scan_kem_pk: TaggedKemPublicKey,
+    asset_policy: OfflineReceiveAssetPolicy,
+    policy_flags: u64,
+    issued_unix_ms: u64,
+    expires_unix_ms: u64,
+) -> Result<OfflineReceiveDescriptor> {
+    let locator_id = locator_id_from_signing_pk(signing_pk);
+    let signing_key = crypto::ml_dsa_65_keypair_from_pkcs8(signing_key_pkcs8)?;
+    let descriptor_binding = offline_receive_descriptor_binding(
+        &chain_id,
+        &locator_id,
+        signing_pk,
+        &scan_kem_pk,
+        asset_policy,
+        policy_flags,
+        issued_unix_ms,
+        expires_unix_ms,
+    )?;
+    let mut descriptor = OfflineReceiveDescriptor {
+        version: DISCOVERY_OFFLINE_RECEIVE_VERSION,
+        chain_id,
+        locator_id,
+        owner_signing_pk: signing_pk.clone(),
+        scan_kem_pk,
+        descriptor_binding,
+        asset_policy,
+        policy_flags,
+        issued_unix_ms,
+        expires_unix_ms,
+        sig: Vec::new(),
+    };
+    descriptor.sig = crypto::ml_dsa_65_sign(
+        &signing_key,
+        &encode_offline_receive_descriptor_signable(&descriptor)?,
+    )?;
+    Ok(descriptor)
+}
+
 pub fn build_signed_discovery_record(
     signing_key_pkcs8: &[u8],
     signing_pk: &TaggedSigningPublicKey,
     chain_id: [u8; 32],
     mailbox_kem_pk: TaggedKemPublicKey,
+    offline_receive: OfflineReceiveDescriptor,
     record_ttl: Duration,
 ) -> Result<(String, [u8; 32], [u8; 32], DiscoveryRecord)> {
     let locator_id = locator_id_from_signing_pk(signing_pk);
     let locator = format_locator(&locator_id);
     let mailbox_id = mailbox_id_for_locator(&chain_id, &locator_id);
     let signing_key = crypto::ml_dsa_65_keypair_from_pkcs8(signing_key_pkcs8)?;
+    offline_receive.validate(&locator_id, &chain_id, signing_pk)?;
     let issued_unix_ms = now_unix_ms();
     let expires_unix_ms = issued_unix_ms.saturating_add(record_ttl.as_millis() as u64);
+    if offline_receive.expires_unix_ms > expires_unix_ms {
+        bail!("offline receive descriptor lifetime must fit inside the discovery record lifetime");
+    }
     let signable = encode_discovery_record_signable(
         &chain_id,
         &locator_id,
         signing_pk,
         &mailbox_id,
         &mailbox_kem_pk,
+        &offline_receive,
         issued_unix_ms,
         expires_unix_ms,
     )?;
@@ -1366,6 +1639,7 @@ pub fn build_signed_discovery_record(
             owner_signing_pk: signing_pk.clone(),
             mailbox_id,
             mailbox_kem_pk,
+            offline_receive,
             issued_unix_ms,
             expires_unix_ms,
             sig,
@@ -1625,6 +1899,7 @@ fn encode_discovery_record_signable(
     owner_signing_pk: &TaggedSigningPublicKey,
     mailbox_id: &[u8; 32],
     mailbox_kem_pk: &TaggedKemPublicKey,
+    offline_receive: &OfflineReceiveDescriptor,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
 ) -> Result<Vec<u8>> {
@@ -1635,6 +1910,7 @@ fn encode_discovery_record_signable(
     write_tagged_signing_public_key(&mut writer, owner_signing_pk);
     writer.write_fixed(mailbox_id);
     write_tagged_kem_public_key(&mut writer, mailbox_kem_pk);
+    writer.write_bytes(&encode_offline_receive_descriptor(offline_receive)?)?;
     writer.write_u64(issued_unix_ms);
     writer.write_u64(expires_unix_ms);
     Ok(writer.into_vec())
@@ -1648,6 +1924,7 @@ fn encode_discovery_record(record: &DiscoveryRecord) -> Result<Vec<u8>> {
     write_tagged_signing_public_key(&mut writer, &record.owner_signing_pk);
     writer.write_fixed(&record.mailbox_id);
     write_tagged_kem_public_key(&mut writer, &record.mailbox_kem_pk);
+    writer.write_bytes(&encode_offline_receive_descriptor(&record.offline_receive)?)?;
     writer.write_u64(record.issued_unix_ms);
     writer.write_u64(record.expires_unix_ms);
     writer.write_bytes(&record.sig)?;
@@ -1663,6 +1940,7 @@ fn decode_discovery_record(bytes: &[u8]) -> Result<DiscoveryRecord> {
         owner_signing_pk: read_tagged_signing_public_key(&mut reader)?,
         mailbox_id: reader.read_fixed()?,
         mailbox_kem_pk: read_tagged_kem_public_key(&mut reader)?,
+        offline_receive: decode_offline_receive_descriptor(&reader.read_bytes()?)?,
         issued_unix_ms: reader.read_u64()?,
         expires_unix_ms: reader.read_u64()?,
         sig: reader.read_bytes()?,
@@ -2186,12 +2464,51 @@ mod tests {
         let pk = crypto::ml_dsa_65_public_key(&key);
         let pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&key)?;
         let chain_id = [7u8; 32];
-        let (_kem_sk, kem_pk) = crypto::ml_kem_768_generate();
-        let (_locator, locator_id, _mailbox_id, record) =
-            build_signed_discovery_record(&pkcs8, &pk, chain_id, kem_pk, Duration::from_secs(60))?;
+        let (_mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(60),
+        )?;
+        let (_locator, locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &pkcs8,
+            &pk,
+            chain_id,
+            mailbox_kem_pk,
+            offline_receive,
+            Duration::from_secs(60),
+        )?;
         let encoded = encode_discovery_record(&record)?;
         let decoded = decode_discovery_record(&encoded)?;
         decoded.validate(&locator_id, &chain_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn offline_receive_descriptor_roundtrip_and_validation() -> Result<()> {
+        let key = crypto::ml_dsa_65_generate()?;
+        let pk = crypto::ml_dsa_65_public_key(&key);
+        let pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&key)?;
+        let chain_id = [8u8; 32];
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let descriptor = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(60),
+        )?;
+        let encoded = encode_offline_receive_descriptor(&descriptor)?;
+        let decoded = decode_offline_receive_descriptor(&encoded)?;
+        let locator_id = locator_id_from_signing_pk(&pk);
+        decoded.validate(&locator_id, &chain_id, &pk)?;
         Ok(())
     }
 
@@ -2219,11 +2536,22 @@ mod tests {
         let pk = crypto::ml_dsa_65_public_key(&key);
         let pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&key)?;
         let chain_id = [9u8; 32];
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(60),
+        )?;
         let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
             &pkcs8,
             &pk,
             chain_id,
             request_pk.clone(),
+            offline_receive,
             Duration::from_secs(60),
         )?;
         let handle = RecipientHandle {

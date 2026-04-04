@@ -78,6 +78,8 @@ Key properties:
 - no probabilistic "wait for more confirmations" model
 - no mining
 - no hashpower market
+- e2e post quantum safe, with hybrid capabilities to follow best practices of NIST.
+- uncompromissable state of the art Privacy
 
 Unchained uses a **Mysticeti-class DAG ordering core** and a **fast path for
 ordinary owned-note transfers**. Shared-state actions such as staking changes
@@ -113,19 +115,27 @@ Wallet UX is built around:
 
 1. short public `LocatorID`s
 2. private discovery
-3. one-time `RecipientHandle` negotiation
-4. direct invoice links for merchant-style flows
+3. offline receive descriptors for ordinary private transfers
+4. one-time `RecipientHandle` negotiation for policy-bound receive flows
+5. direct invoice links for merchant-style flows
 
 From day one, private discovery is implemented as a **stateless PIR service**.
 The discovery directory stores **fixed-size signed discovery records** and
 publishes a **signed manifest** carrying the PIR parameter set, and answers
 only PIR-shaped queries, so it can help a sender resolve a short locator
 without learning which locator was looked up. Discovery returns mailbox
-bootstrap material, not a reusable payment key, and the wallet then negotiates
-a fresh one-time `RecipientHandle`.
+bootstrap material together with a signed offline receive descriptor. Ordinary
+locator payments use that descriptor directly, so wallet-to-wallet sends remain
+asynchronous even when the recipient is offline. Negotiated one-time
+`RecipientHandle`s remain for flows that need explicit recipient authorization,
+request-specific policy, or invoice semantics.
 
 The sender never needs to see large PQ key material, and the ledger never needs
 to see a reusable outward identity.
+
+Unchained therefore has no mailbox round-trip on the ordinary locator path, but
+it still preserves handles and invoices where recipient-controlled constraints
+matter.
 
 ### Network Privacy
 

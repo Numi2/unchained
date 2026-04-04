@@ -38,6 +38,9 @@ transitional and should be removed rather than preserved.
   not a lower-privacy shortcut
 - `[x]` Network-metadata caveat addressed with a low-latency two-role ingress
   design rather than a mixnet
+- `[x]` Decide that ordinary locator sends use first-class PQ offline receive
+  descriptors, while handles and invoices remain the policy-bound receive
+  capabilities
 - `[ ]` Audit the rest of the Markdown docs and remove or relabel legacy PoW
   and archive-era claims
 
@@ -160,12 +163,15 @@ transitional and should be removed rather than preserved.
 
 ## 6. Wallet Addressability
 
-- `[~]` Recipient handles exist, but the repository still needs full alignment
-  to one-time capability semantics everywhere
+- `[~]` Recipient handles, PIR-native discovery, mailbox transport, and
+  non-interactive ordinary locator delivery now exist, but the repository still
+  needs full alignment to one-time capability semantics everywhere
   Public handles are now signed by per-handle payment-capability keys and carry
   per-handle ML-KEM receive keys rather than the wallet-global signing key.
-  PIR-native discovery, mailbox transport, and negotiated-handle execution are
-  still open.
+  Offline locator sends now derive one-time owner identity from signed
+  discovery descriptors instead of requiring mailbox liveness; deeper
+  key-management audit, abuse controls, and performance hardening are still
+  open.
 - `[x]` Enforce fresh one-time outward payment authorization keys per handle or
   invoice
 - `[x]` Ensure no wallet-global outward identity key is exposed in payment
@@ -202,11 +208,27 @@ transitional and should be removed rather than preserved.
   and replica distribution policy are still open.
 - `[x]` Implement mailbox transport and one-time `RecipientHandle`
   request/response flows against PIR-fetched discovery records
+- `[x]` Document PQ offline receive as the ordinary locator-delivery path while
+  retaining negotiated handles and invoices for policy-bound receive flows
+- `[x]` Define the `OfflineReceiveDescriptor` schema, signature binding, and
+  discovery-record extension format
+- `[x]` Define sender policy so ordinary locator sends use offline receive,
+  while handles and invoices remain the explicit policy path
+- `[x]` Implement wallet receive-material support for rotating offline receive
+  descriptors
+- `[x]` Extend wallet output decryption to validate
+  shared-secret-derived one-time owner identity for offline-receive notes
+- `[x]` Implement an explicit wallet send path for offline ordinary transfers
+  using the offline receive descriptor
+- `[ ]` Define rotation, expiry, and compromise-handling policy for offline
+  receive descriptors
 - `[ ]` Implement privacy-preserving abuse controls for discovery queries
   using blinded rate-limit tokens or an equivalent anonymous query-budget
   mechanism
 - `[ ]` Benchmark and tune discovery row size, snapshot cadence, and PIR
   parameters for mobile-wallet latency and bandwidth targets
+- `[ ]` Benchmark offline-receive scan overhead and descriptor-rotation
+  parameters for mobile wallets
 - `[~]` Remove any remaining long-lived receive-key assumptions from wallet UX
   and storage
   Internal self-change and staking-note outputs now derive deterministic
