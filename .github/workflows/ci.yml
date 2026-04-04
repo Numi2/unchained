@@ -84,11 +84,30 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Restore proof fixture cache
+        id: proof-fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: tests/proof-fixtures/shielded-spend
+          key: proof-fixtures-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'proof-core/src/lib.rs', 'proof-core/src/proof_hash.rs', 'src/proof.rs', 'src/proof/native_transfer.rs', 'src/shielded.rs', 'src/wallet.rs', 'tests/finality_support.rs', 'tests/wallet_control.rs', 'tests/pq_network.rs') }}
+
       - name: Mint wallet_control fixture
+        if: steps.proof-fixture-cache.outputs.cache-hit != 'true'
         run: cargo test --locked --test wallet_control mint_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
 
       - name: Mint pq_network fixture
+        if: steps.proof-fixture-cache.outputs.cache-hit != 'true'
         run: cargo test --locked --test pq_network mint_multivalidator_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
+
+      - name: Validate wallet_control fixture path
+        env:
+          UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "0"
+        run: cargo test --locked --test wallet_control deterministic_fee_paid_control_fixture_id_stays_stable -- --exact --nocapture
+
+      - name: Validate pq_network fixture path
+        env:
+          UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "0"
+        run: cargo test --locked --test pq_network deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable -- --exact --nocapture
 
       - name: Upload proof fixtures
         uses: actions/upload-artifact@v4
