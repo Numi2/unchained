@@ -391,6 +391,10 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
 #[tokio::test(flavor = "multi_thread")]
 async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
+    let _proof_fixture_dir = EnvGuard::set(
+        "UNCHAINED_PROOF_FIXTURE_DIR",
+        &finality_support::proof_fixture_dir(),
+    );
     network::set_quiet_logging(true);
 
     let tempdir = TempDir::new()?;
@@ -404,6 +408,8 @@ async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> 
         hex::encode(fixture_id),
         "71f17d493d661275fb9086bef0121afcbc74a334e6e85de46f19453d2a3cd11e"
     );
+    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
+    assert_eq!(journal.fee_amount, PROTOCOL.validator_registration_fee);
 
     drop(wallet);
     wallet_store.close()?;
@@ -419,6 +425,7 @@ async fn mint_fee_paid_control_submission_fixture() -> Result<()> {
         "UNCHAINED_PROOF_FIXTURE_DIR",
         &finality_support::proof_fixture_dir(),
     );
+    let _proof_fixture_mint = EnvGuard::set("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT", "1");
     network::set_quiet_logging(true);
 
     let tempdir = TempDir::new()?;

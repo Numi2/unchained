@@ -311,6 +311,8 @@ async fn deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable(
         hex::encode(fixture_id),
         "f1e522879e8df1ff55a6b78d43b37ef6aea02f0cce2bb905d06bbb77cd2e5695"
     );
+    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
+    assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
 
     Ok(())
 }
@@ -323,6 +325,7 @@ async fn mint_multivalidator_fee_paid_control_submission_fixture() -> anyhow::Re
         "UNCHAINED_PROOF_FIXTURE_DIR",
         finality_support::proof_fixture_dir(),
     );
+    std::env::set_var("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT", "1");
     network::set_quiet_logging(true);
 
     let dir_a = TempDir::new()?;
@@ -376,6 +379,7 @@ async fn mint_multivalidator_fee_paid_control_submission_fixture() -> anyhow::Re
     let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
     assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
     assert!(fixture_path.exists());
+    std::env::remove_var("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT");
 
     Ok(())
 }

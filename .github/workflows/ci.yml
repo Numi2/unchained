@@ -59,9 +59,14 @@ jobs:
       - name: Cargo check
         run: cargo check --locked --all-targets
 
-  test:
-    name: Cargo test
+  mint_fixtures:
+    name: Mint proof fixtures
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      UNCHAINED_PROOF_FIXTURE_DIR: tests/proof-fixtures
+      UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "1"
 
     steps:
       - name: Checkout
@@ -78,6 +83,47 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Mint wallet_control fixture
+        run: cargo test --locked --test wallet_control mint_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
+
+      - name: Mint pq_network fixture
+        run: cargo test --locked --test pq_network mint_multivalidator_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
+
+      - name: Upload proof fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-fixtures-${{ github.run_id }}
+          path: tests/proof-fixtures/shielded-spend/*.bin
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: Cargo test
+    runs-on: ubuntu-latest
+    needs: mint_fixtures
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RISC Zero toolchain
+        run: |
+          curl -L https://risczero.com/install | bash
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download proof fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: proof-fixtures-${{ github.run_id }}
+          path: tests/proof-fixtures/shielded-spend
 
       - name: Run tests
         run: cargo test --locked --all-targets

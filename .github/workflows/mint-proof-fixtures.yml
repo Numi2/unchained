@@ -1,0 +1,79 @@
+name: Mint Proof Fixtures
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which fixture mint tests to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - wallet_control
+          - pq_network
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mint-proof-fixtures-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  UNCHAINED_PROOF_FIXTURE_DIR: tests/proof-fixtures
+  UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "1"
+
+jobs:
+  mint:
+    name: Mint ${{ inputs.target }} fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RISC Zero toolchain
+        run: |
+          curl -L https://risczero.com/install | bash
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Mint wallet_control fixture
+        if: inputs.target == 'all' || inputs.target == 'wallet_control'
+        run: cargo test --locked --test wallet_control mint_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
+
+      - name: Mint pq_network fixture
+        if: inputs.target == 'all' || inputs.target == 'pq_network'
+        run: cargo test --locked --test pq_network mint_multivalidator_fee_paid_control_submission_fixture -- --ignored --exact --nocapture
+
+      - name: Show minted fixture changes
+        run: git status --short tests/proof-fixtures/shielded-spend
+
+      - name: Validate wallet_control fixture path
+        if: inputs.target == 'all' || inputs.target == 'wallet_control'
+        env:
+          UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "0"
+        run: cargo test --locked --test wallet_control deterministic_fee_paid_control_fixture_id_stays_stable -- --exact --nocapture
+
+      - name: Validate pq_network fixture path
+        if: inputs.target == 'all' || inputs.target == 'pq_network'
+        env:
+          UNCHAINED_ALLOW_PROOF_FIXTURE_MINT: "0"
+        run: cargo test --locked --test pq_network deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable -- --exact --nocapture
+
+      - name: Upload shielded-spend fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-fixtures-${{ inputs.target }}-${{ github.run_id }}
+          path: tests/proof-fixtures/shielded-spend/*.bin
+          if-no-files-found: error
+          retention-days: 14

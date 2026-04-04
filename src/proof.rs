@@ -123,6 +123,7 @@ pub struct CheckpointAccumulatorProof {
 }
 
 const PROOF_FIXTURE_DIR_ENV: &str = "UNCHAINED_PROOF_FIXTURE_DIR";
+const PROOF_FIXTURE_MINT_ENV: &str = "UNCHAINED_ALLOW_PROOF_FIXTURE_MINT";
 
 static VERIFIED_SHIELDED_RECEIPTS: Lazy<Mutex<HashMap<[u8; 32], ProofShieldedTxJournal>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -432,6 +433,13 @@ fn proof_fixture_dir() -> Option<PathBuf> {
     std::env::var_os(PROOF_FIXTURE_DIR_ENV).map(PathBuf::from)
 }
 
+fn proof_fixture_mint_allowed() -> bool {
+    matches!(
+        std::env::var(PROOF_FIXTURE_MINT_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 fn transparent_statement_tag(statement: TransparentProofStatement) -> u8 {
     match statement {
         TransparentProofStatement::ShieldedTransfer => 0,
@@ -583,6 +591,15 @@ pub fn prove_shielded_tx(
             seal,
         );
         return Ok((proof, journal));
+    }
+    if let Some(path) = shielded_receipt_fixture_path(&fixture_id) {
+        if !proof_fixture_mint_allowed() {
+            bail!(
+                "missing cached shielded receipt fixture {}; set {}=1 to mint it",
+                path.display(),
+                PROOF_FIXTURE_MINT_ENV
+            );
+        }
     }
     let backend = native_transfer::PrototypeRisc0OrdinaryTransferBackend::new(binding);
     let (seal, journal) = backend.prove(&prepared)?;
