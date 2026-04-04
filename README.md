@@ -152,7 +152,11 @@ request-specific policy, or invoice semantics. Wallets can also verify locator
 resolution against multiple configured discovery mirrors, and negotiated
 handles or direct invoices can bind an exact requested amount when the receive
 flow requires it. Discovery operators can inspect the live manifest, PIR
-envelope, and mailbox queue state through `unchained_node discovery-status`.
+envelope, manifest dataset ID, snapshot epoch, and mailbox queue state through
+`unchained_node discovery-status`. Discovery queries can also be gated by an
+anonymous manifest-bound query-budget proof, and operators can export signed
+snapshot bundles into query-only mirrors with `unchained_node
+discovery-export-snapshot` and `unchained_node discovery-import-snapshot`.
 
 The sender never needs to see large PQ key material, and the ledger never needs
 to see a reusable outward identity.
@@ -399,7 +403,7 @@ remains only as an explicit local/test utility.
 Those send, staking, ingress, and proof-assistant paths now also use a
 canonical `TransparentProof` object with an explicit statement kind instead of
 passing raw backend receipt bytes through transaction and wallet state. Receipt
-decoding, backend method/image identifiers, and prototype-proof cache
+decoding, adapter-local verifier artifacts, and prototype-proof cache
 serialization now live behind `src/proof.rs`, which keeps the steady-state
 protocol and wallet model stable while the proving backend is replaced.
 
@@ -409,13 +413,17 @@ claim, and checkpoint accumulator are named circuit slots with a conservative
 `128-bit` minimum security budget and explicit public-input shapes. The
 prototype backend is still internal to `src/proof.rs`, but the rest of the
 system now reasons about circuit identity rather than backend method constants.
+Checkpoint history bindings also commit only to a verifier-key digest, so raw
+zkVM method identifiers no longer leak into transaction-visible journals.
 
 The proof layer now also carries explicit backend identity and capability
 manifests. Canonical proofs include their backend, circuit, and statement
 metadata, and the remote proof assistant can advertise the exact backend and
-supported circuit inventory before serving witness requests. That keeps the
-wallet and transport model stable while the first native transparent backend is
-introduced behind the same interface.
+supported circuit inventory before serving witness requests. Canonical proof
+metadata also treats seal bytes as opaque adapter output rather than naming a
+specific receipt serialization format. That keeps the wallet and transport
+model stable while the first native transparent backend is introduced behind
+the same interface.
 
 Backend selection is now also routed through a canonical per-circuit backend
 policy inside `src/proof.rs` rather than hard-coded directly into every

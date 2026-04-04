@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use qrcode::render::unicode;
 use qrcode::QrCode;
@@ -42,7 +42,7 @@ struct CommonArgs {
     version,
     about = "Unchained node runtime",
     long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and validator-facing services.",
-    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node discovery-status --json\n  unchained_node start\n"
+    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node discovery-status --json\n  unchained_node discovery-export-snapshot --out discovery.snapshot\n  unchained_node discovery-import-snapshot --input discovery.snapshot\n  unchained_node start\n"
 )]
 struct NodeCli {
     #[command(flatten)]
@@ -141,6 +141,16 @@ enum NodeCmd {
     StartDiscovery,
     /// Query the live discovery service for manifest and queue status
     DiscoveryStatus(DiscoveryStatusArgs),
+    /// Export a signed discovery snapshot bundle for mirror rollout or disaster recovery
+    DiscoveryExportSnapshot {
+        #[arg(long)]
+        out: String,
+    },
+    /// Import a signed discovery snapshot bundle into the local discovery state
+    DiscoveryImportSnapshot {
+        #[arg(long)]
+        input: String,
+    },
     /// Re-gossip all transactions from local DB
     ReplayTransactions,
     /// Export all anchors into a compressed snapshot file
@@ -766,6 +776,8 @@ fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
         max_pending_requests: cfg.discovery.server.max_pending_requests,
         max_pending_responses: cfg.discovery.server.max_pending_responses,
         pir_arity: cfg.discovery.server.pir_arity,
+        query_budget_difficulty_bits: cfg.discovery.server.query_budget_difficulty_bits,
+        allow_mutations: !cfg.discovery.server.query_only_replica,
     }
 }
 
@@ -983,6 +995,45 @@ async fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Re
                 cfg.discovery.server.state_path.as_deref(),
             );
             print_discovery_status_output(&state_path, &status, args)?;
+            Ok(true)
+        }
+        NodeCmd::DiscoveryExportSnapshot { out } => {
+            let identity = load_runtime_identity(cfg)?;
+            let state_path = discovery::discovery_state_path(
+                &cfg.storage.path,
+                cfg.discovery.server.state_path.as_deref(),
+            );
+            let bundle =
+                discovery::export_snapshot_bundle(&identity, &state_path, &discovery_policy(cfg))?;
+            std::fs::write(out, discovery::encode_snapshot_bundle(&bundle)?)
+                .with_context(|| format!("failed to write discovery snapshot bundle to {out}"))?;
+            println!("Discovery snapshot exported.");
+            println!("State path: {state_path}");
+            println!("Snapshot epoch: {}", bundle.snapshot_epoch);
+            println!("Dataset ID: {}", hex::encode(bundle.dataset_id));
+            println!("Record count: {}", bundle.record_count);
+            println!("Output: {out}");
+            Ok(true)
+        }
+        NodeCmd::DiscoveryImportSnapshot { input } => {
+            let state_path = discovery::discovery_state_path(
+                &cfg.storage.path,
+                cfg.discovery.server.state_path.as_deref(),
+            );
+            let bytes = std::fs::read(input).with_context(|| {
+                format!("failed to read discovery snapshot bundle from {input}")
+            })?;
+            let bundle = discovery::decode_snapshot_bundle(&bytes)?;
+            discovery::import_snapshot_bundle(&state_path, &bundle)?;
+            println!("Discovery snapshot imported.");
+            println!("State path: {state_path}");
+            println!("Snapshot epoch: {}", bundle.snapshot_epoch);
+            println!("Dataset ID: {}", hex::encode(bundle.dataset_id));
+            println!("Record count: {}", bundle.record_count);
+            println!(
+                "Source server node ID: {}",
+                hex::encode(bundle.source_server_record.node_id)
+            );
             Ok(true)
         }
         NodeCmd::ValidatorRegisterDoc(args) => {
@@ -1338,11 +1389,15 @@ fn print_discovery_status_output(
                 "state_path": state_path,
                 "chain_id": hex::encode(status.chain_id),
                 "server_node_id": hex::encode(status.server_node_id),
+                "dataset_id": hex::encode(status.dataset_id),
+                "snapshot_epoch": status.snapshot_epoch,
                 "manifest_id": hex::encode(status.manifest_id),
                 "manifest_issued_unix_ms": status.manifest_issued_unix_ms,
                 "record_count": status.record_count,
                 "record_bytes": status.record_bytes,
                 "pir_arity": status.pir_arity,
+                "query_budget_difficulty_bits": status.query_budget_difficulty_bits,
+                "allow_mutations": status.allow_mutations,
                 "record_ttl_secs": status.record_ttl_secs,
                 "max_request_bytes": status.max_request_bytes,
                 "max_response_bytes": status.max_response_bytes,
@@ -1362,11 +1417,21 @@ fn print_discovery_status_output(
     println!("State path: {state_path}");
     println!("Server node ID: {}", hex::encode(status.server_node_id));
     println!("Chain ID: {}", hex::encode(status.chain_id));
+    println!("Dataset ID: {}", hex::encode(status.dataset_id));
+    println!("Snapshot epoch: {}", status.snapshot_epoch);
     println!("Manifest ID: {}", hex::encode(status.manifest_id));
     println!("Manifest issued: {}", status.manifest_issued_unix_ms);
     println!("Record count: {}", status.record_count);
     println!("Record bytes: {}", status.record_bytes);
     println!("PIR arity: {}", status.pir_arity);
+    println!(
+        "Query budget difficulty bits: {}",
+        status.query_budget_difficulty_bits
+    );
+    println!(
+        "Mutations enabled: {}",
+        if status.allow_mutations { "yes" } else { "no" }
+    );
     println!("Record TTL secs: {}", status.record_ttl_secs);
     println!("Active locators: {}", status.active_locator_count);
     println!(
@@ -1652,6 +1717,8 @@ pub async fn run_node_cli() -> Result<()> {
         | NodeCmd::TrustApprove { .. }
         | NodeCmd::PeerId
         | NodeCmd::DiscoveryStatus(..)
+        | NodeCmd::DiscoveryExportSnapshot { .. }
+        | NodeCmd::DiscoveryImportSnapshot { .. }
         | NodeCmd::ValidatorRegisterDoc(..)
         | NodeCmd::ValidatorProfileDoc(..)
         | NodeCmd::ValidatorReactivateDoc(..)

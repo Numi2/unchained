@@ -201,13 +201,15 @@ transitional and should be removed rather than preserved.
   query executor, hot-swap snapshot rotation, and replica consistency checks
   The native server now builds signed snapshots, serves PIR queries, and
   refreshes its in-memory index after locator publication; clients now fail
-  closed on cross-replica record mismatches, but server-side publication and
-  consistency ceremonies are still open.
+  closed on cross-replica record mismatches, and signed snapshot bundles can
+  now be exported into query-only replicas; broader operational rollout and
+  mobile tuning are still open.
 - `[~]` Implement signed snapshot publication and mirrorable discovery replicas
   so clients can verify they are querying the intended directory snapshot
   Signed manifests are now live and verified by clients, and wallet discovery
-  reads can be cross-checked against configured mirrors; mirrored publication
-  and replica distribution policy are still open.
+  reads can be cross-checked against configured mirrors. The node CLI now
+  exports and imports signed snapshot bundles for query-only replica rollout,
+  but wider operator distribution policy is still open.
 - `[x]` Implement mailbox transport and one-time `RecipientHandle`
   request/response flows against PIR-fetched discovery records
 - `[x]` Document PQ offline receive as the ordinary locator-delivery path while
@@ -228,9 +230,12 @@ transitional and should be removed rather than preserved.
   compromised local state, bounded scan-retention windows, automatic rotation
   near expiry, and operator-triggered rotate / compromise-rotate wallet
   control surfaces.
-- `[ ]` Implement privacy-preserving abuse controls for discovery queries
+- `[x]` Implement privacy-preserving abuse controls for discovery queries
   using blinded rate-limit tokens or an equivalent anonymous query-budget
   mechanism
+  Discovery PIR queries now carry anonymous per-query work proofs bound to the
+  signed manifest, request shape, and query payload, so the server can enforce
+  a configurable query budget without learning the resolved locator.
 - `[ ]` Benchmark and tune discovery row size, snapshot cadence, and PIR
   parameters for mobile-wallet latency and bandwidth targets
 - `[ ]` Benchmark offline-receive scan overhead and descriptor-rotation
@@ -305,17 +310,19 @@ transitional and should be removed rather than preserved.
   transactions, wallets, ingress, and proof-assistant transport
   Steady-state transaction, wallet, ingress, and proof-assistant flows now
   carry statement-typed `TransparentProof` objects rather than raw backend
-  receipt bytes, and backend verification / method-ID handling is isolated to
-  `src/proof.rs`.
+  receipt bytes, and backend verification plus adapter-local verifier
+  artifacts are isolated to `src/proof.rs`.
 - `[~]` Remove dependence on the current prototype proving backend as the
   long-term integrity anchor
   Backend-specific receipt parsing and method/image identifiers are now
   contained within `src/proof.rs`, the canonical proof model now carries
   explicit backend identity, and the proof assistant now advertises backend
   capabilities and supported circuits. Proof routing now also runs through a
-  canonical per-circuit backend policy instead of direct method wiring, but
-  the underlying proving backend is still the prototype engine and has not yet
-  been replaced.
+  canonical per-circuit backend policy instead of direct method wiring, and
+  checkpoint history bindings now commit to backend-agnostic verifier-key
+  digests instead of leaking raw zkVM method IDs into transaction-visible
+  journals, but the underlying proving backend is still the prototype engine
+  and has not yet been replaced.
 - `[~]` Define a native transparent STARK-family proving architecture
   The canonical proof layer now has an explicit circuit inventory for ordinary
   transfer, private delegation, private undelegation, unbonding claim, and
@@ -373,8 +380,9 @@ transitional and should be removed rather than preserved.
   signed snapshot publication ceremonies
   Discovery now exposes live operator status over the discovery transport and
   the node CLI can inspect manifest / queue depth / PIR envelope state from a
-  running service; signed snapshot publication ceremonies and mirror rollout
-  policy are still open.
+  running service. The node CLI can also export signed snapshot bundles and
+  import them into query-only replicas; broader operator rollout policy and
+  mobile parameter tuning are still open.
 - `[x]` Add wallet/client CLI and service surfaces for locator resolution via
   PIR and mailbox-based handle negotiation
   `unchained_wallet` now exposes explicit `resolve`, `request-handle`, and
@@ -425,9 +433,13 @@ transitional and should be removed rather than preserved.
   mailbox bootstrap decoding, negotiated-handle completion, snapshot rotation,
   and failure handling under stale manifests or malformed rows.
   The suite now covers publish/resolve/mailbox completion, negotiated
-  amount-bound handles, and mirrored-replica mismatch detection; malformed-row
-  and stale-manifest coverage are still open.
-- `[ ]` Add privacy-invariant tests for discovery abuse controls
+  amount-bound handles, mirrored-replica mismatch detection, anonymous
+  query-budget enforcement, and signed snapshot bundle rollout into a
+  query-only replica; malformed-row and stale-manifest coverage are still
+  open.
+- `[~]` Add privacy-invariant tests for discovery abuse controls
+  The suite now verifies manifest-bound anonymous query-budget proof
+  enforcement, but broader leakage and tuning coverage is still open.
   Query budgeting, retries, relaying, and operator telemetry must not re-link
   locator resolution to a wallet identity or degrade PIR query privacy.
 - `[ ]` Add proof-system tests aligned to the new native circuits
@@ -451,16 +463,18 @@ transitional and should be removed rather than preserved.
   layout, and candidate-slot derivation rules
 - `[x]` Implement the PIR discovery client, directory server, and mailbox
   negotiation path end to end
-- `[ ]` Add anonymous discovery query-budget controls that do not weaken PIR
+- `[x]` Add anonymous discovery query-budget controls that do not weaken PIR
   privacy
-- `[ ]` Ship discovery snapshot publication, mirror distribution, and operator
+- `[~]` Ship discovery snapshot publication, mirror distribution, and operator
   ceremony tooling
 - `[ ]` Tune PIR parameters, row size, and offline-receive rotation for mobile
   latency and bandwidth targets
 - `[~]` Define the replacement proof architecture and circuit inventory
   The canonical proof-object boundary and named circuit inventory are now in
-  place across transaction, wallet, ingress, and proof-assistant paths; the
-  replacement backend and the remaining native circuits are still open.
+  place across transaction, wallet, ingress, and proof-assistant paths, and
+  checkpoint accumulator recursion now binds a generic verifier-key
+  commitment instead of a raw method identifier; the replacement backend and
+  the remaining native circuits are still open.
 
 ## 15. Explicitly Out Of Scope
 

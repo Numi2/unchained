@@ -5,7 +5,7 @@ fn main() {
     let witness: proof_core::CheckpointAccumulatorStepWitness = env::read();
     if let Some(prior) = witness.prior_accumulator.as_ref() {
         let journal = to_vec(prior).expect("serialize prior checkpoint accumulator journal");
-        env::verify(witness.accumulator_image_id, journal.as_slice())
+        env::verify(witness.accumulator_verifier_hint, journal.as_slice())
             .expect("invalid prior checkpoint accumulator receipt");
     }
     let journal =

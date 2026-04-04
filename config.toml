@@ -115,6 +115,7 @@ submit_timeout_secs = 10
 [discovery.server]
 # PIR-backed locator discovery and mailbox service settings.
 # state_path = "/path/to/discovery-state"
+# query_only_replica = true
 record_ttl_secs = 3600
 max_request_bytes = 4194304
 max_response_bytes = 134217728
@@ -122,6 +123,8 @@ submit_timeout_secs = 10
 max_pending_requests = 4096
 max_pending_responses = 4096
 pir_arity = 4
+query_budget_difficulty_bits = 0
+query_only_replica = false
 
 [orphan]
 total_cap = 32768

@@ -302,6 +302,10 @@ pub struct DiscoveryServer {
     pub max_pending_responses: usize,
     #[serde(default = "default_discovery_pir_arity")]
     pub pir_arity: u32,
+    #[serde(default = "default_discovery_query_budget_difficulty_bits")]
+    pub query_budget_difficulty_bits: u8,
+    #[serde(default)]
+    pub query_only_replica: bool,
 }
 
 impl Default for DiscoveryServer {
@@ -315,6 +319,8 @@ impl Default for DiscoveryServer {
             max_pending_requests: default_discovery_max_pending_requests(),
             max_pending_responses: default_discovery_max_pending_responses(),
             pir_arity: default_discovery_pir_arity(),
+            query_budget_difficulty_bits: default_discovery_query_budget_difficulty_bits(),
+            query_only_replica: false,
         }
     }
 }
@@ -387,6 +393,9 @@ fn default_discovery_max_pending_responses() -> usize {
 }
 fn default_discovery_pir_arity() -> u32 {
     4
+}
+fn default_discovery_query_budget_difficulty_bits() -> u8 {
+    0
 }
 fn default_strict_trust() -> bool {
     true
@@ -652,6 +661,8 @@ fn warn_unknown_keys(val: &TomlValue) {
                                 "max_pending_requests",
                                 "max_pending_responses",
                                 "pir_arity",
+                                "query_budget_difficulty_bits",
+                                "query_only_replica",
                             ],
                         );
                     }

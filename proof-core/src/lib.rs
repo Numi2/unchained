@@ -222,7 +222,7 @@ pub struct HistoricalUnspentStratum {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAccumulatorJournal {
     pub version: u8,
-    pub accumulator_image_id: [u32; 8],
+    pub accumulator_verifier_key_commitment: [u8; 32],
     pub note_commitment: [u8; 32],
     pub birth_epoch: u64,
     pub covered_through_epoch: u64,
@@ -235,7 +235,8 @@ pub struct CheckpointAccumulatorJournal {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAccumulatorStepWitness {
-    pub accumulator_image_id: [u32; 8],
+    pub accumulator_verifier_key_commitment: [u8; 32],
+    pub accumulator_verifier_hint: [u32; 8],
     pub note_commitment: [u8; 32],
     pub birth_epoch: u64,
     pub prior_accumulator: Option<CheckpointAccumulatorJournal>,
@@ -265,6 +266,7 @@ pub struct ProofShieldedInputWitness {
     pub membership_proof: NoteMembershipProof,
     pub historical_checkpoint: HistoricalUnspentCheckpoint,
     pub historical_accumulator: Option<CheckpointAccumulatorJournal>,
+    pub historical_accumulator_verifier_hint: Option<[u32; 8]>,
     pub historical_accumulator_receipt: Option<Vec<u8>>,
     pub current_nullifier: [u8; 32],
 }
@@ -292,7 +294,7 @@ pub struct ProofShieldedInputBinding {
     pub historical_from_epoch: u64,
     pub historical_through_epoch: u64,
     pub historical_root_digest: [u8; 32],
-    pub historical_accumulator_image_id: [u32; 8],
+    pub historical_accumulator_verifier_key_commitment: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -407,7 +409,7 @@ pub fn validate_shielded_tx_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         ) = match &input.historical_accumulator {
             Some(accumulator) => {
                 if input
@@ -416,6 +418,9 @@ pub fn validate_shielded_tx_witness(
                     .map_or(true, Vec::is_empty)
                 {
                     bail!("historical accumulator receipt is missing");
+                }
+                if input.historical_accumulator_verifier_hint.is_none() {
+                    bail!("historical accumulator verifier hint is missing");
                 }
                 accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
                 if witness.current_epoch == 0
@@ -427,10 +432,13 @@ pub fn validate_shielded_tx_witness(
                     input.note.birth_epoch,
                     accumulator.covered_through_epoch,
                     accumulator.historical_root_digest,
-                    accumulator.accumulator_image_id,
+                    accumulator.accumulator_verifier_key_commitment,
                 )
             }
             None => {
+                if input.historical_accumulator_verifier_hint.is_some() {
+                    bail!("unexpected historical accumulator verifier hint");
+                }
                 if witness.current_epoch != input.note.birth_epoch {
                     bail!("historical accumulator proof missing");
                 }
@@ -441,7 +449,7 @@ pub fn validate_shielded_tx_witness(
                     input.note.birth_epoch,
                     input.historical_checkpoint.covered_through_epoch,
                     checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u32; 8],
+                    [0u8; 32],
                 )
             }
         };
@@ -459,7 +467,7 @@ pub fn validate_shielded_tx_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -570,7 +578,7 @@ pub fn validate_private_delegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         ) = match &input.historical_accumulator {
             Some(accumulator) => {
                 if input
@@ -579,6 +587,9 @@ pub fn validate_private_delegation_witness(
                     .map_or(true, Vec::is_empty)
                 {
                     bail!("historical accumulator receipt is missing");
+                }
+                if input.historical_accumulator_verifier_hint.is_none() {
+                    bail!("historical accumulator verifier hint is missing");
                 }
                 accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
                 if witness.shielded.current_epoch == 0
@@ -590,10 +601,13 @@ pub fn validate_private_delegation_witness(
                     input.note.birth_epoch,
                     accumulator.covered_through_epoch,
                     accumulator.historical_root_digest,
-                    accumulator.accumulator_image_id,
+                    accumulator.accumulator_verifier_key_commitment,
                 )
             }
             None => {
+                if input.historical_accumulator_verifier_hint.is_some() {
+                    bail!("unexpected historical accumulator verifier hint");
+                }
                 if witness.shielded.current_epoch != input.note.birth_epoch {
                     bail!("historical accumulator proof missing");
                 }
@@ -604,7 +618,7 @@ pub fn validate_private_delegation_witness(
                     input.note.birth_epoch,
                     input.historical_checkpoint.covered_through_epoch,
                     checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u32; 8],
+                    [0u8; 32],
                 )
             }
         };
@@ -622,7 +636,7 @@ pub fn validate_private_delegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -766,7 +780,7 @@ pub fn validate_private_undelegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         ) = match &input.historical_accumulator {
             Some(accumulator) => {
                 if input
@@ -775,6 +789,9 @@ pub fn validate_private_undelegation_witness(
                     .map_or(true, Vec::is_empty)
                 {
                     bail!("historical accumulator receipt is missing");
+                }
+                if input.historical_accumulator_verifier_hint.is_none() {
+                    bail!("historical accumulator verifier hint is missing");
                 }
                 accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
                 if witness.shielded.current_epoch == 0
@@ -786,10 +803,13 @@ pub fn validate_private_undelegation_witness(
                     input.note.birth_epoch,
                     accumulator.covered_through_epoch,
                     accumulator.historical_root_digest,
-                    accumulator.accumulator_image_id,
+                    accumulator.accumulator_verifier_key_commitment,
                 )
             }
             None => {
+                if input.historical_accumulator_verifier_hint.is_some() {
+                    bail!("unexpected historical accumulator verifier hint");
+                }
                 if witness.shielded.current_epoch != input.note.birth_epoch {
                     bail!("historical accumulator proof missing");
                 }
@@ -800,7 +820,7 @@ pub fn validate_private_undelegation_witness(
                     input.note.birth_epoch,
                     input.historical_checkpoint.covered_through_epoch,
                     checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u32; 8],
+                    [0u8; 32],
                 )
             }
         };
@@ -818,7 +838,7 @@ pub fn validate_private_undelegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -964,7 +984,7 @@ pub fn validate_unbonding_claim_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         ) = match &input.historical_accumulator {
             Some(accumulator) => {
                 if input
@@ -973,6 +993,9 @@ pub fn validate_unbonding_claim_witness(
                     .map_or(true, Vec::is_empty)
                 {
                     bail!("historical accumulator receipt is missing");
+                }
+                if input.historical_accumulator_verifier_hint.is_none() {
+                    bail!("historical accumulator verifier hint is missing");
                 }
                 accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
                 if witness.current_epoch == 0
@@ -984,10 +1007,13 @@ pub fn validate_unbonding_claim_witness(
                     input.note.birth_epoch,
                     accumulator.covered_through_epoch,
                     accumulator.historical_root_digest,
-                    accumulator.accumulator_image_id,
+                    accumulator.accumulator_verifier_key_commitment,
                 )
             }
             None => {
+                if input.historical_accumulator_verifier_hint.is_some() {
+                    bail!("unexpected historical accumulator verifier hint");
+                }
                 if witness.current_epoch != input.note.birth_epoch {
                     bail!("historical accumulator proof missing");
                 }
@@ -998,7 +1024,7 @@ pub fn validate_unbonding_claim_witness(
                     input.note.birth_epoch,
                     input.historical_checkpoint.covered_through_epoch,
                     checkpoint_accumulator_historical_digest_from_pairs(&[]),
-                    [0u32; 8],
+                    [0u8; 32],
                 )
             }
         };
@@ -1016,7 +1042,7 @@ pub fn validate_unbonding_claim_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
-            historical_accumulator_image_id,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -1373,8 +1399,10 @@ pub fn validate_checkpoint_accumulator_step_witness(
                     prior.version
                 );
             }
-            if prior.accumulator_image_id != witness.accumulator_image_id {
-                bail!("checkpoint accumulator image id mismatch");
+            if prior.accumulator_verifier_key_commitment
+                != witness.accumulator_verifier_key_commitment
+            {
+                bail!("checkpoint accumulator verifier key commitment mismatch");
             }
             if prior.note_commitment != witness.note_commitment {
                 bail!("checkpoint accumulator note mismatch");
@@ -1426,7 +1454,7 @@ pub fn validate_checkpoint_accumulator_step_witness(
 
     Ok(CheckpointAccumulatorJournal {
         version: CHECKPOINT_ACCUMULATOR_VERSION,
-        accumulator_image_id: witness.accumulator_image_id,
+        accumulator_verifier_key_commitment: witness.accumulator_verifier_key_commitment,
         note_commitment: witness.note_commitment,
         birth_epoch: witness.birth_epoch,
         covered_through_epoch,
@@ -2290,13 +2318,15 @@ mod tests {
     fn sample_accumulator(
         checkpoint: &HistoricalUnspentCheckpoint,
         extension: &HistoricalUnspentExtension,
-        image_id: [u32; 8],
+        verifier_key_commitment: [u8; 32],
+        verifier_hint: [u32; 8],
     ) -> CheckpointAccumulatorJournal {
         let mut prior = None;
         let mut current = None;
         for stratum in &extension.strata {
             let witness = CheckpointAccumulatorStepWitness {
-                accumulator_image_id: image_id,
+                accumulator_verifier_key_commitment: verifier_key_commitment,
+                accumulator_verifier_hint: verifier_hint,
                 note_commitment: checkpoint.note_commitment,
                 birth_epoch: checkpoint.birth_epoch,
                 prior_accumulator: prior.clone(),
@@ -2326,7 +2356,7 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [9u32; 8]);
+        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2351,6 +2381,7 @@ mod tests {
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
                     historical_accumulator: Some(accumulator.clone()),
+                    historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
@@ -2387,8 +2418,8 @@ mod tests {
             accumulator.historical_root_digest
         );
         assert_eq!(
-            journal.inputs[0].historical_accumulator_image_id,
-            accumulator.accumulator_image_id
+            journal.inputs[0].historical_accumulator_verifier_key_commitment,
+            accumulator.accumulator_verifier_key_commitment
         );
         assert_eq!(
             journal.outputs[0].note_commitment,
@@ -2441,7 +2472,7 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [9u32; 8]);
+        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2472,6 +2503,7 @@ mod tests {
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
                     historical_accumulator: Some(accumulator),
+                    historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
@@ -2509,7 +2541,7 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [9u32; 8]);
+        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2548,6 +2580,7 @@ mod tests {
                     membership_proof,
                     historical_checkpoint: updated_checkpoint,
                     historical_accumulator: Some(accumulator),
+                    historical_accumulator_verifier_hint: Some([9u32; 8]),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
@@ -2601,6 +2634,7 @@ mod tests {
                     current_epoch,
                 ),
                 historical_accumulator: None,
+                historical_accumulator_verifier_hint: None,
                 historical_accumulator_receipt: None,
                 current_nullifier,
             }],

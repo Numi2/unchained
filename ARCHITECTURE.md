@@ -343,6 +343,8 @@ Canonical requirements:
 - constant-size responses
 - fixed-size directory records
 - signed snapshot manifests that bind the exact PIR parameter set
+- anonymous query-budget enforcement that does not reveal the resolved locator
+- signed snapshot-bundle export for mirror and query-only replica rollout
 - no cleartext locator lookup API beside the PIR interface
 
 The privacy model is:
@@ -393,21 +395,31 @@ The discovery directory publishes a signed manifest that commits to:
 - dataset ID and snapshot epoch
 - row count and row size
 - PIR seed material, hint material, and filter parameters
+- query-budget policy
 - validity interval and operator signature
 
 Clients then:
 
 1. fetch the latest signed manifest
 2. instantiate the PIR client from the manifest parameters
-3. issue a fixed-shape PIR query for the `LocatorID`
-4. receive a fixed-size record payload
-5. verify the manifest signature and record signature locally
-6. decrypt and use the mailbox bootstrap material to request a one-time
+3. derive any required anonymous query-budget proof from the manifest and the
+   fixed-shape PIR query
+4. issue a fixed-shape PIR query for the `LocatorID`
+5. receive a fixed-size record payload
+6. verify the manifest signature, query-budget policy, and record signature
+   locally
+7. decrypt and use the mailbox bootstrap material to request a one-time
    `RecipientHandle`
 
 Locator indexing must therefore be **PIR-native**: the signed manifest carries
 the exact index parameters, and clients query the directory only through the
 PIR path. There is no cleartext “miss then retry by name” fallback.
+
+Snapshot publication should also be explicit. An operator publishes a signed
+snapshot bundle that commits to the source server identity, dataset ID,
+snapshot epoch, record count, record bytes, and PIR/query-budget policy.
+Mirrors and query-only replicas import that bundle directly rather than
+rebuilding an unauthenticated directory view.
 
 ### Offline Receive Descriptor
 

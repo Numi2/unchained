@@ -38,6 +38,7 @@ const DISCOVERY_ENVELOPE_VERSION: u8 = 1;
 const DISCOVERY_REQUEST_VERSION: u8 = 1;
 const DISCOVERY_RESPONSE_VERSION: u8 = 1;
 const DISCOVERY_MANIFEST_VERSION: u8 = 1;
+const DISCOVERY_SNAPSHOT_BUNDLE_VERSION: u8 = 1;
 const DISCOVERY_RECORD_VERSION: u8 = 1;
 const DISCOVERY_OFFLINE_RECEIVE_VERSION: u8 = 1;
 const DISCOVERY_MAILBOX_REQUEST_VERSION: u8 = 1;
@@ -55,6 +56,9 @@ const DISCOVERY_HYBRID_KEY_DOMAIN: &str = "unchained-discovery-hybrid-key-v1";
 const DISCOVERY_MESSAGE_AEAD_DOMAIN: &str = "unchained-discovery-message-aead-v1";
 const DISCOVERY_MANIFEST_ID_DOMAIN: &str = "unchained-discovery-manifest-id-v1";
 const DISCOVERY_MANIFEST_SIG_DOMAIN: &str = "unchained-discovery-manifest-sig-v1";
+const DISCOVERY_DATASET_ID_DOMAIN: &str = "unchained-discovery-dataset-id-v1";
+const DISCOVERY_QUERY_BUDGET_DOMAIN: &str = "unchained-discovery-query-budget-v1";
+const DISCOVERY_SNAPSHOT_BUNDLE_DOMAIN: &str = "unchained-discovery-snapshot-bundle-v1";
 const DISCOVERY_STORE_DIR: &str = "discovery_service";
 // Discovery rows must fit a full signed wallet record carrying mailbox bootstrap
 // material plus a signed offline receive descriptor.
@@ -73,6 +77,8 @@ const DISCOVERY_CF_LOCATOR: &str = "locator_record";
 const DISCOVERY_CF_MAILBOX_AUTH: &str = "mailbox_auth";
 const DISCOVERY_CF_MAILBOX_REQUEST: &str = "mailbox_request";
 const DISCOVERY_CF_RESPONSE_SLOT: &str = "response_slot";
+const DISCOVERY_CF_META: &str = "meta";
+const DISCOVERY_META_SNAPSHOT: &[u8] = b"snapshot_metadata";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveryRecord {
@@ -114,9 +120,12 @@ pub struct DiscoveryManifest {
     pub version: u8,
     pub chain_id: [u8; 32],
     pub server_node_id: [u8; 32],
+    pub dataset_id: [u8; 32],
+    pub snapshot_epoch: u64,
     pub arity: u32,
     pub record_count: u64,
     pub record_bytes: u32,
+    pub query_budget_difficulty_bits: u8,
     pub issued_unix_ms: u64,
     pub manifest_id: [u8; 32],
     pub seed_mu: [u8; SEED_BYTE_LEN],
@@ -156,6 +165,11 @@ pub struct HandleResponsePlaintext {
     pub issued_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryQueryBudgetProof {
+    pub nonce: [u8; 32],
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveryPolicy {
     pub record_ttl: Duration,
@@ -165,6 +179,8 @@ pub struct DiscoveryPolicy {
     pub max_pending_requests: usize,
     pub max_pending_responses: usize,
     pub pir_arity: u32,
+    pub query_budget_difficulty_bits: u8,
+    pub allow_mutations: bool,
 }
 
 impl Default for DiscoveryPolicy {
@@ -177,6 +193,8 @@ impl Default for DiscoveryPolicy {
             max_pending_requests: 4096,
             max_pending_responses: 4096,
             pir_arity: 4,
+            query_budget_difficulty_bits: 0,
+            allow_mutations: true,
         }
     }
 }
@@ -185,11 +203,15 @@ impl Default for DiscoveryPolicy {
 pub struct DiscoveryServerStatus {
     pub chain_id: [u8; 32],
     pub server_node_id: [u8; 32],
+    pub dataset_id: [u8; 32],
+    pub snapshot_epoch: u64,
     pub manifest_id: [u8; 32],
     pub manifest_issued_unix_ms: u64,
     pub record_count: u64,
     pub record_bytes: u32,
     pub pir_arity: u32,
+    pub query_budget_difficulty_bits: u8,
+    pub allow_mutations: bool,
     pub record_ttl_secs: u64,
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
@@ -222,8 +244,8 @@ pub struct DiscoveryServer {
     index: Arc<RwLock<DiscoveryIndexState>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct LocatorRegistration {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocatorRegistration {
     record: DiscoveryRecord,
     mailbox_auth_hash: [u8; 32],
 }
@@ -241,6 +263,27 @@ struct StoredResponseSlot {
     auth_hash: [u8; 32],
     envelope: Option<Vec<u8>>,
     created_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredSnapshotMetadata {
+    dataset_id: [u8; 32],
+    snapshot_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoverySnapshotBundle {
+    pub version: u8,
+    pub chain_id: [u8; 32],
+    pub source_server_record: NodeRecordV2,
+    pub dataset_id: [u8; 32],
+    pub snapshot_epoch: u64,
+    pub record_count: u64,
+    pub record_bytes: u32,
+    pub query_budget_difficulty_bits: u8,
+    pub exported_unix_ms: u64,
+    pub registrations: Vec<LocatorRegistration>,
+    pub sig: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -270,6 +313,7 @@ enum DiscoveryRequest {
         request_id: [u8; 32],
         manifest_id: [u8; 32],
         query: Vec<u8>,
+        budget_proof: DiscoveryQueryBudgetProof,
     },
     PostMailboxRequest {
         request_id: [u8; 32],
@@ -639,12 +683,14 @@ impl DiscoveryClient {
             .query(locator_id)
             .map_err(|err| anyhow!("failed to build discovery PIR query: {err:?}"))?;
         let request_id = random_request_id();
+        let budget_proof = compute_query_budget_proof(&manifest, &request_id, &query);
         let response = self
             .exchange_request_to_record(
                 DiscoveryRequest::PirQuery {
                     request_id,
                     manifest_id: manifest.manifest_id,
                     query,
+                    budget_proof,
                 },
                 server_record,
             )
@@ -988,6 +1034,7 @@ impl DiscoveryServer {
             chain_id,
             identity.node_id(),
             policy.pir_arity,
+            policy.query_budget_difficulty_bits,
             identity,
         )?));
         let server = Self {
@@ -1045,7 +1092,14 @@ impl DiscoveryServer {
                 .context("discovery failed while reading request envelope")?;
             let request =
                 open_request_from_envelope(&envelope, &self.ingress_keys, self.server_node_id)?;
-            let response = self.handle_request(request)?;
+            let request_id = request.request_id();
+            let response = match self.handle_request(request) {
+                Ok(response) => response,
+                Err(err) => DiscoveryResponse::Error {
+                    request_id,
+                    message: err.to_string(),
+                },
+            };
             send.write_all(&encode_response(&response)?)
                 .await
                 .context("discovery failed to write response")?;
@@ -1079,6 +1133,7 @@ impl DiscoveryServer {
                 record,
                 mailbox_auth_token,
             } => {
+                self.ensure_mutations_allowed()?;
                 let record = decode_discovery_record(&record)?;
                 record.validate(&record.locator_id, &self.chain_id)?;
                 let registration = LocatorRegistration {
@@ -1095,6 +1150,7 @@ impl DiscoveryServer {
                 request_id,
                 manifest_id,
                 query,
+                budget_proof,
             } => {
                 let guard = self
                     .index
@@ -1103,6 +1159,7 @@ impl DiscoveryServer {
                 if guard.manifest.manifest_id != manifest_id {
                     bail!("discovery manifest changed; refetch and retry");
                 }
+                verify_query_budget_proof(&guard.manifest, &request_id, &query, &budget_proof)?;
                 let server = guard
                     .server
                     .as_ref()
@@ -1122,6 +1179,7 @@ impl DiscoveryServer {
                 response_slot_auth_hash,
                 envelope,
             } => {
+                self.ensure_mutations_allowed()?;
                 self.ensure_mailbox_exists(&mailbox_id)?;
                 self.ensure_pending_request_capacity()?;
                 self.ensure_response_slot_capacity()?;
@@ -1151,6 +1209,7 @@ impl DiscoveryServer {
                 auth_token,
                 max_messages,
             } => {
+                self.ensure_mutations_allowed()?;
                 self.verify_mailbox_auth(&mailbox_id, &auth_token)?;
                 let mut messages = Vec::new();
                 for (key, request_id_bytes, message) in self
@@ -1175,6 +1234,7 @@ impl DiscoveryServer {
                 auth_token,
                 envelope,
             } => {
+                self.ensure_mutations_allowed()?;
                 let mut slot = self
                     .store
                     .get_response_slot(&response_slot_id)?
@@ -1192,6 +1252,7 @@ impl DiscoveryServer {
                 response_slot_id,
                 auth_token,
             } => {
+                self.ensure_mutations_allowed()?;
                 let slot = self
                     .store
                     .get_response_slot(&response_slot_id)?
@@ -1252,6 +1313,13 @@ impl DiscoveryServer {
         Ok(())
     }
 
+    fn ensure_mutations_allowed(&self) -> Result<()> {
+        if !self.policy.allow_mutations {
+            bail!("discovery replica is query-only and rejects publish/mailbox mutations");
+        }
+        Ok(())
+    }
+
     fn status(&self) -> Result<DiscoveryServerStatus> {
         let registrations = self.store.list_active_registrations(self.chain_id)?;
         let pending_mailbox_requests = self.store.count_cf(DISCOVERY_CF_MAILBOX_REQUEST)? as u64;
@@ -1269,11 +1337,15 @@ impl DiscoveryServer {
         Ok(DiscoveryServerStatus {
             chain_id: self.chain_id,
             server_node_id: self.server_node_id,
+            dataset_id: manifest.dataset_id,
+            snapshot_epoch: manifest.snapshot_epoch,
             manifest_id: manifest.manifest_id,
             manifest_issued_unix_ms: manifest.issued_unix_ms,
             record_count: manifest.record_count,
             record_bytes: manifest.record_bytes,
             pir_arity: self.policy.pir_arity,
+            query_budget_difficulty_bits: manifest.query_budget_difficulty_bits,
+            allow_mutations: self.policy.allow_mutations,
             record_ttl_secs: self.policy.record_ttl.as_secs(),
             max_request_bytes: self.policy.max_request_bytes as u64,
             max_response_bytes: self.policy.max_response_bytes as u64,
@@ -1288,13 +1360,17 @@ impl DiscoveryServer {
 
     fn refresh_index(&self) -> Result<()> {
         let records = self.store.list_active_registrations(self.chain_id)?;
+        let metadata = next_snapshot_metadata(self.store.as_ref(), &records)?;
         let next_state = DiscoveryIndexState::build(
             self.chain_id,
             self.server_node_id,
             self.policy.pir_arity,
+            self.policy.query_budget_difficulty_bits,
             &self.identity,
             &records,
+            &metadata,
         )?;
+        self.store.put_snapshot_metadata(&metadata)?;
         *self
             .index
             .write()
@@ -1303,18 +1379,60 @@ impl DiscoveryServer {
     }
 }
 
+fn dataset_id_for_registrations(registrations: &[LocatorRegistration]) -> Result<[u8; 32]> {
+    let mut encoded_rows = registrations
+        .iter()
+        .map(|registration| {
+            Ok((
+                registration.record.locator_id,
+                encode_pir_record(&registration.record)?,
+            ))
+        })
+        .collect::<Result<Vec<([u8; 32], Vec<u8>)>>>()?;
+    encoded_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = blake3::Hasher::new_derive_key(DISCOVERY_DATASET_ID_DOMAIN);
+    hasher.update(&(encoded_rows.len() as u64).to_le_bytes());
+    for (locator_id, row) in encoded_rows {
+        hasher.update(&locator_id);
+        hasher.update(&(row.len() as u64).to_le_bytes());
+        hasher.update(&row);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn next_snapshot_metadata(
+    store: &DiscoveryStateStore,
+    registrations: &[LocatorRegistration],
+) -> Result<StoredSnapshotMetadata> {
+    let dataset_id = dataset_id_for_registrations(registrations)?;
+    let snapshot_epoch = match store.get_snapshot_metadata()? {
+        Some(existing) if existing.dataset_id == dataset_id => existing.snapshot_epoch,
+        Some(existing) => existing.snapshot_epoch.saturating_add(1),
+        None if registrations.is_empty() => 0,
+        None => 1,
+    };
+    Ok(StoredSnapshotMetadata {
+        dataset_id,
+        snapshot_epoch,
+    })
+}
+
 impl DiscoveryIndexState {
     fn empty(
         chain_id: [u8; 32],
         server_node_id: [u8; 32],
         arity: u32,
+        query_budget_difficulty_bits: u8,
         identity: &NodeIdentity,
     ) -> Result<Self> {
         let manifest = build_manifest(
             chain_id,
             server_node_id,
+            dataset_id_for_registrations(&[])?,
+            0,
             arity,
             0,
+            query_budget_difficulty_bits,
             [0u8; SEED_BYTE_LEN],
             Vec::new(),
             Vec::new(),
@@ -1330,15 +1448,20 @@ impl DiscoveryIndexState {
         chain_id: [u8; 32],
         server_node_id: [u8; 32],
         arity: u32,
+        query_budget_difficulty_bits: u8,
         identity: &NodeIdentity,
         registrations: &[LocatorRegistration],
+        metadata: &StoredSnapshotMetadata,
     ) -> Result<Self> {
         if registrations.is_empty() {
             let manifest = build_manifest(
                 chain_id,
                 server_node_id,
+                metadata.dataset_id,
+                metadata.snapshot_epoch,
                 arity,
                 0,
+                query_budget_difficulty_bits,
                 [0u8; SEED_BYTE_LEN],
                 Vec::new(),
                 Vec::new(),
@@ -1373,8 +1496,11 @@ impl DiscoveryIndexState {
         let manifest = build_manifest(
             chain_id,
             server_node_id,
+            metadata.dataset_id,
+            metadata.snapshot_epoch,
             arity,
             registrations.len() as u64,
+            query_budget_difficulty_bits,
             seed_mu,
             hint_bytes,
             filter_param_bytes,
@@ -1397,6 +1523,7 @@ impl DiscoveryStateStore {
             DISCOVERY_CF_MAILBOX_AUTH,
             DISCOVERY_CF_MAILBOX_REQUEST,
             DISCOVERY_CF_RESPONSE_SLOT,
+            DISCOVERY_CF_META,
         ];
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -1524,6 +1651,50 @@ impl DiscoveryStateStore {
         Ok(self.db.iterator_cf(cf, IteratorMode::Start).count())
     }
 
+    fn get_snapshot_metadata(&self) -> Result<Option<StoredSnapshotMetadata>> {
+        self.get(DISCOVERY_CF_META, DISCOVERY_META_SNAPSHOT)
+    }
+
+    fn put_snapshot_metadata(&self, metadata: &StoredSnapshotMetadata) -> Result<()> {
+        self.put(DISCOVERY_CF_META, DISCOVERY_META_SNAPSHOT, metadata)
+    }
+
+    fn clear_cf(&self, cf_name: &str) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| anyhow!("missing discovery column family '{cf_name}'"))?;
+        let keys = self
+            .db
+            .iterator_cf(cf, IteratorMode::Start)
+            .map(|item| item.map(|(key, _value)| key.to_vec()))
+            .collect::<std::result::Result<Vec<_>, rocksdb::Error>>()?;
+        for key in keys {
+            self.db.delete_cf(cf, key)?;
+        }
+        Ok(())
+    }
+
+    fn replace_snapshot(
+        &self,
+        registrations: &[LocatorRegistration],
+        metadata: &StoredSnapshotMetadata,
+    ) -> Result<()> {
+        self.clear_cf(DISCOVERY_CF_LOCATOR)?;
+        self.clear_cf(DISCOVERY_CF_MAILBOX_AUTH)?;
+        self.clear_cf(DISCOVERY_CF_MAILBOX_REQUEST)?;
+        self.clear_cf(DISCOVERY_CF_RESPONSE_SLOT)?;
+        for registration in registrations {
+            self.put_registration(registration)?;
+            self.put_mailbox_auth(
+                &registration.record.mailbox_id,
+                &registration.mailbox_auth_hash,
+            )?;
+        }
+        self.put_snapshot_metadata(metadata)?;
+        Ok(())
+    }
+
     fn put<T: serde::Serialize>(&self, cf_name: &str, key: &[u8], value: &T) -> Result<()> {
         let cf = self
             .db
@@ -1574,6 +1745,158 @@ impl DiscoveryRequest {
             | DiscoveryRequest::PollHandleResponse { request_id, .. } => *request_id,
         }
     }
+}
+
+pub fn export_snapshot_bundle(
+    identity: &NodeIdentity,
+    state_path: &str,
+    policy: &DiscoveryPolicy,
+) -> Result<DiscoverySnapshotBundle> {
+    let chain_id = identity
+        .record()
+        .chain_id
+        .ok_or_else(|| anyhow!("discovery server node record must be bound to a chain"))?;
+    let store = DiscoveryStateStore::open(state_path)?;
+    let mut registrations = store.list_active_registrations(chain_id)?;
+    registrations.sort_by(|left, right| left.record.locator_id.cmp(&right.record.locator_id));
+    let metadata = next_snapshot_metadata(&store, &registrations)?;
+    let exported_unix_ms = now_unix_ms();
+    let mut bundle = DiscoverySnapshotBundle {
+        version: DISCOVERY_SNAPSHOT_BUNDLE_VERSION,
+        chain_id,
+        source_server_record: identity.record().clone(),
+        dataset_id: metadata.dataset_id,
+        snapshot_epoch: metadata.snapshot_epoch,
+        record_count: registrations.len() as u64,
+        record_bytes: DISCOVERY_RECORD_BYTES as u32,
+        query_budget_difficulty_bits: policy.query_budget_difficulty_bits,
+        exported_unix_ms,
+        registrations,
+        sig: Vec::new(),
+    };
+    bundle.sig = identity.sign_consensus_message(&encode_snapshot_bundle_signable(&bundle)?)?;
+    Ok(bundle)
+}
+
+pub fn import_snapshot_bundle(state_path: &str, bundle: &DiscoverySnapshotBundle) -> Result<()> {
+    verify_snapshot_bundle(bundle)?;
+    let store = DiscoveryStateStore::open(state_path)?;
+    let computed_dataset_id = dataset_id_for_registrations(&bundle.registrations)?;
+    if computed_dataset_id != bundle.dataset_id {
+        bail!("discovery snapshot bundle dataset_id mismatch");
+    }
+    if bundle.record_count != bundle.registrations.len() as u64 {
+        bail!("discovery snapshot bundle record_count mismatch");
+    }
+    if bundle.record_bytes != DISCOVERY_RECORD_BYTES as u32 {
+        bail!("unsupported discovery snapshot record size");
+    }
+    let metadata = StoredSnapshotMetadata {
+        dataset_id: bundle.dataset_id,
+        snapshot_epoch: bundle.snapshot_epoch,
+    };
+    store.replace_snapshot(&bundle.registrations, &metadata)?;
+    Ok(())
+}
+
+pub fn encode_snapshot_bundle(bundle: &DiscoverySnapshotBundle) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(&encode_snapshot_bundle_without_sig(bundle)?)?;
+    writer.write_bytes(&bundle.sig)?;
+    Ok(writer.into_vec())
+}
+
+pub fn decode_snapshot_bundle(bytes: &[u8]) -> Result<DiscoverySnapshotBundle> {
+    let mut reader = CanonicalReader::new(bytes);
+    let body = reader.read_bytes()?;
+    let sig = reader.read_bytes()?;
+    reader.finish()?;
+    let mut body_reader = CanonicalReader::new(&body);
+    let version = body_reader.read_u8()?;
+    let chain_id = body_reader.read_fixed()?;
+    let source_server_record = crate::canonical::decode_node_record(&body_reader.read_bytes()?)?;
+    let dataset_id = body_reader.read_fixed()?;
+    let snapshot_epoch = body_reader.read_u64()?;
+    let record_count = body_reader.read_u64()?;
+    let record_bytes = body_reader.read_u32()?;
+    let query_budget_difficulty_bits = body_reader.read_u8()?;
+    let exported_unix_ms = body_reader.read_u64()?;
+    let registrations = body_reader.read_vec(|reader| {
+        let record = decode_discovery_record(&reader.read_bytes()?)?;
+        let mailbox_auth_hash = reader.read_fixed()?;
+        Ok(LocatorRegistration {
+            record,
+            mailbox_auth_hash,
+        })
+    })?;
+    body_reader.finish()?;
+    Ok(DiscoverySnapshotBundle {
+        version,
+        chain_id,
+        source_server_record,
+        dataset_id,
+        snapshot_epoch,
+        record_count,
+        record_bytes,
+        query_budget_difficulty_bits,
+        exported_unix_ms,
+        registrations,
+        sig,
+    })
+}
+
+fn encode_snapshot_bundle_without_sig(bundle: &DiscoverySnapshotBundle) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_u8(bundle.version);
+    writer.write_fixed(&bundle.chain_id);
+    writer.write_bytes(&crate::canonical::encode_node_record(
+        &bundle.source_server_record,
+    )?)?;
+    writer.write_fixed(&bundle.dataset_id);
+    writer.write_u64(bundle.snapshot_epoch);
+    writer.write_u64(bundle.record_count);
+    writer.write_u32(bundle.record_bytes);
+    writer.write_u8(bundle.query_budget_difficulty_bits);
+    writer.write_u64(bundle.exported_unix_ms);
+    writer.write_vec(&bundle.registrations, |writer, registration| {
+        writer.write_bytes(&encode_discovery_record(&registration.record)?)?;
+        writer.write_fixed(&registration.mailbox_auth_hash);
+        Ok(())
+    })?;
+    Ok(writer.into_vec())
+}
+
+fn encode_snapshot_bundle_signable(bundle: &DiscoverySnapshotBundle) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(DISCOVERY_SNAPSHOT_BUNDLE_DOMAIN.as_bytes())?;
+    writer.write_bytes(&encode_snapshot_bundle_without_sig(bundle)?)?;
+    Ok(writer.into_vec())
+}
+
+fn verify_snapshot_bundle(bundle: &DiscoverySnapshotBundle) -> Result<()> {
+    if bundle.version != DISCOVERY_SNAPSHOT_BUNDLE_VERSION {
+        bail!(
+            "unsupported discovery snapshot bundle version {}",
+            bundle.version
+        );
+    }
+    bundle
+        .source_server_record
+        .validate(bundle.exported_unix_ms)?;
+    if bundle.source_server_record.chain_id != Some(bundle.chain_id) {
+        bail!("discovery snapshot bundle chain_id mismatch");
+    }
+    if bundle.record_count != bundle.registrations.len() as u64 {
+        bail!("discovery snapshot bundle record_count mismatch");
+    }
+    if bundle.record_bytes != DISCOVERY_RECORD_BYTES as u32 {
+        bail!("unsupported discovery snapshot record size");
+    }
+    let signable = encode_snapshot_bundle_signable(bundle)?;
+    UnparsedPublicKey::new(&ML_DSA_65, bundle.source_server_record.auth_spki.as_slice())
+        .verify(&signable, bundle.sig.as_slice())
+        .map_err(|_| anyhow!("discovery snapshot bundle signature verification failed"))?;
+    Ok(())
 }
 
 pub fn discovery_state_path(base_path: &str, configured: Option<&str>) -> String {
@@ -2035,8 +2358,11 @@ fn ensure_request_id(label: &str, expected: [u8; 32], actual: [u8; 32]) -> Resul
 fn build_manifest(
     chain_id: [u8; 32],
     server_node_id: [u8; 32],
+    dataset_id: [u8; 32],
+    snapshot_epoch: u64,
     arity: u32,
     record_count: u64,
+    query_budget_difficulty_bits: u8,
     seed_mu: [u8; SEED_BYTE_LEN],
     hint_bytes: Vec<u8>,
     filter_param_bytes: Vec<u8>,
@@ -2047,9 +2373,12 @@ fn build_manifest(
         version: DISCOVERY_MANIFEST_VERSION,
         chain_id,
         server_node_id,
+        dataset_id,
+        snapshot_epoch,
         arity,
         record_count,
         record_bytes: DISCOVERY_RECORD_BYTES as u32,
+        query_budget_difficulty_bits,
         issued_unix_ms,
         manifest_id: [0u8; 32],
         seed_mu,
@@ -2073,9 +2402,12 @@ fn encode_manifest_without_id(manifest: &DiscoveryManifest) -> Result<Vec<u8>> {
     writer.write_u8(manifest.version);
     writer.write_fixed(&manifest.chain_id);
     writer.write_fixed(&manifest.server_node_id);
+    writer.write_fixed(&manifest.dataset_id);
+    writer.write_u64(manifest.snapshot_epoch);
     writer.write_u32(manifest.arity);
     writer.write_u64(manifest.record_count);
     writer.write_u32(manifest.record_bytes);
+    writer.write_u8(manifest.query_budget_difficulty_bits);
     writer.write_u64(manifest.issued_unix_ms);
     writer.write_fixed(&manifest.seed_mu);
     writer.write_bytes(&manifest.hint_bytes)?;
@@ -2110,9 +2442,12 @@ fn decode_manifest(bytes: &[u8]) -> Result<DiscoveryManifest> {
         version: body_reader.read_u8()?,
         chain_id: body_reader.read_fixed()?,
         server_node_id: body_reader.read_fixed()?,
+        dataset_id: body_reader.read_fixed()?,
+        snapshot_epoch: body_reader.read_u64()?,
         arity: body_reader.read_u32()?,
         record_count: body_reader.read_u64()?,
         record_bytes: body_reader.read_u32()?,
+        query_budget_difficulty_bits: body_reader.read_u8()?,
         issued_unix_ms: body_reader.read_u64()?,
         manifest_id: decoded_manifest_id,
         seed_mu: body_reader.read_fixed()?,
@@ -2154,6 +2489,12 @@ fn ensure_manifest_compatibility(
     if mirror.chain_id != primary.chain_id {
         bail!("discovery replica manifest chain_id mismatch");
     }
+    if mirror.dataset_id != primary.dataset_id {
+        bail!("discovery replica manifest dataset_id mismatch");
+    }
+    if mirror.snapshot_epoch != primary.snapshot_epoch {
+        bail!("discovery replica manifest snapshot_epoch mismatch");
+    }
     if mirror.arity != primary.arity {
         bail!("discovery replica manifest PIR arity mismatch");
     }
@@ -2162,6 +2503,68 @@ fn ensure_manifest_compatibility(
     }
     if mirror.record_bytes != primary.record_bytes {
         bail!("discovery replica manifest record size mismatch");
+    }
+    if mirror.query_budget_difficulty_bits != primary.query_budget_difficulty_bits {
+        bail!("discovery replica query-budget policy mismatch");
+    }
+    Ok(())
+}
+
+fn query_budget_digest(
+    manifest: &DiscoveryManifest,
+    request_id: &[u8; 32],
+    query: &[u8],
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(DISCOVERY_QUERY_BUDGET_DOMAIN);
+    hasher.update(&manifest.chain_id);
+    hasher.update(&manifest.server_node_id);
+    hasher.update(&manifest.dataset_id);
+    hasher.update(&manifest.snapshot_epoch.to_le_bytes());
+    hasher.update(&manifest.manifest_id);
+    hasher.update(request_id);
+    hasher.update(&(query.len() as u64).to_le_bytes());
+    hasher.update(query);
+    hasher.update(nonce);
+    *hasher.finalize().as_bytes()
+}
+
+fn leading_zero_bits(bytes: &[u8]) -> u32 {
+    let mut total = 0u32;
+    for byte in bytes {
+        let zeros = byte.leading_zeros();
+        total = total.saturating_add(zeros);
+        if zeros != 8 {
+            break;
+        }
+    }
+    total
+}
+
+fn compute_query_budget_proof(
+    manifest: &DiscoveryManifest,
+    request_id: &[u8; 32],
+    query: &[u8],
+) -> DiscoveryQueryBudgetProof {
+    let mut nonce = [0u8; 32];
+    loop {
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let digest = query_budget_digest(manifest, request_id, query, &nonce);
+        if leading_zero_bits(&digest) >= manifest.query_budget_difficulty_bits as u32 {
+            return DiscoveryQueryBudgetProof { nonce };
+        }
+    }
+}
+
+fn verify_query_budget_proof(
+    manifest: &DiscoveryManifest,
+    request_id: &[u8; 32],
+    query: &[u8],
+    proof: &DiscoveryQueryBudgetProof,
+) -> Result<()> {
+    let digest = query_budget_digest(manifest, request_id, query, &proof.nonce);
+    if leading_zero_bits(&digest) < manifest.query_budget_difficulty_bits as u32 {
+        bail!("discovery query budget proof is below the configured difficulty");
     }
     Ok(())
 }
@@ -2400,11 +2803,13 @@ fn encode_request(request: &DiscoveryRequest) -> Result<Vec<u8>> {
             request_id,
             manifest_id,
             query,
+            budget_proof,
         } => {
             writer.write_u8(2);
             writer.write_fixed(request_id);
             writer.write_fixed(manifest_id);
             writer.write_bytes(query)?;
+            writer.write_fixed(&budget_proof.nonce);
         }
         DiscoveryRequest::PostMailboxRequest {
             request_id,
@@ -2480,6 +2885,9 @@ fn decode_request(bytes: &[u8]) -> Result<DiscoveryRequest> {
             request_id: reader.read_fixed()?,
             manifest_id: reader.read_fixed()?,
             query: reader.read_bytes()?,
+            budget_proof: DiscoveryQueryBudgetProof {
+                nonce: reader.read_fixed()?,
+            },
         },
         3 => DiscoveryRequest::PostMailboxRequest {
             request_id: reader.read_fixed()?,
@@ -2528,11 +2936,15 @@ fn encode_response(response: &DiscoveryResponse) -> Result<Vec<u8>> {
             writer.write_fixed(request_id);
             writer.write_fixed(&status.chain_id);
             writer.write_fixed(&status.server_node_id);
+            writer.write_fixed(&status.dataset_id);
+            writer.write_u64(status.snapshot_epoch);
             writer.write_fixed(&status.manifest_id);
             writer.write_u64(status.manifest_issued_unix_ms);
             writer.write_u64(status.record_count);
             writer.write_u32(status.record_bytes);
             writer.write_u32(status.pir_arity);
+            writer.write_u8(status.query_budget_difficulty_bits);
+            writer.write_bool(status.allow_mutations);
             writer.write_u64(status.record_ttl_secs);
             writer.write_u64(status.max_request_bytes);
             writer.write_u64(status.max_response_bytes);
@@ -2613,11 +3025,15 @@ fn decode_response(bytes: &[u8]) -> Result<DiscoveryResponse> {
             let request_id = reader.read_fixed()?;
             let chain_id = reader.read_fixed()?;
             let server_node_id = reader.read_fixed()?;
+            let dataset_id = reader.read_fixed()?;
+            let snapshot_epoch = reader.read_u64()?;
             let manifest_id = reader.read_fixed()?;
             let manifest_issued_unix_ms = reader.read_u64()?;
             let record_count = reader.read_u64()?;
             let record_bytes = reader.read_u32()?;
             let pir_arity = reader.read_u32()?;
+            let query_budget_difficulty_bits = reader.read_u8()?;
+            let allow_mutations = reader.read_bool()?;
             let record_ttl_secs = reader.read_u64()?;
             let max_request_bytes = reader.read_u64()?;
             let max_response_bytes = reader.read_u64()?;
@@ -2636,11 +3052,15 @@ fn decode_response(bytes: &[u8]) -> Result<DiscoveryResponse> {
                 status: DiscoveryServerStatus {
                     chain_id,
                     server_node_id,
+                    dataset_id,
+                    snapshot_epoch,
                     manifest_id,
                     manifest_issued_unix_ms,
                     record_count,
                     record_bytes,
                     pir_arity,
+                    query_budget_difficulty_bits,
+                    allow_mutations,
                     record_ttl_secs,
                     max_request_bytes,
                     max_response_bytes,
@@ -3003,7 +3423,10 @@ mod tests {
         let manifest = build_manifest(
             chain_id,
             identity.node_id(),
+            dataset_id_for_registrations(&[])?,
+            0,
             4,
+            0,
             0,
             [0u8; SEED_BYTE_LEN],
             Vec::new(),
@@ -3287,6 +3710,11 @@ mod tests {
         let initial_status = client.fetch_status().await?;
         assert_eq!(initial_status.chain_id, chain_id);
         assert_eq!(initial_status.server_node_id, identity.node_id());
+        assert_eq!(
+            initial_status.dataset_id,
+            dataset_id_for_registrations(&[])?
+        );
+        assert_eq!(initial_status.snapshot_epoch, 0);
         assert_eq!(initial_status.record_count, 0);
         assert_eq!(initial_status.active_locator_count, 0);
         assert_eq!(initial_status.pending_mailbox_requests, 0);
@@ -3300,6 +3728,8 @@ mod tests {
             initial_status.record_ttl_secs,
             DiscoveryPolicy::default().record_ttl.as_secs()
         );
+        assert_eq!(initial_status.query_budget_difficulty_bits, 0);
+        assert!(initial_status.allow_mutations);
 
         let owner_key = crypto::ml_dsa_65_generate()?;
         let owner_pk = crypto::ml_dsa_65_public_key(&owner_key);
@@ -3357,6 +3787,7 @@ mod tests {
         assert_eq!(status.active_locator_count, 1);
         assert_eq!(status.pending_mailbox_requests, 1);
         assert_eq!(status.pending_handle_responses, 1);
+        assert_eq!(status.snapshot_epoch, 1);
         assert_eq!(
             status.next_locator_expiry_unix_ms,
             Some(record.expires_unix_ms)
@@ -3368,9 +3799,268 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn request_handle_returns_amount_bound_invoice() -> Result<()> {
+    async fn pir_query_budget_proof_is_enforced() -> Result<()> {
         let tempdir = TempDir::new()?;
         let chain_id = [15u8; 32];
+        let listen_addr = unused_loopback_addr()?;
+        let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
+        let state_path = tempdir.path().join("discovery-state");
+        let policy = DiscoveryPolicy {
+            query_budget_difficulty_bits: 8,
+            ..DiscoveryPolicy::default()
+        };
+        let server = DiscoveryServer::bind(
+            &identity,
+            listen_addr,
+            &state_path.to_string_lossy(),
+            policy.clone(),
+        )?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let server_task = tokio::spawn(server.serve(shutdown_rx));
+
+        let client = DiscoveryClient::new(
+            identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let owner_key = crypto::ml_dsa_65_generate()?;
+        let owner_pk = crypto::ml_dsa_65_public_key(&owner_key);
+        let owner_pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&owner_key)?;
+        let locator = locator_from_signing_pk(&owner_pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[71u8; 32], &chain_id, &locator_id);
+        let (_mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            mailbox_kem_pk,
+            offline_receive,
+            Duration::from_secs(300),
+        )?;
+        client.publish_record(&record, &mailbox_auth_token).await?;
+
+        let manifest = client.fetch_manifest().await?;
+        assert_eq!(
+            manifest.query_budget_difficulty_bits,
+            policy.query_budget_difficulty_bits
+        );
+        let mut pir_client = PirClient::setup(
+            &manifest.seed_mu,
+            &manifest.hint_bytes,
+            &manifest.filter_param_bytes,
+        )
+        .map_err(|err| anyhow!("failed to initialize discovery PIR client: {err:?}"))?;
+        let query = pir_client
+            .query(&locator_id)
+            .map_err(|err| anyhow!("failed to build discovery PIR query: {err:?}"))?;
+
+        let invalid_request_id = random_request_id();
+        let mut mismatched_request_id = random_request_id();
+        if mismatched_request_id == invalid_request_id {
+            mismatched_request_id[0] ^= 0x01;
+        }
+        let mismatched_proof =
+            compute_query_budget_proof(&manifest, &mismatched_request_id, &query);
+        let invalid_response = client
+            .exchange_request_to_record(
+                DiscoveryRequest::PirQuery {
+                    request_id: invalid_request_id,
+                    manifest_id: manifest.manifest_id,
+                    query: query.clone(),
+                    budget_proof: mismatched_proof,
+                },
+                identity.record(),
+            )
+            .await?;
+        match invalid_response {
+            DiscoveryResponse::Error {
+                request_id,
+                message,
+            } => {
+                ensure_request_id(
+                    "invalid query-budget request",
+                    invalid_request_id,
+                    request_id,
+                )?;
+                assert!(message.contains("budget proof"));
+            }
+            other => bail!(
+                "expected invalid query-budget response, got {}",
+                response_tag(&other)
+            ),
+        }
+
+        let valid_request_id = random_request_id();
+        let valid_response = client
+            .exchange_request_to_record(
+                DiscoveryRequest::PirQuery {
+                    request_id: valid_request_id,
+                    manifest_id: manifest.manifest_id,
+                    query: query.clone(),
+                    budget_proof: compute_query_budget_proof(&manifest, &valid_request_id, &query),
+                },
+                identity.record(),
+            )
+            .await?;
+        let response_bytes = match valid_response {
+            DiscoveryResponse::Pir {
+                request_id,
+                response,
+            } => {
+                ensure_request_id("valid query-budget request", valid_request_id, request_id)?;
+                response
+            }
+            other => bail!("expected PIR response, got {}", response_tag(&other)),
+        };
+        let encoded_record = pir_client
+            .process_response(&locator_id, &response_bytes)
+            .map_err(|_| anyhow!("locator not found"))?;
+        let resolved = decode_pir_record(&encoded_record)?;
+        assert_eq!(resolved, record);
+
+        let _ = shutdown_tx.send(());
+        server_task.await.map_err(|err| anyhow!(err))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_bundle_rolls_out_query_only_mirror() -> Result<()> {
+        let primary_dir = TempDir::new()?;
+        let mirror_dir = TempDir::new()?;
+        let chain_id = [16u8; 32];
+        let primary_addr = unused_loopback_addr()?;
+        let mirror_addr = unused_loopback_addr()?;
+        let primary_identity = test_runtime_identity(primary_dir.path(), chain_id, primary_addr)?;
+        let mirror_identity = test_runtime_identity(mirror_dir.path(), chain_id, mirror_addr)?;
+        let primary_state_path = primary_dir.path().join("discovery-state");
+        let primary_policy = DiscoveryPolicy {
+            query_budget_difficulty_bits: 6,
+            ..DiscoveryPolicy::default()
+        };
+
+        let primary_server = DiscoveryServer::bind(
+            &primary_identity,
+            primary_addr,
+            &primary_state_path.to_string_lossy(),
+            primary_policy.clone(),
+        )?;
+        let (primary_shutdown_tx, primary_shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let primary_task = tokio::spawn(primary_server.serve(primary_shutdown_rx));
+        let primary_client = DiscoveryClient::new(
+            primary_identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let owner_key = crypto::ml_dsa_65_generate()?;
+        let owner_pk = crypto::ml_dsa_65_public_key(&owner_key);
+        let owner_pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&owner_key)?;
+        let locator = locator_from_signing_pk(&owner_pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[81u8; 32], &chain_id, &locator_id);
+        let (_mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            mailbox_kem_pk,
+            offline_receive,
+            Duration::from_secs(300),
+        )?;
+        primary_client
+            .publish_record(&record, &mailbox_auth_token)
+            .await?;
+        let _ = primary_client.resolve_locator(&locator).await?;
+
+        let _ = primary_shutdown_tx.send(());
+        primary_task.await.map_err(|err| anyhow!(err))??;
+
+        let bundle = export_snapshot_bundle(
+            &primary_identity,
+            &primary_state_path.to_string_lossy(),
+            &primary_policy,
+        )?;
+        let bundle = decode_snapshot_bundle(&encode_snapshot_bundle(&bundle)?)?;
+
+        let mirror_state_path = mirror_dir.path().join("discovery-state");
+        import_snapshot_bundle(&mirror_state_path.to_string_lossy(), &bundle)?;
+
+        let mirror_policy = DiscoveryPolicy {
+            query_budget_difficulty_bits: bundle.query_budget_difficulty_bits,
+            allow_mutations: false,
+            ..DiscoveryPolicy::default()
+        };
+        let mirror_server = DiscoveryServer::bind(
+            &mirror_identity,
+            mirror_addr,
+            &mirror_state_path.to_string_lossy(),
+            mirror_policy,
+        )?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mirror_task = tokio::spawn(mirror_server.serve(shutdown_rx));
+
+        let mirror_client = DiscoveryClient::new(
+            mirror_identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let mirror_manifest = mirror_client.fetch_manifest().await?;
+        assert_eq!(bundle.dataset_id, mirror_manifest.dataset_id);
+        assert_eq!(bundle.snapshot_epoch, mirror_manifest.snapshot_epoch);
+        assert_eq!(
+            bundle.query_budget_difficulty_bits,
+            mirror_manifest.query_budget_difficulty_bits
+        );
+        let mirror_status = mirror_client.fetch_status().await?;
+        assert!(!mirror_status.allow_mutations);
+
+        let resolved = mirror_client.resolve_locator(&locator).await?;
+        assert_eq!(resolved, record);
+
+        let err = mirror_client
+            .publish_record(&record, &mailbox_auth_token)
+            .await
+            .expect_err("query-only mirror should reject publishes");
+        assert!(err.to_string().contains("query-only"));
+
+        let _ = shutdown_tx.send(());
+        mirror_task.await.map_err(|err| anyhow!(err))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_handle_returns_amount_bound_invoice() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let chain_id = [17u8; 32];
         let listen_addr = unused_loopback_addr()?;
         let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
         let state_path = tempdir.path().join("discovery-state");

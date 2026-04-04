@@ -1464,19 +1464,20 @@ fn validate_transfer_against_journal(
         let epoch_zero_empty_history = current_epoch == 0
             && binding.historical_from_epoch == 0
             && binding.historical_through_epoch == 0
-            && binding.historical_accumulator_image_id == [0u32; 8]
+            && binding.historical_accumulator_verifier_key_commitment == [0u8; 32]
             && binding.historical_root_digest == empty_historical_digest;
         let references_historical_accumulator = !epoch_zero_empty_history
             && binding.historical_from_epoch <= binding.historical_through_epoch;
         if references_historical_accumulator
-            && binding.historical_accumulator_image_id != proof::checkpoint_accumulator_image_id()
+            && binding.historical_accumulator_verifier_key_commitment
+                != proof::checkpoint_accumulator_verifier_key_commitment()
         {
-            bail!("historical accumulator method mismatch");
+            bail!("historical accumulator verifier key mismatch");
         }
         if !references_historical_accumulator
-            && binding.historical_accumulator_image_id != [0u32; 8]
+            && binding.historical_accumulator_verifier_key_commitment != [0u8; 32]
         {
-            bail!("empty historical range must not reference an accumulator method");
+            bail!("empty historical range must not reference an accumulator verifier key");
         }
         let expected_digest = if epoch_zero_empty_history {
             empty_historical_digest
@@ -2118,7 +2119,7 @@ mod tests {
             historical_root_digest: proof_core::checkpoint_accumulator_historical_digest_from_pairs(
                 &[],
             ),
-            historical_accumulator_image_id: [0u32; 8],
+            historical_accumulator_verifier_key_commitment: [0u8; 32],
         }];
         let output_bindings = vec![proof::output_binding(&transfer.outputs[0])];
         validate_transfer_against_journal(

@@ -5,8 +5,11 @@ fn main() {
     let witness: proof_core::ProofPrivateUndelegationWitness = env::read();
     for input in &witness.shielded.inputs {
         if let Some(accumulator) = input.historical_accumulator.as_ref() {
+            let verifier_hint = input
+                .historical_accumulator_verifier_hint
+                .expect("missing historical accumulator verifier hint");
             let journal = to_vec(accumulator).expect("serialize checkpoint accumulator journal");
-            env::verify(accumulator.accumulator_image_id, journal.as_slice())
+            env::verify(verifier_hint, journal.as_slice())
                 .expect("invalid checkpoint accumulator receipt");
         }
     }

@@ -39,6 +39,8 @@ use crate::{
 
 const TRANSPARENT_PROOF_VERSION: u8 = 1;
 pub const MIN_TRANSPARENT_PROOF_SECURITY_BITS: u16 = 128;
+const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str =
+    "unchained-transparent-verifier-key-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransparentProofStatement {
@@ -61,7 +63,7 @@ pub enum TransparentProofBackend {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransparentSealEncoding {
-    BincodeRisc0Receipt,
+    OpaqueSealBytesV1,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +130,7 @@ static VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS: Lazy<
 > = Lazy::new(|| Mutex::new(HashMap::new()));
 
 struct TransparentBackendBinding {
+    verifier_key_commitment: [u8; 32],
     method_id: [u32; 8],
     elf: &'static [u8],
 }
@@ -140,6 +143,25 @@ fn configured_backend_for_circuit(_circuit: TransparentCircuit) -> TransparentPr
     TransparentProofBackend::PrototypeRisc0StarkV1
 }
 
+fn verifier_key_commitment_from_method_id(method_id: [u32; 8]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(
+        TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN.len() + std::mem::size_of_val(&method_id),
+    );
+    bytes.extend_from_slice(TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN.as_bytes());
+    for word in method_id {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    crate::crypto::blake3_hash(&bytes)
+}
+
+fn backend_binding(method_id: [u32; 8], elf: &'static [u8]) -> TransparentBackendBinding {
+    TransparentBackendBinding {
+        verifier_key_commitment: verifier_key_commitment_from_method_id(method_id),
+        method_id,
+        elf,
+    }
+}
+
 fn transparent_backend_binding(
     circuit: TransparentCircuit,
     backend: TransparentProofBackend,
@@ -148,37 +170,24 @@ fn transparent_backend_binding(
         (
             TransparentCircuit::OrdinaryTransferV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => TransparentBackendBinding {
-            method_id: SHIELDED_SPEND_METHOD_ID,
-            elf: SHIELDED_SPEND_METHOD_ELF,
-        },
+        ) => backend_binding(SHIELDED_SPEND_METHOD_ID, SHIELDED_SPEND_METHOD_ELF),
         (
             TransparentCircuit::PrivateDelegationV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => TransparentBackendBinding {
-            method_id: PRIVATE_DELEGATION_METHOD_ID,
-            elf: PRIVATE_DELEGATION_METHOD_ELF,
-        },
+        ) => backend_binding(PRIVATE_DELEGATION_METHOD_ID, PRIVATE_DELEGATION_METHOD_ELF),
         (
             TransparentCircuit::PrivateUndelegationV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => TransparentBackendBinding {
-            method_id: PRIVATE_UNDELEGATION_METHOD_ID,
-            elf: PRIVATE_UNDELEGATION_METHOD_ELF,
-        },
-        (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) => {
-            TransparentBackendBinding {
-                method_id: UNBONDING_CLAIM_METHOD_ID,
-                elf: UNBONDING_CLAIM_METHOD_ELF,
-            }
-        }
+        ) => backend_binding(PRIVATE_UNDELEGATION_METHOD_ID, PRIVATE_UNDELEGATION_METHOD_ELF),
+        (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) =>
+            backend_binding(UNBONDING_CLAIM_METHOD_ID, UNBONDING_CLAIM_METHOD_ELF),
         (
             TransparentCircuit::CheckpointAccumulatorV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => TransparentBackendBinding {
-            method_id: CHECKPOINT_ACCUMULATOR_METHOD_ID,
-            elf: CHECKPOINT_ACCUMULATOR_METHOD_ELF,
-        },
+        ) => backend_binding(
+            CHECKPOINT_ACCUMULATOR_METHOD_ID,
+            CHECKPOINT_ACCUMULATOR_METHOD_ELF,
+        ),
     };
     Ok(binding)
 }
@@ -292,7 +301,7 @@ pub fn transparent_backend_descriptor(
             backend,
             proof_family: TransparentProofFamily::Stark,
             target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
-            seal_encoding: TransparentSealEncoding::BincodeRisc0Receipt,
+            seal_encoding: TransparentSealEncoding::OpaqueSealBytesV1,
             name: "prototype-risc0-stark-v1",
         },
     }
@@ -827,7 +836,8 @@ pub fn prove_checkpoint_accumulator(
         }
         let env = builder
             .write(&CheckpointAccumulatorStepWitness {
-                accumulator_image_id: binding.method_id,
+                accumulator_verifier_key_commitment: binding.verifier_key_commitment,
+                accumulator_verifier_hint: binding.method_id,
                 note_commitment: checkpoint.note_commitment,
                 birth_epoch: checkpoint.birth_epoch,
                 prior_accumulator: prior_journal.clone(),
@@ -886,10 +896,16 @@ fn verify_checkpoint_accumulator_seal_bytes(bytes: &[u8]) -> Result<CheckpointAc
     decode_checkpoint_accumulator_journal(&receipt)
 }
 
-pub fn checkpoint_accumulator_image_id() -> [u32; 8] {
+pub fn checkpoint_accumulator_verifier_hint() -> [u32; 8] {
     configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)
         .expect("configured checkpoint accumulator backend binding")
         .method_id
+}
+
+pub fn checkpoint_accumulator_verifier_key_commitment() -> [u8; 32] {
+    configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)
+        .expect("configured checkpoint accumulator backend binding")
+        .verifier_key_commitment
 }
 
 pub fn output_binding(output: &ShieldedOutput) -> ProofShieldedOutputBinding {
@@ -972,12 +988,18 @@ pub fn input_witness_from_local(
     historical_accumulator: Option<&CheckpointAccumulatorProof>,
     current_nullifier: &[u8; 32],
 ) -> ProofShieldedInputWitness {
+    let historical_accumulator_verifier_hint = historical_accumulator.map(|proof| {
+        backend_binding_for_proof(&proof.proof)
+            .expect("checkpoint accumulator proof must use the configured backend")
+            .method_id
+    });
     ProofShieldedInputWitness {
         note: note_to_proof(note),
         note_key: *note_key,
         membership_proof: membership_proof_to_proof(membership_proof),
         historical_checkpoint: checkpoint_to_proof(historical_checkpoint),
         historical_accumulator: historical_accumulator.map(|proof| proof.journal.clone()),
+        historical_accumulator_verifier_hint,
         historical_accumulator_receipt: historical_accumulator
             .map(|proof| proof.proof.seal.clone()),
         current_nullifier: *current_nullifier,
