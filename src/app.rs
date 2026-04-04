@@ -42,7 +42,7 @@ struct CommonArgs {
     version,
     about = "Unchained node runtime",
     long_about = "Run the Unchained network node, bootstrap identity, manage network-facing maintenance tasks, own canonical chain state, and host the local node control plane for wallet and validator-facing services.",
-    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node start\n"
+    after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node discovery-status --json\n  unchained_node start\n"
 )]
 struct NodeCli {
     #[command(flatten)]
@@ -58,7 +58,7 @@ struct NodeCli {
     version,
     about = "Unchained wallet runtime",
     long_about = "Operate the Unchained shielded wallet service, publish a PIR-resolvable receive locator, mint one-time invoice capabilities for merchant-style flows, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start the required network services, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
-    after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet invoice\n  unchained_wallet send --to <LOCATOR> --amount 100\n  unchained_wallet send --invoice <RECIPIENT_INVOICE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
+    after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet receive-rotate\n  unchained_wallet receive-compromise\n  unchained_wallet resolve --locator <LOCATOR>\n  unchained_wallet request-handle --locator <LOCATOR> --amount 100\n  unchained_wallet invoice --amount 100\n  unchained_wallet send --to <LOCATOR> --amount 100\n  unchained_wallet send --invoice <RECIPIENT_INVOICE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -139,6 +139,8 @@ enum NodeCmd {
     StartProofAssistant,
     /// Start the PIR-backed discovery and mailbox service
     StartDiscovery,
+    /// Query the live discovery service for manifest and queue status
+    DiscoveryStatus(DiscoveryStatusArgs),
     /// Re-gossip all transactions from local DB
     ReplayTransactions,
     /// Export all anchors into a compressed snapshot file
@@ -176,6 +178,12 @@ struct SendArgs {
 }
 
 #[derive(Args, Clone, Default)]
+struct DiscoveryStatusArgs {
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone, Default)]
 struct BalanceArgs {
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -195,6 +203,34 @@ struct SubmitControlArgs {
     document: String,
     #[arg(long, default_value_t = false)]
     json: bool,
+}
+
+#[derive(Args, Clone)]
+struct InvoiceArgs {
+    #[arg(long)]
+    amount: Option<u64>,
+    #[command(flatten)]
+    output: ReceiveArgs,
+}
+
+#[derive(Args, Clone)]
+struct ResolveArgs {
+    #[arg(long)]
+    locator: String,
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Args, Clone)]
+struct RequestHandleArgs {
+    #[arg(long)]
+    locator: String,
+    #[arg(long)]
+    amount: u64,
+    #[arg(long, default_value_t = 15)]
+    timeout_secs: u64,
+    #[command(flatten)]
+    output: ReceiveArgs,
 }
 
 #[derive(Args, Clone)]
@@ -255,8 +291,16 @@ enum WalletCmd {
     Serve,
     /// Publish and print the PIR-resolvable receive locator
     Receive(ReceiveArgs),
+    /// Force-rotate the ordinary offline receive capability and republish the locator
+    ReceiveRotate(ReceiveArgs),
+    /// Mark the current ordinary offline receive capability compromised, rotate it, and republish the locator
+    ReceiveCompromise(ReceiveArgs),
+    /// Resolve a locator through PIR and print the authenticated discovery record summary
+    Resolve(ResolveArgs),
+    /// Request a one-time negotiated recipient handle for a policy-bound receive flow
+    RequestHandle(RequestHandleArgs),
     /// Mint and print a one-time invoice capability for merchant-style direct payment
-    Invoice(ReceiveArgs),
+    Invoice(InvoiceArgs),
     /// Send coins using a receive locator or an explicit invoice capability
     Send(SendArgs),
     /// Submit a signed fee-paid shared-state control document through the running wallet
@@ -386,6 +430,12 @@ async fn open_wallet_control_client(
     let client = wallet_control::WalletControlClient::new(&cfg.storage.path);
     client.ping().await?;
     Ok(client)
+}
+
+async fn try_open_wallet_control_client(
+    cfg: &config::Config,
+) -> Option<wallet_control::WalletControlClient> {
+    open_wallet_control_client(cfg).await.ok()
 }
 
 fn published_identity_addresses(cfg: &config::Config) -> Vec<String> {
@@ -635,12 +685,43 @@ fn build_wallet_discovery_client(
             );
         }
     }
+    let mut mirrors = Vec::new();
+    for mirror in &cfg.discovery.wallet.mirrors {
+        let mirror = mirror.trim();
+        if mirror.is_empty() {
+            continue;
+        }
+        let mirror_record = load_validated_service_record(mirror, "discovery mirror")?;
+        let mirror_chain_id = mirror_record
+            .chain_id
+            .ok_or_else(|| anyhow!("discovery mirror node record must be bound to a chain"))?;
+        if mirror_chain_id != chain_id {
+            bail!(
+                "discovery mirror node record is bound to chain {}, expected {}",
+                hex::encode(mirror_chain_id),
+                hex::encode(chain_id),
+            );
+        }
+        mirrors.push(mirror_record);
+    }
     Ok(Some(discovery::DiscoveryClient::new(
         record,
+        mirrors,
         cfg.discovery.wallet.max_request_bytes,
         cfg.discovery.wallet.max_response_bytes,
         Duration::from_secs(cfg.discovery.wallet.submit_timeout_secs),
     )?))
+}
+
+fn build_local_discovery_status_client(cfg: &config::Config) -> Result<discovery::DiscoveryClient> {
+    let identity = load_runtime_identity(cfg)?;
+    discovery::DiscoveryClient::new(
+        identity.record().clone(),
+        Vec::new(),
+        cfg.discovery.server.max_request_bytes,
+        cfg.discovery.server.max_response_bytes,
+        Duration::from_secs(cfg.discovery.server.submit_timeout_secs),
+    )
 }
 
 fn wallet_cover_traffic_enabled(cfg: &config::Config) -> bool {
@@ -820,7 +901,7 @@ fn print_peer_id_output(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
-fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<bool> {
+async fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<bool> {
     match cmd {
         NodeCmd::InitRoot { out } => {
             let (node_id, root_info) = node_identity::init_root_in_dir(&cfg.storage.path)?;
@@ -888,6 +969,20 @@ fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<b
         }
         NodeCmd::PeerId => {
             print_peer_id_output(cfg)?;
+            Ok(true)
+        }
+        NodeCmd::DiscoveryStatus(args) => {
+            let client = build_local_discovery_status_client(cfg)?;
+            let status = client.fetch_status().await.map_err(|err| {
+                anyhow!(
+                    "failed to query the local discovery service. Start `unchained_node start-discovery` first: {err}"
+                )
+            })?;
+            let state_path = discovery::discovery_state_path(
+                &cfg.storage.path,
+                cfg.discovery.server.state_path.as_deref(),
+            );
+            print_discovery_status_output(&state_path, &status, args)?;
             Ok(true)
         }
         NodeCmd::ValidatorRegisterDoc(args) => {
@@ -1189,6 +1284,111 @@ fn print_shareable_output(
     Ok(())
 }
 
+fn print_locator_resolution_output(
+    locator: &str,
+    record: &discovery::DiscoveryRecord,
+    verified_servers: usize,
+    args: &ResolveArgs,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "locator": locator,
+                "chain_id": hex::encode(record.chain_id),
+                "locator_id": hex::encode(record.locator_id),
+                "mailbox_id": hex::encode(record.mailbox_id),
+                "owner_signing_pk": record.owner_signing_pk,
+                "mailbox_kem_pk": record.mailbox_kem_pk,
+                "offline_receive": {
+                    "scan_kem_pk": record.offline_receive.scan_kem_pk,
+                    "asset_policy": record.offline_receive.asset_policy,
+                    "policy_flags": record.offline_receive.policy_flags,
+                    "issued_unix_ms": record.offline_receive.issued_unix_ms,
+                    "expires_unix_ms": record.offline_receive.expires_unix_ms,
+                },
+                "verified_servers": verified_servers,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Resolved Locator");
+    println!();
+    println!("Locator: {locator}");
+    println!("Verified servers: {verified_servers}");
+    println!("Chain ID: {}", hex::encode(record.chain_id));
+    println!("Mailbox ID: {}", hex::encode(record.mailbox_id));
+    println!(
+        "Offline receive expires: {}",
+        record.offline_receive.expires_unix_ms
+    );
+    Ok(())
+}
+
+fn print_discovery_status_output(
+    state_path: &str,
+    status: &discovery::DiscoveryServerStatus,
+    args: &DiscoveryStatusArgs,
+) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "state_path": state_path,
+                "chain_id": hex::encode(status.chain_id),
+                "server_node_id": hex::encode(status.server_node_id),
+                "manifest_id": hex::encode(status.manifest_id),
+                "manifest_issued_unix_ms": status.manifest_issued_unix_ms,
+                "record_count": status.record_count,
+                "record_bytes": status.record_bytes,
+                "pir_arity": status.pir_arity,
+                "record_ttl_secs": status.record_ttl_secs,
+                "max_request_bytes": status.max_request_bytes,
+                "max_response_bytes": status.max_response_bytes,
+                "max_pending_requests": status.max_pending_requests,
+                "max_pending_responses": status.max_pending_responses,
+                "active_locator_count": status.active_locator_count,
+                "next_locator_expiry_unix_ms": status.next_locator_expiry_unix_ms,
+                "pending_mailbox_requests": status.pending_mailbox_requests,
+                "pending_handle_responses": status.pending_handle_responses,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Discovery Status");
+    println!();
+    println!("State path: {state_path}");
+    println!("Server node ID: {}", hex::encode(status.server_node_id));
+    println!("Chain ID: {}", hex::encode(status.chain_id));
+    println!("Manifest ID: {}", hex::encode(status.manifest_id));
+    println!("Manifest issued: {}", status.manifest_issued_unix_ms);
+    println!("Record count: {}", status.record_count);
+    println!("Record bytes: {}", status.record_bytes);
+    println!("PIR arity: {}", status.pir_arity);
+    println!("Record TTL secs: {}", status.record_ttl_secs);
+    println!("Active locators: {}", status.active_locator_count);
+    println!(
+        "Next locator expiry: {}",
+        status
+            .next_locator_expiry_unix_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!(
+        "Pending mailbox requests: {} / {}",
+        status.pending_mailbox_requests, status.max_pending_requests
+    );
+    println!(
+        "Pending handle responses: {} / {}",
+        status.pending_handle_responses, status.max_pending_responses
+    );
+    println!("Max request bytes: {}", status.max_request_bytes);
+    println!("Max response bytes: {}", status.max_response_bytes);
+    Ok(())
+}
+
 fn print_balance_output(state: &wallet::WalletObservedState, args: &BalanceArgs) -> Result<()> {
     let balance = state.balance;
     let outputs = state.spendable_outputs;
@@ -1282,7 +1482,7 @@ pub async fn run_node_cli() -> Result<()> {
     let cfg = load_config(&cli.common.config)?;
     apply_quiet_logging(&cli.common, &cfg);
 
-    if handle_node_operator_command(&cli.cmd, &cfg)? {
+    if handle_node_operator_command(&cli.cmd, &cfg).await? {
         return Ok(());
     }
 
@@ -1451,6 +1651,7 @@ pub async fn run_node_cli() -> Result<()> {
         | NodeCmd::TrustReplace { .. }
         | NodeCmd::TrustApprove { .. }
         | NodeCmd::PeerId
+        | NodeCmd::DiscoveryStatus(..)
         | NodeCmd::ValidatorRegisterDoc(..)
         | NodeCmd::ValidatorProfileDoc(..)
         | NodeCmd::ValidatorReactivateDoc(..)
@@ -1615,10 +1816,88 @@ pub async fn run_wallet_cli() -> Result<()> {
             print_shareable_output("Receive Locator", "locator", &locator, &args)?;
             Ok(())
         }
+        WalletCmd::ReceiveRotate(args) => {
+            let client = open_wallet_control_client(&cfg).await?;
+            let locator = client.rotate_locator().await?;
+            print_shareable_output("Rotated Receive Locator", "locator", &locator, &args)?;
+            Ok(())
+        }
+        WalletCmd::ReceiveCompromise(args) => {
+            let client = open_wallet_control_client(&cfg).await?;
+            let locator = client.compromise_rotate_locator().await?;
+            print_shareable_output(
+                "Compromised Receive Locator Reissued",
+                "locator",
+                &locator,
+                &args,
+            )?;
+            Ok(())
+        }
+        WalletCmd::Resolve(args) => {
+            if let Some(client) = try_open_wallet_control_client(&cfg).await {
+                match client.resolve_locator(&args.locator).await {
+                    Ok((record, replica_count)) => {
+                        print_locator_resolution_output(
+                            &args.locator,
+                            &record,
+                            replica_count,
+                            &args,
+                        )?;
+                        return Ok(());
+                    }
+                    Err(err)
+                        if err
+                            .to_string()
+                            .contains("wallet discovery client is not configured") => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            let discovery_client = build_wallet_discovery_client(&cfg, None)?
+                .ok_or_else(|| anyhow!("resolve requires [discovery.wallet].server"))?;
+            let record = discovery_client.resolve_locator(&args.locator).await?;
+            print_locator_resolution_output(
+                &args.locator,
+                &record,
+                discovery_client.mirror_count() + 1,
+                &args,
+            )?;
+            Ok(())
+        }
+        WalletCmd::RequestHandle(args) => {
+            let timeout = Duration::from_secs(args.timeout_secs.max(1));
+            if let Some(client) = try_open_wallet_control_client(&cfg).await {
+                match client
+                    .request_handle(&args.locator, args.amount, timeout)
+                    .await
+                {
+                    Ok(invoice) => {
+                        print_shareable_output(
+                            "Negotiated Handle",
+                            "invoice",
+                            &invoice,
+                            &args.output,
+                        )?;
+                        return Ok(());
+                    }
+                    Err(err)
+                        if err
+                            .to_string()
+                            .contains("wallet discovery client is not configured") => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            let discovery_client = build_wallet_discovery_client(&cfg, None)?
+                .ok_or_else(|| anyhow!("request-handle requires [discovery.wallet].server"))?;
+            let invoice = discovery_client
+                .request_handle(&args.locator, args.amount, timeout)
+                .await?;
+            print_shareable_output("Negotiated Handle", "invoice", &invoice, &args.output)?;
+            Ok(())
+        }
         WalletCmd::Invoice(args) => {
             let client = open_wallet_control_client(&cfg).await?;
-            let invoice = client.mint_invoice().await?;
-            print_shareable_output("Invoice", "invoice", &invoice, &args)?;
+            let invoice = client.mint_invoice(args.amount).await?;
+            print_shareable_output("Invoice", "invoice", &invoice, &args.output)?;
             Ok(())
         }
         WalletCmd::Balance(args) => {

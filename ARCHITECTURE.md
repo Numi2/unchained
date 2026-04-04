@@ -435,6 +435,11 @@ Ordinary locator payments use that descriptor directly:
 This gives Unchained the asynchronous payment property it needs for ordinary
 wallet-to-wallet sends without exposing a reusable public payment address.
 
+Wallets must support explicit offline-descriptor rotation and compromise
+rotation. Retired or compromised descriptor keys may remain locally scannable
+for a bounded retention window, but only the currently active descriptor may be
+republished in discovery.
+
 ### Handle Negotiation
 
 Discovery also yields encrypted mailbox material.

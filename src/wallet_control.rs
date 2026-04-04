@@ -1,5 +1,6 @@
 use crate::{
     crypto::{Address, TaggedSigningPublicKey},
+    discovery::DiscoveryRecord,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     node_control::NodeControlStateEnvelope,
     storage::wallet_store_path,
@@ -32,7 +33,19 @@ pub enum WalletControlRequest {
     SubscribeState,
     ForceSync,
     ReceiveLocator,
-    MintInvoice,
+    RotateLocator,
+    CompromiseRotateLocator,
+    ResolveLocator {
+        locator: String,
+    },
+    RequestHandle {
+        locator: String,
+        amount: u64,
+        timeout_secs: u64,
+    },
+    MintInvoice {
+        amount: Option<u64>,
+    },
     DeriveGenesisLockSecret {
         coin_id: [u8; 32],
         chain_id: [u8; 32],
@@ -50,12 +63,28 @@ pub enum WalletControlRequest {
 pub enum WalletControlResponse {
     Pong,
     Synced,
-    Locator { locator: String },
-    Invoice { invoice: String },
-    GenesisLockSecret { secret: [u8; 32] },
-    Sent { outcome: SendOutcome },
-    Submitted { outcome: SendOutcome },
-    Error { message: String },
+    Locator {
+        locator: String,
+    },
+    ResolvedLocator {
+        record: DiscoveryRecord,
+        replica_count: usize,
+    },
+    Invoice {
+        invoice: String,
+    },
+    GenesisLockSecret {
+        secret: [u8; 32],
+    },
+    Sent {
+        outcome: SendOutcome,
+    },
+    Submitted {
+        outcome: SendOutcome,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,10 +221,47 @@ impl WalletControlClient {
         }
     }
 
-    pub async fn mint_invoice(&self) -> Result<String> {
-        match self.call(WalletControlRequest::MintInvoice).await? {
+    pub async fn mint_invoice(&self, amount: Option<u64>) -> Result<String> {
+        match self
+            .call(WalletControlRequest::MintInvoice { amount })
+            .await?
+        {
             WalletControlResponse::Invoice { invoice } => Ok(invoice),
             other => bail!("unexpected wallet control invoice response: {other:?}"),
+        }
+    }
+
+    pub async fn resolve_locator(&self, locator: &str) -> Result<(DiscoveryRecord, usize)> {
+        match self
+            .call(WalletControlRequest::ResolveLocator {
+                locator: locator.to_string(),
+            })
+            .await?
+        {
+            WalletControlResponse::ResolvedLocator {
+                record,
+                replica_count,
+            } => Ok((record, replica_count)),
+            other => bail!("unexpected wallet control resolve-locator response: {other:?}"),
+        }
+    }
+
+    pub async fn request_handle(
+        &self,
+        locator: &str,
+        amount: u64,
+        timeout: Duration,
+    ) -> Result<String> {
+        match self
+            .call(WalletControlRequest::RequestHandle {
+                locator: locator.to_string(),
+                amount,
+                timeout_secs: timeout.as_secs().max(1),
+            })
+            .await?
+        {
+            WalletControlResponse::Invoice { invoice } => Ok(invoice),
+            other => bail!("unexpected wallet control request-handle response: {other:?}"),
         }
     }
 
@@ -203,6 +269,25 @@ impl WalletControlClient {
         match self.call(WalletControlRequest::ReceiveLocator).await? {
             WalletControlResponse::Locator { locator } => Ok(locator),
             other => bail!("unexpected wallet control locator response: {other:?}"),
+        }
+    }
+
+    pub async fn rotate_locator(&self) -> Result<String> {
+        match self.call(WalletControlRequest::RotateLocator).await? {
+            WalletControlResponse::Locator { locator } => Ok(locator),
+            other => bail!("unexpected wallet control rotate-locator response: {other:?}"),
+        }
+    }
+
+    pub async fn compromise_rotate_locator(&self) -> Result<String> {
+        match self
+            .call(WalletControlRequest::CompromiseRotateLocator)
+            .await?
+        {
+            WalletControlResponse::Locator { locator } => Ok(locator),
+            other => {
+                bail!("unexpected wallet control compromise-rotate-locator response: {other:?}")
+            }
         }
     }
 
@@ -509,14 +594,44 @@ impl WalletControlService {
         Ok(())
     }
 
-    async fn mint_invoice(&self) -> Result<String> {
+    async fn mint_invoice(&self, amount: Option<u64>) -> Result<String> {
         let _guard = self.op_lock.lock().await;
-        self.wallet.mint_invoice()
+        self.wallet.mint_invoice_with_amount(amount)
     }
 
     async fn receive_locator(&self) -> Result<String> {
         let _guard = self.op_lock.lock().await;
         self.wallet.publish_locator(Duration::from_secs(3600)).await
+    }
+
+    async fn resolve_locator(&self, locator: &str) -> Result<(DiscoveryRecord, usize)> {
+        let _guard = self.op_lock.lock().await;
+        let record = self.wallet.resolve_locator_record(locator).await?;
+        Ok((record, self.wallet.discovery_replica_count()))
+    }
+
+    async fn request_handle(
+        &self,
+        locator: &str,
+        amount: u64,
+        timeout: Duration,
+    ) -> Result<String> {
+        let _guard = self.op_lock.lock().await;
+        self.wallet
+            .request_amount_bound_handle(locator, amount, timeout)
+            .await
+    }
+
+    async fn rotate_locator(&self) -> Result<String> {
+        let _guard = self.op_lock.lock().await;
+        self.wallet.rotate_locator(Duration::from_secs(3600)).await
+    }
+
+    async fn compromise_rotate_locator(&self) -> Result<String> {
+        let _guard = self.op_lock.lock().await;
+        self.wallet
+            .compromise_rotate_locator(Duration::from_secs(3600))
+            .await
     }
 
     async fn send(&self, target: PaymentTarget, amount: u64) -> Result<SendOutcome> {
@@ -767,11 +882,33 @@ async fn handle_request(
                 let _ = state_refresh_tx.send(());
                 Ok(WalletControlResponse::Synced)
             }
+            WalletControlRequest::ResolveLocator { locator } => {
+                let (record, replica_count) = service.resolve_locator(&locator).await?;
+                Ok(WalletControlResponse::ResolvedLocator {
+                    record,
+                    replica_count,
+                })
+            }
+            WalletControlRequest::RequestHandle {
+                locator,
+                amount,
+                timeout_secs,
+            } => Ok(WalletControlResponse::Invoice {
+                invoice: service
+                    .request_handle(&locator, amount, Duration::from_secs(timeout_secs.max(1)))
+                    .await?,
+            }),
             WalletControlRequest::ReceiveLocator => Ok(WalletControlResponse::Locator {
                 locator: service.receive_locator().await?,
             }),
-            WalletControlRequest::MintInvoice => Ok(WalletControlResponse::Invoice {
-                invoice: service.mint_invoice().await?,
+            WalletControlRequest::RotateLocator => Ok(WalletControlResponse::Locator {
+                locator: service.rotate_locator().await?,
+            }),
+            WalletControlRequest::CompromiseRotateLocator => Ok(WalletControlResponse::Locator {
+                locator: service.compromise_rotate_locator().await?,
+            }),
+            WalletControlRequest::MintInvoice { amount } => Ok(WalletControlResponse::Invoice {
+                invoice: service.mint_invoice(amount).await?,
             }),
             WalletControlRequest::DeriveGenesisLockSecret { coin_id, chain_id } => {
                 Ok(WalletControlResponse::GenesisLockSecret {

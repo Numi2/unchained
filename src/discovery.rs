@@ -1,7 +1,7 @@
 use crate::{
     canonical::{
-        decode_recipient_handle, encode_recipient_handle, read_tagged_kem_public_key,
-        read_tagged_signing_public_key, write_tagged_kem_public_key,
+        decode_recipient_handle, encode_recipient_handle, encode_recipient_handle_signable,
+        read_tagged_kem_public_key, read_tagged_signing_public_key, write_tagged_kem_public_key,
         write_tagged_signing_public_key, CanonicalReader, CanonicalWriter,
     },
     crypto::{
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 const DISCOVERY_ALPN: &[u8] = b"unchained-discovery/v1";
@@ -56,15 +56,19 @@ const DISCOVERY_MESSAGE_AEAD_DOMAIN: &str = "unchained-discovery-message-aead-v1
 const DISCOVERY_MANIFEST_ID_DOMAIN: &str = "unchained-discovery-manifest-id-v1";
 const DISCOVERY_MANIFEST_SIG_DOMAIN: &str = "unchained-discovery-manifest-sig-v1";
 const DISCOVERY_STORE_DIR: &str = "discovery_service";
-const DISCOVERY_RECORD_BYTES: usize = 8192;
+// Discovery rows must fit a full signed wallet record carrying mailbox bootstrap
+// material plus a signed offline receive descriptor.
+const DISCOVERY_RECORD_BYTES: usize = 16 * 1024;
 const DISCOVERY_REQUEST_PLAINTEXT_BYTES: usize = 2048;
 const DISCOVERY_RESPONSE_PLAINTEXT_BYTES: usize = 8192;
-const DISCOVERY_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
-const DISCOVERY_CONNECTION_WINDOW_BYTES: u32 = 64 * 1024 * 1024;
-const DISCOVERY_SEND_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+const DISCOVERY_STREAM_WINDOW_BYTES: u32 = 64 * 1024 * 1024;
+const DISCOVERY_CONNECTION_WINDOW_BYTES: u32 = 256 * 1024 * 1024;
+const DISCOVERY_SEND_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
 const DISCOVERY_IDLE_TIMEOUT_SECS: u64 = 30;
 const DISCOVERY_KEEP_ALIVE_SECS: u64 = 5;
 const DISCOVERY_HEADER_BYTES: usize = 1 + 32 + 32 + ML_KEM_768_CT_BYTES + 24;
+const DISCOVERY_HANDLE_REQUEST_TTL_MS: u64 = 15_000;
+const DISCOVERY_HANDLE_POLL_INTERVAL_MS: u64 = 250;
 const DISCOVERY_CF_LOCATOR: &str = "locator_record";
 const DISCOVERY_CF_MAILBOX_AUTH: &str = "mailbox_auth";
 const DISCOVERY_CF_MAILBOX_REQUEST: &str = "mailbox_request";
@@ -169,7 +173,7 @@ impl Default for DiscoveryPolicy {
             record_ttl: Duration::from_secs(3600),
             submit_timeout: Duration::from_secs(10),
             max_request_bytes: 4 * 1024 * 1024,
-            max_response_bytes: 32 * 1024 * 1024,
+            max_response_bytes: 128 * 1024 * 1024,
             max_pending_requests: 4096,
             max_pending_responses: 4096,
             pir_arity: 4,
@@ -177,10 +181,31 @@ impl Default for DiscoveryPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryServerStatus {
+    pub chain_id: [u8; 32],
+    pub server_node_id: [u8; 32],
+    pub manifest_id: [u8; 32],
+    pub manifest_issued_unix_ms: u64,
+    pub record_count: u64,
+    pub record_bytes: u32,
+    pub pir_arity: u32,
+    pub record_ttl_secs: u64,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+    pub max_pending_requests: u64,
+    pub max_pending_responses: u64,
+    pub active_locator_count: u64,
+    pub next_locator_expiry_unix_ms: Option<u64>,
+    pub pending_mailbox_requests: u64,
+    pub pending_handle_responses: u64,
+}
+
 #[derive(Clone)]
 pub struct DiscoveryClient {
     endpoint: Arc<Endpoint>,
     server_record: NodeRecordV2,
+    mirror_records: Vec<NodeRecordV2>,
     submit_timeout: Duration,
     max_request_bytes: usize,
     max_response_bytes: usize,
@@ -233,6 +258,9 @@ enum DiscoveryRequest {
     FetchManifest {
         request_id: [u8; 32],
     },
+    FetchStatus {
+        request_id: [u8; 32],
+    },
     PublishRecord {
         request_id: [u8; 32],
         record: Vec<u8>,
@@ -273,6 +301,10 @@ enum DiscoveryResponse {
     Manifest {
         request_id: [u8; 32],
         manifest: Vec<u8>,
+    },
+    Status {
+        request_id: [u8; 32],
+        status: DiscoveryServerStatus,
     },
     Published {
         request_id: [u8; 32],
@@ -400,6 +432,7 @@ impl OfflineReceiveDescriptor {
 impl DiscoveryClient {
     pub fn new(
         server_record: NodeRecordV2,
+        mirror_records: Vec<NodeRecordV2>,
         max_request_bytes: usize,
         max_response_bytes: usize,
         submit_timeout: Duration,
@@ -410,6 +443,19 @@ impl DiscoveryClient {
         let _ = chain_id;
         let expected = ExpectedPeerStore::new();
         expected.remember(&server_record);
+        for record in &mirror_records {
+            let mirror_chain_id = record
+                .chain_id
+                .ok_or_else(|| anyhow!("discovery mirror node record must be bound to a chain"))?;
+            if mirror_chain_id != chain_id {
+                bail!(
+                    "discovery mirror node record is bound to chain {}, expected {}",
+                    hex::encode(mirror_chain_id),
+                    hex::encode(chain_id),
+                );
+            }
+            expected.remember(record);
+        }
         let rustls_client = build_client_config_with_alpn(None, expected, DISCOVERY_ALPN)?;
         let transport_config = discovery_transport_config()?;
         let mut endpoint = Endpoint::client(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))?;
@@ -420,6 +466,7 @@ impl DiscoveryClient {
         Ok(Self {
             endpoint: Arc::new(endpoint),
             server_record,
+            mirror_records,
             submit_timeout,
             max_request_bytes,
             max_response_bytes,
@@ -432,10 +479,56 @@ impl DiscoveryClient {
             .ok_or_else(|| anyhow!("discovery node record must be bound to a chain"))
     }
 
+    pub fn mirror_count(&self) -> usize {
+        self.mirror_records.len()
+    }
+
     pub async fn fetch_manifest(&self) -> Result<DiscoveryManifest> {
+        let manifest = self.fetch_manifest_from_record(&self.server_record).await?;
+        for mirror in &self.mirror_records {
+            let mirror_manifest = self.fetch_manifest_from_record(mirror).await?;
+            ensure_manifest_compatibility(&manifest, &mirror_manifest)?;
+        }
+        Ok(manifest)
+    }
+
+    pub async fn fetch_status(&self) -> Result<DiscoveryServerStatus> {
         let request_id = random_request_id();
         let response = self
-            .exchange_request(DiscoveryRequest::FetchManifest { request_id })
+            .exchange_request(DiscoveryRequest::FetchStatus { request_id })
+            .await?;
+        match response {
+            DiscoveryResponse::Status {
+                request_id: echoed_request_id,
+                status,
+            } => {
+                ensure_request_id("discovery status", request_id, echoed_request_id)?;
+                Ok(status)
+            }
+            DiscoveryResponse::Error {
+                request_id: echoed_request_id,
+                message,
+            } => {
+                ensure_request_id("discovery status", request_id, echoed_request_id)?;
+                bail!("discovery status fetch failed: {message}");
+            }
+            other => bail!(
+                "unexpected discovery status response: {}",
+                response_tag(&other)
+            ),
+        }
+    }
+
+    async fn fetch_manifest_from_record(
+        &self,
+        server_record: &NodeRecordV2,
+    ) -> Result<DiscoveryManifest> {
+        let request_id = random_request_id();
+        let response = self
+            .exchange_request_to_record(
+                DiscoveryRequest::FetchManifest { request_id },
+                server_record,
+            )
             .await?;
         match response {
             DiscoveryResponse::Manifest {
@@ -444,11 +537,15 @@ impl DiscoveryClient {
             } => {
                 ensure_request_id("discovery manifest", request_id, echoed_request_id)?;
                 let manifest = decode_manifest(&manifest)?;
-                verify_manifest_signature(&manifest, &self.server_record.auth_spki)?;
-                if manifest.chain_id != self.chain_id()? {
+                verify_manifest_signature(&manifest, &server_record.auth_spki)?;
+                if manifest.chain_id
+                    != server_record
+                        .chain_id
+                        .ok_or_else(|| anyhow!("discovery node record must be bound to a chain"))?
+                {
                     bail!("discovery manifest chain_id mismatch");
                 }
-                if manifest.server_node_id != self.server_record.node_id {
+                if manifest.server_node_id != server_record.node_id {
                     bail!("discovery manifest server_node_id mismatch");
                 }
                 if manifest.record_bytes != DISCOVERY_RECORD_BYTES as u32 {
@@ -509,7 +606,26 @@ impl DiscoveryClient {
 
     pub async fn resolve_locator(&self, locator: &str) -> Result<DiscoveryRecord> {
         let locator_id = parse_locator(locator)?;
-        let manifest = self.fetch_manifest().await?;
+        let primary = self
+            .resolve_locator_from_record(&self.server_record, &locator_id)
+            .await?;
+        for mirror in &self.mirror_records {
+            let mirrored = self
+                .resolve_locator_from_record(mirror, &locator_id)
+                .await?;
+            if mirrored != primary {
+                bail!("discovery replica returned a locator record inconsistent with the primary");
+            }
+        }
+        Ok(primary)
+    }
+
+    async fn resolve_locator_from_record(
+        &self,
+        server_record: &NodeRecordV2,
+        locator_id: &[u8; 32],
+    ) -> Result<DiscoveryRecord> {
+        let manifest = self.fetch_manifest_from_record(server_record).await?;
         if manifest.record_count == 0 {
             bail!("locator not found");
         }
@@ -520,15 +636,18 @@ impl DiscoveryClient {
         )
         .map_err(|err| anyhow!("failed to initialize discovery PIR client: {err:?}"))?;
         let query = client
-            .query(&locator_id)
+            .query(locator_id)
             .map_err(|err| anyhow!("failed to build discovery PIR query: {err:?}"))?;
         let request_id = random_request_id();
         let response = self
-            .exchange_request(DiscoveryRequest::PirQuery {
-                request_id,
-                manifest_id: manifest.manifest_id,
-                query,
-            })
+            .exchange_request_to_record(
+                DiscoveryRequest::PirQuery {
+                    request_id,
+                    manifest_id: manifest.manifest_id,
+                    query,
+                },
+                server_record,
+            )
             .await?;
         let response_bytes = match response {
             DiscoveryResponse::Pir {
@@ -551,11 +670,79 @@ impl DiscoveryClient {
             ),
         };
         let encoded_record = client
-            .process_response(&locator_id, &response_bytes)
+            .process_response(locator_id, &response_bytes)
             .map_err(|_| anyhow!("locator not found"))?;
         let record = decode_pir_record(&encoded_record)?;
-        record.validate(&locator_id, &manifest.chain_id)?;
+        record.validate(locator_id, &manifest.chain_id)?;
         Ok(record)
+    }
+
+    pub async fn request_handle(
+        &self,
+        locator: &str,
+        requested_amount: u64,
+        timeout: Duration,
+    ) -> Result<String> {
+        let record = self.resolve_locator(locator).await?;
+        let request_timeout = timeout.max(Duration::from_millis(DISCOVERY_HANDLE_POLL_INTERVAL_MS));
+        let now = now_unix_ms();
+        let request_ttl_ms = (request_timeout.as_millis() as u64).clamp(
+            DISCOVERY_HANDLE_POLL_INTERVAL_MS,
+            DISCOVERY_HANDLE_REQUEST_TTL_MS,
+        );
+        let request_id = random_request_id();
+        let response_slot_id = random_request_id();
+        let response_auth_token = response_slot_auth_token();
+        let (response_kem_sk, response_kem_pk) = crypto::ml_kem_768_generate();
+        let response_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&response_kem_sk);
+        let request = HandleRequestPlaintext {
+            version: DISCOVERY_MAILBOX_REQUEST_VERSION,
+            chain_id: record.chain_id,
+            locator_id: record.locator_id,
+            request_id,
+            response_slot_id,
+            response_auth_token,
+            response_kem_pk,
+            requested_amount,
+            issued_unix_ms: now,
+            expires_unix_ms: now.saturating_add(request_ttl_ms),
+        };
+        let envelope = seal_handle_request(&request, &record.mailbox_kem_pk)?;
+        self.post_mailbox_request(
+            record.mailbox_id,
+            response_slot_id,
+            response_auth_token,
+            envelope,
+        )
+        .await?;
+        let deadline = Instant::now() + request_timeout;
+        loop {
+            if let Some(response_envelope) = self
+                .poll_handle_response(response_slot_id, response_auth_token)
+                .await?
+            {
+                let response = open_handle_response(&response_envelope, &response_kem_sk)?;
+                if response.chain_id != record.chain_id {
+                    bail!("discovery handle response chain_id mismatch");
+                }
+                if response.locator_id != record.locator_id {
+                    bail!("discovery handle response locator_id mismatch");
+                }
+                if response.request_id != request_id {
+                    bail!("discovery handle response request_id mismatch");
+                }
+                validate_recipient_handle(&response.handle, record.chain_id)?;
+                if response.handle.requested_amount != Some(requested_amount) {
+                    bail!("discovery handle response amount constraint mismatch");
+                }
+                return serde_json::to_string(&response.handle)
+                    .context("serialize negotiated recipient handle");
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for negotiated recipient handle");
+            }
+            time::sleep(Duration::from_millis(DISCOVERY_HANDLE_POLL_INTERVAL_MS)).await;
+        }
     }
 
     pub async fn post_mailbox_request(
@@ -728,14 +915,18 @@ impl DiscoveryClient {
         }
     }
 
-    async fn exchange_request(&self, request: DiscoveryRequest) -> Result<DiscoveryResponse> {
-        let envelope =
-            seal_request_to_server(&request, &self.server_record, self.max_request_bytes)?;
+    async fn exchange_request_to_record(
+        &self,
+        request: DiscoveryRequest,
+        server_record: &NodeRecordV2,
+    ) -> Result<DiscoveryResponse> {
+        let request_label = request_tag(&request);
+        let envelope = seal_request_to_server(&request, server_record, self.max_request_bytes)?;
         let connection = time::timeout(
             self.submit_timeout,
             self.endpoint.connect(
-                self.server_record.primary_address()?,
-                &self.server_record.server_name(),
+                server_record.primary_address()?,
+                &server_record.server_name(),
             )?,
         )
         .await
@@ -752,8 +943,18 @@ impl DiscoveryClient {
         let response_bytes = recv
             .read_to_end(self.max_response_bytes)
             .await
-            .context("discovery failed while waiting for response")?;
+            .with_context(|| {
+                format!(
+                    "discovery {request_label} failed while waiting for response (limit {} bytes)",
+                    self.max_response_bytes
+                )
+            })?;
         decode_response(&response_bytes)
+    }
+
+    async fn exchange_request(&self, request: DiscoveryRequest) -> Result<DiscoveryResponse> {
+        self.exchange_request_to_record(request, &self.server_record)
+            .await
     }
 }
 
@@ -869,6 +1070,10 @@ impl DiscoveryServer {
                     manifest: encode_manifest(&manifest)?,
                 })
             }
+            DiscoveryRequest::FetchStatus { request_id } => Ok(DiscoveryResponse::Status {
+                request_id,
+                status: self.status()?,
+            }),
             DiscoveryRequest::PublishRecord {
                 request_id,
                 record,
@@ -1045,6 +1250,40 @@ impl DiscoveryServer {
             bail!("invalid mailbox auth token");
         }
         Ok(())
+    }
+
+    fn status(&self) -> Result<DiscoveryServerStatus> {
+        let registrations = self.store.list_active_registrations(self.chain_id)?;
+        let pending_mailbox_requests = self.store.count_cf(DISCOVERY_CF_MAILBOX_REQUEST)? as u64;
+        let pending_handle_responses = self.store.count_cf(DISCOVERY_CF_RESPONSE_SLOT)? as u64;
+        let next_locator_expiry_unix_ms = registrations
+            .iter()
+            .map(|registration| registration.record.expires_unix_ms)
+            .min();
+        let manifest = self
+            .index
+            .read()
+            .map_err(|_| anyhow!("discovery index lock poisoned"))?
+            .manifest
+            .clone();
+        Ok(DiscoveryServerStatus {
+            chain_id: self.chain_id,
+            server_node_id: self.server_node_id,
+            manifest_id: manifest.manifest_id,
+            manifest_issued_unix_ms: manifest.issued_unix_ms,
+            record_count: manifest.record_count,
+            record_bytes: manifest.record_bytes,
+            pir_arity: self.policy.pir_arity,
+            record_ttl_secs: self.policy.record_ttl.as_secs(),
+            max_request_bytes: self.policy.max_request_bytes as u64,
+            max_response_bytes: self.policy.max_response_bytes as u64,
+            max_pending_requests: self.policy.max_pending_requests as u64,
+            max_pending_responses: self.policy.max_pending_responses as u64,
+            active_locator_count: registrations.len() as u64,
+            next_locator_expiry_unix_ms,
+            pending_mailbox_requests,
+            pending_handle_responses,
+        })
     }
 
     fn refresh_index(&self) -> Result<()> {
@@ -1326,6 +1565,7 @@ impl DiscoveryRequest {
     fn request_id(&self) -> [u8; 32] {
         match self {
             DiscoveryRequest::FetchManifest { request_id }
+            | DiscoveryRequest::FetchStatus { request_id }
             | DiscoveryRequest::PublishRecord { request_id, .. }
             | DiscoveryRequest::PirQuery { request_id, .. }
             | DiscoveryRequest::PostMailboxRequest { request_id, .. }
@@ -1762,12 +2002,26 @@ pub fn open_handle_response(
 fn response_tag(response: &DiscoveryResponse) -> &'static str {
     match response {
         DiscoveryResponse::Manifest { .. } => "manifest",
+        DiscoveryResponse::Status { .. } => "status",
         DiscoveryResponse::Published { .. } => "published",
         DiscoveryResponse::Pir { .. } => "pir",
         DiscoveryResponse::MailboxMessages { .. } => "mailbox_messages",
         DiscoveryResponse::Posted { .. } => "posted",
         DiscoveryResponse::HandleResponse { .. } => "handle_response",
         DiscoveryResponse::Error { .. } => "error",
+    }
+}
+
+fn request_tag(request: &DiscoveryRequest) -> &'static str {
+    match request {
+        DiscoveryRequest::FetchManifest { .. } => "manifest",
+        DiscoveryRequest::FetchStatus { .. } => "status",
+        DiscoveryRequest::PublishRecord { .. } => "publish",
+        DiscoveryRequest::PirQuery { .. } => "pir_query",
+        DiscoveryRequest::PostMailboxRequest { .. } => "post_mailbox_request",
+        DiscoveryRequest::PollMailbox { .. } => "poll_mailbox",
+        DiscoveryRequest::PostHandleResponse { .. } => "post_handle_response",
+        DiscoveryRequest::PollHandleResponse { .. } => "poll_handle_response",
     }
 }
 
@@ -1890,6 +2144,48 @@ fn verify_manifest_signature(manifest: &DiscoveryManifest, auth_spki: &[u8]) -> 
     UnparsedPublicKey::new(&ML_DSA_65, auth_spki)
         .verify(&signable, manifest.sig.as_slice())
         .map_err(|_| anyhow!("discovery manifest signature verification failed"))?;
+    Ok(())
+}
+
+fn ensure_manifest_compatibility(
+    primary: &DiscoveryManifest,
+    mirror: &DiscoveryManifest,
+) -> Result<()> {
+    if mirror.chain_id != primary.chain_id {
+        bail!("discovery replica manifest chain_id mismatch");
+    }
+    if mirror.arity != primary.arity {
+        bail!("discovery replica manifest PIR arity mismatch");
+    }
+    if mirror.record_count != primary.record_count {
+        bail!("discovery replica manifest record_count mismatch");
+    }
+    if mirror.record_bytes != primary.record_bytes {
+        bail!("discovery replica manifest record size mismatch");
+    }
+    Ok(())
+}
+
+fn validate_recipient_handle(handle: &RecipientHandle, chain_id: [u8; 32]) -> Result<()> {
+    if handle.chain_id != chain_id {
+        bail!("recipient handle chain_id mismatch");
+    }
+    if handle.expires_unix_ms <= handle.issued_unix_ms {
+        bail!("recipient handle expiration must be after issuance");
+    }
+    if now_unix_ms() >= handle.expires_unix_ms {
+        bail!("recipient handle has expired");
+    }
+    let msg = encode_recipient_handle_signable(
+        &handle.chain_id,
+        &handle.signing_pk,
+        &handle.receive_key_id,
+        &handle.kem_pk,
+        handle.requested_amount,
+        handle.issued_unix_ms,
+        handle.expires_unix_ms,
+    )?;
+    handle.signing_pk.verify(&msg, &handle.sig)?;
     Ok(())
 }
 
@@ -2086,6 +2382,10 @@ fn encode_request(request: &DiscoveryRequest) -> Result<Vec<u8>> {
             writer.write_u8(0);
             writer.write_fixed(request_id);
         }
+        DiscoveryRequest::FetchStatus { request_id } => {
+            writer.write_u8(7);
+            writer.write_fixed(request_id);
+        }
         DiscoveryRequest::PublishRecord {
             request_id,
             record,
@@ -2168,6 +2468,9 @@ fn decode_request(bytes: &[u8]) -> Result<DiscoveryRequest> {
         0 => DiscoveryRequest::FetchManifest {
             request_id: reader.read_fixed()?,
         },
+        7 => DiscoveryRequest::FetchStatus {
+            request_id: reader.read_fixed()?,
+        },
         1 => DiscoveryRequest::PublishRecord {
             request_id: reader.read_fixed()?,
             record: reader.read_bytes()?,
@@ -2219,6 +2522,29 @@ fn encode_response(response: &DiscoveryResponse) -> Result<Vec<u8>> {
             writer.write_u8(0);
             writer.write_fixed(request_id);
             writer.write_bytes(manifest)?;
+        }
+        DiscoveryResponse::Status { request_id, status } => {
+            writer.write_u8(7);
+            writer.write_fixed(request_id);
+            writer.write_fixed(&status.chain_id);
+            writer.write_fixed(&status.server_node_id);
+            writer.write_fixed(&status.manifest_id);
+            writer.write_u64(status.manifest_issued_unix_ms);
+            writer.write_u64(status.record_count);
+            writer.write_u32(status.record_bytes);
+            writer.write_u32(status.pir_arity);
+            writer.write_u64(status.record_ttl_secs);
+            writer.write_u64(status.max_request_bytes);
+            writer.write_u64(status.max_response_bytes);
+            writer.write_u64(status.max_pending_requests);
+            writer.write_u64(status.max_pending_responses);
+            writer.write_u64(status.active_locator_count);
+            writer.write_bool(status.next_locator_expiry_unix_ms.is_some());
+            if let Some(next_locator_expiry_unix_ms) = status.next_locator_expiry_unix_ms {
+                writer.write_u64(next_locator_expiry_unix_ms);
+            }
+            writer.write_u64(status.pending_mailbox_requests);
+            writer.write_u64(status.pending_handle_responses);
         }
         DiscoveryResponse::Published { request_id } => {
             writer.write_u8(1);
@@ -2283,6 +2609,50 @@ fn decode_response(bytes: &[u8]) -> Result<DiscoveryResponse> {
             request_id: reader.read_fixed()?,
             manifest: reader.read_bytes()?,
         },
+        7 => {
+            let request_id = reader.read_fixed()?;
+            let chain_id = reader.read_fixed()?;
+            let server_node_id = reader.read_fixed()?;
+            let manifest_id = reader.read_fixed()?;
+            let manifest_issued_unix_ms = reader.read_u64()?;
+            let record_count = reader.read_u64()?;
+            let record_bytes = reader.read_u32()?;
+            let pir_arity = reader.read_u32()?;
+            let record_ttl_secs = reader.read_u64()?;
+            let max_request_bytes = reader.read_u64()?;
+            let max_response_bytes = reader.read_u64()?;
+            let max_pending_requests = reader.read_u64()?;
+            let max_pending_responses = reader.read_u64()?;
+            let active_locator_count = reader.read_u64()?;
+            let next_locator_expiry_unix_ms = if reader.read_bool()? {
+                Some(reader.read_u64()?)
+            } else {
+                None
+            };
+            let pending_mailbox_requests = reader.read_u64()?;
+            let pending_handle_responses = reader.read_u64()?;
+            DiscoveryResponse::Status {
+                request_id,
+                status: DiscoveryServerStatus {
+                    chain_id,
+                    server_node_id,
+                    manifest_id,
+                    manifest_issued_unix_ms,
+                    record_count,
+                    record_bytes,
+                    pir_arity,
+                    record_ttl_secs,
+                    max_request_bytes,
+                    max_response_bytes,
+                    max_pending_requests,
+                    max_pending_responses,
+                    active_locator_count,
+                    next_locator_expiry_unix_ms,
+                    pending_mailbox_requests,
+                    pending_handle_responses,
+                },
+            }
+        }
         1 => DiscoveryResponse::Published {
             request_id: reader.read_fixed()?,
         },
@@ -2448,6 +2818,37 @@ mod tests {
     use crate::{crypto, node_identity, protocol::CURRENT};
     use tempfile::TempDir;
 
+    fn unused_loopback_addr() -> Result<std::net::SocketAddr> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        Ok(addr)
+    }
+
+    fn test_runtime_identity(
+        base_dir: &std::path::Path,
+        chain_id: [u8; 32],
+        listen_addr: std::net::SocketAddr,
+    ) -> Result<crate::node_identity::NodeIdentity> {
+        let address = listen_addr.to_string();
+        let _ = node_identity::init_root_in_dir(base_dir)?;
+        let (_, request) = node_identity::prepare_auth_request_in_dir(
+            base_dir,
+            CURRENT.version,
+            Some(chain_id),
+            vec![address.clone()],
+            None,
+        )?;
+        let (_, record) = node_identity::sign_auth_request_in_dir(base_dir, &request, 30)?;
+        let _ = node_identity::install_node_record_in_dir(base_dir, &record)?;
+        crate::node_identity::NodeIdentity::load_runtime_in_dir(
+            base_dir,
+            CURRENT.version,
+            Some(chain_id),
+            vec![address],
+        )
+    }
+
     #[test]
     fn locator_roundtrip_is_stable() -> Result<()> {
         let key = crypto::ml_dsa_65_generate()?;
@@ -2559,6 +2960,7 @@ mod tests {
             signing_pk: record.owner_signing_pk.clone(),
             receive_key_id: [6u8; 32],
             kem_pk: request_pk.clone(),
+            requested_amount: Some(42),
             issued_unix_ms: 30,
             expires_unix_ms: 40,
             sig: vec![1, 2, 3],
@@ -2615,6 +3017,471 @@ mod tests {
         let mut tampered = decoded.clone();
         tampered.sig[0] ^= 0x01;
         assert!(verify_manifest_signature(&tampered, &identity.record().auth_spki).is_err());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_publish_resolve_and_mailbox_flow_end_to_end() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let chain_id = [12u8; 32];
+        let listen_addr = unused_loopback_addr()?;
+        let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
+        let state_path = tempdir.path().join("discovery-state");
+        let server = DiscoveryServer::bind(
+            &identity,
+            listen_addr,
+            &state_path.to_string_lossy(),
+            DiscoveryPolicy::default(),
+        )?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let server_task = tokio::spawn(server.serve(shutdown_rx));
+
+        let client = DiscoveryClient::new(
+            identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let key = crypto::ml_dsa_65_generate()?;
+        let pk = crypto::ml_dsa_65_public_key(&key);
+        let pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&key)?;
+        let locator = locator_from_signing_pk(&pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[44u8; 32], &chain_id, &locator_id);
+        let (mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let mailbox_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&mailbox_kem_sk);
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &pkcs8,
+            &pk,
+            chain_id,
+            mailbox_kem_pk.clone(),
+            offline_receive,
+            Duration::from_secs(300),
+        )?;
+        client.publish_record(&record, &mailbox_auth_token).await?;
+
+        let resolved = client.resolve_locator(&locator).await?;
+        assert_eq!(resolved, record);
+
+        let (response_kem_sk, response_kem_pk) = crypto::ml_kem_768_generate();
+        let response_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&response_kem_sk);
+        let response_slot_id = [21u8; 32];
+        let response_auth_token = [22u8; 32];
+        let handle_request = HandleRequestPlaintext {
+            version: DISCOVERY_MAILBOX_REQUEST_VERSION,
+            chain_id,
+            locator_id,
+            request_id: [23u8; 32],
+            response_slot_id,
+            response_auth_token,
+            response_kem_pk: response_kem_pk.clone(),
+            requested_amount: 55,
+            issued_unix_ms: now_unix_ms(),
+            expires_unix_ms: now_unix_ms().saturating_add(60_000),
+        };
+        let request_envelope = seal_handle_request(&handle_request, &record.mailbox_kem_pk)?;
+        client
+            .post_mailbox_request(
+                record.mailbox_id,
+                response_slot_id,
+                response_auth_token,
+                request_envelope,
+            )
+            .await?;
+        let messages = client
+            .poll_mailbox(record.mailbox_id, mailbox_auth_token, 8)
+            .await?;
+        assert_eq!(messages.len(), 1);
+        let opened_request = open_handle_request(&messages[0].envelope, &mailbox_kem_sk)?;
+        assert_eq!(opened_request, handle_request);
+
+        let handle = RecipientHandle {
+            chain_id,
+            signing_pk: record.owner_signing_pk.clone(),
+            receive_key_id: [24u8; 32],
+            kem_pk: response_kem_pk.clone(),
+            requested_amount: Some(55),
+            issued_unix_ms: now_unix_ms(),
+            expires_unix_ms: now_unix_ms().saturating_add(60_000),
+            sig: vec![1, 2, 3],
+        };
+        let handle_response = HandleResponsePlaintext {
+            version: DISCOVERY_MAILBOX_RESPONSE_VERSION,
+            chain_id,
+            locator_id,
+            request_id: handle_request.request_id,
+            handle: handle.clone(),
+            issued_unix_ms: now_unix_ms(),
+        };
+        let response_envelope = seal_handle_response(&handle_response, &response_kem_pk)?;
+        client
+            .post_handle_response(response_slot_id, response_auth_token, response_envelope)
+            .await?;
+        let polled_response = client
+            .poll_handle_response(response_slot_id, response_auth_token)
+            .await?
+            .ok_or_else(|| anyhow!("missing handle response envelope"))?;
+        let opened_response = open_handle_response(&polled_response, &response_kem_sk)?;
+        assert_eq!(opened_response, handle_response);
+
+        let _ = shutdown_tx.send(());
+        server_task.await.map_err(|err| anyhow!(err))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mirrored_resolution_detects_inconsistent_records() -> Result<()> {
+        let primary_dir = TempDir::new()?;
+        let mirror_dir = TempDir::new()?;
+        let chain_id = [13u8; 32];
+        let primary_addr = unused_loopback_addr()?;
+        let mirror_addr = unused_loopback_addr()?;
+        let primary_identity = test_runtime_identity(primary_dir.path(), chain_id, primary_addr)?;
+        let mirror_identity = test_runtime_identity(mirror_dir.path(), chain_id, mirror_addr)?;
+
+        let primary_server = DiscoveryServer::bind(
+            &primary_identity,
+            primary_addr,
+            &primary_dir.path().join("discovery-state").to_string_lossy(),
+            DiscoveryPolicy::default(),
+        )?;
+        let mirror_server = DiscoveryServer::bind(
+            &mirror_identity,
+            mirror_addr,
+            &mirror_dir.path().join("discovery-state").to_string_lossy(),
+            DiscoveryPolicy::default(),
+        )?;
+        let (shutdown_tx, primary_shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let mirror_shutdown_rx = shutdown_tx.subscribe();
+        let primary_task = tokio::spawn(primary_server.serve(primary_shutdown_rx));
+        let mirror_task = tokio::spawn(mirror_server.serve(mirror_shutdown_rx));
+
+        let primary_client = DiscoveryClient::new(
+            primary_identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+        let mirror_client = DiscoveryClient::new(
+            mirror_identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+        let verifying_client = DiscoveryClient::new(
+            primary_identity.record().clone(),
+            vec![mirror_identity.record().clone()],
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let key = crypto::ml_dsa_65_generate()?;
+        let pk = crypto::ml_dsa_65_public_key(&key);
+        let pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&key)?;
+        let locator = locator_from_signing_pk(&pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[41u8; 32], &chain_id, &locator_id);
+        let (_mailbox_kem_sk_a, mailbox_kem_pk_a) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk_a, scan_kem_pk_a) = crypto::ml_kem_768_generate();
+        let offline_receive_a = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk_a,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record_a) = build_signed_discovery_record(
+            &pkcs8,
+            &pk,
+            chain_id,
+            mailbox_kem_pk_a,
+            offline_receive_a,
+            Duration::from_secs(300),
+        )?;
+        primary_client
+            .publish_record(&record_a, &mailbox_auth_token)
+            .await?;
+        mirror_client
+            .publish_record(&record_a, &mailbox_auth_token)
+            .await?;
+        let resolved = verifying_client.resolve_locator(&locator).await?;
+        assert_eq!(resolved, record_a);
+
+        let (_mailbox_kem_sk_b, mailbox_kem_pk_b) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk_b, scan_kem_pk_b) = crypto::ml_kem_768_generate();
+        let offline_receive_b = build_signed_offline_receive_descriptor(
+            &pkcs8,
+            &pk,
+            chain_id,
+            scan_kem_pk_b,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record_b) = build_signed_discovery_record(
+            &pkcs8,
+            &pk,
+            chain_id,
+            mailbox_kem_pk_b,
+            offline_receive_b,
+            Duration::from_secs(300),
+        )?;
+        mirror_client
+            .publish_record(&record_b, &mailbox_auth_token)
+            .await?;
+        let err = verifying_client
+            .resolve_locator(&locator)
+            .await
+            .expect_err("mirror inconsistency should fail resolution");
+        assert!(err
+            .to_string()
+            .contains("discovery replica returned a locator record inconsistent"));
+
+        let _ = shutdown_tx.send(());
+        primary_task.await.map_err(|err| anyhow!(err))??;
+        mirror_task.await.map_err(|err| anyhow!(err))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_status_reports_live_manifest_and_queue_depths() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let chain_id = [14u8; 32];
+        let listen_addr = unused_loopback_addr()?;
+        let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
+        let state_path = tempdir.path().join("discovery-state");
+        let server = DiscoveryServer::bind(
+            &identity,
+            listen_addr,
+            &state_path.to_string_lossy(),
+            DiscoveryPolicy::default(),
+        )?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let server_task = tokio::spawn(server.serve(shutdown_rx));
+
+        let client = DiscoveryClient::new(
+            identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let initial_status = client.fetch_status().await?;
+        assert_eq!(initial_status.chain_id, chain_id);
+        assert_eq!(initial_status.server_node_id, identity.node_id());
+        assert_eq!(initial_status.record_count, 0);
+        assert_eq!(initial_status.active_locator_count, 0);
+        assert_eq!(initial_status.pending_mailbox_requests, 0);
+        assert_eq!(initial_status.pending_handle_responses, 0);
+        assert_eq!(initial_status.record_bytes, DISCOVERY_RECORD_BYTES as u32);
+        assert_eq!(
+            initial_status.pir_arity,
+            DiscoveryPolicy::default().pir_arity
+        );
+        assert_eq!(
+            initial_status.record_ttl_secs,
+            DiscoveryPolicy::default().record_ttl.as_secs()
+        );
+
+        let owner_key = crypto::ml_dsa_65_generate()?;
+        let owner_pk = crypto::ml_dsa_65_public_key(&owner_key);
+        let owner_pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&owner_key)?;
+        let locator = locator_from_signing_pk(&owner_pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[62u8; 32], &chain_id, &locator_id);
+        let (_mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            mailbox_kem_pk,
+            offline_receive,
+            Duration::from_secs(300),
+        )?;
+        client.publish_record(&record, &mailbox_auth_token).await?;
+
+        let (_response_kem_sk, response_kem_pk) = crypto::ml_kem_768_generate();
+        client
+            .post_mailbox_request(
+                record.mailbox_id,
+                [63u8; 32],
+                [64u8; 32],
+                seal_handle_request(
+                    &HandleRequestPlaintext {
+                        version: DISCOVERY_MAILBOX_REQUEST_VERSION,
+                        chain_id,
+                        locator_id,
+                        request_id: [65u8; 32],
+                        response_slot_id: [63u8; 32],
+                        response_auth_token: [64u8; 32],
+                        response_kem_pk,
+                        requested_amount: 7,
+                        issued_unix_ms: now_unix_ms(),
+                        expires_unix_ms: now_unix_ms().saturating_add(60_000),
+                    },
+                    &record.mailbox_kem_pk,
+                )?,
+            )
+            .await?;
+
+        let status = client.fetch_status().await?;
+        assert_eq!(status.record_count, 1);
+        assert_eq!(status.active_locator_count, 1);
+        assert_eq!(status.pending_mailbox_requests, 1);
+        assert_eq!(status.pending_handle_responses, 1);
+        assert_eq!(
+            status.next_locator_expiry_unix_ms,
+            Some(record.expires_unix_ms)
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task.await.map_err(|err| anyhow!(err))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_handle_returns_amount_bound_invoice() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let chain_id = [15u8; 32];
+        let listen_addr = unused_loopback_addr()?;
+        let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
+        let state_path = tempdir.path().join("discovery-state");
+        let server = DiscoveryServer::bind(
+            &identity,
+            listen_addr,
+            &state_path.to_string_lossy(),
+            DiscoveryPolicy::default(),
+        )?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let server_task = tokio::spawn(server.serve(shutdown_rx));
+
+        let client = DiscoveryClient::new(
+            identity.record().clone(),
+            Vec::new(),
+            4 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Duration::from_secs(5),
+        )?;
+
+        let owner_key = crypto::ml_dsa_65_generate()?;
+        let owner_pk = crypto::ml_dsa_65_public_key(&owner_key);
+        let owner_pkcs8 = crypto::ml_dsa_65_keypair_to_pkcs8(&owner_key)?;
+        let locator = locator_from_signing_pk(&owner_pk);
+        let locator_id = parse_locator(&locator)?;
+        let mailbox_auth_token = mailbox_auth_token(&[52u8; 32], &chain_id, &locator_id);
+        let (mailbox_kem_sk, mailbox_kem_pk) = crypto::ml_kem_768_generate();
+        let mailbox_kem_sk = crypto::ml_kem_768_secret_key_to_bytes(&mailbox_kem_sk);
+        let (_scan_kem_sk, scan_kem_pk) = crypto::ml_kem_768_generate();
+        let offline_receive = build_signed_offline_receive_descriptor(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            scan_kem_pk,
+            OfflineReceiveAssetPolicy::BaseAssetOnly,
+            0,
+            Duration::from_secs(300),
+        )?;
+        let (_locator, _locator_id, _mailbox_id, record) = build_signed_discovery_record(
+            &owner_pkcs8,
+            &owner_pk,
+            chain_id,
+            mailbox_kem_pk,
+            offline_receive,
+            Duration::from_secs(300),
+        )?;
+        client.publish_record(&record, &mailbox_auth_token).await?;
+
+        let responder_client = client.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                let messages = responder_client
+                    .poll_mailbox(record.mailbox_id, mailbox_auth_token, 8)
+                    .await?;
+                if messages.is_empty() {
+                    time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                let request = open_handle_request(&messages[0].envelope, &mailbox_kem_sk)?;
+                let handle_key = crypto::ml_dsa_65_generate()?;
+                let handle_signing_pk = crypto::ml_dsa_65_public_key(&handle_key);
+                let signable = encode_recipient_handle_signable(
+                    &chain_id,
+                    &handle_signing_pk,
+                    &[77u8; 32],
+                    &request.response_kem_pk,
+                    Some(request.requested_amount),
+                    now_unix_ms(),
+                    now_unix_ms().saturating_add(60_000),
+                )?;
+                let handle = RecipientHandle {
+                    chain_id,
+                    signing_pk: handle_signing_pk,
+                    receive_key_id: [77u8; 32],
+                    kem_pk: request.response_kem_pk.clone(),
+                    requested_amount: Some(request.requested_amount),
+                    issued_unix_ms: now_unix_ms(),
+                    expires_unix_ms: now_unix_ms().saturating_add(60_000),
+                    sig: crypto::ml_dsa_65_sign(&handle_key, &signable)?,
+                };
+                let response = HandleResponsePlaintext {
+                    version: DISCOVERY_MAILBOX_RESPONSE_VERSION,
+                    chain_id,
+                    locator_id: request.locator_id,
+                    request_id: request.request_id,
+                    handle,
+                    issued_unix_ms: now_unix_ms(),
+                };
+                let envelope = seal_handle_response(&response, &request.response_kem_pk)?;
+                responder_client
+                    .post_handle_response(
+                        request.response_slot_id,
+                        request.response_auth_token,
+                        envelope,
+                    )
+                    .await?;
+                return Ok::<(), anyhow::Error>(());
+            }
+        });
+
+        let handle_json = client
+            .request_handle(&locator, 77, Duration::from_secs(5))
+            .await?;
+        let handle = decode_recipient_handle(&encode_recipient_handle(&serde_json::from_str::<
+            RecipientHandle,
+        >(&handle_json)?)?)?;
+        assert_eq!(handle.requested_amount, Some(77));
+
+        responder.await.map_err(|err| anyhow!(err))??;
+        let _ = shutdown_tx.send(());
+        server_task.await.map_err(|err| anyhow!(err))??;
         Ok(())
     }
 }

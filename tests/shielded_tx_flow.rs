@@ -266,9 +266,18 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
         recipient_signing_pk_repeat,
         receiver_wallet.public_key().clone()
     );
+    let amount_bound_handle = receiver_wallet.mint_invoice_with_amount(Some(2))?;
 
     assert_eq!(sender_wallet.balance()?, 2);
     assert_eq!(receiver_wallet.balance()?, 0);
+
+    let amount_mismatch = sender_wallet
+        .prepare_shielded_send(&amount_bound_handle, 1)
+        .await
+        .expect_err("amount-constrained handle should reject a mismatched send amount");
+    assert!(amount_mismatch
+        .to_string()
+        .contains("recipient handle is constrained to amount 2"));
 
     let prepared_a = sender_wallet
         .prepare_shielded_send(&recipient_handle, 1)

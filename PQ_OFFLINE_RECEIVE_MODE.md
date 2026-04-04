@@ -108,16 +108,25 @@ The wallet now:
 
 - reuses a fresh active descriptor when republishing the locator record
 - rotates to a new descriptor when the active one approaches expiry
-- retains old descriptor keys locally so historical outputs remain decryptable
+- supports explicit operator-triggered rotation when the locator capability
+  should be refreshed immediately
+- supports explicit compromise rotation that marks the previous descriptor as
+  compromised before publishing the next one
+- retains retired and compromised descriptor keys locally for a bounded scan
+  window so historical outputs remain decryptable
 
 This avoids unbounded key churn from ordinary republishing while preserving the
 ability to receive asynchronously.
 
-Longer-horizon policy is still open around:
+The current local retention rule is simple:
 
-- compromise response
-- retention windows for expired descriptor keys
-- rotation cadence tuning for mobile wallets
+- descriptor secret keys remain eligible for compact scanning until
+  `descriptor_expiry + bounded_scan_retention`
+- active descriptors are the only ones eligible for republication
+- retired and compromised descriptors are never republished
+
+Longer-horizon tuning is still open around mobile-wallet rotation cadence and
+retention-size benchmarking.
 
 ## What Still Uses Handles Or Invoices
 

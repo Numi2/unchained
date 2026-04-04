@@ -1,6 +1,6 @@
 mod finality_support;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -197,7 +197,7 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
     assert_eq!(state.identity.address, wallet.address());
     assert_eq!(state.identity.signing_pk, wallet.public_key().clone());
 
-    let receive_handle = client.mint_invoice().await?;
+    let receive_handle = client.mint_invoice(None).await?;
     let (receive_address, receive_signing_pk, _receive_kem_pk) =
         Wallet::parse_invoice(&receive_handle)?;
     assert_ne!(receive_address, wallet.address());
@@ -294,8 +294,9 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
     )?;
     let discovery_client = discovery::DiscoveryClient::new(
         discovery_record,
+        Vec::new(),
         4 * 1024 * 1024,
-        32 * 1024 * 1024,
+        128 * 1024 * 1024,
         std::time::Duration::from_secs(10),
     )?;
 
@@ -314,6 +315,30 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
     let record = discovery_client.resolve_locator(&locator).await?;
     assert_eq!(record.chain_id, genesis.hash);
     assert_eq!(record.locator_id, discovery::parse_locator(&locator)?);
+    let (resolved_record, replica_count) = client.resolve_locator(&locator).await?;
+    assert_eq!(resolved_record, record);
+    assert_eq!(replica_count, 1);
+
+    let mailbox_wallet = wallet.clone();
+    let mailbox_task = tokio::spawn(async move {
+        for _ in 0..40 {
+            if mailbox_wallet.service_discovery_mailbox_once().await? > 0 {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("wallet control request-handle did not reach the discovery mailbox");
+    });
+    let negotiated_handle = client
+        .request_handle(&locator, 1, std::time::Duration::from_secs(5))
+        .await
+        .context("wallet control request-handle")?;
+    mailbox_task
+        .await
+        .context("join mailbox responder task")?
+        .context("service discovery mailbox once")?;
+    let negotiated: unchained::wallet::RecipientHandle = serde_json::from_str(&negotiated_handle)?;
+    assert_eq!(negotiated.requested_amount, Some(1));
 
     let (response_sk, response_pk) = unchained::crypto::ml_kem_768_generate();
     let response_sk = unchained::crypto::ml_kem_768_secret_key_to_bytes(&response_sk);

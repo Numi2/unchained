@@ -100,6 +100,29 @@ max_request_bytes = 33554432
 max_response_bytes = 16777216
 submit_timeout_secs = 30
 
+[discovery.wallet]
+# Canonical wallet addressability goes through a primary discovery server and
+# optional read-only mirrors. Each entry accepts a signed NodeRecordV2 string or
+# a file path containing one.
+# server = "/path/to/discovery.node-record"
+# mirrors = ["/path/to/discovery-mirror-a.node-record", "/path/to/discovery-mirror-b.node-record"]
+publish_interval_secs = 300
+poll_interval_secs = 5
+max_request_bytes = 4194304
+max_response_bytes = 134217728
+submit_timeout_secs = 10
+
+[discovery.server]
+# PIR-backed locator discovery and mailbox service settings.
+# state_path = "/path/to/discovery-state"
+record_ttl_secs = 3600
+max_request_bytes = 4194304
+max_response_bytes = 134217728
+submit_timeout_secs = 10
+max_pending_requests = 4096
+max_pending_responses = 4096
+pir_arity = 4
+
 [orphan]
 total_cap = 32768
 per_height_cap = 64

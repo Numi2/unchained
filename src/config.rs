@@ -178,6 +178,8 @@ impl Default for WalletProofAssistant {
 pub struct WalletDiscovery {
     #[serde(default)]
     pub server: Option<String>,
+    #[serde(default)]
+    pub mirrors: Vec<String>,
     #[serde(default = "default_discovery_publish_interval_secs")]
     pub publish_interval_secs: u64,
     #[serde(default = "default_discovery_poll_interval_secs")]
@@ -194,6 +196,7 @@ impl Default for WalletDiscovery {
     fn default() -> Self {
         Self {
             server: None,
+            mirrors: Vec::new(),
             publish_interval_secs: default_discovery_publish_interval_secs(),
             poll_interval_secs: default_discovery_poll_interval_secs(),
             max_request_bytes: default_discovery_max_request_bytes(),
@@ -371,7 +374,7 @@ fn default_discovery_max_request_bytes() -> usize {
     4 * 1024 * 1024
 }
 fn default_discovery_max_response_bytes() -> usize {
-    32 * 1024 * 1024
+    128 * 1024 * 1024
 }
 fn default_discovery_submit_timeout_secs() -> u64 {
     10
@@ -628,6 +631,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                             wallet,
                             &[
                                 "server",
+                                "mirrors",
                                 "publish_interval_secs",
                                 "poll_interval_secs",
                                 "max_request_bytes",

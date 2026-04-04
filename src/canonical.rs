@@ -1522,6 +1522,7 @@ pub fn encode_recipient_handle_signable(
     signing_pk: &TaggedSigningPublicKey,
     receive_key_id: &[u8; 32],
     kem_pk: &TaggedKemPublicKey,
+    requested_amount: Option<u64>,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
 ) -> Result<Vec<u8>> {
@@ -1530,6 +1531,10 @@ pub fn encode_recipient_handle_signable(
     write_tagged_signing_public_key(&mut writer, signing_pk);
     writer.write_fixed(receive_key_id);
     write_tagged_kem_public_key(&mut writer, kem_pk);
+    writer.write_bool(requested_amount.is_some());
+    if let Some(requested_amount) = requested_amount {
+        writer.write_u64(requested_amount);
+    }
     writer.write_u64(issued_unix_ms);
     writer.write_u64(expires_unix_ms);
     Ok(writer.into_vec())
@@ -1541,6 +1546,10 @@ pub fn encode_recipient_handle(doc: &RecipientHandle) -> Result<Vec<u8>> {
     write_tagged_signing_public_key(&mut writer, &doc.signing_pk);
     writer.write_fixed(&doc.receive_key_id);
     write_tagged_kem_public_key(&mut writer, &doc.kem_pk);
+    writer.write_bool(doc.requested_amount.is_some());
+    if let Some(requested_amount) = doc.requested_amount {
+        writer.write_u64(requested_amount);
+    }
     writer.write_u64(doc.issued_unix_ms);
     writer.write_u64(doc.expires_unix_ms);
     writer.write_bytes(&doc.sig)?;
@@ -1554,6 +1563,11 @@ pub fn decode_recipient_handle(bytes: &[u8]) -> Result<RecipientHandle> {
         signing_pk: read_tagged_signing_public_key(&mut reader)?,
         receive_key_id: reader.read_fixed()?,
         kem_pk: read_tagged_kem_public_key(&mut reader)?,
+        requested_amount: if reader.read_bool()? {
+            Some(reader.read_u64()?)
+        } else {
+            None
+        },
         issued_unix_ms: reader.read_u64()?,
         expires_unix_ms: reader.read_u64()?,
         sig: reader.read_bytes()?,

@@ -1,46 +1,66 @@
 # Unchained
 
-Unchained is a **private real-time settlement chain** built for **post-quantum
-safety**.
+Unchained is a specialized cryptographic settlement network engineered for post-quantum security, sub-second deterministic finality, and end-to-end privacy. By combining a Mysticeti-class Directed Acyclic Graph (DAG) Byzantine Fault Tolerant (BFT) ordering core with a shielded note-based state model, Unchained achieves real-time settlement without exposing transaction graphs, participant identities, or public balances. The architecture strictly excludes general-purpose computation, public mempools, and proof-of-work mechanisms, optimizing exclusively for the latency and privacy requirements of institutional treasury movement, stablecoin settlement, and confidential financial operations.
 
-The canonical design is:
+## 1. Cryptographic Primitives and Transport Security
 
-- shielded delegated proof of stake
-- Mysticeti-class DAG BFT ordering
-- fast-path finality for ordinary private payments
-- private delegation and staking
-- stateless PIR-native private discovery for `LocatorID` resolution
-- hybrid `X25519MLKEM768` transport
-- `ML-DSA` hot-path validator signatures
-- `SLH-DSA` cold recovery and governance keys
-- transparent STARK-family proofs with a conservative `>= 128-bit` target
+The network employs a hybrid cryptographic posture, adhering to NIST post-quantum standardization guidelines while maintaining classical security fallbacks.
 
-Unchained is **not** a mining chain, **not** a generic smart-contract chain,
-and **not** a public-mempool chain.
+- **Transport Layer**: Network communication utilizes a hybrid `X25519` and `ML-KEM-768` key encapsulation mechanism over TLS 1.3 and QUIC. This ensures forward secrecy against both classical and quantum adversaries.
+- **Consensus Authentication**: Validator hot-path signatures for quorum certificates and block proposals rely on `ML-DSA`, providing efficient post-quantum authentication for high-frequency consensus operations.
+- **Cold Storage and Governance**: As part of the target architecture, high-value, low-frequency operations such as root recovery, validator authorization, and emergency governance are designated to utilize `SLH-DSA` (Stateless Hash-Based Digital Signature Algorithm), prioritizing conservative security assumptions over signature size.
 
-## Why Unchained Exists
+## 2. Consensus Architecture: Shielded Delegated Proof of Stake
 
-The market already has:
+Unchained implements a stake-weighted Delegated Proof of Stake (DPoS) consensus mechanism with a restricted active validator committee (typically 32 nodes) to accommodate the bandwidth overhead of post-quantum signatures.
 
-- fast public chains
-- privacy-oriented chains
-- post-quantum research chains
+### DAG BFT Ordering and Fast-Path Finality
 
-It does **not** already have a strong answer for this product:
+The consensus protocol utilizes a Mysticeti-class DAG ordering core. To minimize latency for standard operations, Unchained implements a bifurcated execution model:
 
-**sub-second confidential settlement with deterministic finality and a credible
-post-quantum posture.**
+- **Class A (Fast Path)**: Ordinary private transfers that consume only sender-controlled notes bypass full DAG ordering. These transactions achieve deterministic finality in approximately 250–700 milliseconds by taking the shortest safe certification path.
+- **Class B (BFT Fallback)**: Shared-state operations, including validator-set transitions, private delegation, and asset issuance, are routed through the full BFT ordering path, achieving finality in 500–1200 milliseconds. Contended fast-path transactions deterministically degrade to this path.
 
-That gap matters for:
+The protocol enforces deterministic finality. Probabilistic confirmation models, heaviest-chain rules, and mining are explicitly excluded.
 
-- stablecoin settlement
-- treasury movement
-- payroll
-- exchange inventory transfers
-- OTC settlement
-- merchant settlement without public counterparty graphs
-- fintech wallets that cannot expose balances and transaction relationships on
-  a public ledger
+## 3. State Model and Privacy Invariants
+
+The canonical ledger state is a shielded note and object model. There are no transparent balance tables or public account structures.
+
+- **State Transitions**: Transactions consume existing encrypted notes and produce new encrypted notes. Spent notes are irrevocably marked by cryptographically secure nullifiers.
+- **Privacy Preservation**: For ordinary payments, the network observes only nullifiers, note commitments, encrypted ciphertexts, and zero-knowledge validity proofs. Sender identity, recipient identity, transaction amounts, and the broader payment graph remain cryptographically shielded.
+- **Shielded Staking**: Delegation is represented by shielded pool-share notes. Rewards accrue via pool exchange rate adjustments rather than public per-wallet credits. Slashing is executed at the validator-pool level, preserving the anonymity of individual delegators.
+
+## 4. Stateless PIR-Native Addressability
+
+Unchained eliminates reusable public payment addresses to prevent off-chain transaction graph analysis. Wallet addressability is achieved through a Private Information Retrieval (PIR) subsystem.
+
+- **Locator Resolution**: Users share short, human-readable `LocatorID`s. Wallets resolve these locators via a stateless single-server PIR query against a directory of fixed-size authenticated records.
+- **Cryptographic Unlinkability**: The PIR protocol ensures the directory server cannot determine which `LocatorID` a client is querying.
+- **Offline Receive Descriptors**: The PIR response yields an offline receive descriptor containing an `ML-KEM` public key and policy constraints. Senders construct shielded outputs using this descriptor, enabling asynchronous payments without live negotiation. Wallets can also explicitly rotate or compromise-rotate that descriptor without changing the outward locator.
+- **One-Time Capabilities**: For policy-bound flows, the PIR payload bootstraps the negotiation of a single-use `RecipientHandle`, ensuring payment authorization keys are never reused.
+
+## 5. Network Metadata Privacy
+
+To mitigate traffic analysis and source-IP correlation, Unchained replaces the standard public mempool with a role-separated ingress architecture.
+
+- **Access Relays**: Receive padded, encrypted transaction envelopes from clients. They observe the client's network identity but cannot decrypt the transaction payload.
+- **Submission Gateways**: Receive envelopes from access relays, decrypt the payloads, and interface with the validator network. They observe the transaction plaintext but have no visibility into the originating client's network identity.
+- **Timing Obfuscation**: Gateways enforce short, fixed release windows and micro-batched validator ingress. Wallets emit deterministic background cover traffic to obfuscate submission timing.
+
+## 6. Computational Integrity and Proof System
+
+Transaction validity is enforced through purpose-built, transparent STARK-family zero-knowledge proofs.
+
+- **Security Budget**: The proof system targets a conservative minimum security level of $\ge 128$ bits.
+- **Trusted Setup**: The architecture strictly requires transparent proof systems, eliminating the need for a trusted setup phase.
+- **Native Circuits**: To maintain sub-second proving latency, Unchained utilizes highly optimized native circuits for core operations (transfer, delegation, unbonding, issuance) rather than relying on general-purpose zkVM execution in the critical path.
+
+## Repository Status and Build Instructions
+
+The repository is currently transitioning toward the architecture defined above. Legacy components (e.g., Proof-of-Work artifacts, archive-receipt accounting) are deprecated. `ARCHITECTURE.md` serves as the definitive specification.
+
+
 
 ## Product Definition
 
@@ -128,7 +148,11 @@ bootstrap material together with a signed offline receive descriptor. Ordinary
 locator payments use that descriptor directly, so wallet-to-wallet sends remain
 asynchronous even when the recipient is offline. Negotiated one-time
 `RecipientHandle`s remain for flows that need explicit recipient authorization,
-request-specific policy, or invoice semantics.
+request-specific policy, or invoice semantics. Wallets can also verify locator
+resolution against multiple configured discovery mirrors, and negotiated
+handles or direct invoices can bind an exact requested amount when the receive
+flow requires it. Discovery operators can inspect the live manifest, PIR
+envelope, and mailbox queue state through `unchained_node discovery-status`.
 
 The sender never needs to see large PQ key material, and the ledger never needs
 to see a reusable outward identity.
@@ -176,7 +200,8 @@ or a general-purpose zkVM in the steady-state critical path.
 The target experience is simple:
 
 - share a short locator or invoice QR
-- wallet resolves privately or consumes the invoice directly
+- wallet resolves privately, optionally cross-checks discovery mirrors, or
+  consumes the invoice directly
 - payment finalizes in under a second when the network is healthy
 - the recipient, amount graph, and ownership graph remain shielded by default
 
