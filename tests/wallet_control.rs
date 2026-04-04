@@ -197,9 +197,9 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
     assert_eq!(state.identity.address, wallet.address());
     assert_eq!(state.identity.signing_pk, wallet.public_key().clone());
 
-    let receive_handle = client.mint_receive_handle().await?;
+    let receive_handle = client.mint_invoice().await?;
     let (receive_address, receive_signing_pk, _receive_kem_pk) =
-        Wallet::parse_address(&receive_handle)?;
+        Wallet::parse_invoice(&receive_handle)?;
     assert_ne!(receive_address, wallet.address());
     assert_ne!(receive_signing_pk, wallet.public_key().clone());
 
@@ -348,7 +348,7 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
     let response = discovery::open_handle_response(&response_envelope, &response_sk)?;
     assert_eq!(response.request_id, request.request_id);
     let handle_json = serde_json::to_string(&response.handle)?;
-    let (_address, _signing_pk, _kem_pk) = Wallet::parse_address(&handle_json)?;
+    let (_address, _signing_pk, _kem_pk) = Wallet::parse_invoice(&handle_json)?;
 
     let _ = shutdown_tx.send(());
     server_task.await??;

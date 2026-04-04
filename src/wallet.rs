@@ -1181,33 +1181,23 @@ impl Wallet {
         Ok(material.locator)
     }
 
-    pub fn export_address(&self) -> Result<String> {
-        self.export_address_for_chain(self.effective_chain_id()?)
+    pub fn mint_invoice(&self) -> Result<String> {
+        self.mint_invoice_for_chain(self.effective_chain_id()?)
     }
 
-    fn export_address_for_chain(&self, chain_id: [u8; 32]) -> Result<String> {
+    fn mint_invoice_for_chain(&self, chain_id: [u8; 32]) -> Result<String> {
         self.mint_recipient_handle_for_chain(chain_id)
     }
 
-    pub fn export_stealth_address(&self) -> Result<String> {
-        self.export_address()
-    }
-
-    pub fn parse_address(
-        addr_str: &str,
+    pub fn parse_invoice(
+        invoice_str: &str,
     ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
-        let handle = Self::parse_recipient_handle_document(addr_str)?;
+        let handle = Self::parse_recipient_handle_document(invoice_str)?;
         Ok((
             crate::crypto::address_from_pk(&handle.signing_pk),
             handle.signing_pk,
             handle.kem_pk,
         ))
-    }
-
-    pub fn parse_stealth_address(
-        addr_str: &str,
-    ) -> Result<(Address, TaggedSigningPublicKey, TaggedKemPublicKey)> {
-        Self::parse_address(addr_str)
     }
 
     fn parse_recipient_handle(
@@ -1245,7 +1235,7 @@ impl Wallet {
         ))
     }
 
-    pub fn validate_recipient_handle(&self, handle: &str) -> Result<()> {
+    pub fn validate_invoice(&self, handle: &str) -> Result<()> {
         self.parse_recipient_handle(handle).map(|_| ())
     }
 
@@ -3061,13 +3051,9 @@ impl Wallet {
         })
     }
 
-    /// Sends a canonical shielded transaction to a verified recipient handle.
-    pub async fn send_to_recipient_handle(
-        &self,
-        recipient_handle: &str,
-        amount: u64,
-    ) -> Result<SendOutcome> {
-        let prepared = self.prepare_shielded_send(recipient_handle, amount).await?;
+    /// Sends a canonical shielded transaction against an explicit one-time invoice capability.
+    pub async fn send_to_invoice(&self, invoice: &str, amount: u64) -> Result<SendOutcome> {
+        let prepared = self.prepare_shielded_send(invoice, amount).await?;
         let proof = self.prove_shielded_tx_proof(prepared.witness()).await?;
         self.submit_prepared_shielded_send(prepared, proof).await
     }
@@ -3128,7 +3114,7 @@ impl Wallet {
                 Self::validate_recipient_handle_document_for_chain(&response.handle, chain_id)?;
                 let handle_json =
                     serde_json::to_string(&response.handle).context("serialize resolved handle")?;
-                return self.send_to_recipient_handle(&handle_json, amount).await;
+                return self.send_to_invoice(&handle_json, amount).await;
             }
             time::sleep(Duration::from_secs(1)).await;
         }
@@ -3151,7 +3137,7 @@ impl Wallet {
             if Self::now_unix_ms() >= request.expires_unix_ms {
                 continue;
             }
-            let handle_json = self.export_address_for_chain(chain_id)?;
+            let handle_json = self.mint_invoice_for_chain(chain_id)?;
             let handle: RecipientHandle =
                 serde_json::from_str(&handle_json).context("decode minted handle")?;
             let response = HandleResponsePlaintext {
@@ -3205,13 +3191,9 @@ impl Wallet {
         Ok(())
     }
 
-    /// Simple wrapper: pay using a recipient handle or locator.
-    pub async fn pay(&self, to: &str, amount: u64) -> Result<SendOutcome> {
-        if Self::looks_like_recipient_handle_document(to) {
-            self.send_to_recipient_handle(to, amount).await
-        } else {
-            self.send_to_locator(to, amount).await
-        }
+    /// Sends using a PIR-resolved wallet locator.
+    pub async fn send(&self, locator: &str, amount: u64) -> Result<SendOutcome> {
+        self.send_to_locator(locator, amount).await
     }
 
     pub async fn delegate_to_validator(
@@ -3443,15 +3425,15 @@ mod tests {
     }
 
     #[test]
-    fn exported_receive_handles_are_single_use_and_signed() -> Result<()> {
+    fn minted_invoices_are_single_use_and_signed() -> Result<()> {
         let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
         let tempdir = TempDir::new()?;
         let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
         let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
         let chain_id = [7u8; 32];
 
-        let handle_a = wallet.export_address_for_chain(chain_id)?;
-        let handle_b = wallet.export_address_for_chain(chain_id)?;
+        let handle_a = wallet.mint_invoice_for_chain(chain_id)?;
+        let handle_b = wallet.mint_invoice_for_chain(chain_id)?;
         let doc_a = Wallet::parse_recipient_handle_document(&handle_a)?;
         let doc_b = Wallet::parse_recipient_handle_document(&handle_b)?;
 
@@ -3474,14 +3456,14 @@ mod tests {
     }
 
     #[test]
-    fn expired_receive_keys_are_pruned_before_new_handles_are_minted() -> Result<()> {
+    fn expired_receive_keys_are_pruned_before_new_invoices_are_minted() -> Result<()> {
         let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "unit-test-wallet-passphrase");
         let tempdir = TempDir::new()?;
         let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
         let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
         let chain_id = [9u8; 32];
 
-        let original_handle = wallet.export_address_for_chain(chain_id)?;
+        let original_handle = wallet.mint_invoice_for_chain(chain_id)?;
         let original_doc = Wallet::parse_recipient_handle_document(&original_handle)?;
         let mut expired = wallet
             .load_receive_key_record(wallet_store.as_ref(), &original_doc.receive_key_id)?
@@ -3489,7 +3471,7 @@ mod tests {
         expired.expires_unix_ms = 0;
         wallet.store_receive_key_record(wallet_store.as_ref(), &expired)?;
 
-        let rotated_handle = wallet.export_address_for_chain(chain_id)?;
+        let rotated_handle = wallet.mint_invoice_for_chain(chain_id)?;
         let rotated_doc = Wallet::parse_recipient_handle_document(&rotated_handle)?;
         assert_ne!(original_doc.receive_key_id, rotated_doc.receive_key_id);
         assert_ne!(original_doc.signing_pk, rotated_doc.signing_pk);

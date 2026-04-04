@@ -15,6 +15,8 @@ use crate::{
     wallet::RecipientHandle,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use aws_lc_rs::signature::UnparsedPublicKey;
+use aws_lc_rs::unstable::signature::ML_DSA_65;
 use chacha20poly1305::{
     aead::{Aead, NewAead},
     Key, XChaCha20Poly1305, XNonce,
@@ -49,6 +51,7 @@ const DISCOVERY_MAILBOX_KEY_DOMAIN: &str = "unchained-discovery-mailbox-key-v1";
 const DISCOVERY_HYBRID_KEY_DOMAIN: &str = "unchained-discovery-hybrid-key-v1";
 const DISCOVERY_MESSAGE_AEAD_DOMAIN: &str = "unchained-discovery-message-aead-v1";
 const DISCOVERY_MANIFEST_ID_DOMAIN: &str = "unchained-discovery-manifest-id-v1";
+const DISCOVERY_MANIFEST_SIG_DOMAIN: &str = "unchained-discovery-manifest-sig-v1";
 const DISCOVERY_STORE_DIR: &str = "discovery_service";
 const DISCOVERY_RECORD_BYTES: usize = 8192;
 const DISCOVERY_REQUEST_PLAINTEXT_BYTES: usize = 2048;
@@ -90,6 +93,7 @@ pub struct DiscoveryManifest {
     pub seed_mu: [u8; SEED_BYTE_LEN],
     pub hint_bytes: Vec<u8>,
     pub filter_param_bytes: Vec<u8>,
+    pub sig: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +163,7 @@ pub struct DiscoveryClient {
 
 pub struct DiscoveryServer {
     endpoint: Endpoint,
+    identity: NodeIdentity,
     ingress_keys: IngressKeyMaterial,
     server_node_id: [u8; 32],
     chain_id: [u8; 32],
@@ -353,7 +358,18 @@ impl DiscoveryClient {
                 manifest,
             } => {
                 ensure_request_id("discovery manifest", request_id, echoed_request_id)?;
-                decode_manifest(&manifest)
+                let manifest = decode_manifest(&manifest)?;
+                verify_manifest_signature(&manifest, &self.server_record.auth_spki)?;
+                if manifest.chain_id != self.chain_id()? {
+                    bail!("discovery manifest chain_id mismatch");
+                }
+                if manifest.server_node_id != self.server_record.node_id {
+                    bail!("discovery manifest server_node_id mismatch");
+                }
+                if manifest.record_bytes != DISCOVERY_RECORD_BYTES as u32 {
+                    bail!("unsupported discovery manifest record size");
+                }
+                Ok(manifest)
             }
             DiscoveryResponse::Error {
                 request_id: echoed_request_id,
@@ -682,9 +698,15 @@ impl DiscoveryServer {
         server_config.transport_config(transport_config);
         let endpoint = Endpoint::server(server_config, listen_addr)?;
         let store = Arc::new(DiscoveryStateStore::open(state_path)?);
-        let index = Arc::new(RwLock::new(DiscoveryIndexState::empty(chain_id)?));
+        let index = Arc::new(RwLock::new(DiscoveryIndexState::empty(
+            chain_id,
+            identity.node_id(),
+            policy.pir_arity,
+            identity,
+        )?));
         let server = Self {
             endpoint,
+            identity: identity.clone(),
             ingress_keys: load_local_ingress_key_material_in_dir(identity.dir())?,
             server_node_id: identity.node_id(),
             chain_id,
@@ -946,6 +968,7 @@ impl DiscoveryServer {
             self.chain_id,
             self.server_node_id,
             self.policy.pir_arity,
+            &self.identity,
             &records,
         )?;
         *self
@@ -957,15 +980,21 @@ impl DiscoveryServer {
 }
 
 impl DiscoveryIndexState {
-    fn empty(chain_id: [u8; 32]) -> Result<Self> {
+    fn empty(
+        chain_id: [u8; 32],
+        server_node_id: [u8; 32],
+        arity: u32,
+        identity: &NodeIdentity,
+    ) -> Result<Self> {
         let manifest = build_manifest(
             chain_id,
-            [0u8; 32],
-            4,
+            server_node_id,
+            arity,
             0,
             [0u8; SEED_BYTE_LEN],
             Vec::new(),
             Vec::new(),
+            identity,
         )?;
         Ok(Self {
             manifest,
@@ -977,6 +1006,7 @@ impl DiscoveryIndexState {
         chain_id: [u8; 32],
         server_node_id: [u8; 32],
         arity: u32,
+        identity: &NodeIdentity,
         registrations: &[LocatorRegistration],
     ) -> Result<Self> {
         if registrations.is_empty() {
@@ -988,6 +1018,7 @@ impl DiscoveryIndexState {
                 [0u8; SEED_BYTE_LEN],
                 Vec::new(),
                 Vec::new(),
+                identity,
             )?;
             return Ok(Self {
                 manifest,
@@ -1023,6 +1054,7 @@ impl DiscoveryIndexState {
             seed_mu,
             hint_bytes,
             filter_param_bytes,
+            identity,
         )?;
         Ok(Self {
             manifest,
@@ -1480,6 +1512,7 @@ fn build_manifest(
     seed_mu: [u8; SEED_BYTE_LEN],
     hint_bytes: Vec<u8>,
     filter_param_bytes: Vec<u8>,
+    identity: &NodeIdentity,
 ) -> Result<DiscoveryManifest> {
     let issued_unix_ms = now_unix_ms();
     let mut manifest = DiscoveryManifest {
@@ -1494,8 +1527,10 @@ fn build_manifest(
         seed_mu,
         hint_bytes,
         filter_param_bytes,
+        sig: Vec::new(),
     };
     manifest.manifest_id = manifest_id(&manifest)?;
+    manifest.sig = identity.sign_consensus_message(&encode_manifest_signable(&manifest)?)?;
     Ok(manifest)
 }
 
@@ -1520,10 +1555,19 @@ fn encode_manifest_without_id(manifest: &DiscoveryManifest) -> Result<Vec<u8>> {
     Ok(writer.into_vec())
 }
 
+fn encode_manifest_signable(manifest: &DiscoveryManifest) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    writer.write_bytes(DISCOVERY_MANIFEST_SIG_DOMAIN.as_bytes())?;
+    writer.write_bytes(&encode_manifest_without_id(manifest)?)?;
+    writer.write_fixed(&manifest.manifest_id);
+    Ok(writer.into_vec())
+}
+
 fn encode_manifest(manifest: &DiscoveryManifest) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_bytes(&encode_manifest_without_id(manifest)?)?;
     writer.write_fixed(&manifest.manifest_id);
+    writer.write_bytes(&manifest.sig)?;
     Ok(writer.into_vec())
 }
 
@@ -1531,6 +1575,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DiscoveryManifest> {
     let mut reader = CanonicalReader::new(bytes);
     let body = reader.read_bytes()?;
     let decoded_manifest_id = reader.read_fixed()?;
+    let sig = reader.read_bytes()?;
     reader.finish()?;
     let mut body_reader = CanonicalReader::new(&body);
     let manifest = DiscoveryManifest {
@@ -1545,6 +1590,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DiscoveryManifest> {
         seed_mu: body_reader.read_fixed()?,
         hint_bytes: body_reader.read_bytes()?,
         filter_param_bytes: body_reader.read_bytes()?,
+        sig,
     };
     body_reader.finish()?;
     if manifest.version != DISCOVERY_MANIFEST_VERSION {
@@ -1556,7 +1602,21 @@ fn decode_manifest(bytes: &[u8]) -> Result<DiscoveryManifest> {
     if manifest.manifest_id != manifest_id(&manifest)? {
         bail!("invalid discovery manifest id");
     }
+    if manifest.record_bytes != DISCOVERY_RECORD_BYTES as u32 {
+        bail!("unsupported discovery manifest record size");
+    }
+    if manifest.sig.is_empty() {
+        bail!("discovery manifest signature is missing");
+    }
     Ok(manifest)
+}
+
+fn verify_manifest_signature(manifest: &DiscoveryManifest, auth_spki: &[u8]) -> Result<()> {
+    let signable = encode_manifest_signable(manifest)?;
+    UnparsedPublicKey::new(&ML_DSA_65, auth_spki)
+        .verify(&signable, manifest.sig.as_slice())
+        .map_err(|_| anyhow!("discovery manifest signature verification failed"))?;
+    Ok(())
 }
 
 fn encode_discovery_record_signable(
@@ -2107,7 +2167,8 @@ fn discovery_transport_config() -> Result<Arc<quinn::TransportConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto;
+    use crate::{crypto, node_identity, protocol::CURRENT};
+    use tempfile::TempDir;
 
     #[test]
     fn locator_roundtrip_is_stable() -> Result<()> {
@@ -2185,6 +2246,47 @@ mod tests {
         let response_envelope = seal_handle_response(&response, &request_pk)?;
         let opened_response = open_handle_response(&response_envelope, &request_sk)?;
         assert_eq!(opened_response.handle, handle);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_roundtrip_verifies_server_signature() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let chain_id = [11u8; 32];
+        let address = "127.0.0.1:41001".to_string();
+        let _ = node_identity::init_root_in_dir(tempdir.path())?;
+        let (_, request) = node_identity::prepare_auth_request_in_dir(
+            tempdir.path(),
+            CURRENT.version,
+            Some(chain_id),
+            vec![address.clone()],
+            None,
+        )?;
+        let (_, record) = node_identity::sign_auth_request_in_dir(tempdir.path(), &request, 30)?;
+        let _ = node_identity::install_node_record_in_dir(tempdir.path(), &record)?;
+        let identity = NodeIdentity::load_runtime_in_dir(
+            tempdir.path(),
+            CURRENT.version,
+            Some(chain_id),
+            vec![address],
+        )?;
+        let manifest = build_manifest(
+            chain_id,
+            identity.node_id(),
+            4,
+            0,
+            [0u8; SEED_BYTE_LEN],
+            Vec::new(),
+            Vec::new(),
+            &identity,
+        )?;
+        let encoded = encode_manifest(&manifest)?;
+        let decoded = decode_manifest(&encoded)?;
+        verify_manifest_signature(&decoded, &identity.record().auth_spki)?;
+
+        let mut tampered = decoded.clone();
+        tampered.sig[0] ^= 0x01;
+        assert!(verify_manifest_signature(&tampered, &identity.record().auth_spki).is_err());
         Ok(())
     }
 }

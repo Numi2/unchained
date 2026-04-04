@@ -32,13 +32,13 @@ pub enum WalletControlRequest {
     SubscribeState,
     ForceSync,
     ReceiveLocator,
-    MintReceiveHandle,
+    MintInvoice,
     DeriveGenesisLockSecret {
         coin_id: [u8; 32],
         chain_id: [u8; 32],
     },
     Send {
-        recipient_handle: String,
+        target: PaymentTarget,
         amount: u64,
     },
     SubmitSharedStateControl {
@@ -51,11 +51,17 @@ pub enum WalletControlResponse {
     Pong,
     Synced,
     Locator { locator: String },
-    ReceiveHandle { handle: String },
+    Invoice { invoice: String },
     GenesisLockSecret { secret: [u8; 32] },
     Sent { outcome: SendOutcome },
     Submitted { outcome: SendOutcome },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PaymentTarget {
+    Locator { locator: String },
+    Invoice { invoice: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,10 +192,10 @@ impl WalletControlClient {
         }
     }
 
-    pub async fn mint_receive_handle(&self) -> Result<String> {
-        match self.call(WalletControlRequest::MintReceiveHandle).await? {
-            WalletControlResponse::ReceiveHandle { handle } => Ok(handle),
-            other => bail!("unexpected wallet control receive-handle response: {other:?}"),
+    pub async fn mint_invoice(&self) -> Result<String> {
+        match self.call(WalletControlRequest::MintInvoice).await? {
+            WalletControlResponse::Invoice { invoice } => Ok(invoice),
+            other => bail!("unexpected wallet control invoice response: {other:?}"),
         }
     }
 
@@ -218,10 +224,27 @@ impl WalletControlClient {
         }
     }
 
-    pub async fn send(&self, recipient_handle: &str, amount: u64) -> Result<SendOutcome> {
+    pub async fn send_to_locator(&self, locator: &str, amount: u64) -> Result<SendOutcome> {
         match self
             .call(WalletControlRequest::Send {
-                recipient_handle: recipient_handle.to_string(),
+                target: PaymentTarget::Locator {
+                    locator: locator.to_string(),
+                },
+                amount,
+            })
+            .await?
+        {
+            WalletControlResponse::Sent { outcome } => Ok(outcome),
+            other => bail!("unexpected wallet control send response: {other:?}"),
+        }
+    }
+
+    pub async fn send_to_invoice(&self, invoice: &str, amount: u64) -> Result<SendOutcome> {
+        match self
+            .call(WalletControlRequest::Send {
+                target: PaymentTarget::Invoice {
+                    invoice: invoice.to_string(),
+                },
                 amount,
             })
             .await?
@@ -486,9 +509,9 @@ impl WalletControlService {
         Ok(())
     }
 
-    async fn mint_receive_handle(&self) -> Result<String> {
+    async fn mint_invoice(&self) -> Result<String> {
         let _guard = self.op_lock.lock().await;
-        self.wallet.export_address()
+        self.wallet.mint_invoice()
     }
 
     async fn receive_locator(&self) -> Result<String> {
@@ -496,9 +519,14 @@ impl WalletControlService {
         self.wallet.publish_locator(Duration::from_secs(3600)).await
     }
 
-    async fn send(&self, recipient_handle: String, amount: u64) -> Result<SendOutcome> {
+    async fn send(&self, target: PaymentTarget, amount: u64) -> Result<SendOutcome> {
         let _guard = self.op_lock.lock().await;
-        self.wallet.pay(&recipient_handle, amount).await
+        match target {
+            PaymentTarget::Locator { locator } => self.wallet.send(&locator, amount).await,
+            PaymentTarget::Invoice { invoice } => {
+                self.wallet.send_to_invoice(&invoice, amount).await
+            }
+        }
     }
 
     async fn submit_shared_state_control(
@@ -742,8 +770,8 @@ async fn handle_request(
             WalletControlRequest::ReceiveLocator => Ok(WalletControlResponse::Locator {
                 locator: service.receive_locator().await?,
             }),
-            WalletControlRequest::MintReceiveHandle => Ok(WalletControlResponse::ReceiveHandle {
-                handle: service.mint_receive_handle().await?,
+            WalletControlRequest::MintInvoice => Ok(WalletControlResponse::Invoice {
+                invoice: service.mint_invoice().await?,
             }),
             WalletControlRequest::DeriveGenesisLockSecret { coin_id, chain_id } => {
                 Ok(WalletControlResponse::GenesisLockSecret {
@@ -752,11 +780,8 @@ async fn handle_request(
                         .compute_genesis_lock_secret(&coin_id, &chain_id),
                 })
             }
-            WalletControlRequest::Send {
-                recipient_handle,
-                amount,
-            } => {
-                let outcome = service.send(recipient_handle, amount).await?;
+            WalletControlRequest::Send { target, amount } => {
+                let outcome = service.send(target, amount).await?;
                 let _ = state_refresh_tx.send(());
                 Ok(WalletControlResponse::Sent { outcome })
             }

@@ -252,12 +252,12 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     node_client.ping()?;
     let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client.clone()));
     let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
-    let recipient_handle = receiver_wallet.export_address()?;
-    let recipient_handle_repeat = receiver_wallet.export_address()?;
+    let recipient_handle = receiver_wallet.mint_invoice()?;
+    let recipient_handle_repeat = receiver_wallet.mint_invoice()?;
     let (_recipient_addr, recipient_signing_pk, recipient_kem_pk) =
-        Wallet::parse_address(&recipient_handle)?;
+        Wallet::parse_invoice(&recipient_handle)?;
     let (_recipient_addr_repeat, recipient_signing_pk_repeat, recipient_kem_pk_repeat) =
-        Wallet::parse_address(&recipient_handle_repeat)?;
+        Wallet::parse_invoice(&recipient_handle_repeat)?;
 
     assert_ne!(recipient_signing_pk, recipient_signing_pk_repeat);
     assert_ne!(recipient_kem_pk, recipient_kem_pk_repeat);
@@ -349,7 +349,7 @@ async fn wallet_can_sync_compact_state_over_remote_ingress_without_node_control(
 
     assert_eq!(remote_wallet.balance()?, 260);
     assert_eq!(remote_wallet.list_owned_shielded_notes()?.len(), 260);
-    assert!(remote_wallet.export_address().is_ok());
+    assert!(remote_wallet.mint_invoice().is_ok());
 
     ingress.shutdown().await?;
     net.shutdown().await;
@@ -394,7 +394,7 @@ async fn wallet_can_prepare_shielded_send_over_remote_ingress_without_node_contr
 
     let sender_wallet = Arc::new(sender_wallet.with_ingress_client(ingress.client.clone()));
     let receiver_wallet = Arc::new(receiver_wallet.with_ingress_client(ingress.client.clone()));
-    let recipient_handle = receiver_wallet.export_address()?;
+    let recipient_handle = receiver_wallet.mint_invoice()?;
 
     let prepared = sender_wallet
         .prepare_shielded_send(&recipient_handle, 1)
@@ -453,13 +453,13 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
             .with_ingress_client(ingress.client.clone()),
     );
     let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
-    let recipient_handle = receiver_wallet.export_address()?;
-    let _ = Wallet::parse_address(&recipient_handle)?;
+    let recipient_handle = receiver_wallet.mint_invoice()?;
+    let _ = Wallet::parse_invoice(&recipient_handle)?;
 
     assert_eq!(sender_wallet.balance()?, 2);
     assert_eq!(receiver_wallet.balance()?, 0);
 
-    let outcome = sender_wallet.pay(&recipient_handle, 1).await?;
+    let outcome = sender_wallet.send_to_invoice(&recipient_handle, 1).await?;
     let tx_id = outcome.tx_id;
     assert_eq!(outcome.input_count, 2);
     assert_eq!(outcome.output_count, 1);

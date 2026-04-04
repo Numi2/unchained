@@ -118,10 +118,11 @@ Wallet UX is built around:
 
 From day one, private discovery is implemented as a **stateless PIR service**.
 The discovery directory stores **fixed-size signed discovery records** and
-answers only PIR-shaped queries, so it can help a sender resolve a short
-locator without learning which locator was looked up. Discovery returns
-mailbox bootstrap material, not a reusable payment key, and the wallet then
-negotiates a fresh one-time `RecipientHandle`.
+publishes a **signed manifest** carrying the PIR parameter set, and answers
+only PIR-shaped queries, so it can help a sender resolve a short locator
+without learning which locator was looked up. Discovery returns mailbox
+bootstrap material, not a reusable payment key, and the wallet then negotiates
+a fresh one-time `RecipientHandle`.
 
 The sender never needs to see large PQ key material, and the ledger never needs
 to see a reusable outward identity.

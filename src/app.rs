@@ -57,8 +57,8 @@ struct NodeCli {
     author,
     version,
     about = "Unchained wallet runtime",
-    long_about = "Operate the Unchained shielded wallet service, publish a PIR-resolvable receive locator, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start the required network services, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
-    after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet send --to <LOCATOR_OR_RECIPIENT_HANDLE> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
+    long_about = "Operate the Unchained shielded wallet service, publish a PIR-resolvable receive locator, mint one-time invoice capabilities for merchant-style flows, send shielded transactions, and inspect wallet state through the capability-authenticated wallet control plane. Start the required network services, then `unchained_wallet serve`, and use the remaining wallet commands as clients of that running wallet service.",
+    after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet invoice\n  unchained_wallet send --to <LOCATOR> --amount 100\n  unchained_wallet send --invoice <RECIPIENT_INVOICE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
     #[command(flatten)]
@@ -167,6 +167,8 @@ struct ReceiveArgs {
 struct SendArgs {
     #[arg(long = "to")]
     to: Option<String>,
+    #[arg(long, conflicts_with = "to")]
+    invoice: Option<String>,
     #[arg(long)]
     amount: Option<u64>,
     #[arg(long, default_value_t = false)]
@@ -252,9 +254,10 @@ enum WalletCmd {
     /// Host the local wallet control socket used by other runtimes
     Serve,
     /// Publish and print the PIR-resolvable receive locator
-    #[command(alias = "address")]
     Receive(ReceiveArgs),
-    /// Send coins using a receive locator or a single-use recipient handle
+    /// Mint and print a one-time invoice capability for merchant-style direct payment
+    Invoice(ReceiveArgs),
+    /// Send coins using a receive locator or an explicit invoice capability
     Send(SendArgs),
     /// Submit a signed fee-paid shared-state control document through the running wallet
     SubmitControl(SubmitControlArgs),
@@ -1029,17 +1032,28 @@ async fn run_send_flow(
     client: &wallet_control::WalletControlClient,
     args: &SendArgs,
 ) -> Result<()> {
-    let guided = args.to.is_none() || args.amount.is_none();
+    let guided = (args.to.is_none() && args.invoice.is_none()) || args.amount.is_none();
     if guided && !atty::is(atty::Stream::Stdin) {
-        bail!("Interactive send requires a TTY. Pass --to and --amount in non-interactive mode.");
+        bail!(
+            "Interactive send requires a TTY. Pass --to or --invoice together with --amount in non-interactive mode."
+        );
     }
-    let to_raw = match &args.to {
-        Some(to) => to.clone(),
-        None => prompt_line("Recipient locator or single-use handle: ")?,
+    let (target_kind, target_raw) = match (&args.to, &args.invoice) {
+        (Some(locator), None) => ("locator", locator.clone()),
+        (None, Some(invoice)) => ("invoice", invoice.clone()),
+        (None, None) => {
+            let locator = prompt_line("Recipient locator (leave blank to use an invoice): ")?;
+            if locator.trim().is_empty() {
+                ("invoice", prompt_line("Invoice: ")?)
+            } else {
+                ("locator", locator)
+            }
+        }
+        (Some(_), Some(_)) => bail!("pass either --to or --invoice, not both"),
     };
-    let to = load_receiver_code(&to_raw)?;
-    if to.is_empty() {
-        bail!("Address cannot be empty");
+    let target = load_receiver_code(&target_raw)?;
+    if target.is_empty() {
+        bail!("Recipient cannot be empty");
     }
 
     let amount = match args.amount {
@@ -1058,7 +1072,15 @@ async fn run_send_flow(
             "Ready to send {amount} coin{}.",
             if amount == 1 { "" } else { "s" }
         );
-        println!("Recipient: {}", short_text(&to));
+        println!(
+            "{}: {}",
+            if target_kind == "locator" {
+                "Locator"
+            } else {
+                "Invoice"
+            },
+            short_text(&target)
+        );
         let confirm = prompt_line("Broadcast now? [Y/n]: ")?;
         if matches!(confirm.to_ascii_lowercase().as_str(), "n" | "no") {
             println!("Cancelled.");
@@ -1066,14 +1088,19 @@ async fn run_send_flow(
         }
     }
 
-    let outcome = client.send(&to, amount).await?;
+    let outcome = if target_kind == "locator" {
+        client.send_to_locator(&target, amount).await?
+    } else {
+        client.send_to_invoice(&target, amount).await?
+    };
 
     if args.json {
         println!(
             "{}",
             serde_json::json!({
                 "ok": true,
-                "to": to,
+                "target_kind": target_kind,
+                "target": target,
                 "amount": amount,
                 "fee_amount": outcome.fee_amount,
                 "tx_id": hex::encode(outcome.tx_id),
@@ -1097,42 +1124,55 @@ async fn run_send_flow(
         outcome.fee_amount,
         if outcome.fee_amount == 1 { "" } else { "s" }
     );
-    println!("Recipient: {}", short_text(&to));
+    println!(
+        "{}: {}",
+        if target_kind == "locator" {
+            "Locator"
+        } else {
+            "Invoice"
+        },
+        short_text(&target)
+    );
     println!("Tx ID: {}", hex::encode(outcome.tx_id));
     println!();
     println!("Track confirmation with `unchained_wallet history`.");
     Ok(())
 }
 
-fn print_receive_output(handle: &str, args: &ReceiveArgs) -> Result<()> {
-    let locator = handle.to_string();
+fn print_shareable_output(
+    label: &str,
+    json_key: &str,
+    value: &str,
+    args: &ReceiveArgs,
+) -> Result<()> {
+    let value = value.to_string();
     let copied = if args.copy {
-        copy_to_clipboard(&locator).is_ok()
+        copy_to_clipboard(&value).is_ok()
     } else {
         false
     };
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "locator": locator,
-                "copied": copied,
-            })
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            json_key.to_string(),
+            serde_json::Value::String(value.clone()),
         );
+        obj.insert("copied".to_string(), serde_json::Value::Bool(copied));
+        println!("{}", serde_json::Value::Object(obj));
         return Ok(());
     }
 
     if args.plain {
-        println!("{locator}");
+        println!("{value}");
         return Ok(());
     }
 
-    println!("Receive");
+    println!("{label}");
     println!();
-    println!("{locator}");
+    println!("{value}");
     println!();
-    if let Err(err) = print_qr_to_terminal(&locator) {
+    if let Err(err) = print_qr_to_terminal(&value) {
         eprintln!("QR unavailable: {err}");
     }
     if args.copy {
@@ -1171,7 +1211,8 @@ fn print_balance_output(state: &wallet::WalletObservedState, args: &BalanceArgs)
         if balance == 1 { "" } else { "s" }
     );
     println!("Spendable outputs: {outputs}");
-    println!("Receive: `unchained_wallet receive`");
+    println!("Receive locator: `unchained_wallet receive`");
+    println!("Mint invoice: `unchained_wallet invoice`");
     Ok(())
 }
 
@@ -1453,6 +1494,11 @@ pub async fn run_wallet_cli() -> Result<()> {
             {
                 wallet = wallet.with_discovery_client(discovery_client);
             }
+            if !wallet.has_discovery_client() {
+                bail!(
+                    "wallet serve requires [discovery.wallet].server; PIR-native locator discovery is a canonical runtime dependency"
+                );
+            }
             if node_client.is_none() && !wallet.has_ingress_client() {
                 bail!(
                     "wallet serve requires either a reachable local node control socket or configured [ingress.wallet] relay/gateway services"
@@ -1566,7 +1612,13 @@ pub async fn run_wallet_cli() -> Result<()> {
         WalletCmd::Receive(args) => {
             let client = open_wallet_control_client(&cfg).await?;
             let locator = client.receive_locator().await?;
-            print_receive_output(&locator, &args)?;
+            print_shareable_output("Receive Locator", "locator", &locator, &args)?;
+            Ok(())
+        }
+        WalletCmd::Invoice(args) => {
+            let client = open_wallet_control_client(&cfg).await?;
+            let invoice = client.mint_invoice().await?;
+            print_shareable_output("Invoice", "invoice", &invoice, &args)?;
             Ok(())
         }
         WalletCmd::Balance(args) => {

@@ -341,7 +341,7 @@ Canonical requirements:
 - constant-size queries
 - constant-size responses
 - fixed-size directory records
-- signed snapshot manifests plus authenticated fixed-size row proofs
+- signed snapshot manifests that bind the exact PIR parameter set
 - no cleartext locator lookup API beside the PIR interface
 
 The privacy model is:
@@ -354,11 +354,12 @@ The privacy model is:
 Hashed low-entropy identifiers are not a privacy primitive and are not a valid
 substitute for private discovery.
 
-The canonical implementation target is a **low-communication stateless PIR**
-design in the WhisPIR class. That is the right trade for Unchained because
-discovery clients are ephemeral, discovery records are small, and the
-directory changes frequently. Unchained should not take a non-colluding-server
-or offline-preprocessing dependency for basic wallet addressability.
+The canonical implementation target is a **low-communication stateless
+single-server PIR** backend over fixed-size records. That is the right trade
+for Unchained because discovery clients are ephemeral, discovery records are
+small, and the directory changes frequently. Unchained should not take a
+non-colluding-server or offline-preprocessing dependency for basic wallet
+addressability.
 
 ### PIR-Native Discovery Records
 
@@ -390,25 +391,22 @@ The discovery directory publishes a signed manifest that commits to:
 
 - dataset ID and snapshot epoch
 - row count and row size
-- locator-to-slot placement parameters and salts
-- PIR parameter set
-- authenticated row-commitment root
+- PIR seed material, hint material, and filter parameters
 - validity interval and operator signature
 
 Clients then:
 
 1. fetch the latest signed manifest
-2. derive a small fixed candidate-slot set from the `LocatorID`
-3. issue PIR queries for all candidate slots
-4. receive fixed-size rows plus fixed-size authentication proofs
-5. verify the manifest, row proofs, and record signatures locally
+2. instantiate the PIR client from the manifest parameters
+3. issue a fixed-shape PIR query for the `LocatorID`
+4. receive a fixed-size record payload
+5. verify the manifest signature and record signature locally
 6. decrypt and use the mailbox bootstrap material to request a one-time
    `RecipientHandle`
 
-Locator placement must therefore be **PIR-native**: clients derive the small
-fixed candidate set from public manifest parameters, and collision handling
-happens inside the PIR response path. There is no cleartext “miss then retry by
-name” fallback.
+Locator indexing must therefore be **PIR-native**: the signed manifest carries
+the exact index parameters, and clients query the directory only through the
+PIR path. There is no cleartext “miss then retry by name” fallback.
 
 ### Handle Negotiation
 

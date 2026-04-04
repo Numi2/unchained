@@ -1,5 +1,7 @@
 # State Of Unchained Task List
 
+Unchained aims to be a state of the art blockchain that is e2e post quantum safe and privacy with uncompromising intent.
+
 This file tracks the concrete work required to move the repository to the
 canonical Unchained design described in `ARCHITECTURE.md`.
 
@@ -180,20 +182,25 @@ transitional and should be removed rather than preserved.
   The architectural role separation is now explicit; the codebase audit and
   implementation cleanup remain open under cryptography and key-management
   tasks.
-- `[ ]` Define and lock the canonical discovery manifest, snapshot, and
-  row-authentication formats for PIR-native lookups
-- `[ ]` Define and lock the fixed-size discovery-record schema, padding rules,
+- `[x]` Define and lock the canonical discovery manifest, snapshot, and
+  signed-PIR-parameter formats for native locator lookups
+- `[x]` Define and lock the fixed-size discovery-record schema, padding rules,
   and record size for small-record PIR operation
-- `[ ]` Implement locator placement into PIR snapshots using a public salted
-  fixed-fanout candidate-slot derivation with no cleartext lookup fallback
-- `[ ]` Implement the Rust PIR discovery client library for manifest fetch,
-  query generation, response verification, record decoding, and mailbox
+- `[x]` Implement PIR-native locator indexing from signed manifest parameters
+  with no cleartext lookup fallback
+- `[x]` Implement the Rust PIR discovery client library for manifest fetch,
+  signature verification, query generation, record decoding, and mailbox
   bootstrap extraction
-- `[ ]` Implement the discovery directory server with snapshot builder, PIR
+- `[~]` Implement the discovery directory server with snapshot builder, PIR
   query executor, hot-swap snapshot rotation, and replica consistency checks
-- `[ ]` Implement signed snapshot publication and mirrorable discovery replicas
+  The native server now builds signed snapshots, serves PIR queries, and
+  refreshes its in-memory index after locator publication; cross-replica
+  consistency enforcement is still open.
+- `[~]` Implement signed snapshot publication and mirrorable discovery replicas
   so clients can verify they are querying the intended directory snapshot
-- `[ ]` Implement mailbox transport and one-time `RecipientHandle`
+  Signed manifests are now live and verified by clients; mirrored publication
+  and replica distribution policy are still open.
+- `[x]` Implement mailbox transport and one-time `RecipientHandle`
   request/response flows against PIR-fetched discovery records
 - `[ ]` Implement privacy-preserving abuse controls for discovery queries
   using blinded rate-limit tokens or an equivalent anonymous query-budget
@@ -205,8 +212,9 @@ transitional and should be removed rather than preserved.
   Internal self-change and staking-note outputs now derive deterministic
   one-time internal ML-KEM receive keys from wallet secret material and the
   transaction send seed, and outward handles now mint one-time payment
-  capability keys plus one-time ML-KEM receive keys. Discovery/mailbox UX still
-  needs the broader negotiated-handle cleanup.
+  capability keys plus one-time ML-KEM receive keys. PIR-native locator
+  discovery, mailbox negotiation, and direct invoice flows are now wired into
+  the wallet and CLI; the remaining work is a deeper key-management audit.
 
 ## 7. Network Privacy And Ingress
 
@@ -288,7 +296,7 @@ transitional and should be removed rather than preserved.
   transport now also carry explicit backend identity and capability manifests.
   The backend swap itself is still open.
 - `[ ]` Set and document a conservative `>= 128-bit` security budget
-- `[ ]` Implement native circuits for ordinary transfer
+- `[ ]` Implement native circuits for transfer
 - `[ ]` Implement native circuits for staking flows
 - `[ ]` Implement native circuits for issuance and redemption
 - `[ ]` Remove general-purpose zkVM assumptions from the steady-state critical
