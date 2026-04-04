@@ -90,6 +90,7 @@ struct SentShieldedTxRecord {
     tx_id: [u8; 32],
     commit_epoch: u64,
     amount: u64,
+    fee_amount: u64,
     counterparty: Address,
 }
 
@@ -199,7 +200,12 @@ impl PreparedShieldedTx {
     }
 
     pub fn tx_with_proof(&self, proof: Vec<u8>) -> Tx {
-        Tx::new(self.nullifiers.clone(), self.outputs.clone(), proof)
+        Tx::new(
+            self.nullifiers.clone(),
+            self.outputs.clone(),
+            self.witness.fee_amount,
+            proof,
+        )
     }
 }
 
@@ -215,6 +221,7 @@ impl PreparedPrivateDelegation {
                 transfer: OrdinaryPrivateTransfer {
                     nullifiers: self.nullifiers.clone(),
                     outputs: self.outputs.clone(),
+                    fee_amount: self.witness.shielded.fee_amount,
                     proof,
                 },
             }),
@@ -235,6 +242,7 @@ impl PreparedPrivateUndelegation {
                 transfer: OrdinaryPrivateTransfer {
                     nullifiers: self.nullifiers.clone(),
                     outputs: self.outputs.clone(),
+                    fee_amount: self.witness.shielded.fee_amount,
                     proof,
                 },
             }),
@@ -254,6 +262,7 @@ impl PreparedUnbondingClaim {
                 transfer: OrdinaryPrivateTransfer {
                     nullifiers: self.nullifiers.clone(),
                     outputs: self.outputs.clone(),
+                    fee_amount: self.witness.fee_amount,
                     proof,
                 },
             }),
@@ -1309,7 +1318,8 @@ impl Wallet {
     fn derive_send_seed(
         &self,
         recipient_address: &Address,
-        amount: u64,
+        primary_amount: u64,
+        fee_amount: u64,
         current_epoch: u64,
         selected_notes: &[OwnedShieldedNote],
     ) -> [u8; 32] {
@@ -1317,7 +1327,8 @@ impl Wallet {
         hasher.update(&self.lock_seed);
         hasher.update(&self.address);
         hasher.update(recipient_address);
-        hasher.update(&amount.to_le_bytes());
+        hasher.update(&primary_amount.to_le_bytes());
+        hasher.update(&fee_amount.to_le_bytes());
         hasher.update(&current_epoch.to_le_bytes());
         hasher.update(&(selected_notes.len() as u64).to_le_bytes());
         for note in selected_notes {
@@ -1436,6 +1447,7 @@ impl Wallet {
         tx_id: &[u8; 32],
         commit_epoch: u64,
         amount: u64,
+        fee_amount: u64,
         counterparty: Address,
     ) -> Result<()> {
         store.put(
@@ -1445,6 +1457,7 @@ impl Wallet {
                 tx_id: *tx_id,
                 commit_epoch,
                 amount,
+                fee_amount,
                 counterparty,
             },
         )
@@ -1539,20 +1552,25 @@ impl Wallet {
             rotation_round,
         )
         .await?;
+        let fee_amount = crate::transaction::ordinary_private_transfer_fee_amount();
+        let required_total = amount
+            .checked_add(fee_amount)
+            .ok_or_else(|| anyhow!("ordinary private transfer total exceeds u64"))?;
         let selected_notes = {
             let mut selected = Vec::new();
             let mut total = 0u64;
             for note in available_notes {
                 total = total.saturating_add(note.note.value);
                 selected.push(note);
-                if total >= amount {
+                if total >= required_total {
                     break;
                 }
             }
-            if total < amount {
+            if total < required_total {
                 bail!(
-                    "Insufficient funds: requested {}, available {}",
+                    "Insufficient funds: requested {} plus fee {}, available {}",
                     amount,
+                    fee_amount,
                     total
                 );
             }
@@ -1567,8 +1585,13 @@ impl Wallet {
         let note_tree = &snapshot.note_tree;
         let tree_root = note_tree.root();
         let chain_id = snapshot.chain_id;
-        let send_seed =
-            self.derive_send_seed(&recipient_address, amount, current_epoch, &selected_notes);
+        let send_seed = self.derive_send_seed(
+            &recipient_address,
+            amount,
+            fee_amount,
+            current_epoch,
+            &selected_notes,
+        );
 
         let mut input_witnesses = Vec::with_capacity(selected_notes.len());
         let mut nullifiers = Vec::with_capacity(selected_notes.len());
@@ -1612,7 +1635,7 @@ impl Wallet {
         ));
         outputs.push(recipient_output);
 
-        let change = total_selected.saturating_sub(amount);
+        let change = total_selected.saturating_sub(required_total);
         if change > 0 {
             let change_entropy = self.derive_output_entropy(&send_seed, 1);
             let change_receive_kem_pk =
@@ -1637,6 +1660,7 @@ impl Wallet {
             chain_id,
             current_epoch,
             note_tree_root: tree_root,
+            fee_amount,
             inputs: input_witnesses,
             outputs: output_witnesses,
         };
@@ -1670,6 +1694,10 @@ impl Wallet {
             rotation_round,
         )
         .await?;
+        let fee_amount = PROTOCOL.private_delegation_fee;
+        let required_total = amount
+            .checked_add(fee_amount)
+            .ok_or_else(|| anyhow!("private delegation total exceeds u64"))?;
 
         let selected_notes = {
             let mut selected = Vec::new();
@@ -1677,14 +1705,15 @@ impl Wallet {
             for note in available_notes {
                 total = total.saturating_add(note.note.value);
                 selected.push(note);
-                if total >= amount {
+                if total >= required_total {
                     break;
                 }
             }
-            if total < amount {
+            if total < required_total {
                 bail!(
-                    "Insufficient funds for delegation: requested {}, available {}",
+                    "Insufficient funds for delegation: requested {} plus fee {}, available {}",
                     amount,
+                    fee_amount,
                     total
                 );
             }
@@ -1699,8 +1728,13 @@ impl Wallet {
         let note_tree = &snapshot.note_tree;
         let tree_root = note_tree.root();
         let chain_id = snapshot.chain_id;
-        let send_seed =
-            self.derive_send_seed(&self.address(), amount, current_epoch, &selected_notes);
+        let send_seed = self.derive_send_seed(
+            &self.address(),
+            amount,
+            fee_amount,
+            current_epoch,
+            &selected_notes,
+        );
 
         let mut input_witnesses = Vec::with_capacity(selected_notes.len());
         let mut nullifiers = Vec::with_capacity(selected_notes.len());
@@ -1749,7 +1783,7 @@ impl Wallet {
         ));
         outputs.push(delegated_output);
 
-        let change = total_selected.saturating_sub(amount);
+        let change = total_selected.saturating_sub(required_total);
         if change > 0 {
             let change_entropy = self.derive_output_entropy(&send_seed, 1);
             let change_receive_kem_pk =
@@ -1774,6 +1808,7 @@ impl Wallet {
                 chain_id,
                 current_epoch,
                 note_tree_root: tree_root,
+                fee_amount,
                 inputs: input_witnesses,
                 outputs: output_witnesses,
             },
@@ -1814,6 +1849,14 @@ impl Wallet {
             rotation_round,
         )
         .await?;
+        let fee_amount = PROTOCOL.private_undelegation_fee;
+        if undelegation_preview.claim_amount <= fee_amount {
+            bail!(
+                "undelegation claim value {} is not sufficient to cover fee {}",
+                undelegation_preview.claim_amount,
+                fee_amount
+            );
+        }
 
         let selected_notes = {
             let mut selected = Vec::new();
@@ -1846,6 +1889,7 @@ impl Wallet {
         let send_seed = self.derive_send_seed(
             &self.address(),
             share_amount,
+            fee_amount,
             current_epoch,
             &selected_notes,
         );
@@ -1886,7 +1930,10 @@ impl Wallet {
             },
             self.signing_pk.clone(),
             claim_receive_kem_pk,
-            undelegation_preview.claim_amount,
+            undelegation_preview
+                .claim_amount
+                .checked_sub(fee_amount)
+                .ok_or_else(|| anyhow!("undelegation claim fee exceeds the redeemed amount"))?,
             current_epoch,
             &claim_entropy,
         )?;
@@ -1926,11 +1973,13 @@ impl Wallet {
                 chain_id,
                 current_epoch,
                 note_tree_root: tree_root,
+                fee_amount,
                 inputs: input_witnesses,
                 outputs: output_witnesses,
             },
             validator_id: validator_id.0,
             claim_output_index: 0,
+            gross_claim_amount: undelegation_preview.claim_amount,
         };
 
         Ok(PreparedPrivateUndelegation {
@@ -1965,6 +2014,14 @@ impl Wallet {
         let total_claim_amount = available_notes
             .iter()
             .fold(0u64, |sum, note| sum.saturating_add(note.note.value));
+        let fee_amount = PROTOCOL.unbonding_claim_fee;
+        if total_claim_amount <= fee_amount {
+            bail!(
+                "mature unbonding claim value {} is not sufficient to cover fee {}",
+                total_claim_amount,
+                fee_amount
+            );
+        }
         let state_binding = Self::state_binding_from_snapshot(&snapshot)?;
         let current_epoch = snapshot.current_nullifier_epoch;
         let note_tree = &snapshot.note_tree;
@@ -1973,6 +2030,7 @@ impl Wallet {
         let send_seed = self.derive_send_seed(
             &self.address(),
             total_claim_amount,
+            fee_amount,
             current_epoch,
             &available_notes,
         );
@@ -2007,7 +2065,9 @@ impl Wallet {
         let (payout_output, payout_plaintext, payout_seed) = self.build_shielded_output(
             self.signing_pk.clone(),
             payout_receive_kem_pk,
-            total_claim_amount,
+            total_claim_amount
+                .checked_sub(fee_amount)
+                .ok_or_else(|| anyhow!("unbonding claim fee exceeds the payout amount"))?,
             current_epoch,
             &payout_entropy,
         )?;
@@ -2015,6 +2075,7 @@ impl Wallet {
             chain_id,
             current_epoch,
             note_tree_root: tree_root,
+            fee_amount,
             inputs: input_witnesses,
             outputs: vec![proof::output_witness_from_local(
                 &payout_plaintext,
@@ -2046,7 +2107,12 @@ impl Wallet {
                 "prepared shielded transaction is stale; canonical shielded state changed, re-prepare the send"
             );
         }
-        let tx = Tx::new(prepared.nullifiers.clone(), prepared.outputs, proof_bytes);
+        let tx = Tx::new(
+            prepared.nullifiers.clone(),
+            prepared.outputs,
+            prepared.witness.fee_amount,
+            proof_bytes,
+        );
         let tx_id = self.require_node_client()?.submit_tx(&tx)?;
         for (owned, nullifier) in prepared
             .selected_notes
@@ -2060,6 +2126,7 @@ impl Wallet {
             &tx_id,
             prepared.current_epoch,
             prepared.amount,
+            prepared.witness.fee_amount,
             prepared.recipient_address,
         )?;
         self.scan_tx_for_me(&tx)?;
@@ -2067,6 +2134,7 @@ impl Wallet {
 
         Ok(SendOutcome {
             tx_id,
+            fee_amount: prepared.witness.fee_amount,
             input_count: tx.input_count(),
             output_count: tx.output_count(),
         })
@@ -2284,6 +2352,7 @@ pub struct TransactionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendOutcome {
     pub tx_id: [u8; 32],
+    pub fee_amount: u64,
     pub input_count: usize,
     pub output_count: usize,
 }

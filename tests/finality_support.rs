@@ -51,10 +51,20 @@ impl TestCommittee {
 
     #[allow(dead_code)]
     pub fn from_identities(identities: Vec<NodeIdentity>) -> Self {
-        let members = identities
+        Self::from_weighted_identities(
+            identities
+                .into_iter()
+                .map(|identity| (identity, 1))
+                .collect(),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn from_weighted_identities(weighted_identities: Vec<(NodeIdentity, u64)>) -> Self {
+        let members = weighted_identities
             .into_iter()
-            .map(|identity| CommitteeMember {
-                validator: validator_from_record(identity.record(), 1)
+            .map(|(identity, voting_power)| CommitteeMember {
+                validator: validator_from_record(identity.record(), voting_power)
                     .expect("derive validator from runtime identity"),
                 signer: CommitteeSigner::Identity(identity),
             })

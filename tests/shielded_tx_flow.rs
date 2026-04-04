@@ -74,24 +74,32 @@ fn seed_genesis(
     Ok(genesis)
 }
 
-fn seed_sender_coin(store: &Store, wallet: &Wallet, genesis: &Anchor) -> anyhow::Result<Coin> {
+fn seed_sender_coins(
+    store: &Store,
+    wallet: &Wallet,
+    genesis: &Anchor,
+    count: u64,
+) -> anyhow::Result<Vec<Coin>> {
     let chain_id = genesis.hash;
-    let nonce = 7;
-    let candidate_id = Coin::calculate_id(&genesis.hash, nonce, &wallet.address());
-    let lock_secret = wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
-    let lock_hash =
-        unchained::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &lock_secret);
-    let coin = Coin::new_with_creator_pk_and_lock(
-        genesis.hash,
-        nonce,
-        wallet.address(),
-        wallet.public_key().clone(),
-        lock_hash,
-    );
-    store.put("coin", &coin.id, &coin)?;
-    store.put_coin_epoch(&coin.id, genesis.num)?;
-    store.put_coin_epoch_rev(genesis.num, &coin.id)?;
-    Ok(coin)
+    let mut coins = Vec::with_capacity(count as usize);
+    for nonce in 7..(7 + count) {
+        let candidate_id = Coin::calculate_id(&genesis.hash, nonce, &wallet.address());
+        let lock_secret = wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
+        let lock_hash =
+            unchained::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &lock_secret);
+        let coin = Coin::new_with_creator_pk_and_lock(
+            genesis.hash,
+            nonce,
+            wallet.address(),
+            wallet.public_key().clone(),
+            lock_hash,
+        );
+        store.put("coin", &coin.id, &coin)?;
+        store.put_coin_epoch(&coin.id, genesis.num)?;
+        store.put_coin_epoch_rev(genesis.num, &coin.id)?;
+        coins.push(coin);
+    }
+    Ok(coins)
 }
 
 fn mutate_shielded_note_tree(store: &Store, commitment: [u8; 32]) -> anyhow::Result<()> {
@@ -224,7 +232,7 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -248,7 +256,7 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     assert_eq!(recipient_signing_pk, recipient_signing_pk_repeat);
     assert_ne!(recipient_kem_pk, recipient_kem_pk_repeat);
 
-    assert_eq!(sender_wallet.balance()?, 1);
+    assert_eq!(sender_wallet.balance()?, 2);
     assert_eq!(receiver_wallet.balance()?, 0);
 
     let prepared_a = sender_wallet
@@ -258,7 +266,7 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
         .prepare_shielded_send(&recipient_handle, 1)
         .await?;
 
-    assert_eq!(prepared_a.input_count(), 1);
+    assert_eq!(prepared_a.input_count(), 2);
     assert_eq!(prepared_a.output_count(), 1);
     assert_eq!(
         bincode::serialize(prepared_a.witness())?,
@@ -300,13 +308,14 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
         .contains("prepared shielded transaction is stale"));
 
     let journal = proof_core::validate_shielded_tx_witness(prepared_a.witness())?;
-    assert_eq!(journal.inputs.len(), 1);
+    assert_eq!(journal.inputs.len(), 2);
+    assert_eq!(journal.fee_amount, PROTOCOL.ordinary_private_transfer_fee);
     assert_eq!(journal.outputs.len(), 1);
 
     let tx = prepared_a.tx_with_proof(Vec::new());
     receiver_wallet.scan_tx_for_me(&tx)?;
 
-    assert_eq!(sender_wallet.balance()?, 1);
+    assert_eq!(sender_wallet.balance()?, 2);
     assert_eq!(receiver_wallet.balance()?, 1);
     assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
 
@@ -335,7 +344,7 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -351,19 +360,19 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let recipient_handle = receiver_wallet.export_address()?;
     let _ = Wallet::parse_address(&recipient_handle)?;
 
-    assert_eq!(sender_wallet.balance()?, 1);
+    assert_eq!(sender_wallet.balance()?, 2);
     assert_eq!(receiver_wallet.balance()?, 0);
 
     let outcome = sender_wallet.pay(&recipient_handle, 1).await?;
     let tx_id = outcome.tx_id;
-    assert_eq!(outcome.input_count, 1);
+    assert_eq!(outcome.input_count, 2);
     assert_eq!(outcome.output_count, 1);
 
     let tx_bytes = sender_db
         .get_raw_bytes("tx", &tx_id)?
         .expect("persisted tx bytes");
     let tx = unchained::canonical::decode_tx(&tx_bytes)?;
-    assert_eq!(tx.input_count(), 1);
+    assert_eq!(tx.input_count(), 2);
     assert_eq!(tx.output_count(), 1);
     assert!(sender_db.load_fast_path_pending_tx(&tx_id)?.is_none());
     assert!(sender_db.load_shared_state_pending_tx(&tx_id)?.is_none());
@@ -398,7 +407,7 @@ async fn private_delegation_updates_validator_pool_and_wallet_note_state() -> an
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -476,7 +485,7 @@ async fn private_undelegation_updates_pool_and_wallet_note_state() -> anyhow::Re
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -497,7 +506,7 @@ async fn private_undelegation_updates_pool_and_wallet_note_state() -> anyhow::Re
     let validator_id = validator_set.validators[0].id;
 
     let delegated = sender_wallet
-        .prepare_private_delegation(validator_id, 1)
+        .prepare_private_delegation(validator_id, 2)
         .await?;
     let delegation_journal = proof_core::validate_private_delegation_witness(delegated.witness())?;
     let delegation_tx = delegated.tx_with_proof(Vec::new());
@@ -524,17 +533,18 @@ async fn private_undelegation_updates_pool_and_wallet_note_state() -> anyhow::Re
             .consensus_status
             .registered_validator_pools
             .iter()
-            .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 2)
+            .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 3)
     })
     .await?;
 
     let undelegated = sender_wallet
-        .prepare_private_undelegation(validator_id, 1)
+        .prepare_private_undelegation(validator_id, 2)
         .await?;
     let undelegation_journal =
         proof_core::validate_private_undelegation_witness(undelegated.witness())?;
     assert_eq!(undelegation_journal.validator_id, validator_id.0);
-    assert_eq!(undelegation_journal.burned_share_value, 1);
+    assert_eq!(undelegation_journal.burned_share_value, 2);
+    assert_eq!(undelegation_journal.gross_claim_amount, 2);
     assert_eq!(undelegation_journal.claim_value, 1);
     assert_eq!(
         undelegation_journal.release_epoch,
@@ -548,7 +558,7 @@ async fn private_undelegation_updates_pool_and_wallet_note_state() -> anyhow::Re
         .expect("delegated validator pool")
         .apply_undelegation(
             undelegation_journal.burned_share_value,
-            undelegation_journal.claim_value,
+            undelegation_journal.gross_claim_amount,
             undelegation_journal.current_epoch,
             undelegation_journal.release_epoch,
             PROTOCOL.stake_unbonding_epochs,
@@ -602,7 +612,7 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -623,7 +633,7 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
     let validator_id = validator_set.validators[0].id;
 
     let delegation_state = state_client.state()?;
-    let delegation_tx_id = sender_wallet.delegate_to_validator(validator_id, 1).await?;
+    let delegation_tx_id = sender_wallet.delegate_to_validator(validator_id, 2).await?;
     assert!(sender_db.get_raw_bytes("tx", &delegation_tx_id)?.is_none());
     assert!(sender_db
         .load_shared_state_pending_tx(&delegation_tx_id)?
@@ -662,7 +672,7 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
                     .consensus_status
                     .registered_validator_pools
                     .iter()
-                    .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 2)
+                    .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 3)
         })
         .await?;
     assert_eq!(
@@ -681,7 +691,7 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
 
     let undelegation_state = state_client.state()?;
     let undelegation_tx_id = sender_wallet
-        .undelegate_from_validator(validator_id, 1)
+        .undelegate_from_validator(validator_id, 2)
         .await?;
     assert!(sender_db
         .get_raw_bytes("tx", &undelegation_tx_id)?
@@ -771,7 +781,7 @@ async fn private_delegation_end_to_end_proving_soak() -> anyhow::Result<()> {
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_coin = seed_sender_coin(sender_db.as_ref(), &sender_wallet, &genesis)?;
+    let _sender_coins = seed_sender_coins(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(

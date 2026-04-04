@@ -14,7 +14,8 @@ use crate::node_identity::{
 use crate::protocol::CURRENT as PROTOCOL;
 use crate::staking::{
     expected_validator_set_for_epoch, load_or_compute_active_validator_set,
-    register_genesis_local_validator_pool,
+    register_genesis_local_validator_pool, RewardSuppressionReason, ValidatorPool,
+    ValidatorRewardEvent,
 };
 use crate::storage::{protocol_chain_id, Store};
 use crate::sync::SyncState;
@@ -1566,10 +1567,14 @@ impl RuntimeState {
         proposal: &AnchorProposal,
         envelope: &SignedEnvelope,
     ) -> Result<()> {
-        let proposer = ValidatorId::from_hot_key(&proposer_record.auth_spki);
-        if let Some(record) =
-            evidence::observe_anchor_proposal(self.db.as_ref(), proposer, proposal, envelope)?
-        {
+        let proposer_author = evidence::EnvelopeAuthor::from_record(proposer_record);
+        let proposer = proposer_author.validator_id();
+        if let Some(record) = evidence::observe_anchor_proposal(
+            self.db.as_ref(),
+            &proposer_author,
+            proposal,
+            envelope,
+        )? {
             bail!(
                 "recorded proposal equivocation evidence {} for validator {} at epoch {} slot {}",
                 hex::encode(record.evidence_id),
@@ -1596,11 +1601,13 @@ impl RuntimeState {
 
     fn observe_shared_state_dag_batch(
         &self,
+        author_record: &NodeRecordV2,
         batch: &SharedStateDagBatch,
         envelope: &SignedEnvelope,
     ) -> Result<()> {
+        let author = evidence::EnvelopeAuthor::from_record(author_record);
         if let Some(record) =
-            evidence::observe_shared_state_dag_batch(self.db.as_ref(), batch, envelope)?
+            evidence::observe_shared_state_dag_batch(self.db.as_ref(), &author, batch, envelope)?
         {
             bail!(
                 "recorded DAG batch equivocation evidence {} for validator {} at epoch {} round {}",
@@ -2062,9 +2069,10 @@ impl RuntimeState {
             bail!("shared-state DAG batch author is not part of the active validator set");
         }
         validate_shared_state_dag_batch_author(&batch, author_record)?;
-        self.observe_shared_state_dag_batch(&batch, envelope)?;
+        self.observe_shared_state_dag_batch(author_record, &batch, envelope)?;
         self.db.store_shared_state_dag_batch(&batch)?;
         let observation = crate::evidence::StoredSharedStateDagObservation {
+            author: evidence::EnvelopeAuthor::from_record(author_record),
             batch_id: batch.batch_id,
             envelope: envelope.clone(),
         };
@@ -4771,7 +4779,107 @@ fn chain_compatible(local_chain_id: Option<[u8; 32]>, remote_chain_id: Option<[u
 #[cfg(test)]
 mod tests {
     use super::chain_compatible;
+    use super::settle_anchor_validator_rewards;
+    use crate::consensus::{
+        OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys, ValidatorSet,
+        ValidatorVote, VoteTarget,
+    };
+    use crate::crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign};
+    use crate::epoch::Anchor;
+    use crate::staking::{
+        RewardSuppressionReason, ValidatorMetadata, ValidatorPool, ValidatorStatus,
+    };
     use crate::storage::protocol_chain_id;
+    use crate::Store;
+    use tempfile::TempDir;
+
+    fn reward_test_pool(
+        voting_power: u64,
+        node_id: [u8; 32],
+        commission_bps: u16,
+        status: ValidatorStatus,
+    ) -> (ValidatorPool, aws_lc_rs::unstable::signature::PqdsaKeyPair) {
+        let hot_key = ml_dsa_65_generate().unwrap();
+        let cold_key = ml_dsa_65_generate().unwrap();
+        let validator = Validator::new(
+            voting_power,
+            ValidatorKeys {
+                hot_ml_dsa_65_spki: ml_dsa_65_public_key_spki(&hot_key).unwrap(),
+                cold_governance_key: ml_dsa_65_public_key_spki(&cold_key).unwrap(),
+            },
+        )
+        .unwrap();
+        let pool = ValidatorPool::new(
+            validator,
+            node_id,
+            commission_bps,
+            voting_power,
+            0,
+            status,
+            ValidatorMetadata {
+                display_name: format!("validator-{}", hex::encode(&node_id[..4])),
+                website: None,
+                description: Some("reward test validator".to_string()),
+            },
+        )
+        .unwrap();
+        (pool, hot_key)
+    }
+
+    fn reward_test_anchor(
+        num: u64,
+        validator_set: &ValidatorSet,
+        signers: &[(ValidatorId, &aws_lc_rs::unstable::signature::PqdsaKeyPair)],
+    ) -> Anchor {
+        let position = Anchor::position_for_num(num);
+        let parent_hash = if num == 0 {
+            None
+        } else {
+            Some([num as u8; 32])
+        };
+        let target = VoteTarget {
+            position,
+            ordering_path: OrderingPath::FastPathPrivateTransfer,
+            block_digest: Anchor::compute_hash(
+                num,
+                parent_hash,
+                position,
+                OrderingPath::FastPathPrivateTransfer,
+                [num as u8; 32],
+                0,
+                0,
+                &[],
+                &[],
+                [0u8; 32],
+                0,
+                validator_set,
+            ),
+        };
+        let votes = signers
+            .iter()
+            .map(|(validator_id, hot_key)| ValidatorVote {
+                voter: *validator_id,
+                target: target.clone(),
+                signature: ml_dsa_65_sign(hot_key, &target.signing_bytes()).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let qc = QuorumCertificate::from_votes(validator_set, target.clone(), votes).unwrap();
+        Anchor::new(
+            num,
+            parent_hash,
+            OrderingPath::FastPathPrivateTransfer,
+            [num as u8; 32],
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            [0u8; 32],
+            0,
+            validator_set.clone(),
+            qc,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn protocol_chain_id_remains_compatible_during_genesis_rebind() {
@@ -4782,6 +4890,164 @@ mod tests {
         assert!(chain_compatible(Some(provisional), Some(canonical)));
         assert!(!chain_compatible(Some(canonical), Some([8u8; 32])));
         assert!(!chain_compatible(None, Some(canonical)));
+    }
+
+    #[test]
+    fn finalized_anchor_rewards_raise_exchange_rate_and_invalidate_future_committees() {
+        let dir = TempDir::new().unwrap();
+        let db = Store::open(&dir.path().to_string_lossy()).unwrap();
+        let (pool_a, hot_a) = reward_test_pool(50_000, [0x11; 32], 2_500, ValidatorStatus::Active);
+        let (pool_b, hot_b) = reward_test_pool(70_000, [0x22; 32], 0, ValidatorStatus::Active);
+        db.store_validator_pool(&pool_a).unwrap();
+        db.store_validator_pool(&pool_b).unwrap();
+        let validator_set =
+            ValidatorSet::new(0, vec![pool_a.validator.clone(), pool_b.validator.clone()]).unwrap();
+        let future_committee = ValidatorSet::new(1, vec![pool_a.validator.clone()]).unwrap();
+        db.store_validator_committee(&future_committee).unwrap();
+
+        let anchor = reward_test_anchor(
+            1,
+            &validator_set,
+            &[(pool_a.validator.id, &hot_a), (pool_b.validator.id, &hot_b)],
+        );
+        let events = settle_anchor_validator_rewards(&db, &anchor, 3).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(db.load_validator_committee(1).unwrap().is_none());
+
+        let updated_a = db
+            .load_validator_pool(&pool_a.validator.id)
+            .unwrap()
+            .expect("rewarded validator A");
+        let updated_b = db
+            .load_validator_pool(&pool_b.validator.id)
+            .unwrap()
+            .expect("rewarded validator B");
+        assert_eq!(updated_a.total_bonded_stake, pool_a.total_bonded_stake + 6);
+        assert_eq!(updated_a.pending_commission_stake, 1);
+        assert_eq!(updated_a.claimable_bonded_stake().unwrap(), 50_005);
+        assert_eq!(
+            updated_a.total_delegation_shares,
+            pool_a.total_delegation_shares
+        );
+        assert_eq!(updated_b.total_bonded_stake, pool_b.total_bonded_stake + 9);
+        assert_eq!(updated_b.pending_commission_stake, 0);
+        assert_eq!(updated_b.claimable_bonded_stake().unwrap(), 70_009);
+
+        let stored_events = db
+            .load_validator_reward_events_for_anchor(anchor.num)
+            .unwrap();
+        assert_eq!(stored_events.len(), 2);
+        assert!(stored_events
+            .iter()
+            .all(|event| event.suppression_reason.is_none()));
+        let event_a = stored_events
+            .iter()
+            .find(|event| event.validator_id == pool_a.validator.id)
+            .unwrap();
+        assert_eq!(event_a.protocol_reward, 5);
+        assert_eq!(event_a.fee_reward, 1);
+        assert_eq!(event_a.gross_reward, 6);
+        assert_eq!(event_a.commission_reward, 1);
+        assert_eq!(event_a.share_backed_reward, 5);
+        let event_b = stored_events
+            .iter()
+            .find(|event| event.validator_id == pool_b.validator.id)
+            .unwrap();
+        assert_eq!(event_b.protocol_reward, 7);
+        assert_eq!(event_b.fee_reward, 2);
+        assert_eq!(event_b.gross_reward, 9);
+        assert_eq!(event_b.commission_reward, 0);
+        assert_eq!(event_b.share_backed_reward, 9);
+    }
+
+    #[test]
+    fn finalized_anchor_rewards_suppress_missed_and_jailed_validators() {
+        let dir = TempDir::new().unwrap();
+        let db = Store::open(&dir.path().to_string_lossy()).unwrap();
+        let (pool_a, hot_a) = reward_test_pool(50_001, [0x11; 32], 0, ValidatorStatus::Active);
+        let (pool_b, _hot_b) = reward_test_pool(40_000, [0x22; 32], 0, ValidatorStatus::Active);
+        let (pool_c, hot_c) = reward_test_pool(30_000, [0x33; 32], 0, ValidatorStatus::Jailed);
+        db.store_validator_pool(&pool_a).unwrap();
+        db.store_validator_pool(&pool_b).unwrap();
+        db.store_validator_pool(&pool_c).unwrap();
+        let validator_set = ValidatorSet::new(
+            0,
+            vec![
+                pool_a.validator.clone(),
+                pool_b.validator.clone(),
+                pool_c.validator.clone(),
+            ],
+        )
+        .unwrap();
+        let anchor = reward_test_anchor(
+            1,
+            &validator_set,
+            &[(pool_a.validator.id, &hot_a), (pool_c.validator.id, &hot_c)],
+        );
+        let events = settle_anchor_validator_rewards(&db, &anchor, 4).unwrap();
+        assert_eq!(events.len(), 3);
+
+        let updated_a = db
+            .load_validator_pool(&pool_a.validator.id)
+            .unwrap()
+            .expect("rewarded validator A");
+        let updated_b = db
+            .load_validator_pool(&pool_b.validator.id)
+            .unwrap()
+            .expect("missed-vote validator B");
+        let updated_c = db
+            .load_validator_pool(&pool_c.validator.id)
+            .unwrap()
+            .expect("jailed validator C");
+        assert_eq!(updated_a.total_bonded_stake, pool_a.total_bonded_stake + 9);
+        assert_eq!(updated_b.total_bonded_stake, pool_b.total_bonded_stake);
+        assert_eq!(updated_c.total_bonded_stake, pool_c.total_bonded_stake);
+
+        let stored_events = db
+            .load_validator_reward_events_for_anchor(anchor.num)
+            .unwrap();
+        let event_a = stored_events
+            .iter()
+            .find(|event| event.validator_id == pool_a.validator.id)
+            .unwrap();
+        let event_b = stored_events
+            .iter()
+            .find(|event| event.validator_id == pool_b.validator.id)
+            .unwrap();
+        let event_c = stored_events
+            .iter()
+            .find(|event| event.validator_id == pool_c.validator.id)
+            .unwrap();
+        assert_eq!(event_a.suppression_reason, None);
+        assert_eq!(event_a.protocol_reward, 5);
+        assert_eq!(event_a.fee_reward, 4);
+        assert_eq!(event_a.gross_reward, 9);
+        assert_eq!(
+            event_b.suppression_reason,
+            Some(RewardSuppressionReason::MissedVote)
+        );
+        assert_eq!(event_b.protocol_reward, 0);
+        assert_eq!(event_b.fee_reward, 0);
+        assert_eq!(event_b.gross_reward, 0);
+        assert_eq!(
+            event_c.suppression_reason,
+            Some(RewardSuppressionReason::Jailed)
+        );
+        assert_eq!(event_c.protocol_reward, 0);
+        assert_eq!(event_c.fee_reward, 0);
+        assert_eq!(event_c.gross_reward, 0);
+        assert_eq!(
+            event_a.total_rewarded_voting_power,
+            pool_a.validator.voting_power
+        );
+        assert_eq!(
+            event_b.total_rewarded_voting_power,
+            pool_a.validator.voting_power
+        );
+        assert_eq!(
+            event_c.total_rewarded_voting_power,
+            pool_a.validator.voting_power
+        );
     }
 }
 
@@ -5367,7 +5633,7 @@ fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
         ordered_tx_count: anchor.ordered_tx_count,
         validator_set: anchor.validator_set.clone(),
     };
-    match anchor.ordering_path {
+    let total_fee_revenue = match anchor.ordering_path {
         OrderingPath::FastPathPrivateTransfer => {
             let batch = db
                 .load_fast_path_batch(&anchor.merkle_root)?
@@ -5375,6 +5641,7 @@ fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
             validate_fast_path_batch_for_proposal(&proposal, &batch, db)
                 .map_err(anyhow::Error::msg)?;
             batch.apply_finalized(db)?;
+            batch.total_fee_revenue()?
         }
         OrderingPath::DagBftSharedState => {
             let parent = if anchor.num == 0 {
@@ -5394,17 +5661,217 @@ fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let batch = SharedStateBatch::from_dag_batches(&dag_batches)?;
-            batch.apply_finalized(db)?;
+            batch.apply_finalized(db, anchor.position.epoch)?;
             for batch_id in &anchor.ordered_batch_ids {
                 db.mark_shared_state_dag_batch_finalized(batch_id, anchor.num)?;
             }
+            batch.total_fee_revenue()?
         }
-    }
+    };
+    let _ = settle_anchor_validator_rewards(db, anchor, total_fee_revenue)?;
     db.store_validator_committee(&anchor.validator_set)?;
     db.put("epoch", &anchor.num.to_le_bytes(), anchor)?;
     db.put("epoch", b"latest", anchor)?;
     db.put("anchor", &anchor.hash, anchor)?;
+    let _ = evidence::record_anchor_liveness_faults(db, anchor)?;
     Ok(())
+}
+
+fn anchor_reward_for_validator(voting_power: u64) -> Result<u64> {
+    if voting_power == 0 {
+        bail!("validator rewards require non-zero voting power");
+    }
+    let proportional = u64::try_from(
+        ((voting_power as u128) * (PROTOCOL.validator_reward_bps_per_anchor as u128)) / 10_000u128,
+    )
+    .map_err(|_| anyhow!("validator reward exceeds u64"))?;
+    Ok(proportional.max(PROTOCOL.minimum_validator_reward_per_anchor))
+}
+
+fn settle_anchor_validator_rewards(
+    db: &Store,
+    anchor: &Anchor,
+    total_fee_revenue: u64,
+) -> Result<Vec<ValidatorRewardEvent>> {
+    if anchor.num == 0 {
+        return Ok(Vec::new());
+    }
+
+    let validator_pool_cf = db
+        .db
+        .cf_handle("validator_pool")
+        .ok_or_else(|| anyhow!("'validator_pool' column family missing"))?;
+    let validator_reward_cf = db
+        .db
+        .cf_handle("validator_reward_event")
+        .ok_or_else(|| anyhow!("'validator_reward_event' column family missing"))?;
+    let voters = anchor
+        .qc
+        .votes
+        .iter()
+        .map(|vote| vote.voter)
+        .collect::<HashSet<_>>();
+    let mut pools = HashMap::<ValidatorId, ValidatorPool>::new();
+    let mut total_rewarded_voting_power = 0u64;
+    for validator in &anchor.validator_set.validators {
+        let pool = db
+            .load_validator_pool(&validator.id)?
+            .ok_or_else(|| anyhow!("missing validator pool for finalized reward settlement"))?;
+        let rewarded = voters.contains(&validator.id)
+            && !matches!(
+                pool.status,
+                crate::staking::ValidatorStatus::Jailed | crate::staking::ValidatorStatus::Retired
+            );
+        if rewarded {
+            total_rewarded_voting_power = total_rewarded_voting_power
+                .checked_add(validator.voting_power)
+                .ok_or_else(|| anyhow!("rewarded validator voting power overflow"))?;
+        }
+        pools.insert(validator.id, pool);
+    }
+
+    let fee_rewards = distribute_fee_revenue_by_voting_power(
+        anchor,
+        total_rewarded_voting_power,
+        total_fee_revenue,
+        &pools,
+        &voters,
+    )?;
+
+    let mut write_batch = WriteBatch::default();
+    let mut events = Vec::with_capacity(anchor.validator_set.validators.len());
+    let mut rewards_applied = false;
+    for validator in &anchor.validator_set.validators {
+        let pool = pools
+            .get(&validator.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("validator pool cache is missing the finalized validator"))?;
+        let suppression_reason = if !voters.contains(&validator.id) {
+            Some(RewardSuppressionReason::MissedVote)
+        } else {
+            match pool.status {
+                crate::staking::ValidatorStatus::Jailed => Some(RewardSuppressionReason::Jailed),
+                crate::staking::ValidatorStatus::Retired => Some(RewardSuppressionReason::Retired),
+                crate::staking::ValidatorStatus::PendingActivation
+                | crate::staking::ValidatorStatus::Active => None,
+            }
+        };
+        let mut resulting_pool = pool.clone();
+        let protocol_reward = if suppression_reason.is_none() {
+            anchor_reward_for_validator(validator.voting_power)?
+        } else {
+            0
+        };
+        let fee_reward = if suppression_reason.is_none() {
+            *fee_rewards.get(&validator.id).unwrap_or(&0)
+        } else {
+            0
+        };
+        let mut gross_reward = 0u64;
+        let mut commission_reward = 0u64;
+        let mut share_backed_reward = 0u64;
+        if suppression_reason.is_none() {
+            let accrual = pool.accrue_reward(
+                protocol_reward
+                    .checked_add(fee_reward)
+                    .ok_or_else(|| anyhow!("validator reward overflow"))?,
+            )?;
+            gross_reward = accrual.gross_reward;
+            commission_reward = accrual.commission_reward;
+            share_backed_reward = accrual.share_backed_reward;
+            resulting_pool = accrual.updated_pool;
+            write_batch.put_cf(
+                validator_pool_cf,
+                &resulting_pool.validator.id.0,
+                bincode::serialize(&resulting_pool)
+                    .context("serialize reward-settled validator pool")?,
+            );
+            rewards_applied = true;
+        }
+        let event = ValidatorRewardEvent {
+            anchor_hash: anchor.hash,
+            anchor_num: anchor.num,
+            validator_id: validator.id,
+            validator_voting_power: validator.voting_power,
+            total_rewarded_voting_power,
+            protocol_reward,
+            fee_reward,
+            gross_reward,
+            commission_reward,
+            share_backed_reward,
+            bonded_stake_before: pool.total_bonded_stake,
+            bonded_stake_after: resulting_pool.total_bonded_stake,
+            pending_commission_before: pool.pending_commission_stake,
+            pending_commission_after: resulting_pool.pending_commission_stake,
+            resulting_status: resulting_pool.status,
+            suppression_reason,
+        };
+        event.validate()?;
+        write_batch.put_cf(
+            validator_reward_cf,
+            &Store::validator_reward_event_key(event.anchor_num, &event.validator_id),
+            bincode::serialize(&event).context("serialize validator reward event")?,
+        );
+        events.push(event);
+    }
+
+    if rewards_applied {
+        db.invalidate_future_validator_committees(&mut write_batch, anchor.position.epoch)?;
+        db.write_batch(write_batch)
+            .context("write finalized anchor reward settlement to the database")?;
+    } else if !events.is_empty() {
+        db.write_batch(write_batch)
+            .context("write finalized anchor reward suppression events to the database")?;
+    }
+    Ok(events)
+}
+
+fn distribute_fee_revenue_by_voting_power(
+    anchor: &Anchor,
+    total_rewarded_voting_power: u64,
+    total_fee_revenue: u64,
+    pools: &HashMap<ValidatorId, ValidatorPool>,
+    voters: &HashSet<ValidatorId>,
+) -> Result<HashMap<ValidatorId, u64>> {
+    let mut rewards = HashMap::new();
+    if total_fee_revenue == 0 || total_rewarded_voting_power == 0 {
+        return Ok(rewards);
+    }
+
+    let rewarded_validators = anchor
+        .validator_set
+        .validators
+        .iter()
+        .filter(|validator| {
+            voters.contains(&validator.id)
+                && pools
+                    .get(&validator.id)
+                    .map(|pool| {
+                        !matches!(
+                            pool.status,
+                            crate::staking::ValidatorStatus::Jailed
+                                | crate::staking::ValidatorStatus::Retired
+                        )
+                    })
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    let mut remaining_fee = total_fee_revenue as u128;
+    let mut remaining_power = total_rewarded_voting_power as u128;
+    for validator in rewarded_validators {
+        let reward = if remaining_power == validator.voting_power as u128 {
+            u64::try_from(remaining_fee).map_err(|_| anyhow!("validator fee reward exceeds u64"))?
+        } else {
+            u64::try_from((remaining_fee * validator.voting_power as u128) / remaining_power.max(1))
+                .map_err(|_| anyhow!("validator fee reward exceeds u64"))?
+        };
+        rewards.insert(validator.id, reward);
+        remaining_fee = remaining_fee.saturating_sub(reward as u128);
+        remaining_power = remaining_power.saturating_sub(validator.voting_power as u128);
+    }
+
+    Ok(rewards)
 }
 
 fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {

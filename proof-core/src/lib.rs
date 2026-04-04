@@ -281,6 +281,7 @@ pub struct ProofShieldedTxWitness {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub note_tree_root: [u8; 32],
+    pub fee_amount: u64,
     pub inputs: Vec<ProofShieldedInputWitness>,
     pub outputs: Vec<ProofShieldedOutputWitness>,
 }
@@ -305,6 +306,7 @@ pub struct ProofShieldedTxJournal {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub note_tree_root: [u8; 32],
+    pub fee_amount: u64,
     pub inputs: Vec<ProofShieldedInputBinding>,
     pub outputs: Vec<ProofShieldedOutputBinding>,
 }
@@ -322,6 +324,7 @@ pub struct ProofPrivateDelegationJournal {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub note_tree_root: [u8; 32],
+    pub fee_amount: u64,
     pub inputs: Vec<ProofShieldedInputBinding>,
     pub outputs: Vec<ProofShieldedOutputBinding>,
     pub validator_id: [u8; 32],
@@ -336,6 +339,7 @@ pub struct ProofPrivateUndelegationWitness {
     pub shielded: ProofShieldedTxWitness,
     pub validator_id: [u8; 32],
     pub claim_output_index: u32,
+    pub gross_claim_amount: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -343,12 +347,14 @@ pub struct ProofPrivateUndelegationJournal {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub note_tree_root: [u8; 32],
+    pub fee_amount: u64,
     pub inputs: Vec<ProofShieldedInputBinding>,
     pub outputs: Vec<ProofShieldedOutputBinding>,
     pub validator_id: [u8; 32],
     pub claim_output_index: u32,
     pub claim_note_commitment: [u8; 32],
     pub burned_share_value: u64,
+    pub gross_claim_amount: u64,
     pub claim_value: u64,
     pub release_epoch: u64,
 }
@@ -491,7 +497,7 @@ pub fn validate_shielded_tx_witness(
         });
     }
 
-    if total_in != total_out {
+    if total_in != total_out.saturating_add(witness.fee_amount as u128) {
         bail!("shielded value balance mismatch");
     }
 
@@ -499,6 +505,7 @@ pub fn validate_shielded_tx_witness(
         chain_id: witness.chain_id,
         current_epoch: witness.current_epoch,
         note_tree_root: witness.note_tree_root,
+        fee_amount: witness.fee_amount,
         inputs: input_bindings,
         outputs: output_bindings,
     })
@@ -671,7 +678,10 @@ pub fn validate_private_delegation_witness(
         });
     }
 
-    if payment_input_total != payment_output_total.saturating_add(witness.delegated_amount as u128)
+    if payment_input_total
+        != payment_output_total
+            .saturating_add(witness.delegated_amount as u128)
+            .saturating_add(witness.shielded.fee_amount as u128)
     {
         bail!("private delegation amount balance mismatch");
     }
@@ -680,6 +690,7 @@ pub fn validate_private_delegation_witness(
         chain_id: witness.shielded.chain_id,
         current_epoch: witness.shielded.current_epoch,
         note_tree_root: witness.shielded.note_tree_root,
+        fee_amount: witness.shielded.fee_amount,
         inputs: input_bindings,
         outputs: output_bindings,
         validator_id: witness.validator_id,
@@ -704,6 +715,9 @@ pub fn validate_private_undelegation_witness(
     let claim_output_index = witness.claim_output_index as usize;
     if claim_output_index >= witness.shielded.outputs.len() {
         bail!("claim output index is out of range");
+    }
+    if witness.gross_claim_amount == 0 {
+        bail!("gross undelegation claim amount must be non-zero");
     }
 
     let mut input_share_total = 0u128;
@@ -874,11 +888,18 @@ pub fn validate_private_undelegation_witness(
         .ok_or_else(|| anyhow!("private undelegation share accounting underflow"))?;
     let burned_share_value = u64::try_from(burned_share_value)
         .map_err(|_| anyhow!("private undelegation burned share value exceeds u64"))?;
+    let claim_value = claim_value.ok_or_else(|| anyhow!("missing unbonding claim output value"))?;
+    if (claim_value as u128).saturating_add(witness.shielded.fee_amount as u128)
+        != witness.gross_claim_amount as u128
+    {
+        bail!("private undelegation amount balance mismatch");
+    }
 
     Ok(ProofPrivateUndelegationJournal {
         chain_id: witness.shielded.chain_id,
         current_epoch: witness.shielded.current_epoch,
         note_tree_root: witness.shielded.note_tree_root,
+        fee_amount: witness.shielded.fee_amount,
         inputs: input_bindings,
         outputs: output_bindings,
         validator_id: witness.validator_id,
@@ -886,7 +907,8 @@ pub fn validate_private_undelegation_witness(
         claim_note_commitment: claim_note_commitment
             .ok_or_else(|| anyhow!("missing unbonding claim output note commitment"))?,
         burned_share_value,
-        claim_value: claim_value.ok_or_else(|| anyhow!("missing unbonding claim output value"))?,
+        gross_claim_amount: witness.gross_claim_amount,
+        claim_value,
         release_epoch: release_epoch.ok_or_else(|| anyhow!("missing unbonding release epoch"))?,
     })
 }
@@ -1032,7 +1054,7 @@ pub fn validate_unbonding_claim_witness(
         });
     }
 
-    if total_in != total_out {
+    if total_in != total_out.saturating_add(witness.fee_amount as u128) {
         bail!("shielded value balance mismatch");
     }
 
@@ -1040,6 +1062,7 @@ pub fn validate_unbonding_claim_witness(
         chain_id: witness.chain_id,
         current_epoch: witness.current_epoch,
         note_tree_root: witness.note_tree_root,
+        fee_amount: witness.fee_amount,
         inputs: input_bindings,
         outputs: output_bindings,
     })
@@ -2287,7 +2310,10 @@ mod tests {
         current.expect("non-empty extension")
     }
 
-    fn sample_witness(output_value: u64) -> (ProofShieldedTxWitness, CheckpointAccumulatorJournal) {
+    fn sample_witness(
+        output_value: u64,
+        fee_amount: u64,
+    ) -> (ProofShieldedTxWitness, CheckpointAccumulatorJournal) {
         let chain_id = [7u8; 32];
         let current_epoch = 2;
         let (input_note, input_note_key) = sample_note(11, 7, 1);
@@ -2318,6 +2344,7 @@ mod tests {
                 chain_id,
                 current_epoch,
                 note_tree_root: membership_proof.root,
+                fee_amount,
                 inputs: vec![ProofShieldedInputWitness {
                     note: input_note,
                     note_key: input_note_key,
@@ -2335,11 +2362,12 @@ mod tests {
 
     #[test]
     fn valid_witness_yields_public_journal_bindings() {
-        let (witness, accumulator) = sample_witness(7);
+        let (witness, accumulator) = sample_witness(6, 1);
         let journal = validate_shielded_tx_witness(&witness).expect("valid witness");
         assert_eq!(journal.chain_id, witness.chain_id);
         assert_eq!(journal.current_epoch, witness.current_epoch);
         assert_eq!(journal.note_tree_root, witness.note_tree_root);
+        assert_eq!(journal.fee_amount, 1);
         assert_eq!(journal.inputs.len(), 1);
         assert_eq!(journal.outputs.len(), 1);
         assert_eq!(
@@ -2374,7 +2402,7 @@ mod tests {
 
     #[test]
     fn invalid_historical_accumulator_is_rejected() {
-        let (mut witness, _) = sample_witness(7);
+        let (mut witness, _) = sample_witness(6, 1);
         witness.inputs[0]
             .historical_accumulator
             .as_mut()
@@ -2390,7 +2418,7 @@ mod tests {
 
     #[test]
     fn value_imbalance_is_rejected() {
-        let (witness, _) = sample_witness(6);
+        let (witness, _) = sample_witness(6, 0);
         let err = validate_shielded_tx_witness(&witness).expect_err("value imbalance");
         assert!(
             err.to_string().contains("shielded value balance mismatch"),
@@ -2431,12 +2459,13 @@ mod tests {
             4,
             current_epoch,
         );
-        let change_output = sample_output_witness(55, 2, current_epoch);
+        let change_output = sample_output_witness(55, 1, current_epoch);
         let witness = ProofPrivateDelegationWitness {
             shielded: ProofShieldedTxWitness {
                 chain_id,
                 current_epoch,
                 note_tree_root: membership_proof.root,
+                fee_amount: 1,
                 inputs: vec![ProofShieldedInputWitness {
                     note: input_note,
                     note_key: input_note_key,
@@ -2455,6 +2484,7 @@ mod tests {
 
         let journal =
             validate_private_delegation_witness(&witness).expect("valid delegation witness");
+        assert_eq!(journal.fee_amount, 1);
         assert_eq!(journal.delegated_amount, 5);
         assert_eq!(journal.delegation_share_value, 4);
     }
@@ -2511,6 +2541,7 @@ mod tests {
                 chain_id,
                 current_epoch,
                 note_tree_root: membership_proof.root,
+                fee_amount: 1,
                 inputs: vec![ProofShieldedInputWitness {
                     note: input_note,
                     note_key: input_note_key,
@@ -2524,11 +2555,14 @@ mod tests {
             },
             validator_id,
             claim_output_index: 0,
+            gross_claim_amount: 6,
         };
 
         let journal =
             validate_private_undelegation_witness(&witness).expect("valid undelegation witness");
+        assert_eq!(journal.fee_amount, 1);
         assert_eq!(journal.burned_share_value, 3);
+        assert_eq!(journal.gross_claim_amount, 6);
         assert_eq!(journal.claim_value, 5);
         assert_eq!(journal.release_epoch, 10);
     }
@@ -2557,6 +2591,7 @@ mod tests {
             chain_id,
             current_epoch,
             note_tree_root: membership_proof.root,
+            fee_amount: 0,
             inputs: vec![ProofShieldedInputWitness {
                 note: input_note,
                 note_key: input_note_key,

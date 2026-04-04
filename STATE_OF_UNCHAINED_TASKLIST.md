@@ -77,8 +77,12 @@ transitional and should be removed rather than preserved.
   history
 - `[~]` Define validator liveness, equivocation, and slashing evidence rules
   Conflicting proposals, validator votes, and validator-authored DAG batches
-  now persist canonical equivocation evidence; liveness faults, governed
-  penalties, and slash execution are still open.
+  now persist canonical equivocation evidence; finalized anchors also derive
+  missed-vote liveness faults, and slashable evidence is now admitted through
+  ordered shared-state penalty actions. Repeated-fault accumulation,
+  jail/reactivation state, and committee exclusion/re-entry now derive from
+  ordered accountability state. Broader liveness-fault classes and long-term
+  policy evolution are still open.
 
 ## 4. Shielded Staking
 
@@ -88,10 +92,16 @@ transitional and should be removed rather than preserved.
 - `[x]` Define shielded delegation notes or pool-share notes
 - `[x]` Define private undelegation and unbonding flows
 - `[x]` Define shielded staking note semantics
-- `[ ]` Define reward accrual through pool accounting rather than public
+- `[x]` Define reward accrual through pool accounting rather than public
   per-wallet rewards
-- `[ ]` Define slash handling at the validator-pool level while keeping
+  Finalized anchors now settle validator rewards directly into validator-pool
+  state, validator commission is reserved inside the pool rather than emitted
+  as a public wallet credit, and missed-vote or jailed/retired validators are
+  automatically suppressed from reward growth.
+- `[x]` Define slash handling at the validator-pool level while keeping
   delegator ownership shielded
+- `[x]` Define validator jail/reactivation lifecycle and committee re-entry
+  rules from ordered accountability state
 - `[~]` Implement native circuits for delegation, undelegation, and stake claim
 - `[ ]` Define wallet UX for delegation without exposing a public delegator
   graph
@@ -102,8 +112,12 @@ transitional and should be removed rather than preserved.
   by the old epoch/archive design
 - `[ ]` Refactor the note model around the new settlement path rather than PoW
   anchor materialization
-- `[ ]` Define fee handling so ordinary private payments do not need a
+- `[x]` Define fee handling so ordinary private payments do not need a
   transparent payment path
+  Ordinary private transfers, private delegation, private undelegation, and
+  mature unbonding claims now carry explicit shielded fee amounts inside their
+  proof-balance equations, and finalized anchors route the exact finalized fee
+  pot back into validator-pool reward settlement.
 - `[ ]` Keep ordinary transfers on a native fast path without revealing extra
   sender or recipient metadata
 - `[x]` Define native transaction classes clearly: ordinary transfer vs

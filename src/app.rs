@@ -559,6 +559,7 @@ async fn run_send_flow(
                 "ok": true,
                 "to": to,
                 "amount": amount,
+                "fee_amount": outcome.fee_amount,
                 "tx_id": hex::encode(outcome.tx_id),
                 "input_count": outcome.input_count,
                 "output_count": outcome.output_count,
@@ -570,13 +571,15 @@ async fn run_send_flow(
     println!("Sent");
     println!();
     println!(
-        "Broadcast shielded transaction consuming {} note{} and creating {} note{} for {} coin{}.",
+        "Broadcast shielded transaction consuming {} note{}, creating {} note{}, sending {} coin{}, and paying {} coin{} in shielded fees.",
         outcome.input_count,
         if outcome.input_count == 1 { "" } else { "s" },
         outcome.output_count,
         if outcome.output_count == 1 { "" } else { "s" },
         amount,
-        if amount == 1 { "" } else { "s" }
+        if amount == 1 { "" } else { "s" },
+        outcome.fee_amount,
+        if outcome.fee_amount == 1 { "" } else { "s" }
     );
     println!("Recipient: {}", short_text(&to));
     println!("Tx ID: {}", hex::encode(outcome.tx_id));

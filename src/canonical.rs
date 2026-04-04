@@ -11,6 +11,11 @@ use crate::{
         ML_DSA_65_PK_BYTES, ML_KEM_768_PK_BYTES,
     },
     epoch::{Anchor, AnchorProposal},
+    evidence::{
+        ConsensusEvidence, DagBatchEquivocationEvidence, EnvelopeAuthor, LivenessFaultKind,
+        LivenessFaultProof, ProposalEquivocationEvidence, SlashableEvidence,
+        VoteEquivocationEvidence,
+    },
     network::{
         CompactEpoch, EpochByHash, EpochCandidatesResponse, EpochGetTxn, EpochHeadersBatch,
         EpochHeadersRange, EpochLeavesBundle, EpochTxn, SelectedIdsBundle,
@@ -31,13 +36,13 @@ use crate::{
         ShieldedSpendContext,
     },
     staking::{
-        ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate, ValidatorRegistration,
-        ValidatorStatus,
+        ValidatorAccountability, ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate,
+        ValidatorReactivation, ValidatorRegistration, ValidatorStatus,
     },
     transaction::{
-        FastPathBatch, OrdinaryPrivateTransfer, SharedStateAction, SharedStateAuthorization,
-        SharedStateBatch, SharedStateDagBatch, SharedStateTx, ShieldedOutput,
-        ShieldedOutputPlaintext, Tx,
+        FastPathBatch, OrdinaryPrivateTransfer, PenaltyEvidenceAdmission, SharedStateAction,
+        SharedStateAuthorization, SharedStateBatch, SharedStateDagBatch, SharedStateTx,
+        ShieldedOutput, ShieldedOutputPlaintext, Tx,
     },
     wallet::RecipientHandle,
 };
@@ -284,6 +289,21 @@ fn read_option_bytes(reader: &mut CanonicalReader<'_>) -> Result<Option<Vec<u8>>
     }
 }
 
+fn write_option_u64(writer: &mut CanonicalWriter, value: Option<u64>) {
+    writer.write_bool(value.is_some());
+    if let Some(value) = value {
+        writer.write_u64(value);
+    }
+}
+
+fn read_option_u64(reader: &mut CanonicalReader<'_>) -> Result<Option<u64>> {
+    if reader.read_bool()? {
+        Ok(Some(reader.read_u64()?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn write_validator_id(writer: &mut CanonicalWriter, value: &ValidatorId) {
     writer.write_fixed(&value.0);
 }
@@ -396,6 +416,25 @@ fn read_validator_status(reader: &mut CanonicalReader<'_>) -> Result<ValidatorSt
     }
 }
 
+fn write_validator_accountability(
+    writer: &mut CanonicalWriter,
+    accountability: &ValidatorAccountability,
+) {
+    writer.write_u32(accountability.liveness_faults);
+    writer.write_u32(accountability.safety_faults);
+    write_option_u64(writer, accountability.jailed_until_epoch);
+}
+
+fn read_validator_accountability(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<ValidatorAccountability> {
+    Ok(ValidatorAccountability {
+        liveness_faults: reader.read_u32()?,
+        safety_faults: reader.read_u32()?,
+        jailed_until_epoch: read_option_u64(reader)?,
+    })
+}
+
 fn write_validator_metadata(
     writer: &mut CanonicalWriter,
     metadata: &ValidatorMetadata,
@@ -421,9 +460,11 @@ fn write_validator_pool(writer: &mut CanonicalWriter, pool: &ValidatorPool) -> R
     writer.write_fixed(&pool.node_id);
     writer.write_u32(pool.commission_bps as u32);
     writer.write_u64(pool.total_bonded_stake);
+    writer.write_u64(pool.pending_commission_stake);
     writer.write_u128(pool.total_delegation_shares);
     writer.write_u64(pool.activation_epoch);
     write_validator_status(writer, pool.status);
+    write_validator_accountability(writer, &pool.accountability);
     write_validator_metadata(writer, &pool.metadata)?;
     Ok(())
 }
@@ -434,9 +475,11 @@ fn read_validator_pool(reader: &mut CanonicalReader<'_>) -> Result<ValidatorPool
     let commission_bps = u16::try_from(reader.read_u32()?)
         .map_err(|_| anyhow!("validator commission exceeds u16"))?;
     let total_bonded_stake = reader.read_u64()?;
+    let pending_commission_stake = reader.read_u64()?;
     let total_delegation_shares = reader.read_u128()?;
     let activation_epoch = reader.read_u64()?;
     let status = read_validator_status(reader)?;
+    let accountability = read_validator_accountability(reader)?;
     let metadata = read_validator_metadata(reader)?;
     let mut pool = ValidatorPool::new(
         validator,
@@ -447,7 +490,9 @@ fn read_validator_pool(reader: &mut CanonicalReader<'_>) -> Result<ValidatorPool
         status,
         metadata,
     )?;
+    pool.pending_commission_stake = pending_commission_stake;
     pool.total_delegation_shares = total_delegation_shares;
+    pool.accountability = accountability;
     pool.validate()?;
     Ok(pool)
 }
@@ -490,6 +535,251 @@ fn read_validator_profile_update(
     Ok(update)
 }
 
+fn write_validator_reactivation(
+    writer: &mut CanonicalWriter,
+    reactivation: &ValidatorReactivation,
+) {
+    write_validator_id(writer, &reactivation.validator_id);
+}
+
+fn read_validator_reactivation(reader: &mut CanonicalReader<'_>) -> Result<ValidatorReactivation> {
+    let reactivation = ValidatorReactivation {
+        validator_id: read_validator_id(reader)?,
+    };
+    reactivation.validate()?;
+    Ok(reactivation)
+}
+
+fn write_envelope_author(writer: &mut CanonicalWriter, author: &EnvelopeAuthor) -> Result<()> {
+    writer.write_fixed(&author.node_id);
+    writer.write_bytes(&author.auth_spki)?;
+    Ok(())
+}
+
+fn read_envelope_author(reader: &mut CanonicalReader<'_>) -> Result<EnvelopeAuthor> {
+    Ok(EnvelopeAuthor {
+        node_id: reader.read_fixed()?,
+        auth_spki: reader.read_bytes()?,
+    })
+}
+
+fn write_proposal_equivocation_evidence(
+    writer: &mut CanonicalWriter,
+    evidence: &ProposalEquivocationEvidence,
+) -> Result<()> {
+    write_validator_id(writer, &evidence.proposer);
+    write_consensus_position(writer, &evidence.position);
+    write_envelope_author(writer, &evidence.first_author)?;
+    write_anchor_proposal(writer, &evidence.first_proposal)?;
+    writer.write_bytes(&encode_signed_envelope(&evidence.first_envelope)?)?;
+    write_envelope_author(writer, &evidence.second_author)?;
+    write_anchor_proposal(writer, &evidence.second_proposal)?;
+    writer.write_bytes(&encode_signed_envelope(&evidence.second_envelope)?)?;
+    Ok(())
+}
+
+fn read_proposal_equivocation_evidence(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<ProposalEquivocationEvidence> {
+    let proposer = read_validator_id(reader)?;
+    let position = read_consensus_position(reader)?;
+    let evidence = ProposalEquivocationEvidence::new(
+        proposer,
+        read_envelope_author(reader)?,
+        read_anchor_proposal(reader)?,
+        decode_signed_envelope(&reader.read_bytes()?)?,
+        read_envelope_author(reader)?,
+        read_anchor_proposal(reader)?,
+        decode_signed_envelope(&reader.read_bytes()?)?,
+    )?;
+    if evidence.position != position {
+        bail!("proposal equivocation position mismatch");
+    }
+    Ok(evidence)
+}
+
+fn write_vote_equivocation_evidence(
+    writer: &mut CanonicalWriter,
+    evidence: &VoteEquivocationEvidence,
+) -> Result<()> {
+    write_validator_id(writer, &evidence.voter);
+    write_consensus_position(writer, &evidence.position);
+    write_validator_vote(writer, &evidence.first_vote)?;
+    write_validator_vote(writer, &evidence.second_vote)?;
+    Ok(())
+}
+
+fn read_vote_equivocation_evidence(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<VoteEquivocationEvidence> {
+    let voter = read_validator_id(reader)?;
+    let position = read_consensus_position(reader)?;
+    let evidence =
+        VoteEquivocationEvidence::new(read_validator_vote(reader)?, read_validator_vote(reader)?)?;
+    if evidence.voter != voter {
+        bail!("vote equivocation voter mismatch");
+    }
+    if evidence.position != position {
+        bail!("vote equivocation position mismatch");
+    }
+    Ok(evidence)
+}
+
+fn write_dag_batch_equivocation_evidence(
+    writer: &mut CanonicalWriter,
+    evidence: &DagBatchEquivocationEvidence,
+) -> Result<()> {
+    write_validator_id(writer, &evidence.author);
+    writer.write_u64(evidence.epoch);
+    writer.write_u64(evidence.round);
+    write_envelope_author(writer, &evidence.first_author_info)?;
+    write_shared_state_dag_batch(writer, &evidence.first_batch)?;
+    writer.write_bytes(&encode_signed_envelope(&evidence.first_envelope)?)?;
+    write_envelope_author(writer, &evidence.second_author_info)?;
+    write_shared_state_dag_batch(writer, &evidence.second_batch)?;
+    writer.write_bytes(&encode_signed_envelope(&evidence.second_envelope)?)?;
+    Ok(())
+}
+
+fn read_dag_batch_equivocation_evidence(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<DagBatchEquivocationEvidence> {
+    let author = read_validator_id(reader)?;
+    let epoch = reader.read_u64()?;
+    let round = reader.read_u64()?;
+    let evidence = DagBatchEquivocationEvidence::new(
+        author,
+        read_envelope_author(reader)?,
+        read_shared_state_dag_batch(reader)?,
+        decode_signed_envelope(&reader.read_bytes()?)?,
+        read_envelope_author(reader)?,
+        read_shared_state_dag_batch(reader)?,
+        decode_signed_envelope(&reader.read_bytes()?)?,
+    )?;
+    if evidence.epoch != epoch {
+        bail!("DAG batch equivocation epoch mismatch");
+    }
+    if evidence.round != round {
+        bail!("DAG batch equivocation round mismatch");
+    }
+    Ok(evidence)
+}
+
+fn write_consensus_evidence(
+    writer: &mut CanonicalWriter,
+    evidence: &ConsensusEvidence,
+) -> Result<()> {
+    match evidence {
+        ConsensusEvidence::ProposalEquivocation(evidence) => {
+            writer.write_u8(1);
+            write_proposal_equivocation_evidence(writer, evidence)?;
+        }
+        ConsensusEvidence::VoteEquivocation(evidence) => {
+            writer.write_u8(2);
+            write_vote_equivocation_evidence(writer, evidence)?;
+        }
+        ConsensusEvidence::DagBatchEquivocation(evidence) => {
+            writer.write_u8(3);
+            write_dag_batch_equivocation_evidence(writer, evidence)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_consensus_evidence(reader: &mut CanonicalReader<'_>) -> Result<ConsensusEvidence> {
+    match reader.read_u8()? {
+        1 => Ok(ConsensusEvidence::ProposalEquivocation(
+            read_proposal_equivocation_evidence(reader)?,
+        )),
+        2 => Ok(ConsensusEvidence::VoteEquivocation(
+            read_vote_equivocation_evidence(reader)?,
+        )),
+        3 => Ok(ConsensusEvidence::DagBatchEquivocation(
+            read_dag_batch_equivocation_evidence(reader)?,
+        )),
+        other => bail!("unsupported consensus evidence tag {}", other),
+    }
+}
+
+fn write_liveness_fault_kind(writer: &mut CanonicalWriter, kind: LivenessFaultKind) {
+    writer.write_u8(match kind {
+        LivenessFaultKind::MissedVote => 1,
+    });
+}
+
+fn read_liveness_fault_kind(reader: &mut CanonicalReader<'_>) -> Result<LivenessFaultKind> {
+    match reader.read_u8()? {
+        1 => Ok(LivenessFaultKind::MissedVote),
+        other => bail!("unsupported liveness fault kind {}", other),
+    }
+}
+
+fn write_liveness_fault_proof(
+    writer: &mut CanonicalWriter,
+    fault: &LivenessFaultProof,
+) -> Result<()> {
+    write_validator_id(writer, &fault.validator);
+    write_consensus_position(writer, &fault.position);
+    write_ordering_path(writer, fault.ordering_path);
+    writer.write_fixed(&fault.anchor_hash);
+    write_liveness_fault_kind(writer, fault.kind);
+    Ok(())
+}
+
+fn read_liveness_fault_proof(reader: &mut CanonicalReader<'_>) -> Result<LivenessFaultProof> {
+    Ok(LivenessFaultProof {
+        validator: read_validator_id(reader)?,
+        position: read_consensus_position(reader)?,
+        ordering_path: read_ordering_path(reader)?,
+        anchor_hash: reader.read_fixed()?,
+        kind: read_liveness_fault_kind(reader)?,
+    })
+}
+
+fn write_slashable_evidence(
+    writer: &mut CanonicalWriter,
+    evidence: &SlashableEvidence,
+) -> Result<()> {
+    match evidence {
+        SlashableEvidence::Consensus(evidence) => {
+            writer.write_u8(1);
+            write_consensus_evidence(writer, evidence)?;
+        }
+        SlashableEvidence::Liveness(fault) => {
+            writer.write_u8(2);
+            write_liveness_fault_proof(writer, fault)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_slashable_evidence(reader: &mut CanonicalReader<'_>) -> Result<SlashableEvidence> {
+    match reader.read_u8()? {
+        1 => Ok(SlashableEvidence::Consensus(read_consensus_evidence(
+            reader,
+        )?)),
+        2 => Ok(SlashableEvidence::Liveness(read_liveness_fault_proof(
+            reader,
+        )?)),
+        other => bail!("unsupported slashable evidence tag {}", other),
+    }
+}
+
+fn write_penalty_evidence_admission(
+    writer: &mut CanonicalWriter,
+    admission: &PenaltyEvidenceAdmission,
+) -> Result<()> {
+    write_slashable_evidence(writer, &admission.evidence)
+}
+
+fn read_penalty_evidence_admission(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<PenaltyEvidenceAdmission> {
+    Ok(PenaltyEvidenceAdmission {
+        evidence: read_slashable_evidence(reader)?,
+    })
+}
+
 fn write_shared_state_action(
     writer: &mut CanonicalWriter,
     action: &SharedStateAction,
@@ -516,6 +806,14 @@ fn write_shared_state_action(
         SharedStateAction::ClaimUnbonding(claim) => {
             writer.write_u8(5);
             write_ordinary_private_transfer(writer, &claim.transfer)?;
+        }
+        SharedStateAction::AdmitPenaltyEvidence(admission) => {
+            writer.write_u8(6);
+            write_penalty_evidence_admission(writer, admission)?;
+        }
+        SharedStateAction::ReactivateValidator(reactivation) => {
+            writer.write_u8(7);
+            write_validator_reactivation(writer, reactivation);
         }
     }
     Ok(())
@@ -545,6 +843,12 @@ fn read_shared_state_action(reader: &mut CanonicalReader<'_>) -> Result<SharedSt
             crate::transaction::ClaimUnbonding {
                 transfer: read_ordinary_private_transfer(reader)?,
             },
+        )),
+        6 => Ok(SharedStateAction::AdmitPenaltyEvidence(
+            read_penalty_evidence_admission(reader)?,
+        )),
+        7 => Ok(SharedStateAction::ReactivateValidator(
+            read_validator_reactivation(reader)?,
         )),
         other => bail!("unsupported shared-state action tag {}", other),
     }
@@ -577,6 +881,7 @@ fn write_ordinary_private_transfer(
         writer.write_bytes(&encode_shielded_output(output)?)?;
         Ok(())
     })?;
+    writer.write_u64(transfer.fee_amount);
     writer.write_bytes(&transfer.proof)?;
     Ok(())
 }
@@ -587,6 +892,7 @@ fn read_ordinary_private_transfer(
     Ok(OrdinaryPrivateTransfer {
         nullifiers: reader.read_vec(|reader| reader.read_fixed())?,
         outputs: reader.read_vec(|reader| decode_shielded_output(&reader.read_bytes()?))?,
+        fee_amount: reader.read_u64()?,
         proof: reader.read_bytes()?,
     })
 }

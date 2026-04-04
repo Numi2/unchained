@@ -278,6 +278,9 @@ impl Store {
             "validator_committee",
             "tx",
             "consensus_evidence",
+            "liveness_fault",
+            "validator_penalty_event",
+            "validator_reward_event",
             "anchor_proposal_observation",
             "validator_vote_observation",
             "shared_state_dag_observation",
@@ -336,7 +339,10 @@ impl Store {
             "validator_pool",      // validator_id -> ValidatorPool
             "validator_committee", // epoch -> ValidatorSet
             "tx",
-            "consensus_evidence", // evidence_id -> ConsensusEvidenceRecord
+            "consensus_evidence",      // evidence_id -> ConsensusEvidenceRecord
+            "liveness_fault",          // evidence_id -> LivenessFaultRecord
+            "validator_penalty_event", // evidence_id -> ValidatorPenaltyEvent
+            "validator_reward_event",  // anchor_num||validator_id -> ValidatorRewardEvent
             "anchor_proposal_observation", // proposer||epoch||slot -> StoredAnchorProposalObservation
             "validator_vote_observation",  // voter||epoch||slot -> StoredValidatorVoteObservation
             "shared_state_dag_observation", // epoch||round||author -> StoredSharedStateDagObservation
@@ -833,6 +839,32 @@ impl Store {
         self.get("validator_committee", &epoch.to_le_bytes())
     }
 
+    pub fn invalidate_future_validator_committees(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        current_epoch: u64,
+    ) -> Result<()> {
+        let validator_committee_cf = self
+            .db
+            .cf_handle("validator_committee")
+            .ok_or_else(|| anyhow::anyhow!("'validator_committee' column family missing"))?;
+        let iter = self
+            .db
+            .iterator_cf(validator_committee_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            let epoch_bytes: [u8; 8] = key
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid validator committee key"))?;
+            let epoch = u64::from_le_bytes(epoch_bytes);
+            if epoch > current_epoch {
+                batch.delete_cf(validator_committee_cf, key);
+            }
+        }
+        Ok(())
+    }
+
     pub fn store_shared_state_pending_tx(
         &self,
         tx_id: &[u8; 32],
@@ -1053,6 +1085,164 @@ impl Store {
                 .then(left.evidence_id.cmp(&right.evidence_id))
         });
         Ok(records)
+    }
+
+    pub fn store_liveness_fault_record(
+        &self,
+        record: &crate::evidence::LivenessFaultRecord,
+    ) -> Result<()> {
+        let existing = self.get_raw_bytes("liveness_fault", &record.evidence_id)?;
+        if existing.is_none() {
+            self.put("liveness_fault", &record.evidence_id, record)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_liveness_fault_record(
+        &self,
+        evidence_id: &[u8; 32],
+    ) -> Result<Option<crate::evidence::LivenessFaultRecord>> {
+        self.get("liveness_fault", evidence_id)
+    }
+
+    pub fn load_liveness_fault_records(&self) -> Result<Vec<crate::evidence::LivenessFaultRecord>> {
+        let cf = self
+            .db
+            .cf_handle("liveness_fault")
+            .ok_or_else(|| anyhow::anyhow!("'liveness_fault' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut records: Vec<crate::evidence::LivenessFaultRecord> = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            records.push(
+                bincode::deserialize(&value)
+                    .context("deserialize liveness fault record from storage")?,
+            );
+        }
+        records.sort_by(|left, right| {
+            right
+                .recorded_unix_ms
+                .cmp(&left.recorded_unix_ms)
+                .then(left.evidence_id.cmp(&right.evidence_id))
+        });
+        Ok(records)
+    }
+
+    pub fn store_validator_penalty_event(
+        &self,
+        event: &crate::staking::ValidatorPenaltyEvent,
+    ) -> Result<()> {
+        let existing = self.get_raw_bytes("validator_penalty_event", &event.evidence_id)?;
+        if existing.is_none() {
+            self.put("validator_penalty_event", &event.evidence_id, event)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_validator_penalty_event(
+        &self,
+        evidence_id: &[u8; 32],
+    ) -> Result<Option<crate::staking::ValidatorPenaltyEvent>> {
+        self.get("validator_penalty_event", evidence_id)
+    }
+
+    pub fn load_validator_penalty_events(
+        &self,
+    ) -> Result<Vec<crate::staking::ValidatorPenaltyEvent>> {
+        let cf = self
+            .db
+            .cf_handle("validator_penalty_event")
+            .ok_or_else(|| anyhow::anyhow!("'validator_penalty_event' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut events: Vec<crate::staking::ValidatorPenaltyEvent> = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            events.push(
+                bincode::deserialize(&value)
+                    .context("deserialize validator penalty event from storage")?,
+            );
+        }
+        events.sort_by(|left, right| {
+            right
+                .applied_in_epoch
+                .cmp(&left.applied_in_epoch)
+                .then(left.evidence_id.cmp(&right.evidence_id))
+        });
+        Ok(events)
+    }
+
+    pub(crate) fn validator_reward_event_key(
+        anchor_num: u64,
+        validator_id: &crate::consensus::ValidatorId,
+    ) -> [u8; 40] {
+        let mut key = [0u8; 40];
+        key[..8].copy_from_slice(&anchor_num.to_le_bytes());
+        key[8..].copy_from_slice(&validator_id.0);
+        key
+    }
+
+    pub fn store_validator_reward_event(
+        &self,
+        event: &crate::staking::ValidatorRewardEvent,
+    ) -> Result<()> {
+        self.put(
+            "validator_reward_event",
+            &Self::validator_reward_event_key(event.anchor_num, &event.validator_id),
+            event,
+        )
+    }
+
+    pub fn load_validator_reward_events(
+        &self,
+    ) -> Result<Vec<crate::staking::ValidatorRewardEvent>> {
+        let cf = self
+            .db
+            .cf_handle("validator_reward_event")
+            .ok_or_else(|| anyhow::anyhow!("'validator_reward_event' column family missing"))?;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut events: Vec<crate::staking::ValidatorRewardEvent> = Vec::new();
+        for item in iter {
+            let (_key, value) = item?;
+            events.push(
+                bincode::deserialize(&value)
+                    .context("deserialize validator reward event from storage")?,
+            );
+        }
+        events.sort_by(|left, right| {
+            right
+                .anchor_num
+                .cmp(&left.anchor_num)
+                .then(left.validator_id.cmp(&right.validator_id))
+        });
+        Ok(events)
+    }
+
+    pub fn load_validator_reward_events_for_anchor(
+        &self,
+        anchor_num: u64,
+    ) -> Result<Vec<crate::staking::ValidatorRewardEvent>> {
+        let cf = self
+            .db
+            .cf_handle("validator_reward_event")
+            .ok_or_else(|| anyhow::anyhow!("'validator_reward_event' column family missing"))?;
+        let prefix = anchor_num.to_le_bytes();
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        let mut events: Vec<crate::staking::ValidatorRewardEvent> = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            events.push(
+                bincode::deserialize(&value)
+                    .context("deserialize validator reward event from storage")?,
+            );
+        }
+        events.sort_by(|left, right| left.validator_id.cmp(&right.validator_id));
+        Ok(events)
     }
 
     fn shared_state_dag_round_key(epoch: u64, round: u64, author: &[u8; 32]) -> Vec<u8> {

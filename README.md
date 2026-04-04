@@ -209,7 +209,8 @@ The current foundation slice now includes:
 - leader-proposed checkpoint certification with explicit validator vote
   collection over the network
 - persisted consensus-accountability evidence for conflicting anchor proposals,
-  conflicting validator votes, and conflicting validator-authored DAG batches
+  conflicting validator votes, conflicting validator-authored DAG batches, and
+  finalized-QC-derived missed-vote liveness faults
 - content-addressed shared-state batch dissemination and batch retrieval for
   validator-ordered actions
 - finalized checkpoint objects that commit parent linkage, ordering path,
@@ -245,8 +246,9 @@ ordered DAG/BFT path instead of letting it race the fast path.
 
 The remaining consensus gap is narrower: richer multi-round DAG scheduling,
 stronger end-to-end coverage for proof-heavy fast-path/fallback flows across
-multiple validators, and governed liveness/slashing execution on top of the now
-persisted equivocation evidence path.
+multiple validators, broader liveness/accountability policy beyond the current
+deterministic equivocation-plus-missed-vote schedule, and full fee-backed
+wallet/operator coverage across every ordered transaction class.
 
 Validator activation is now pulled from persisted validator-pool state rather
 than inherited indefinitely from the parent checkpoint. The staking lifecycle
@@ -260,6 +262,35 @@ to wallet scanning rather than disappearing behind the shared-state wrapper.
 Full zk proving remains available for delegation and the new staking actions,
 but the heavy proving paths stay in explicit soak coverage rather than routine
 test targets.
+
+Accountability is now enforceable on-chain. Finalized anchors derive missed-vote
+liveness-fault records directly from the quorum certificate, slashable evidence
+is admitted through ordered shared-state transactions rather than ad hoc local
+operator action, and validator-pool penalties reduce bonded stake while leaving
+delegation-share ownership intact so delegator ownership remains shielded even
+when a pool is slashed. Repeated faults now accumulate in canonical validator
+state, liveness or safety faults can jail validators out of future committees,
+cold-governance reactivation returns a served jail term back to pending
+activation, and repeated safety faults retire the pool permanently. Finalized
+committee snapshots remain persisted for finalized epochs, but future committee
+selection is derived from current ordered validator-pool state rather than
+being frozen by speculative reads.
+
+Reward accrual now follows the same canonical validator-pool state machine.
+Each finalized anchor settles per-validator rewards directly into pool state,
+missed-vote or jailed/retired validators are suppressed automatically, validator
+commission is reserved inside the pool without creating public per-wallet reward
+credits, and delegation-share value rises only through claimable pool stake.
+That makes undelegation and delayed claim redemption realize rewards through the
+pool exchange rate rather than through a separate public reward balance.
+
+Fee material now follows that same path instead of escaping into a transparent
+side channel. Ordinary private transfers, private delegation, private
+undelegation, and mature unbonding claims all carry explicit fee amounts inside
+their shielded proof balance equations, and finalized anchors apportion the
+exact finalized fee pot back into validator pools alongside the base protocol
+reward. Fees therefore stay private at submission time while still landing in
+the same pool-accounting reward path that drives delegation economics.
 
 ## Build
 
