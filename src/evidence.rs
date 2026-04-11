@@ -9,7 +9,7 @@ use crate::{
     canonical::{self, CanonicalReader},
     consensus::{ConsensusPosition, OrderingPath, ValidatorId, ValidatorSet, ValidatorVote},
     epoch::{Anchor, AnchorProposal},
-    node_identity::{NodeRecordV2, SignedEnvelope},
+    node_identity::{NodeRecordV3, SignedEnvelope},
     storage::Store,
     transaction::SharedStateDagBatch,
 };
@@ -24,7 +24,7 @@ pub struct EnvelopeAuthor {
 }
 
 impl EnvelopeAuthor {
-    pub fn from_record(record: &NodeRecordV2) -> Self {
+    pub fn from_record(record: &NodeRecordV3) -> Self {
         Self {
             node_id: record.node_id,
             auth_spki: record.auth_spki.clone(),
@@ -36,7 +36,7 @@ impl EnvelopeAuthor {
     }
 
     pub fn verify_envelope(&self, envelope: &SignedEnvelope) -> Result<()> {
-        let record = NodeRecordV2 {
+        let record = NodeRecordV3 {
             version: envelope.version,
             protocol_version: envelope.protocol_version,
             node_id: self.node_id,

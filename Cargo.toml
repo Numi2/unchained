@@ -5,13 +5,8 @@ edition = "2021"
 autobins = false
 
 [workspace]
-members = ["methods", "proof-core"]
+members = ["proof-core"]
 resolver = "2"
-
-[patch.crates-io]
-risc0-circuit-rv32im-sys = { path = "vendor/risc0-circuit-rv32im-sys" }
-risc0-sys = { path = "vendor/risc0-sys" }
-risc0-zkp = { path = "vendor/risc0-zkp" }
 
 # Post-quantum cryptography is enabled via rustls features in dependencies
 
@@ -61,10 +56,15 @@ serde_bytes = "0.11.17"
 once_cell = "1.19"
 serde_json = "1.0"
 hyper = { version = "0.14", features = ["full"] }
-risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std", "prove", "disable-dev-mode"] }
-methods = { path = "methods" }
 proof-core = { path = "proof-core" }
 chalamet_pir = "0.6.0"
+p3-air = "=0.5.2"
+p3-uni-stark = "=0.5.2"
+p3-fri = "=0.5.2"
+p3-merkle-tree = "=0.5.2"
+p3-blake3 = "=0.5.2"
+p3-baby-bear = "=0.5.2"
+slh-dsa = "=0.2.0-rc.4"
 
 hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, features = ["tokio-runtime"] }
 hickory-proto = "=0.25.0-alpha.4"

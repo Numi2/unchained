@@ -9,6 +9,7 @@ pub struct Config {
     pub net: Net,
     pub p2p: P2p,
     pub storage: Storage,
+    #[serde(default)]
     pub epoch: Epoch,
     pub metrics: Metrics,
     #[serde(default)]
@@ -25,7 +26,7 @@ pub struct Config {
 pub struct Net {
     pub listen_port: u16,
     #[serde(default)]
-    pub bootstrap: Vec<String>, // signed NodeRecordV2 strings or file paths
+    pub bootstrap: Vec<String>, // signed NodeRecordV3 strings or file paths
     #[serde(default)]
     pub trust_updates: Vec<String>, // signed TrustUpdateV1 strings or file paths
     #[serde(default = "default_strict_trust")]
@@ -70,9 +71,19 @@ pub struct Storage {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Epoch {
-    pub seconds: u64,
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Epoch {}
+
+impl Epoch {
+    pub fn checkpoint_cadence_ms(&self) -> u64 {
+        (PROTOCOL.slots_per_epoch as u64)
+            .saturating_mul(PROTOCOL.slot_duration_ms)
+            .max(1)
+    }
+
+    pub fn checkpoint_cadence_secs(&self) -> u64 {
+        self.checkpoint_cadence_ms().saturating_add(999) / 1000
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -559,7 +570,7 @@ fn warn_unknown_keys(val: &TomlValue) {
                     ],
                 ),
                 ("storage", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["path"]),
-                ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &["seconds"]),
+                ("epoch", TomlValue::Table(t)) => warn_unknown_keys_in(t, &[]),
                 ("metrics", TomlValue::Table(t)) => {
                     warn_unknown_keys_in(t, &["bind", "last_epochs_to_show"])
                 }

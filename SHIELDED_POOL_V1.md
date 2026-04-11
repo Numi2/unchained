@@ -1,8 +1,9 @@
 # Shielded Pool V1
 
 This file describes the current shielded-pool model used by the repository.
-The terminology here matches the code in `src/shielded.rs`, `src/wallet.rs`,
-`src/transaction.rs`, `src/proof.rs`, and `proof-core/src/lib.rs`.
+The terminology here matches the canonicalized code in `src/shielded.rs`,
+`src/wallet.rs`, `src/transaction.rs`, `src/proof.rs`, and
+`proof-core/src/lib.rs`.
 
 ## Core Types
 
@@ -11,15 +12,10 @@ The main shielded-pool objects implemented in `src/shielded.rs` are:
 - `ShieldedNote`
 - `NoteCommitmentTree`
 - `ActiveNullifierEpoch`
-- `ArchivedNullifierEpoch`
+- `HistoricalNullifierWindow`
 - `NullifierRootLedger`
-- `ArchiveShard`
-- `ArchiveProviderManifest`
-- `ArchiveReplicaAttestation`
-- `ArchiveCustodyCommitment`
-- `ArchiveServiceLedger`
-- `ArchiveAvailabilityCertificate`
-- `ArchiveOperatorScorecard`
+- `FinalizedHistoryShard`
+- `FinalizedHistoryDirectory`
 - `HistoricalUnspentCheckpoint`
 - `HistoricalUnspentServiceResponse`
 - `HistoricalUnspentSegment`
@@ -34,11 +30,12 @@ The model separates three concerns:
 
 - note existence: the note commitment tree
 - current-epoch replay prevention: the active nullifier epoch
-- prior-epoch replay prevention: archived nullifier epochs plus portable
-  checkpoints
+- prior-epoch replay prevention: finalized historical nullifier windows plus
+  portable checkpoints
 
-This is why validators do not need a perpetually growing flat historic
-nullifier table in canonical hot state.
+Validators do not need a perpetually growing flat historic nullifier table in
+canonical hot state. Finalized history is consensus-derived local state, not an
+external data market.
 
 ## Notes And Nullifiers
 
@@ -61,11 +58,12 @@ The public chain state only needs the note commitment.
 - the chain ID
 - the target epoch
 
-So the same note produces distinct deterministic nullifiers across epochs.
+The same note therefore produces distinct deterministic nullifiers across
+epochs.
 
-## Archived Nullifier Epochs
+## Historical Nullifier Windows
 
-Each closed nullifier epoch is stored as an `ArchivedNullifierEpoch` with:
+Each closed nullifier epoch is stored as a `HistoricalNullifierWindow` with:
 
 - the epoch number
 - the sorted nullifier set
@@ -74,8 +72,8 @@ Each closed nullifier epoch is stored as an `ArchivedNullifierEpoch` with:
 `NullifierRootLedger` keeps the compact epoch-to-root mapping that validators
 and wallets use for historical binding.
 
-`ArchivedNullifierEpoch::prove_absence()` produces authenticated absence proofs
-based on predecessor/successor boundaries in the sorted set.
+`HistoricalNullifierWindow::prove_absence()` produces authenticated absence
+proofs based on predecessor/successor boundaries in the sorted set.
 
 ## Portable Checkpoints
 
@@ -88,23 +86,21 @@ verification for one note. It records:
 - a transcript root over prior verified historical steps
 - a verified epoch count
 
-Provider-side checkpoint service logic is implemented by `ShieldedSyncServer`.
-On the network path, those responses move as checkpoint batch requests and
-responses over the PQ transport rather than as a local-only helper.
+Checkpoint service logic is implemented by `ShieldedSyncServer` over local
+finalized history. Network and node-control callers exchange checkpoint batch
+requests and responses without provider manifests or external shard discovery.
 
 ## Checkpoint Aggregation
 
-The current wallet and network code implement a multi-stage checkpoint flow:
+The current wallet and network code implement a local finalized-history flow:
 
 1. Build checkpoint extension requests from owned notes.
-2. Segment requests by archive shard.
-3. Route segments across providers from `ArchiveDirectory`.
-4. Pad provider/shard buckets with synthetic cover requests.
-5. Rerandomize provider responses.
-6. Compress rerandomized segments into packets.
-7. Compress packets into strata.
-8. Aggregate strata into one `HistoricalUnspentExtension`.
-9. Prove checkpoint accumulator updates with succinct receipts.
+2. Serve absence records from local finalized nullifier windows.
+3. Rerandomize service responses.
+4. Compress rerandomized segments into packets.
+5. Compress packets into strata.
+6. Aggregate strata into one `HistoricalUnspentExtension`.
+7. Prove checkpoint accumulator updates with native-proof-capability plumbing.
 
 The relevant code lives in:
 
@@ -117,40 +113,14 @@ The relevant code lives in:
 `HistoricalUnspentCheckpoint::apply_accumulator()` advance local checkpoint
 state against the `NullifierRootLedger`.
 
-## Archive Directory
-
-`ArchiveDirectory` derives a routing and scoring view from:
-
-- the root ledger
-- provider manifests
-- replica attestations
-- service ledgers
-- custody commitments
-- retrieval receipts
-
-From those inputs it computes:
-
-- contiguous archive shards
-- provider coverage over shard ranges
-- replica reports
-- availability certificates
-- operator scorecards
-- custody assignments
-- provider selection for checkpoint segments and shard repair
-
-The network runtime persists and exchanges those archive objects through the
-column families defined in `src/storage.rs`.
-
 ## Proof-Carrying Spend Path
 
 The spend path is proof-carrying in the checked-in runtime:
 
 - `proof-core` defines the witness and journal schema
-- `methods/guest` verifies shielded spend witnesses in the zkVM
-- `methods/checkpoint-guest` verifies checkpoint accumulator steps
-- `src/proof.rs` produces and verifies succinct receipts
+- `src/proof.rs` produces and verifies native proof envelopes
 - `src/wallet.rs` assembles witness data and produces the spend proof
-- `src/transaction.rs` accepts the transaction only if the receipt journal
+- `src/transaction.rs` accepts the transaction only if the public journal
   matches live chain state
 
 Private witness material includes:
@@ -165,8 +135,8 @@ Public transaction material includes:
 
 - current-epoch nullifiers
 - encrypted shielded outputs
-- the succinct receipt bytes
-- the receipt journal bindings validated against local state
+- proof seal bytes
+- public journal bindings validated against local state
 
 ## Storage
 
@@ -176,36 +146,29 @@ including:
 - `shielded_note_tree`
 - `shielded_nullifier_epoch`
 - `shielded_root_ledger`
-- `shielded_checkpoint`
 - `shielded_output`
-- `shielded_owned_note`
 - `shielded_active_nullifier`
 - `shielded_spent_note`
-- `shielded_archive_provider`
-- `shielded_archive_replica`
-- `shielded_archive_operator`
-- `shielded_archive_accounting`
-- `shielded_archive_custody`
-- `shielded_archive_receipt`
+
+Legacy local wallet state is kept in the wallet database. Removed provider
+column families are dropped during schema opening if an old dev database still
+contains them.
 
 ## Runtime Scope
 
-The live runtime already includes:
+The live runtime includes:
 
 1. deterministic genesis-note materialization
 2. evolving-nullifier epochs and root-ledger rollover
 3. signed KeyDoc recipient documents
-4. fixed-cadence wallet refresh with cover requests
-5. segmented multi-provider checkpoint routing
-6. response rerandomization plus packet/stratum aggregation
-7. checkpoint accumulator proving
-8. archive manifests, replica attestations, custody commitments, retrieval
-   receipts, availability certificates, and operator scorecards
-9. archive shard repair and deterministic custody rebalancing in the network
-   runtime
+4. fixed-cadence wallet refresh with local finalized-history requests
+5. response rerandomization plus packet/stratum aggregation
+6. checkpoint accumulator API surfaces that now fail clearly until native
+   circuits are implemented
+7. native ordinary-transfer proof envelope generation and verification
 
 Areas that still read as frontier work in the current design are:
 
-1. stronger operator economics beyond deterministic score and routing weights
-2. very long-horizon archive durability assumptions
+1. full Plonky3 AIR constraints for ordinary transfer
+2. native checkpoint accumulator, staking, issuance, and redemption circuits
 3. deeper recursive compression above the current stratum/accumulator layer

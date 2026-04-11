@@ -1,6 +1,6 @@
 use crate::{
     consensus::{ConsensusPosition, Validator, ValidatorId, ValidatorSet, MAX_ACTIVE_VALIDATORS},
-    node_identity::{validator_from_record, NodeRecordV2},
+    node_identity::{validator_from_record, NodeRecordV3},
     storage::Store,
 };
 use anyhow::{bail, Result};
@@ -318,7 +318,7 @@ impl ValidatorPool {
     }
 
     pub fn from_node_record(
-        record: &NodeRecordV2,
+        record: &NodeRecordV3,
         commission_bps: u16,
         total_bonded_stake: u64,
         activation_epoch: u64,
@@ -793,7 +793,7 @@ pub fn select_active_validator_set(epoch: u64, pools: &[ValidatorPool]) -> Resul
 
 pub fn register_genesis_local_validator_pool(
     db: &Store,
-    record: &NodeRecordV2,
+    record: &NodeRecordV3,
 ) -> Result<ValidatorPool> {
     let validator_id = ValidatorId::from_hot_key(&record.auth_spki);
     if let Some(existing) = db.load_validator_pool(&validator_id)? {
@@ -857,7 +857,7 @@ pub fn ensure_validator_set_matches_epoch_state(
 }
 
 pub fn local_validator_pool_from_record(
-    record: &NodeRecordV2,
+    record: &NodeRecordV3,
     commission_bps: u16,
     total_bonded_stake: u64,
     activation_epoch: u64,

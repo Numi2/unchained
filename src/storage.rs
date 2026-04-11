@@ -23,6 +23,9 @@ pub struct Store {
     mirror_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>)>>, // background mirroring
 }
 
+const CHAIN_STORAGE_SCHEMA_VERSION: u32 = 3;
+const CHAIN_STORAGE_SCHEMA_VERSION_KEY: &[u8] = b"chain_storage_schema_version";
+
 fn build_cf_options() -> Options {
     let mut cf_opts = Options::default();
     {
@@ -357,17 +360,11 @@ impl Store {
             "meta", // miscellaneous metadata (e.g., cursors)
             // Shielded pool state
             "shielded_note_tree", // singleton canonical note commitment tree
-            "shielded_nullifier_epoch", // epoch -> ArchivedNullifierEpoch
+            "shielded_nullifier_epoch", // epoch -> HistoricalNullifierWindow
             "shielded_root_ledger", // singleton historical nullifier root ledger
             "shielded_output",    // tx_id||output_index -> ShieldedOutput
             "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
             "shielded_spent_note", // note_commitment -> spent marker
-            "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
-            "shielded_archive_replica", // provider_id||shard_id -> ArchiveReplicaAttestation
-            "shielded_archive_operator", // provider_id -> ArchiveOperatorScorecard
-            "shielded_archive_accounting", // provider_id -> ArchiveServiceLedger
-            "shielded_archive_custody", // provider_id||shard_id -> ArchiveCustodyCommitment
-            "shielded_archive_receipt", // receipt_digest -> ArchiveRetrievalReceipt
         ];
 
         let mut db = open_db_with_families(&db_path, &cf_names)?;
@@ -380,6 +377,36 @@ impl Store {
         ] {
             if db.cf_handle(obsolete_cf).is_some() {
                 db.drop_cf(obsolete_cf).with_context(|| {
+                    format!("Failed to drop obsolete chain column family '{obsolete_cf}'")
+                })?;
+            }
+        }
+        for suffix in [
+            "provider",
+            "replica",
+            "operator",
+            "accounting",
+            "custody",
+            "receipt",
+        ] {
+            let obsolete_cf = format!("shielded_finalized_{}_{suffix}", "history");
+            if db.cf_handle(&obsolete_cf).is_some() {
+                db.drop_cf(&obsolete_cf).with_context(|| {
+                    format!("Failed to drop obsolete chain column family '{obsolete_cf}'")
+                })?;
+            }
+        }
+        for suffix in [
+            "provider",
+            "replica",
+            "operator",
+            "accounting",
+            "custody",
+            "receipt",
+        ] {
+            let obsolete_cf = format!("shielded_{}ive_{suffix}", "arch");
+            if db.cf_handle(&obsolete_cf).is_some() {
+                db.drop_cf(&obsolete_cf).with_context(|| {
                     format!("Failed to drop obsolete chain column family '{obsolete_cf}'")
                 })?;
             }
@@ -424,7 +451,53 @@ impl Store {
         store
             .health_check()
             .with_context(|| "Database health check failed during initialization")?;
+        store.ensure_chain_storage_schema()?;
         Ok(store)
+    }
+
+    fn meta_cf(&self) -> Result<&rocksdb::ColumnFamily> {
+        self.db
+            .cf_handle("meta")
+            .ok_or_else(|| anyhow::anyhow!("'meta' column family missing"))
+    }
+
+    fn load_chain_storage_schema_version(&self) -> Result<Option<u32>> {
+        let cf = self.meta_cf()?;
+        match self.db.get_cf(cf, CHAIN_STORAGE_SCHEMA_VERSION_KEY)? {
+            Some(bytes) => {
+                let raw: [u8; 4] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("invalid chain storage schema version marker"))?;
+                Ok(Some(u32::from_le_bytes(raw)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn store_chain_storage_schema_version(&self, version: u32) -> Result<()> {
+        let cf = self.meta_cf()?;
+        self.db
+            .put_cf(cf, CHAIN_STORAGE_SCHEMA_VERSION_KEY, version.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn ensure_chain_storage_schema(&self) -> Result<()> {
+        match self.load_chain_storage_schema_version()? {
+            None => self.store_chain_storage_schema_version(CHAIN_STORAGE_SCHEMA_VERSION)?,
+            Some(version) if version > CHAIN_STORAGE_SCHEMA_VERSION => {
+                bail!(
+                    "chain storage schema {} is newer than supported schema {}",
+                    version,
+                    CHAIN_STORAGE_SCHEMA_VERSION
+                );
+            }
+            Some(version) if version < CHAIN_STORAGE_SCHEMA_VERSION => {
+                self.store_chain_storage_schema_version(CHAIN_STORAGE_SCHEMA_VERSION)?;
+            }
+            Some(_) => {}
+        }
+        Ok(())
     }
 
     pub fn put<T: Serialize>(&self, cf: &str, key: &[u8], value: &T) -> Result<()> {
@@ -1473,49 +1546,71 @@ impl Store {
         }
     }
 
-    pub fn store_shielded_nullifier_epoch(
+    pub fn store_shielded_historical_nullifier_window(
         &self,
-        epoch: &crate::shielded::ArchivedNullifierEpoch,
+        epoch: &crate::shielded::HistoricalNullifierWindow,
     ) -> Result<()> {
         let cf = self
             .db
             .cf_handle("shielded_nullifier_epoch")
             .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
-        let bytes = crate::canonical::encode_archived_nullifier_epoch(epoch)?;
+        let bytes = crate::canonical::encode_historical_nullifier_window(epoch)?;
         self.db.put_cf(cf, &epoch.epoch.to_le_bytes(), bytes)?;
         Ok(())
     }
 
-    pub fn load_shielded_nullifier_epoch(
+    pub fn store_shielded_nullifier_epoch(
+        &self,
+        epoch: &crate::shielded::HistoricalNullifierWindow,
+    ) -> Result<()> {
+        self.store_shielded_historical_nullifier_window(epoch)
+    }
+
+    pub fn load_shielded_historical_nullifier_window(
         &self,
         epoch: u64,
-    ) -> Result<Option<crate::shielded::ArchivedNullifierEpoch>> {
+    ) -> Result<Option<crate::shielded::HistoricalNullifierWindow>> {
         let cf = self
             .db
             .cf_handle("shielded_nullifier_epoch")
             .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
         match self.db.get_cf(cf, &epoch.to_le_bytes())? {
-            Some(bytes) => Ok(Some(crate::canonical::decode_archived_nullifier_epoch(
+            Some(bytes) => Ok(Some(crate::canonical::decode_historical_nullifier_window(
                 &bytes,
             )?)),
             None => Ok(None),
         }
     }
 
-    pub fn iterate_shielded_nullifier_epochs(
+    pub fn load_shielded_nullifier_epoch(
         &self,
-    ) -> Result<Vec<crate::shielded::ArchivedNullifierEpoch>> {
+        epoch: u64,
+    ) -> Result<Option<crate::shielded::HistoricalNullifierWindow>> {
+        self.load_shielded_historical_nullifier_window(epoch)
+    }
+
+    pub fn iterate_shielded_historical_nullifier_windows(
+        &self,
+    ) -> Result<Vec<crate::shielded::HistoricalNullifierWindow>> {
         let cf = self
             .db
             .cf_handle("shielded_nullifier_epoch")
             .ok_or_else(|| anyhow::anyhow!("'shielded_nullifier_epoch' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut archived = Vec::new();
+        let mut historical = Vec::new();
         for item in iter {
             let (_key, value) = item?;
-            archived.push(crate::canonical::decode_archived_nullifier_epoch(&value)?);
+            historical.push(crate::canonical::decode_historical_nullifier_window(
+                &value,
+            )?);
         }
-        Ok(archived)
+        Ok(historical)
+    }
+
+    pub fn iterate_shielded_nullifier_epochs(
+        &self,
+    ) -> Result<Vec<crate::shielded::HistoricalNullifierWindow>> {
+        self.iterate_shielded_historical_nullifier_windows()
     }
 
     pub fn store_shielded_root_ledger(
@@ -1544,226 +1639,6 @@ impl Store {
             )?)),
             None => Ok(None),
         }
-    }
-
-    pub fn store_shielded_archive_provider(
-        &self,
-        manifest: &crate::shielded::ArchiveProviderManifest,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_provider")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
-        let bytes = crate::canonical::encode_archive_provider_manifest(manifest)?;
-        self.db.put_cf(cf, &manifest.provider_id, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_provider(
-        &self,
-        provider_id: &[u8; 32],
-    ) -> Result<Option<crate::shielded::ArchiveProviderManifest>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_provider")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
-        match self.db.get_cf(cf, provider_id)? {
-            Some(bytes) => Ok(Some(crate::canonical::decode_archive_provider_manifest(
-                &bytes,
-            )?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn load_shielded_archive_providers(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveProviderManifest>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_provider")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_provider' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut manifests = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            manifests.push(crate::canonical::decode_archive_provider_manifest(&value)?);
-        }
-        Ok(manifests)
-    }
-
-    pub fn store_shielded_archive_replica(
-        &self,
-        replica: &crate::shielded::ArchiveReplicaAttestation,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_replica")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_replica' column family missing"))?;
-        let mut key = Vec::with_capacity(40);
-        key.extend_from_slice(&replica.provider_id);
-        key.extend_from_slice(&replica.shard_id.to_le_bytes());
-        let bytes = crate::canonical::encode_archive_replica_attestation(replica)?;
-        self.db.put_cf(cf, key, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_replicas(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveReplicaAttestation>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_replica")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_replica' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut replicas = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            replicas.push(crate::canonical::decode_archive_replica_attestation(
-                &value,
-            )?);
-        }
-        Ok(replicas)
-    }
-
-    pub fn store_shielded_archive_operator_scorecard(
-        &self,
-        scorecard: &crate::shielded::ArchiveOperatorScorecard,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_operator")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
-        let bytes = crate::canonical::encode_archive_operator_scorecard(scorecard)?;
-        self.db.put_cf(cf, &scorecard.provider_id, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_operator_scorecards(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveOperatorScorecard>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_operator")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut scorecards = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            scorecards.push(crate::canonical::decode_archive_operator_scorecard(&value)?);
-        }
-        Ok(scorecards)
-    }
-
-    pub fn store_shielded_archive_service_ledger(
-        &self,
-        ledger: &crate::shielded::ArchiveServiceLedger,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_accounting")
-            .ok_or_else(|| {
-                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
-            })?;
-        let bytes = crate::canonical::encode_archive_service_ledger(ledger)?;
-        self.db.put_cf(cf, &ledger.provider_id, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_service_ledger(
-        &self,
-        provider_id: &[u8; 32],
-    ) -> Result<Option<crate::shielded::ArchiveServiceLedger>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_accounting")
-            .ok_or_else(|| {
-                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
-            })?;
-        match self.db.get_cf(cf, provider_id)? {
-            Some(bytes) => Ok(Some(crate::canonical::decode_archive_service_ledger(
-                &bytes,
-            )?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn load_shielded_archive_service_ledgers(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveServiceLedger>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_accounting")
-            .ok_or_else(|| {
-                anyhow::anyhow!("'shielded_archive_accounting' column family missing")
-            })?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut ledgers = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            ledgers.push(crate::canonical::decode_archive_service_ledger(&value)?);
-        }
-        Ok(ledgers)
-    }
-
-    pub fn store_shielded_archive_custody_commitment(
-        &self,
-        commitment: &crate::shielded::ArchiveCustodyCommitment,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_custody")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_custody' column family missing"))?;
-        let mut key = Vec::with_capacity(40);
-        key.extend_from_slice(&commitment.provider_id);
-        key.extend_from_slice(&commitment.shard_id.to_le_bytes());
-        let bytes = crate::canonical::encode_archive_custody_commitment(commitment)?;
-        self.db.put_cf(cf, key, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_custody_commitments(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveCustodyCommitment>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_custody")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_custody' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut commitments = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            commitments.push(crate::canonical::decode_archive_custody_commitment(&value)?);
-        }
-        Ok(commitments)
-    }
-
-    pub fn store_shielded_archive_retrieval_receipt(
-        &self,
-        receipt: &crate::shielded::ArchiveRetrievalReceipt,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_receipt")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
-        let bytes = crate::canonical::encode_archive_retrieval_receipt(receipt)?;
-        self.db.put_cf(cf, &receipt.receipt_digest, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_retrieval_receipts(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveRetrievalReceipt>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_receipt")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut receipts = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            receipts.push(crate::canonical::decode_archive_retrieval_receipt(&value)?);
-        }
-        Ok(receipts)
     }
 
     pub fn store_shielded_output(

@@ -25,7 +25,7 @@ sync_timeout_secs = 1800
 # This is essential for nodes running behind a NAT.
 
 # Bootstrap nodes to connect to.
-# Each entry must be a signed NodeRecordV2 compact string or a path to a file containing one.
+# Each entry must be a signed NodeRecordV3 compact string or a path to a file containing one.
 bootstrap = []
 
 # Optional signed trust-update documents for revocation/replacement of node roots.
@@ -44,18 +44,13 @@ max_messages_per_window = 1000
 # rebuilding the app every time the node writes to its database.
 path = "../blockchain_data"
 
-[epoch]
-# Local checkpoint cadence in seconds for a standalone validator/runtime.
-# Finalized slot/epoch consensus state is protocol-defined, not operator-tuned.
-seconds = 222
-
 [metrics]
 # Optional local observability endpoint. Must remain loopback-only.
 bind = "127.0.0.1:9100"
 
 [ingress.wallet]
 # Wallet ordinary-path submission goes through a distinct access relay and
-# submission gateway. Each field accepts a signed NodeRecordV2 string or a file
+# submission gateway. Each field accepts a signed NodeRecordV3 string or a file
 # path containing one.
 # relay = "/path/to/access-relay.node-record"
 # gateway = "/path/to/submission-gateway.node-record"
@@ -102,7 +97,7 @@ submit_timeout_secs = 30
 
 [discovery.wallet]
 # Canonical wallet addressability goes through a primary discovery server and
-# optional read-only mirrors. Each entry accepts a signed NodeRecordV2 string or
+# optional read-only mirrors. Each entry accepts a signed NodeRecordV3 string or
 # a file path containing one.
 # server = "/path/to/discovery.node-record"
 # mirrors = ["/path/to/discovery-mirror-a.node-record", "/path/to/discovery-mirror-b.node-record"]

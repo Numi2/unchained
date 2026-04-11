@@ -3,7 +3,7 @@ use crate::{
     crypto::{self, ML_KEM_768_CT_BYTES},
     node_identity::{
         build_client_config_with_alpn, build_server_config_with_alpn,
-        load_local_ingress_key_material_in_dir, ExpectedPeerStore, NodeIdentity, NodeRecordV2,
+        load_local_ingress_key_material_in_dir, ExpectedPeerStore, NodeIdentity, NodeRecordV3,
     },
     proof,
     shielded::{HistoricalUnspentCheckpoint, HistoricalUnspentExtension},
@@ -84,7 +84,7 @@ enum ProofAssistantResponse {
 #[derive(Clone)]
 pub struct ProofAssistantClient {
     endpoint: Arc<Endpoint>,
-    server_record: NodeRecordV2,
+    server_record: NodeRecordV3,
     capabilities_cache: Arc<Mutex<Option<proof::TransparentProverCapabilities>>>,
     submit_timeout: Duration,
     max_request_bytes: usize,
@@ -117,7 +117,7 @@ pub struct ProofAssistantServer {
 
 impl ProofAssistantClient {
     pub fn new(
-        server_record: NodeRecordV2,
+        server_record: NodeRecordV3,
         max_request_bytes: usize,
         max_response_bytes: usize,
         submit_timeout: Duration,
@@ -596,7 +596,7 @@ impl ProofAssistantRequest {
 
 fn seal_request_to_server(
     request: &ProofAssistantRequest,
-    server_record: &NodeRecordV2,
+    server_record: &NodeRecordV3,
     max_request_bytes: usize,
 ) -> Result<Vec<u8>> {
     let plaintext = encode_request(request)?;

@@ -576,7 +576,7 @@ fn load_runtime_identity(cfg: &config::Config) -> Result<node_identity::NodeIden
     )
 }
 
-fn load_validated_service_record(item: &str, label: &str) -> Result<node_identity::NodeRecordV2> {
+fn load_validated_service_record(item: &str, label: &str) -> Result<node_identity::NodeRecordV3> {
     let record = node_identity::load_node_record(item)
         .map_err(|err| anyhow!("failed to load {label} node record: {err}"))?;
     record.validate(now_unix_ms())?;
@@ -587,7 +587,7 @@ fn load_ingress_record(
     item: &str,
     label: &str,
     expected_chain_id: [u8; 32],
-) -> Result<node_identity::NodeRecordV2> {
+) -> Result<node_identity::NodeRecordV3> {
     let record = load_validated_service_record(item, label)?;
     if record.chain_id != Some(expected_chain_id) {
         bail!(
@@ -606,7 +606,7 @@ fn load_ingress_records(
     items: &[String],
     label: &str,
     expected_chain_id: [u8; 32],
-) -> Result<Vec<node_identity::NodeRecordV2>> {
+) -> Result<Vec<node_identity::NodeRecordV3>> {
     items
         .iter()
         .map(|item| load_ingress_record(item, label, expected_chain_id))
@@ -784,7 +784,7 @@ fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
 fn load_operator_node_record(
     cfg: &config::Config,
     provided: Option<&str>,
-) -> Result<node_identity::NodeRecordV2> {
+) -> Result<node_identity::NodeRecordV3> {
     let record = if let Some(item) = provided {
         node_identity::load_node_record(item)?
     } else {
@@ -1111,7 +1111,6 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     );
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
-        cfg.epoch.clone(),
         cfg.net.clone(),
         net.clone(),
         shutdown_tx.subscribe(),
@@ -1614,7 +1613,10 @@ pub async fn run_node_cli() -> Result<()> {
             if let Some(public_ip) = cfg.net.public_ip.clone() {
                 println!("Public IP: {public_ip}");
             }
-            println!("Local checkpoint cadence: {} seconds", cfg.epoch.seconds);
+            println!(
+                "Protocol checkpoint cadence: {} seconds",
+                cfg.epoch.checkpoint_cadence_secs()
+            );
             println!("Consensus foundation: validator/BFT runtime");
             println!("Settlement manager: enabled");
             println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);

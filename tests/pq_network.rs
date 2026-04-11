@@ -20,9 +20,7 @@ use unchained::node_identity::{self, validator_from_record, NodeIdentity};
 use unchained::proof;
 use unchained::protocol::CURRENT as PROTOCOL;
 use unchained::shielded::{
-    local_archive_provider_manifest, local_archive_replica_attestations, route_checkpoint_requests,
-    ArchiveDirectory, ArchivedNullifierEpoch, CheckpointExtensionRequest, EvolvingNullifierQuery,
-    HistoricalUnspentCheckpoint, NullifierRootLedger,
+    CheckpointExtensionRequest, EvolvingNullifierQuery, HistoricalUnspentCheckpoint,
 };
 use unchained::staking::{
     ValidatorAccountability, ValidatorMetadata, ValidatorPool, ValidatorProfileUpdate,
@@ -1791,7 +1789,7 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
         provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
     let (node_id_b_before, _) =
         provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b.clone()])?;
-    let bootstrap_record_a = node_identity::NodeRecordV2::decode_compact(&bootstrap_a)?;
+    let bootstrap_record_a = node_identity::NodeRecordV3::decode_compact(&bootstrap_a)?;
 
     drop(db_a_seed);
     drop(db_b_seed);
@@ -1966,7 +1964,7 @@ async fn pq_network_disconnects_peer_that_sends_invalid_envelope() -> anyhow::Re
     let addr_victim = format!("127.0.0.1:{port_victim}");
     let (_, bootstrap_victim) =
         provision_runtime_identity(&dir_victim, Some(genesis.hash), vec![addr_victim.clone()])?;
-    let victim_record = node_identity::NodeRecordV2::decode_compact(&bootstrap_victim)?;
+    let victim_record = node_identity::NodeRecordV3::decode_compact(&bootstrap_victim)?;
 
     let (db_victim, net_victim, _) =
         spawn_test_node(&dir_victim, build_net(port_victim, vec![])).await?;
@@ -2042,227 +2040,5 @@ async fn pq_network_disconnects_peer_that_sends_invalid_envelope() -> anyhow::Re
     endpoint.wait_idle().await;
     net_victim.shutdown().await;
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn pq_mesh_archive_provider_discovery_and_shard_sync() -> anyhow::Result<()> {
-    let _guard = test_guard();
-    network::set_quiet_logging(true);
-
-    let dir_a = TempDir::new()?;
-    let dir_b = TempDir::new()?;
-
-    let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
-    let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(&db_a_seed, &committee)?;
-    seed_genesis(&db_b_seed, &committee)?;
-
-    let archived = ArchivedNullifierEpoch::new(1, vec![[11u8; 32], [22u8; 32], [33u8; 32]]);
-    let mut ledger = NullifierRootLedger::default();
-    ledger.remember_epoch(&archived);
-    db_a_seed.store_shielded_root_ledger(&ledger)?;
-    db_b_seed.store_shielded_root_ledger(&ledger)?;
-    db_a_seed.store_shielded_nullifier_epoch(&archived)?;
-
-    let port_a = pick_udp_port();
-    let port_b = pick_udp_port();
-    let addr_a = format!("127.0.0.1:{port_a}");
-    let addr_b = format!("127.0.0.1:{port_b}");
-
-    let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
-    provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b.clone()])?;
-
-    drop(db_a_seed);
-    drop(db_b_seed);
-
-    let (_db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
-    let (db_b, net_b, _) =
-        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
-
-    wait_for_peers(&net_a, 1, "archive node A").await;
-    wait_for_peers(&net_b, 1, "archive node B").await;
-
-    net_b.ensure_archive_epochs(&[1]).await?;
-
-    wait_for_condition(
-        "archived nullifier epoch sync over PQ mesh",
-        Duration::from_secs(10),
-        || {
-            db_b.load_shielded_nullifier_epoch(1)
-                .ok()
-                .flatten()
-                .map(|stored| stored == archived)
-                .unwrap_or(false)
-        },
-    )
-    .await;
-
-    let providers = db_b.load_shielded_archive_providers()?;
-    assert!(
-        !providers.is_empty(),
-        "archive provider manifest was not persisted on the receiving node"
-    );
-
-    net_b.shutdown().await;
-    net_a.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
-    let _guard = test_guard();
-    network::set_quiet_logging(true);
-
-    let dir_a = TempDir::new()?;
-    let dir_b = TempDir::new()?;
-
-    let db_a_seed = Store::open(&dir_a.path().to_string_lossy())?;
-    let db_b_seed = Store::open(&dir_b.path().to_string_lossy())?;
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(&db_a_seed, &committee)?;
-    seed_genesis(&db_b_seed, &committee)?;
-
-    let archived = ArchivedNullifierEpoch::new(1, vec![[11u8; 32], [22u8; 32], [33u8; 32]]);
-    let mut ledger = NullifierRootLedger::default();
-    ledger.remember_epoch(&archived);
-    db_a_seed.store_shielded_root_ledger(&ledger)?;
-    db_b_seed.store_shielded_root_ledger(&ledger)?;
-    db_a_seed.store_shielded_nullifier_epoch(&archived)?;
-
-    let port_a = pick_udp_port();
-    let port_b = pick_udp_port();
-    let addr_a = format!("127.0.0.1:{port_a}");
-    let addr_b = format!("127.0.0.1:{port_b}");
-
-    let (_, bootstrap_a) =
-        provision_runtime_identity(&dir_a, Some(genesis.hash), vec![addr_a.clone()])?;
-    let (node_id_b_hex, _) =
-        provision_runtime_identity(&dir_b, Some(genesis.hash), vec![addr_b.clone()])?;
-    let provider_record_a = node_identity::NodeRecordV2::decode_compact(&bootstrap_a)?;
-    let node_id_b = hex::decode(node_id_b_hex)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid node id length"))?;
-
-    drop(db_a_seed);
-    drop(db_b_seed);
-
-    let (_db_a, net_a, _) = spawn_test_node(&dir_a, build_net(port_a, vec![])).await?;
-    let (db_b, net_b, _) =
-        spawn_test_node(&dir_b, build_net(port_b, vec![bootstrap_a.clone()])).await?;
-
-    wait_for_peers(&net_a, 1, "checkpoint node A").await;
-    wait_for_peers(&net_b, 1, "checkpoint node B").await;
-
-    wait_for_condition(
-        "archive provider manifest discovery",
-        Duration::from_secs(10),
-        || {
-            db_b.load_shielded_archive_providers()
-                .map(|providers| {
-                    providers
-                        .iter()
-                        .any(|manifest| manifest.provider_id == provider_record_a.node_id)
-                })
-                .unwrap_or(false)
-        },
-    )
-    .await;
-
-    let ledger = db_b
-        .load_shielded_root_ledger()?
-        .ok_or_else(|| anyhow::anyhow!("missing shielded root ledger"))?;
-    let mut providers = db_b.load_shielded_archive_providers()?;
-    let local_manifest = local_archive_provider_manifest(
-        node_id_b,
-        &ledger,
-        PROTOCOL.archive_shard_epoch_span,
-        &transaction::local_available_archive_epochs(&db_b, &ledger)?,
-    )?;
-    if let Some(existing) = providers
-        .iter_mut()
-        .find(|existing| existing.provider_id == local_manifest.provider_id)
-    {
-        *existing = local_manifest.clone();
-    } else {
-        providers.push(local_manifest.clone());
-    }
-    let base_directory = ArchiveDirectory::from_root_ledger_and_providers(
-        &ledger,
-        PROTOCOL.archive_shard_epoch_span,
-        providers.clone(),
-    )?;
-    let mut replicas =
-        local_archive_replica_attestations(provider_record_a.node_id, &base_directory, 32)?;
-    replicas.extend(local_archive_replica_attestations(
-        local_manifest.provider_id,
-        &base_directory,
-        32,
-    )?);
-    let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas(
-        &ledger,
-        PROTOCOL.archive_shard_epoch_span,
-        providers,
-        replicas,
-    )?;
-
-    let rotation_round = 7u64;
-    let checkpoint = (0u64..10_000)
-        .find_map(|counter| {
-            let note_commitment = *blake3::hash(&counter.to_le_bytes()).as_bytes();
-            let checkpoint = HistoricalUnspentCheckpoint::genesis(note_commitment, 1);
-            let blinding = *blake3::hash(&counter.to_le_bytes()).as_bytes();
-            route_checkpoint_requests(
-                &directory,
-                &[CheckpointExtensionRequest::new(
-                    checkpoint.clone(),
-                    vec![EvolvingNullifierQuery {
-                        epoch: 1,
-                        nullifier: [44u8; 32],
-                    }],
-                    blinding,
-                )],
-                rotation_round,
-                PROTOCOL.oblivious_sync_min_batch as usize,
-                PROTOCOL.max_historical_nullifier_batch as usize,
-            )
-            .ok()
-            .and_then(|batches| batches.first().map(|batch| batch.provider_id))
-            .filter(|provider_id| *provider_id == provider_record_a.node_id)
-            .map(|_| checkpoint)
-        })
-        .ok_or_else(|| anyhow::anyhow!("could not route checkpoint request to remote provider"))?;
-
-    let extensions = net_b
-        .request_historical_extensions(
-            &[CheckpointExtensionRequest::new(
-                checkpoint.clone(),
-                vec![EvolvingNullifierQuery {
-                    epoch: 1,
-                    nullifier: [44u8; 32],
-                }],
-                [55u8; 32],
-            )],
-            rotation_round,
-        )
-        .await?;
-    assert_eq!(extensions.len(), 1);
-    assert_eq!(extensions[0].strata.len(), 1);
-    assert_eq!(extensions[0].strata[0].packets.len(), 1);
-    assert_eq!(extensions[0].strata[0].packets[0].segments.len(), 1);
-    let serving_provider = extensions[0].strata[0].packets[0].segments[0].provider_id;
-    assert!(serving_provider == provider_record_a.node_id || serving_provider == node_id_b);
-    if serving_provider == node_id_b {
-        assert!(db_b.load_shielded_nullifier_epoch(1)?.is_some());
-    }
-
-    let updated = checkpoint.apply_extension(&extensions[0], &ledger)?;
-    assert_eq!(updated.covered_through_epoch, 1);
-    assert_eq!(updated.verified_epoch_count, 1);
-
-    net_b.shutdown().await;
-    net_a.shutdown().await;
     Ok(())
 }

@@ -6,7 +6,7 @@ use crate::{
     evidence::ConsensusEvidenceRecord,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     network::NetHandle,
-    shielded::{ArchivedNullifierEpoch, NoteCommitmentTree, NullifierRootLedger},
+    shielded::{HistoricalNullifierWindow, NoteCommitmentTree, NullifierRootLedger},
     staking::{ValidatorPool, ValidatorRewardEvent},
     storage::Store,
     transaction::{self, ShieldedOutput, Tx},
@@ -44,7 +44,7 @@ pub struct ShieldedRuntimeSnapshot {
     pub shielded_outputs: Vec<([u8; 32], u32, ShieldedOutput)>,
     pub note_tree: NoteCommitmentTree,
     pub root_ledger: NullifierRootLedger,
-    pub archived_nullifier_epochs: Vec<ArchivedNullifierEpoch>,
+    pub historical_nullifier_windows: Vec<HistoricalNullifierWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub struct WalletSendRuntimeMaterial {
     pub registered_validator_pools: Vec<ValidatorPool>,
     pub note_tree: NoteCommitmentTree,
     pub root_ledger: NullifierRootLedger,
-    pub archived_nullifier_epochs: Vec<ArchivedNullifierEpoch>,
+    pub historical_nullifier_windows: Vec<HistoricalNullifierWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,7 +159,7 @@ pub fn build_shielded_runtime_snapshot(db: &Store) -> Result<ShieldedRuntimeSnap
         shielded_outputs: db.iterate_shielded_outputs()?,
         note_tree: db.load_shielded_note_tree()?.unwrap_or_default(),
         root_ledger: db.load_shielded_root_ledger()?.unwrap_or_default(),
-        archived_nullifier_epochs: db.iterate_shielded_nullifier_epochs()?,
+        historical_nullifier_windows: db.iterate_shielded_historical_nullifier_windows()?,
     })
 }
 
@@ -227,7 +227,7 @@ pub fn build_wallet_send_runtime_material(db: &Store) -> Result<WalletSendRuntim
         registered_validator_pools: db.load_validator_pools()?,
         note_tree: db.load_shielded_note_tree()?.unwrap_or_default(),
         root_ledger: db.load_shielded_root_ledger()?.unwrap_or_default(),
-        archived_nullifier_epochs: db.iterate_shielded_nullifier_epochs()?,
+        historical_nullifier_windows: db.iterate_shielded_historical_nullifier_windows()?,
     })
 }
 

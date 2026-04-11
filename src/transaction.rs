@@ -1770,9 +1770,9 @@ fn rollover_active_nullifier_epoch(db: &Store) -> Result<()> {
         .unwrap_or_else(NullifierRootLedger::default);
     let mut changed = false;
     while active.epoch < current_epoch {
-        let archived = active.archive()?;
-        db.store_shielded_nullifier_epoch(&archived)?;
-        ledger.remember_epoch(&archived);
+        let historical = active.historical_nullifier_window()?;
+        db.store_shielded_historical_nullifier_window(&historical)?;
+        ledger.remember_epoch(&historical);
         active = ActiveNullifierEpoch::new(active.epoch.saturating_add(1));
         changed = true;
     }
@@ -1801,17 +1801,27 @@ fn historical_root_digest_for_range(
     Ok(proof_core::checkpoint_accumulator_historical_digest_from_pairs(&pairs))
 }
 
-pub fn local_available_archive_epochs(
+pub fn local_available_historical_nullifier_windows(
     db: &Store,
     ledger: &NullifierRootLedger,
 ) -> Result<BTreeSet<u64>> {
     let mut epochs = BTreeSet::new();
     for epoch in ledger.roots.keys() {
-        if db.load_shielded_nullifier_epoch(*epoch)?.is_some() {
+        if db
+            .load_shielded_historical_nullifier_window(*epoch)?
+            .is_some()
+        {
             epochs.insert(*epoch);
         }
     }
     Ok(epochs)
+}
+
+pub fn local_available_finalized_history_epochs(
+    db: &Store,
+    ledger: &NullifierRootLedger,
+) -> Result<BTreeSet<u64>> {
+    local_available_historical_nullifier_windows(db, ledger)
 }
 
 #[cfg(test)]

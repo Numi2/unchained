@@ -400,37 +400,29 @@ ordinary sends, private staking flows, shared-state fee payments, or
 checkpoint-accumulator receipts. The heavyweight full shielded runtime snapshot
 remains only as an explicit local/test utility.
 
-Those send, staking, ingress, and proof-assistant paths now also use a
-canonical `TransparentProof` object with an explicit statement kind instead of
-passing raw backend receipt bytes through transaction and wallet state. Receipt
-decoding, adapter-local verifier artifacts, and prototype-proof cache
-serialization now live behind `src/proof.rs`, which keeps the steady-state
-protocol and wallet model stable while the proving backend is replaced.
+Those send, staking, ingress, and proof-assistant paths now use a canonical
+`TransparentProof` object with an explicit statement kind instead of passing
+backend receipt bytes through transaction and wallet state. The checked-in
+default proof backend is the native `Plonky3NativeStarkV1` path.
 
 That proof boundary now carries an explicit canonical circuit inventory as
 well: ordinary transfer, private delegation, private undelegation, unbonding
 claim, and checkpoint accumulator are named circuit slots with a conservative
 `128-bit` minimum security budget and explicit public-input shapes. The
-prototype backend is still internal to `src/proof.rs`, but the rest of the
-system now reasons about circuit identity rather than backend method constants.
-Checkpoint history bindings also commit only to a verifier-key digest, so raw
-zkVM method identifiers no longer leak into transaction-visible journals.
+ordinary-transfer circuit is currently the only advertised proving capability;
+non-transfer proof APIs fail explicitly until their native circuits land.
 
 The proof layer now also carries explicit backend identity and capability
 manifests. Canonical proofs include their backend, circuit, and statement
 metadata, and the remote proof assistant can advertise the exact backend and
 supported circuit inventory before serving witness requests. Canonical proof
-metadata also treats seal bytes as opaque adapter output rather than naming a
-specific receipt serialization format, and each proof now commits to a
-backend-agnostic statement digest of the decoded public journal. That keeps
-the wallet and transport model stable while the first native transparent
-backend is introduced behind the same interface.
+metadata treats seal bytes as a versioned native envelope, and each proof
+commits to a backend-agnostic statement digest of the decoded public journal.
 
 Backend selection is now also routed through a canonical per-circuit backend
 policy inside `src/proof.rs` rather than hard-coded directly into every
-prove/verify path. The current policy still maps every supported circuit to the
-prototype backend, but swapping in the first native backend no longer requires
-rewiring wallet, assistant, or transaction logic.
+prove/verify path. The current policy maps new proof generation to
+`Plonky3NativeStarkV1` only.
 
 Proof-facing transfer commitments have also started moving onto the native
 backend’s actual primitive stack. `proof-core` and the shielded runtime now
@@ -439,14 +431,12 @@ parents, and checkpoint/history transcript digests through an algebraic
 proof-hash adapter rather than raw BLAKE3 calls at the circuit boundary.
 Ordinary transfer proving now prepares an explicit `native_transfer` scaffold
 with separated public inputs, private witness material, envelope bindings, and
-trace sizing before dispatching to the current prototype backend. Ordinary
-transfer inputs are also no longer shaped around hidden checkpoint-accumulator
-receipts: the wallet now builds deterministic full-history extension witnesses
-from genesis for each spent note, and transfer journals no longer expose an
-accumulator verifier-key binding just to support recursive zkVM assumptions.
-The remaining gap is the real one: replacing the adapter-local zkVM execution
-with an actual native STARK AIR/prover over that direct history witness model
-and pulling ciphertext/KEM checks out of that critical path.
+trace sizing before producing a native proof envelope. Ordinary-transfer inputs
+are no longer shaped around hidden checkpoint-accumulator receipts: the wallet
+builds deterministic full-history extension witnesses from genesis for each
+spent note. The remaining gap is the real one: replacing the current native
+envelope scaffold with the full Plonky3 AIR/prover and pulling ciphertext/KEM
+checks out of that critical path.
 
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`

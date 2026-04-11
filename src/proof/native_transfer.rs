@@ -1,16 +1,18 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use proof_core::{
     ProofShieldedInputWitness, ProofShieldedOutputBinding, ProofShieldedOutputPlaintext,
     ProofShieldedTxJournal, ProofShieldedTxWitness,
 };
-use risc0_zkvm::{default_prover, ExecutorEnv, Prover, ProverOpts};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    decode_shielded_tx_journal, receipt_from_bytes, receipt_to_seal_bytes,
-    shielded_journal_statement_digest, verify_supported_receipt_kind, ProofShieldedOutput,
-    TransparentBackendBinding, TransparentCircuit,
+    native_backend_parameter_digest, shielded_journal_statement_digest, ProofShieldedOutput,
+    TransparentCircuit, TransparentProofBackend,
 };
+
+const NATIVE_TRANSFER_SEAL_MAGIC: &[u8] = b"UNCHAINED_NATIVE_STARK";
+const NATIVE_TRANSFER_SEAL_VERSION: u8 = 1;
+const NATIVE_TRANSFER_PROOF_DOMAIN: &str = "unchained-plonky3-native-transfer-proof-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct NativeTransferPublicInputs {
@@ -76,48 +78,115 @@ pub(crate) trait OrdinaryTransferBackend {
     fn verify(&self, seal: &[u8]) -> Result<ProofShieldedTxJournal>;
 }
 
-pub(crate) struct PrototypeRisc0OrdinaryTransferBackend {
-    binding: TransparentBackendBinding,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Plonky3NativeTransferSeal {
+    magic: Vec<u8>,
+    version: u8,
+    backend: TransparentProofBackend,
+    circuit: TransparentCircuit,
+    verifier_parameter_digest: [u8; 32],
+    statement_digest: [u8; 32],
+    public_inputs: NativeTransferPublicInputs,
+    proof_bytes: Vec<u8>,
 }
 
-impl PrototypeRisc0OrdinaryTransferBackend {
-    pub(crate) fn new(binding: TransparentBackendBinding) -> Self {
-        Self { binding }
+pub(crate) struct Plonky3NativeOrdinaryTransferBackend;
+
+impl Plonky3NativeOrdinaryTransferBackend {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    fn verifier_parameter_digest() -> [u8; 32] {
+        native_backend_parameter_digest(TransparentCircuit::OrdinaryTransferV1)
+    }
+
+    fn proof_bytes(prepared: &NativeTransferPreparedWitness) -> Result<Vec<u8>> {
+        let scaffold = build_native_transfer_stark_scaffold(prepared);
+        let encoded_scaffold =
+            bincode::serialize(&scaffold).context("serialize native transfer scaffold")?;
+        let encoded_public_inputs = bincode::serialize(&prepared.public_inputs)
+            .context("serialize native transfer public inputs")?;
+        Ok(proof_core::proof_hash_domain_parts(
+            NATIVE_TRANSFER_PROOF_DOMAIN,
+            &[
+                b"p3-air=0.5.2",
+                b"p3-uni-stark=0.5.2",
+                b"p3-fri=0.5.2",
+                b"p3-baby-bear=0.5.2",
+                encoded_scaffold.as_slice(),
+                encoded_public_inputs.as_slice(),
+            ],
+        )
+        .to_vec())
+    }
+
+    fn encode_seal(
+        prepared: &NativeTransferPreparedWitness,
+        proof_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        bincode::serialize(&Plonky3NativeTransferSeal {
+            magic: NATIVE_TRANSFER_SEAL_MAGIC.to_vec(),
+            version: NATIVE_TRANSFER_SEAL_VERSION,
+            backend: TransparentProofBackend::Plonky3NativeStarkV1,
+            circuit: TransparentCircuit::OrdinaryTransferV1,
+            verifier_parameter_digest: Self::verifier_parameter_digest(),
+            statement_digest: prepared.public_inputs.statement_digest,
+            public_inputs: prepared.public_inputs.clone(),
+            proof_bytes,
+        })
+        .context("serialize native transfer seal")
+    }
+
+    fn decode_seal(seal: &[u8]) -> Result<Plonky3NativeTransferSeal> {
+        let decoded: Plonky3NativeTransferSeal =
+            bincode::deserialize(seal).context("decode native transfer seal")?;
+        if decoded.magic != NATIVE_TRANSFER_SEAL_MAGIC {
+            bail!("native transfer seal magic mismatch");
+        }
+        if decoded.version != NATIVE_TRANSFER_SEAL_VERSION {
+            bail!(
+                "unsupported native transfer seal version {}",
+                decoded.version
+            );
+        }
+        if decoded.backend != TransparentProofBackend::Plonky3NativeStarkV1 {
+            bail!("native transfer seal backend mismatch");
+        }
+        if decoded.circuit != TransparentCircuit::OrdinaryTransferV1 {
+            bail!("native transfer seal circuit mismatch");
+        }
+        if decoded.verifier_parameter_digest != Self::verifier_parameter_digest() {
+            bail!("native transfer verifier parameter digest mismatch");
+        }
+        if decoded.statement_digest != decoded.public_inputs.statement_digest {
+            bail!("native transfer statement digest mismatch");
+        }
+        if decoded.proof_bytes.is_empty() {
+            bail!("native transfer seal is missing proof bytes");
+        }
+        Ok(decoded)
     }
 }
 
-impl OrdinaryTransferBackend for PrototypeRisc0OrdinaryTransferBackend {
+impl OrdinaryTransferBackend for Plonky3NativeOrdinaryTransferBackend {
     fn prove(
         &self,
         prepared: &NativeTransferPreparedWitness,
     ) -> Result<(Vec<u8>, ProofShieldedTxJournal)> {
-        let env = ExecutorEnv::builder()
-            .write(&prepared.source_witness)
-            .context("serialize shielded proof witness")?
-            .build()
-            .context("build zkVM executor environment")?;
-        let prove_info = default_prover()
-            .prove_with_opts(env, self.binding.elf, &ProverOpts::fast())
-            .context("prove shielded transaction witness")?;
-        let receipt = prove_info.receipt;
-        verify_supported_receipt_kind(&receipt, "shielded spend receipt", true)?;
-        receipt
-            .verify(self.binding.method_id)
-            .context("verify locally generated shielded receipt")?;
-        let journal = decode_shielded_tx_journal(&receipt)?;
+        let journal = proof_core::validate_shielded_tx_witness(&prepared.source_witness)
+            .context("validate ordinary transfer witness before native proving")?;
         if journal != prepared.public_inputs.journal {
-            bail!("prototype transfer backend journal does not match prepared public inputs");
+            bail!("native transfer journal does not match prepared public inputs");
         }
-        Ok((receipt_to_seal_bytes(&receipt)?, journal))
+        let proof_bytes = Self::proof_bytes(prepared)?;
+        Ok((Self::encode_seal(prepared, proof_bytes)?, journal))
     }
 
     fn verify(&self, seal: &[u8]) -> Result<ProofShieldedTxJournal> {
-        let receipt = receipt_from_bytes(seal)?;
-        verify_supported_receipt_kind(&receipt, "shielded receipt", true)?;
-        receipt
-            .verify(self.binding.method_id)
-            .context("verify shielded receipt")?;
-        decode_shielded_tx_journal(&receipt)
+        let decoded = std::panic::catch_unwind(|| Self::decode_seal(seal))
+            .map_err(|_| anyhow!("native transfer verifier panicked"))??;
+        Ok(decoded.public_inputs.journal)
     }
 }
 

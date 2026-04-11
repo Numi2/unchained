@@ -142,16 +142,10 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   target architecture
 - `[~]` Remove dependence on the current prototype proving backend as the
   long-term integrity anchor
-  Backend-specific receipt parsing and method/image identifiers are now
-  contained within `src/proof.rs`, the canonical proof model now carries
-  explicit backend identity, and the proof assistant now advertises backend
-  capabilities and supported circuits. Proof routing now also runs through a
-  canonical per-circuit backend policy instead of direct method wiring, and
-  checkpoint history bindings now commit to backend-agnostic verifier-key
-  digests instead of leaking raw zkVM method IDs into transaction-visible
-  journals. Proof envelopes also bind a canonical statement digest for the
-  decoded public journal, but the underlying proving backend is still the
-  prototype engine and has not yet been replaced.
+  The prototype proof stack has been removed from the default codebase. The
+  canonical proof model carries explicit backend identity, and proof routing
+  now maps new proof generation to `Plonky3NativeStarkV1` only. Proof envelopes
+  bind a canonical statement digest for the decoded public journal.
 - `[~]` Define a native transparent STARK-family proving architecture
   The canonical proof layer now has an explicit circuit inventory for ordinary
   transfer, private delegation, private undelegation, unbonding claim, and
@@ -162,11 +156,11 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   an algebraic proof-hash adapter in `proof-core` and `src/shielded.rs`, and
   ordinary transfer now prepares an explicit native-backend scaffold with
   separated public inputs, private witness material, envelope bindings, and
-  trace layout before dispatching to the prototype backend. Ordinary transfer
+  trace layout before producing a native proof envelope. Ordinary transfer
   witnesses now also use deterministic full-history extensions from genesis
   rather than hidden checkpoint-accumulator receipts, and transfer journals no
-  longer leak an accumulator verifier-key binding. The backend swap itself is
-  still open.
+  longer leak an accumulator verifier-key binding. The remaining open work is
+  the full Plonky3 AIR/prover implementation behind the native envelope.
 - `[ ]` Set and document a conservative `>= 128-bit` security budget
 - `[~]` Implement native circuits for transfer
   Ordinary transfer now has the first extracted native-backend boundary in
@@ -176,7 +170,7 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   prover, and verifier are still missing.
 - `[ ]` Implement native circuits for staking flows
 - `[ ]` Implement native circuits for issuance and redemption
-- `[ ]` Remove general-purpose zkVM assumptions from the steady-state critical
+- `[~]` Remove general-purpose zkVM assumptions from the steady-state critical
   path
 
 ## 8. Cryptography And Key Management

@@ -196,8 +196,6 @@ pub struct HistoricalUnspentExtension {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoricalUnspentSegment {
-    pub provider_id: [u8; 32],
-    pub provider_manifest_digest: [u8; 32],
     pub from_epoch: u64,
     pub through_epoch: u64,
     pub segment_service_root: [u8; 32],
@@ -1411,8 +1409,6 @@ impl HistoricalUnspentSegment {
         }
         let expected_segment_root = rerandomized_segment_root(
             &self.segment_service_root,
-            &self.provider_id,
-            &self.provider_manifest_digest,
             &self.segment_historical_root_digest,
             &self.rerandomization_blinding,
         );
@@ -1424,8 +1420,6 @@ impl HistoricalUnspentSegment {
 
     pub fn commitment_digest(&self) -> [u8; 32] {
         checkpoint_segment_commitment_digest(
-            &self.provider_id,
-            &self.provider_manifest_digest,
             self.from_epoch,
             self.through_epoch,
             &self.segment_historical_root_digest,
@@ -1850,8 +1844,6 @@ fn checkpoint_segment_service_root(
 
 fn rerandomized_segment_root(
     service_root: &[u8; 32],
-    provider_id: &[u8; 32],
-    provider_manifest_digest: &[u8; 32],
     historical_root_digest: &[u8; 32],
     blinding: &[u8; 32],
 ) -> [u8; 32] {
@@ -1859,8 +1851,6 @@ fn rerandomized_segment_root(
         CHECKPOINT_RERANDOMIZE_DOMAIN,
         &[
             service_root.as_slice(),
-            provider_id.as_slice(),
-            provider_manifest_digest.as_slice(),
             historical_root_digest.as_slice(),
             blinding.as_slice(),
         ],
@@ -1868,8 +1858,6 @@ fn rerandomized_segment_root(
 }
 
 fn checkpoint_segment_commitment_digest(
-    provider_id: &[u8; 32],
-    provider_manifest_digest: &[u8; 32],
     from_epoch: u64,
     through_epoch: u64,
     historical_root_digest: &[u8; 32],
@@ -1879,8 +1867,6 @@ fn checkpoint_segment_commitment_digest(
     proof_hash_domain_parts(
         CHECKPOINT_SEGMENT_COMMIT_DOMAIN,
         &[
-            provider_id.as_slice(),
-            provider_manifest_digest.as_slice(),
             &from_epoch.to_le_bytes(),
             &through_epoch.to_le_bytes(),
             historical_root_digest.as_slice(),
@@ -2100,8 +2086,6 @@ mod tests {
         checkpoint: &HistoricalUnspentCheckpoint,
         through_epoch: u64,
     ) -> HistoricalUnspentExtension {
-        let provider_id = [1u8; 32];
-        let provider_manifest_digest = [2u8; 32];
         let from_epoch = checkpoint.covered_through_epoch.saturating_add(1);
         if through_epoch < from_epoch {
             return HistoricalUnspentExtension {
@@ -2146,8 +2130,6 @@ mod tests {
                 .expect("segment service root");
         let rerandomization_blinding = [3u8; 32];
         let segment = HistoricalUnspentSegment {
-            provider_id,
-            provider_manifest_digest,
             from_epoch,
             through_epoch,
             segment_service_root,
@@ -2155,8 +2137,6 @@ mod tests {
             rerandomization_blinding,
             segment_transcript_root: rerandomized_segment_root(
                 &segment_service_root,
-                &provider_id,
-                &provider_manifest_digest,
                 &historical_root_digest,
                 &rerandomization_blinding,
             ),

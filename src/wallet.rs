@@ -45,7 +45,6 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     Key, XChaCha20Poly1305, XNonce,
 };
-use std::collections::BTreeSet;
 use std::sync::Arc;
 // no AEAD usage in deterministic OTP flow
 use atty;
@@ -73,7 +72,6 @@ const OFFLINE_DESCRIPTOR_ROTATION_WINDOW_DIVISOR: u64 = 2;
 const OFFLINE_DESCRIPTOR_SCAN_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const RECEIVE_KEY_ID_DOMAIN: &str = "unchained-wallet-receive-key-id-v1";
 const INTERNAL_RECEIVE_KEY_DOMAIN: &str = "unchained-wallet-internal-receive-key-v1";
-const LOCAL_ARCHIVE_PROVIDER_DOMAIN: &str = "unchained-wallet-local-archive-provider-v1";
 const LOCAL_EXTENSION_BLINDING_DOMAIN: &str = "unchained-wallet-local-extension-blinding-v1";
 const LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN: &str =
     "unchained-wallet-local-extension-request-blinding-v1";
@@ -819,12 +817,6 @@ impl Wallet {
         Ok(crate::crypto::blake3_hash(
             &canonical::encode_nullifier_root_ledger(ledger)?,
         ))
-    }
-
-    fn local_archive_provider_id(chain_id: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(LOCAL_ARCHIVE_PROVIDER_DOMAIN);
-        hasher.update(chain_id);
-        *hasher.finalize().as_bytes()
     }
 
     fn local_extension_aggregate_blinding(
@@ -1952,8 +1944,8 @@ impl Wallet {
     fn build_local_historical_extensions_from_runtime(
         &self,
         chain_id: [u8; 32],
-        root_ledger: &shielded::NullifierRootLedger,
-        archived_nullifier_epochs: &[shielded::ArchivedNullifierEpoch],
+        _root_ledger: &shielded::NullifierRootLedger,
+        historical_nullifier_windows: &[shielded::HistoricalNullifierWindow],
         requests: &[shielded::CheckpointExtensionRequest],
         rotation_round: u64,
     ) -> Result<Vec<shielded::HistoricalUnspentExtension>> {
@@ -1961,25 +1953,9 @@ impl Wallet {
             return Ok(Vec::new());
         }
 
-        let provider_id = Self::local_archive_provider_id(&chain_id);
-        let available_epochs = archived_nullifier_epochs
-            .iter()
-            .map(|archived| archived.epoch)
-            .collect::<BTreeSet<_>>();
-        let manifest = shielded::local_archive_provider_manifest(
-            provider_id,
-            root_ledger,
-            crate::protocol::CURRENT.archive_shard_epoch_span,
-            &available_epochs,
-        )?;
-        let directory = shielded::ArchiveDirectory::from_root_ledger_and_providers(
-            root_ledger,
-            crate::protocol::CURRENT.archive_shard_epoch_span,
-            vec![manifest.clone()],
-        )?;
         let mut server = shielded::ShieldedSyncServer::new();
-        for archived in archived_nullifier_epochs {
-            server.insert_archived_epoch(archived.clone())?;
+        for window in historical_nullifier_windows {
+            server.insert_historical_nullifier_window(window.clone())?;
         }
 
         let mut results = requests
@@ -2008,13 +1984,12 @@ impl Wallet {
             .iter()
             .map(|(_, request)| (*request).clone())
             .collect::<Vec<_>>();
-        let responses = server.serve_checkpoints_batch(&manifest, &batch_requests)?;
+        let responses = server.serve_local_checkpoints_batch(&batch_requests)?;
         if responses.len() != batch_requests.len() {
             bail!("local checkpoint batch response length mismatch");
         }
 
         for ((request_index, request), response) in nonempty.into_iter().zip(responses) {
-            response.verify_against_request(request, &manifest, &directory)?;
             results[request_index] = Some(shielded::HistoricalUnspentExtension::aggregate(
                 request.local_checkpoint()?,
                 vec![response.rerandomize(request.presentation.blinding)],
@@ -2040,7 +2015,7 @@ impl Wallet {
         chain_id: [u8; 32],
         current_epoch: u64,
         root_ledger: &shielded::NullifierRootLedger,
-        archived_nullifier_epochs: &[shielded::ArchivedNullifierEpoch],
+        historical_nullifier_windows: &[shielded::HistoricalNullifierWindow],
         rotation_round: u64,
     ) -> Result<(Vec<proof_core::ProofShieldedInputWitness>, Vec<[u8; 32]>)> {
         let mut membership_proofs = Vec::with_capacity(selected_notes.len());
@@ -2093,7 +2068,7 @@ impl Wallet {
         let extensions = self.build_local_historical_extensions_from_runtime(
             chain_id,
             root_ledger,
-            archived_nullifier_epochs,
+            historical_nullifier_windows,
             &requests,
             rotation_round,
         )?;
@@ -2134,7 +2109,7 @@ impl Wallet {
         chain_id: [u8; 32],
         current_epoch: u64,
         root_ledger: &shielded::NullifierRootLedger,
-        archived_nullifier_epochs: &[shielded::ArchivedNullifierEpoch],
+        historical_nullifier_windows: &[shielded::HistoricalNullifierWindow],
         rotation_round: u64,
     ) -> Result<()> {
         let wallet_store = self.wallet_store()?;
@@ -2156,7 +2131,7 @@ impl Wallet {
         let extensions = self.build_local_historical_extensions_from_runtime(
             chain_id,
             root_ledger,
-            archived_nullifier_epochs,
+            historical_nullifier_windows,
             &requests,
             rotation_round,
         )?;
@@ -2223,7 +2198,7 @@ impl Wallet {
             chain_id,
             current_epoch,
             &snapshot.root_ledger,
-            &snapshot.archived_nullifier_epochs,
+            &snapshot.historical_nullifier_windows,
             0,
         )?;
 
@@ -2395,7 +2370,7 @@ impl Wallet {
                 material.compact_wallet_sync.chain_id,
                 material.compact_wallet_sync.current_nullifier_epoch,
                 &material.root_ledger,
-                &material.archived_nullifier_epochs,
+                &material.historical_nullifier_windows,
                 rotation_round,
             )
             .await?;
@@ -2710,7 +2685,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;
@@ -2722,7 +2697,7 @@ impl Wallet {
                 shielded_outputs: Vec::new(),
                 note_tree: material.note_tree,
                 root_ledger: material.root_ledger,
-                archived_nullifier_epochs: material.archived_nullifier_epochs,
+                historical_nullifier_windows: material.historical_nullifier_windows,
             },
             available_notes,
             fee_amount,
@@ -2767,7 +2742,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;
@@ -2819,7 +2794,7 @@ impl Wallet {
             chain_id,
             current_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )?;
 
@@ -2905,7 +2880,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;
@@ -2957,7 +2932,7 @@ impl Wallet {
             chain_id,
             current_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )?;
 
@@ -3040,7 +3015,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;
@@ -3207,7 +3182,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;
@@ -3377,7 +3352,7 @@ impl Wallet {
             material.compact_wallet_sync.chain_id,
             material.compact_wallet_sync.current_nullifier_epoch,
             &material.root_ledger,
-            &material.archived_nullifier_epochs,
+            &material.historical_nullifier_windows,
             rotation_round,
         )
         .await?;

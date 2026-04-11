@@ -8,7 +8,7 @@ use crate::{
     node_identity::{
         build_client_config_with_alpn, build_server_config_with_alpn,
         load_local_ingress_key_material_in_dir, tls_peer_spki, ExpectedPeerStore, NodeIdentity,
-        NodeRecordV2,
+        NodeRecordV3,
     },
     transaction::Tx,
 };
@@ -101,8 +101,8 @@ struct PendingGatewaySubmission {
 #[derive(Clone)]
 pub struct IngressClient {
     endpoint: Arc<Endpoint>,
-    relay_record: NodeRecordV2,
-    gateway_record: NodeRecordV2,
+    relay_record: NodeRecordV3,
+    gateway_record: NodeRecordV3,
     chain_id: [u8; 32],
     envelope_size_bytes: usize,
     submit_timeout: Duration,
@@ -129,7 +129,7 @@ impl Default for AccessRelayPolicy {
 
 pub struct AccessRelayServer {
     endpoint: Endpoint,
-    gateway_records: HashMap<[u8; 32], NodeRecordV2>,
+    gateway_records: HashMap<[u8; 32], NodeRecordV3>,
     gateway_expected_peers: Arc<ExpectedPeerStore>,
     gateway_client_config: quinn::ClientConfig,
     policy: AccessRelayPolicy,
@@ -160,7 +160,7 @@ impl Default for SubmissionGatewayPolicy {
 pub struct SubmissionGatewayServer {
     endpoint: Endpoint,
     ingress_keys: crate::node_identity::IngressKeyMaterial,
-    allowed_relays_by_auth_spki: HashMap<Vec<u8>, NodeRecordV2>,
+    allowed_relays_by_auth_spki: HashMap<Vec<u8>, NodeRecordV3>,
     validator_client: NodeControlClient,
     policy: SubmissionGatewayPolicy,
     queue: Arc<AsyncMutex<VecDeque<PendingGatewaySubmission>>>,
@@ -169,8 +169,8 @@ pub struct SubmissionGatewayServer {
 
 impl IngressClient {
     pub fn new(
-        relay_record: NodeRecordV2,
-        gateway_record: NodeRecordV2,
+        relay_record: NodeRecordV3,
+        gateway_record: NodeRecordV3,
         envelope_size_bytes: usize,
         submit_timeout: Duration,
     ) -> Result<Self> {
@@ -416,7 +416,7 @@ impl Drop for IngressClient {
 impl AccessRelayServer {
     pub fn bind(
         identity: &NodeIdentity,
-        gateway_records: Vec<NodeRecordV2>,
+        gateway_records: Vec<NodeRecordV3>,
         listen_addr: SocketAddr,
         policy: AccessRelayPolicy,
     ) -> Result<Self> {
@@ -553,7 +553,7 @@ impl AccessRelayServer {
 
     async fn forward_to_gateway(
         &self,
-        gateway_record: &NodeRecordV2,
+        gateway_record: &NodeRecordV3,
         envelope: Vec<u8>,
     ) -> Result<IngressAccept> {
         self.gateway_expected_peers.remember(gateway_record);
@@ -589,7 +589,7 @@ impl AccessRelayServer {
 impl SubmissionGatewayServer {
     pub fn bind(
         identity: &NodeIdentity,
-        allowed_relays: Vec<NodeRecordV2>,
+        allowed_relays: Vec<NodeRecordV3>,
         listen_addr: SocketAddr,
         validator_control_base_path: &str,
         policy: SubmissionGatewayPolicy,
@@ -833,7 +833,7 @@ fn parse_gateway_id(envelope: &[u8]) -> Result<[u8; 32]> {
 
 fn seal_submission_to_gateway(
     submission: &GatewaySubmission,
-    gateway_record: &NodeRecordV2,
+    gateway_record: &NodeRecordV3,
     envelope_size_bytes: usize,
 ) -> Result<Vec<u8>> {
     let envelope_size_bytes = envelope_size_bytes.max(DEFAULT_ENVELOPE_SIZE_BYTES);
@@ -1154,8 +1154,8 @@ fn encode_wallet_send_runtime_material(material: &WalletSendRuntimeMaterial) -> 
     writer.write_bytes(&canonical::encode_nullifier_root_ledger(
         &material.root_ledger,
     )?)?;
-    writer.write_vec(&material.archived_nullifier_epochs, |writer, archived| {
-        writer.write_bytes(&canonical::encode_archived_nullifier_epoch(archived)?)
+    writer.write_vec(&material.historical_nullifier_windows, |writer, window| {
+        writer.write_bytes(&canonical::encode_historical_nullifier_window(window)?)
     })?;
     Ok(writer.into_vec())
 }
@@ -1169,8 +1169,9 @@ fn decode_wallet_send_runtime_material(bytes: &[u8]) -> Result<WalletSendRuntime
             .read_vec(|reader| canonical::decode_validator_pool(&reader.read_bytes()?))?,
         note_tree: canonical::decode_note_commitment_tree(&reader.read_bytes()?)?,
         root_ledger: canonical::decode_nullifier_root_ledger(&reader.read_bytes()?)?,
-        archived_nullifier_epochs: reader
-            .read_vec(|reader| canonical::decode_archived_nullifier_epoch(&reader.read_bytes()?))?,
+        historical_nullifier_windows: reader.read_vec(|reader| {
+            canonical::decode_historical_nullifier_window(&reader.read_bytes()?)
+        })?,
     };
     reader.finish()?;
     Ok(material)

@@ -15,6 +15,11 @@ use rustls::{
     SignatureAlgorithm, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
+use slh_dsa::{
+    signature::{Keypair as SlhKeypair, Signer as SlhSigner, Verifier as SlhVerifier},
+    Shake128s, Signature as SlhSignature, SigningKey as SlhSigningKey,
+    VerifyingKey as SlhVerifyingKey,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::fs;
@@ -30,13 +35,18 @@ const NODE_INGRESS_KEM_KEY_PATH: &str = "node_ingress_mlkem.bin";
 const NODE_INGRESS_X25519_KEY_PATH: &str = "node_ingress_x25519.bin";
 const NODE_AUTH_REQUEST_PATH: &str = "node_auth_request.bin";
 const NODE_RECORD_PATH: &str = "node_record.bin";
-const NODE_RECORD_VERSION: u8 = 2;
+const NODE_RECORD_VERSION: u8 = 3;
 const NODE_ROOT_INFO_VERSION: u8 = 1;
 const NODE_AUTH_REQUEST_VERSION: u8 = 1;
 const NODE_RECORD_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const NODE_RECORD_RENEW_BEFORE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
-const NODE_RECORD_DOMAIN: &[u8] = b"unchained-node-record-v2";
+const NODE_RECORD_V3_DOMAIN: &[u8] = b"unchained-node-record-v3";
 const NODE_AUTH_REQUEST_DOMAIN: &[u8] = b"unchained-node-auth-request-v1";
+const SLH_DSA_SHAKE_128S_ROOT_SECRET_PREFIX: &[u8] =
+    b"unchained-slh-dsa-shake-128s-root-secret-v1\0";
+const SLH_DSA_SHAKE_128S_ROOT_PUBLIC_PREFIX: &[u8] =
+    b"unchained-slh-dsa-shake-128s-root-public-v1\0";
+const SLH_DSA_SHAKE_128S_SEED_BYTES: usize = 16;
 const ENVELOPE_DOMAIN: &[u8] = b"unchained-wire-envelope-v2";
 const ENVELOPE_LIFETIME_MS: u64 = 30_000;
 const ENVELOPE_MAX_CLOCK_SKEW_MS: u64 = 5_000;
@@ -44,8 +54,12 @@ const ENVELOPE_NONCE_BYTES: usize = 16;
 const TRUST_UPDATE_VERSION: u8 = 1;
 const TRUST_UPDATE_DOMAIN: &[u8] = b"unchained-trust-update-v1";
 
+type ColdRootKey = SlhSigningKey<Shake128s>;
+type ColdRootVerifyingKey = SlhVerifyingKey<Shake128s>;
+type ColdRootSignature = SlhSignature<Shake128s>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeRecordV2 {
+pub struct NodeRecordV3 {
     pub version: u8,
     pub protocol_version: u32,
     pub node_id: [u8; 32],
@@ -61,7 +75,7 @@ pub struct NodeRecordV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeRecordSignableV2 {
+struct NodeRecordSignableV3 {
     version: u8,
     protocol_version: u32,
     node_id: [u8; 32],
@@ -190,7 +204,7 @@ pub struct NodeIdentity {
     node_id: [u8; 32],
     auth_key: Arc<PqdsaKeyPair>,
     certified_key: Arc<CertifiedKey>,
-    record: NodeRecordV2,
+    record: NodeRecordV3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +236,7 @@ impl ExpectedPeerStore {
         })
     }
 
-    pub fn remember(&self, record: &NodeRecordV2) {
+    pub fn remember(&self, record: &NodeRecordV3) {
         let mut guard = self
             .by_server_name
             .write()
@@ -230,7 +244,7 @@ impl ExpectedPeerStore {
         guard.insert(record.server_name(), record.auth_spki.clone());
     }
 
-    pub fn forget(&self, record: &NodeRecordV2) {
+    pub fn forget(&self, record: &NodeRecordV3) {
         let mut guard = self
             .by_server_name
             .write()
@@ -251,7 +265,7 @@ impl ExpectedPeerStore {
     }
 }
 
-impl NodeRecordV2 {
+impl NodeRecordV3 {
     pub fn validate(&self, now_unix_ms: u64) -> Result<()> {
         if self.version != NODE_RECORD_VERSION {
             bail!("unsupported node record version {}", self.version);
@@ -268,10 +282,9 @@ impl NodeRecordV2 {
         if self.node_id != derive_node_id(&self.root_spki) {
             bail!("node record node_id does not match root key");
         }
-        let signable = NodeRecordSignableV2::from(self.clone());
+        let signable = NodeRecordSignableV3::from(self.clone());
         let bytes = record_signable_bytes(&signable)?;
-        UnparsedPublicKey::new(&ML_DSA_65, self.root_spki.as_slice())
-            .verify(&bytes, self.sig.as_slice())
+        verify_cold_root_signature(&self.root_spki, &bytes, self.sig.as_slice())
             .map_err(|_| anyhow!("node record signature verification failed"))?;
         Ok(())
     }
@@ -316,7 +329,7 @@ impl TrustUpdateV1 {
         }
     }
 
-    pub fn new_replacement(subject_node_id: [u8; 32], replacement: &NodeRecordV2) -> Self {
+    pub fn new_replacement(subject_node_id: [u8; 32], replacement: &NodeRecordV3) -> Self {
         Self {
             version: TRUST_UPDATE_VERSION,
             action: TrustUpdateAction::Replace,
@@ -394,9 +407,12 @@ impl TrustUpdateV1 {
             if !approved_by.insert(approval.signer_node_id) {
                 continue;
             }
-            UnparsedPublicKey::new(&ML_DSA_65, approval.signer_root_spki.as_slice())
-                .verify(&signable_bytes, approval.sig.as_slice())
-                .map_err(|_| anyhow!("trust update approval signature verification failed"))?;
+            verify_cold_root_signature(
+                &approval.signer_root_spki,
+                &signable_bytes,
+                approval.sig.as_slice(),
+            )
+            .map_err(|_| anyhow!("trust update approval signature verification failed"))?;
         }
         if approved_by.len() < required_approvals {
             bail!(
@@ -437,6 +453,7 @@ impl NodeAuthRequestV1 {
         if self.node_id != derive_node_id(&self.root_spki) {
             bail!("auth request node_id does not match root key");
         }
+        verifying_key_from_root_spki(&self.root_spki)?;
         let bytes = auth_request_signable_bytes(&NodeAuthRequestSignableV1::from(self.clone()))?;
         UnparsedPublicKey::new(&ML_DSA_65, self.auth_spki.as_slice())
             .verify(&bytes, self.sig.as_slice())
@@ -488,7 +505,7 @@ impl From<NodeAuthRequestV1> for NodeAuthRequestSignableV1 {
 }
 
 impl TrustPolicy {
-    pub fn load(bootstrap_records: &[NodeRecordV2], items: &[String]) -> Result<Self> {
+    pub fn load(bootstrap_records: &[NodeRecordV3], items: &[String]) -> Result<Self> {
         let trustees = bootstrap_records
             .iter()
             .map(|record| record.root_spki.clone())
@@ -532,7 +549,7 @@ impl TrustPolicy {
         self
     }
 
-    pub fn ensure_record_allowed(&self, record: &NodeRecordV2) -> Result<()> {
+    pub fn ensure_record_allowed(&self, record: &NodeRecordV3) -> Result<()> {
         if self.revoked_node_ids.contains(&record.node_id) {
             bail!("node record revoked by trust policy");
         }
@@ -551,8 +568,8 @@ impl TrustPolicy {
     }
 }
 
-impl From<NodeRecordV2> for NodeRecordSignableV2 {
-    fn from(value: NodeRecordV2) -> Self {
+impl From<NodeRecordV3> for NodeRecordSignableV3 {
+    fn from(value: NodeRecordV3) -> Self {
         Self {
             version: value.version,
             protocol_version: value.protocol_version,
@@ -632,7 +649,7 @@ impl SignedEnvelope {
         })
     }
 
-    pub fn verify(&self, record: &NodeRecordV2, now_unix_ms: u64) -> Result<()> {
+    pub fn verify(&self, record: &NodeRecordV3, now_unix_ms: u64) -> Result<()> {
         if self.version != NODE_RECORD_VERSION {
             bail!("unsupported wire envelope version {}", self.version);
         }
@@ -711,8 +728,8 @@ impl NodeIdentity {
         let dir = identity_dir(dir.as_ref());
         fs::create_dir_all(&dir)?;
 
-        let root = Arc::new(load_or_create_key(&dir.join(NODE_ROOT_KEY_PATH))?);
-        let root_info = root_info_from_key(root.as_ref())?;
+        let root = load_or_create_root_key(&dir.join(NODE_ROOT_KEY_PATH))?;
+        let root_info = root_info_from_key(&root)?;
         persist_root_info(&dir, &root_info)?;
 
         let persisted = load_persisted_record(&dir).ok();
@@ -748,7 +765,7 @@ impl NodeIdentity {
 
         let record = if needs_refresh {
             let record = sign_node_record(
-                root.as_ref(),
+                &root,
                 protocol_version,
                 chain_id,
                 root_info.node_id,
@@ -883,7 +900,7 @@ impl NodeIdentity {
         self.certified_key.clone()
     }
 
-    pub fn record(&self) -> &NodeRecordV2 {
+    pub fn record(&self) -> &NodeRecordV3 {
         &self.record
     }
 
@@ -902,19 +919,10 @@ impl NodeIdentity {
     }
 
     pub fn approve_trust_update(&self, update: &mut TrustUpdateV1) -> Result<()> {
-        let root = load_key(&self.dir.join(NODE_ROOT_KEY_PATH))?;
-        let signer_root_spki = root
-            .public_key()
-            .as_der()
-            .map_err(|_| anyhow!("failed to DER-encode node root public key"))?
-            .as_ref()
-            .to_vec();
+        let root = load_root_key(&self.dir.join(NODE_ROOT_KEY_PATH))?;
+        let signer_root_spki = root_spki_from_key(&root);
         let signable = trust_update_signable_bytes(&TrustUpdateSignableV1::from(update.clone()))?;
-        let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-        let sig_len = root
-            .sign(&signable, &mut sig)
-            .map_err(|_| anyhow!("failed to sign trust update"))?;
-        sig.truncate(sig_len);
+        let sig = sign_with_cold_root(&root, &signable)?;
         let signer_node_id = derive_node_id(&signer_root_spki);
         if let Some(existing) = update
             .approvals
@@ -935,7 +943,7 @@ impl NodeIdentity {
 }
 
 pub fn validator_from_record(
-    record: &NodeRecordV2,
+    record: &NodeRecordV3,
     voting_power: u64,
 ) -> Result<crate::consensus::Validator> {
     crate::consensus::Validator::new(
@@ -973,7 +981,7 @@ pub fn load_local_runtime_record_in_dir(
     protocol_version: u32,
     chain_id: Option<[u8; 32]>,
     addresses: Vec<String>,
-) -> Result<NodeRecordV2> {
+) -> Result<NodeRecordV3> {
     Ok(
         NodeIdentity::load_runtime_in_dir(dir, protocol_version, chain_id, addresses)?
             .record()
@@ -1021,8 +1029,8 @@ pub fn sign_with_local_root_in_dir(dir: impl AsRef<Path>, msg: &[u8]) -> Result<
             path.display()
         );
     }
-    let root = load_key(&path)?;
-    crypto::ml_dsa_65_sign(&root, msg)
+        let root = load_root_key(&path)?;
+        sign_with_cold_root(&root, msg)
 }
 
 pub fn load_local_node_id() -> Result<String> {
@@ -1039,12 +1047,8 @@ pub fn load_local_node_id_in_dir(dir: impl AsRef<Path>) -> Result<String> {
         return Ok(hex::encode(info.node_id));
     }
     if dir.join(NODE_ROOT_KEY_PATH).exists() {
-        let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))?;
-        let root_spki = root
-            .public_key()
-            .as_der()
-            .map_err(|_| anyhow!("failed to DER-encode node root public key"))?;
-        return Ok(hex::encode(derive_node_id(root_spki.as_ref())));
+        let root = load_root_key(&dir.join(NODE_ROOT_KEY_PATH))?;
+        return Ok(hex::encode(derive_node_id(&root_spki_from_key(&root))));
     }
     bail!("no node identity present; run `unchained_node init-root` and the auth ceremony first")
 }
@@ -1053,9 +1057,9 @@ pub fn init_root_in_dir(dir: impl AsRef<Path>) -> Result<(String, String)> {
     let dir = identity_dir(dir.as_ref());
     fs::create_dir_all(&dir)?;
     let root = if dir.join(NODE_ROOT_KEY_PATH).exists() {
-        load_key(&dir.join(NODE_ROOT_KEY_PATH))?
+        load_root_key(&dir.join(NODE_ROOT_KEY_PATH))?
     } else {
-        generate_key(&dir.join(NODE_ROOT_KEY_PATH))?
+        generate_root_key(&dir.join(NODE_ROOT_KEY_PATH))?
     };
     let info = root_info_from_key(&root)?;
     persist_root_info(&dir, &info)?;
@@ -1128,7 +1132,7 @@ pub fn sign_auth_request_in_dir(
 ) -> Result<(String, String)> {
     let dir = identity_dir(dir.as_ref());
     fs::create_dir_all(&dir)?;
-    let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))?;
+    let root = load_root_key(&dir.join(NODE_ROOT_KEY_PATH))?;
     let root_info = root_info_from_key(&root)?;
     persist_root_info(&dir, &root_info)?;
     let request = load_auth_request_item(request_source)?;
@@ -1201,16 +1205,12 @@ pub fn create_trust_update_replace(
 
 pub fn approve_trust_update_in_dir(dir: impl AsRef<Path>, update_source: &str) -> Result<String> {
     let dir = identity_dir(dir.as_ref());
-    let root = load_key(&dir.join(NODE_ROOT_KEY_PATH))
+    let root = load_root_key(&dir.join(NODE_ROOT_KEY_PATH))
         .map_err(|_| anyhow!("missing node root key; run `unchained_node init-root` first"))?;
     let root_info = root_info_from_key(&root)?;
     let mut update = load_trust_update(update_source)?;
     let signable = trust_update_signable_bytes(&TrustUpdateSignableV1::from(update.clone()))?;
-    let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-    let sig_len = root
-        .sign(&signable, &mut sig)
-        .map_err(|_| anyhow!("failed to sign trust update"))?;
-    sig.truncate(sig_len);
+    let sig = sign_with_cold_root(&root, &signable)?;
     let signer_node_id = root_info.node_id;
     if let Some(existing) = update
         .approvals
@@ -1299,7 +1299,7 @@ pub fn tls_peer_spki(peer_identity: Option<Box<dyn std::any::Any>>) -> Result<Ve
         .ok_or_else(|| anyhow!("peer raw public key missing"))
 }
 
-pub fn verify_record_matches_tls(record: &NodeRecordV2, tls_spki: &[u8]) -> Result<()> {
+pub fn verify_record_matches_tls(record: &NodeRecordV3, tls_spki: &[u8]) -> Result<()> {
     if record.auth_spki != tls_spki {
         bail!("peer TLS key does not match signed node record");
     }
@@ -1318,7 +1318,7 @@ fn identity_dir(base: &Path) -> PathBuf {
     }
 }
 
-fn load_persisted_record(dir: &Path) -> Result<NodeRecordV2> {
+fn load_persisted_record(dir: &Path) -> Result<NodeRecordV3> {
     let bytes = fs::read(dir.join(NODE_RECORD_PATH))?;
     canonical::decode_node_record(&bytes)
 }
@@ -1331,14 +1331,14 @@ fn refresh_runtime_record(
     protocol_version: u32,
     chain_id: Option<[u8; 32]>,
     addresses: &[String],
-) -> Result<NodeRecordV2> {
+) -> Result<NodeRecordV3> {
     let root_path = dir.join(NODE_ROOT_KEY_PATH);
     if !root_path.exists() {
         bail!(
             "installed node record is stale for the local chain/config and the node root key is unavailable for automatic refresh"
         );
     }
-    let root = load_key(&root_path)?;
+    let root = load_root_key(&root_path)?;
     let root_info = root_info_from_key(&root)?;
     persist_root_info(dir, &root_info)?;
     let now = now_unix_ms();
@@ -1359,7 +1359,7 @@ fn refresh_runtime_record(
     Ok(record)
 }
 
-fn persist_record(dir: &Path, record: &NodeRecordV2) -> Result<()> {
+fn persist_record(dir: &Path, record: &NodeRecordV3) -> Result<()> {
     let bytes = canonical::encode_node_record(record)?;
     let path = dir.join(NODE_RECORD_PATH);
     fs::write(&path, bytes)?;
@@ -1390,6 +1390,46 @@ fn load_or_create_key(path: &Path) -> Result<PqdsaKeyPair> {
         return load_key(path);
     }
     generate_key(path)
+}
+
+fn load_or_create_root_key(path: &Path) -> Result<ColdRootKey> {
+    if path.exists() {
+        return load_root_key(path);
+    }
+    generate_root_key(path)
+}
+
+fn load_root_key(path: &Path) -> Result<ColdRootKey> {
+    let bytes = fs::read(path)?;
+    let Some(secret) = bytes.strip_prefix(SLH_DSA_SHAKE_128S_ROOT_SECRET_PREFIX) else {
+        bail!(
+            "legacy ML-DSA node root material found at {}; this devnet-reset branch requires regenerating SLH-DSA root material",
+            path.display()
+        );
+    };
+    ColdRootKey::try_from(secret)
+        .map_err(|_| anyhow!("failed to parse SLH-DSA root key at {}", path.display()))
+}
+
+fn generate_root_key(path: &Path) -> Result<ColdRootKey> {
+    let mut sk_seed = [0u8; SLH_DSA_SHAKE_128S_SEED_BYTES];
+    let mut sk_prf = [0u8; SLH_DSA_SHAKE_128S_SEED_BYTES];
+    let mut pk_seed = [0u8; SLH_DSA_SHAKE_128S_SEED_BYTES];
+    OsRng.fill_bytes(&mut sk_seed);
+    OsRng.fill_bytes(&mut sk_prf);
+    OsRng.fill_bytes(&mut pk_seed);
+    let key = ColdRootKey::slh_keygen_internal(&sk_seed, &sk_prf, &pk_seed);
+    let mut bytes = Vec::with_capacity(
+        SLH_DSA_SHAKE_128S_ROOT_SECRET_PREFIX.len() + key.to_vec().len(),
+    );
+    bytes.extend_from_slice(SLH_DSA_SHAKE_128S_ROOT_SECRET_PREFIX);
+    bytes.extend_from_slice(&key.to_vec());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)?;
+    set_private_permissions(path)?;
+    Ok(key)
 }
 
 fn load_key(path: &Path) -> Result<PqdsaKeyPair> {
@@ -1482,13 +1522,8 @@ fn build_certified_key(auth_key: Arc<PqdsaKeyPair>) -> Result<CertifiedKey> {
     Ok(CertifiedKey::new(cert, signing_key))
 }
 
-fn root_info_from_key(root: &PqdsaKeyPair) -> Result<NodeRootInfoV1> {
-    let root_spki = root
-        .public_key()
-        .as_der()
-        .map_err(|_| anyhow!("failed to DER-encode node root public key"))?
-        .as_ref()
-        .to_vec();
+fn root_info_from_key(root: &ColdRootKey) -> Result<NodeRootInfoV1> {
+    let root_spki = root_spki_from_key(root);
     Ok(NodeRootInfoV1 {
         version: NODE_ROOT_INFO_VERSION,
         node_id: derive_node_id(&root_spki),
@@ -1505,8 +1540,39 @@ fn auth_spki_from_key(auth_key: &PqdsaKeyPair) -> Result<Vec<u8>> {
         .to_vec())
 }
 
+fn root_spki_from_key(root: &ColdRootKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        SLH_DSA_SHAKE_128S_ROOT_PUBLIC_PREFIX.len() + root.verifying_key().to_vec().len(),
+    );
+    out.extend_from_slice(SLH_DSA_SHAKE_128S_ROOT_PUBLIC_PREFIX);
+    out.extend_from_slice(&root.verifying_key().to_vec());
+    out
+}
+
+fn verifying_key_from_root_spki(root_spki: &[u8]) -> Result<ColdRootVerifyingKey> {
+    let Some(public_key) = root_spki.strip_prefix(SLH_DSA_SHAKE_128S_ROOT_PUBLIC_PREFIX) else {
+        bail!("node root key is not SLH-DSA-SHAKE-128s; regenerate node identity for this devnet reset");
+    };
+    ColdRootVerifyingKey::try_from(public_key)
+        .map_err(|_| anyhow!("failed to parse SLH-DSA root public key"))
+}
+
+fn sign_with_cold_root(root: &ColdRootKey, message: &[u8]) -> Result<Vec<u8>> {
+    let signature: ColdRootSignature = SlhSigner::try_sign(root, message)
+        .map_err(|_| anyhow!("failed to sign with SLH-DSA root key"))?;
+    Ok(signature.to_vec())
+}
+
+fn verify_cold_root_signature(root_spki: &[u8], message: &[u8], sig: &[u8]) -> Result<()> {
+    let verifying_key = verifying_key_from_root_spki(root_spki)?;
+    let signature = ColdRootSignature::try_from(sig)
+        .map_err(|_| anyhow!("failed to parse SLH-DSA root signature"))?;
+    SlhVerifier::verify(&verifying_key, message, &signature)
+        .map_err(|_| anyhow!("SLH-DSA root signature verification failed"))
+}
+
 fn sign_node_record(
-    root: &PqdsaKeyPair,
+    root: &ColdRootKey,
     protocol_version: u32,
     chain_id: Option<[u8; 32]>,
     node_id: [u8; 32],
@@ -1517,8 +1583,8 @@ fn sign_node_record(
     addresses: Vec<String>,
     issued_unix_ms: u64,
     expires_unix_ms: u64,
-) -> Result<NodeRecordV2> {
-    let signable = NodeRecordSignableV2 {
+) -> Result<NodeRecordV3> {
+    let signable = NodeRecordSignableV3 {
         version: NODE_RECORD_VERSION,
         protocol_version,
         node_id,
@@ -1532,12 +1598,8 @@ fn sign_node_record(
         expires_unix_ms,
     };
     let signable_bytes = record_signable_bytes(&signable)?;
-    let mut sig = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-    let sig_len = root
-        .sign(&signable_bytes, &mut sig)
-        .map_err(|_| anyhow!("failed to sign node record"))?;
-    sig.truncate(sig_len);
-    Ok(NodeRecordV2 {
+    let sig = sign_with_cold_root(root, &signable_bytes)?;
+    Ok(NodeRecordV3 {
         version: NODE_RECORD_VERSION,
         protocol_version,
         node_id,
@@ -1554,15 +1616,19 @@ fn sign_node_record(
 }
 
 fn derive_node_id(root_spki: &[u8]) -> [u8; 32] {
-    *blake3::Hasher::new_derive_key("unchained-node-id-v2")
+    *blake3::Hasher::new_derive_key("unchained-node-id-v3")
         .update(root_spki)
         .finalize()
         .as_bytes()
 }
 
-fn record_signable_bytes(signable: &NodeRecordSignableV2) -> Result<Vec<u8>> {
+fn record_signable_bytes(signable: &NodeRecordSignableV3) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_bytes(NODE_RECORD_DOMAIN)?;
+    let domain = match signable.version {
+        NODE_RECORD_VERSION => NODE_RECORD_V3_DOMAIN,
+        other => bail!("unsupported node record signable version {}", other),
+    };
+    writer.write_bytes(domain)?;
     writer.write_u8(signable.version);
     writer.write_u32(signable.protocol_version);
     writer.write_fixed(&signable.node_id);
@@ -1766,7 +1832,7 @@ pub fn load_trust_update(item: &str) -> Result<TrustUpdateV1> {
     TrustUpdateV1::decode_compact(trimmed)
 }
 
-pub fn load_node_record(item: &str) -> Result<NodeRecordV2> {
+pub fn load_node_record(item: &str) -> Result<NodeRecordV3> {
     load_node_record_item(item)
 }
 
@@ -1796,7 +1862,7 @@ fn load_auth_request_item(item: &str) -> Result<NodeAuthRequestV1> {
     NodeAuthRequestV1::decode_compact(trimmed)
 }
 
-fn load_node_record_item(item: &str) -> Result<NodeRecordV2> {
+fn load_node_record_item(item: &str) -> Result<NodeRecordV3> {
     let trimmed = item.trim();
     if Path::new(trimmed).exists() {
         let bytes = fs::read(trimmed)?;
@@ -1804,9 +1870,9 @@ fn load_node_record_item(item: &str) -> Result<NodeRecordV2> {
             return Ok(record);
         }
         let text = String::from_utf8(bytes).context("node record file is not valid UTF-8")?;
-        return NodeRecordV2::decode_compact(text.trim());
+        return NodeRecordV3::decode_compact(text.trim());
     }
-    NodeRecordV2::decode_compact(trimmed)
+    NodeRecordV3::decode_compact(trimmed)
 }
 
 fn required_trust_approvals(trustee_count: usize) -> usize {
@@ -2170,6 +2236,22 @@ mod tests {
         assert!(policy
             .ensure_record_allowed(trustee_c_identity.record())
             .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn node_record_v3_validates_with_canonical_domain() -> Result<()> {
+        let dir = TempDir::new()?;
+        let identity = NodeIdentity::load_or_create_in_dir(
+            dir.path(),
+            7,
+            Some([6u8; 32]),
+            vec!["127.0.0.1:4040".to_string()],
+        )?;
+
+        let v3 = identity.record().clone();
+        assert_eq!(v3.version, NODE_RECORD_VERSION);
+        v3.validate(now_unix_ms())?;
         Ok(())
     }
 }

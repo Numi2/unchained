@@ -650,7 +650,6 @@ impl MerkleTree {
 
 pub struct Manager {
     db: Arc<Store>,
-    cfg: crate::config::Epoch,
     net_cfg: crate::config::Net,
     net: NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
@@ -660,7 +659,6 @@ pub struct Manager {
 impl Manager {
     pub fn new(
         db: Arc<Store>,
-        cfg: crate::config::Epoch,
         net_cfg: crate::config::Net,
         net: NetHandle,
         shutdown_rx: broadcast::Receiver<()>,
@@ -669,7 +667,6 @@ impl Manager {
         let anchor_tx = net.anchor_sender();
         Self {
             db,
-            cfg,
             net_cfg,
             net,
             anchor_tx,
@@ -717,10 +714,12 @@ impl Manager {
             }
 
             // Tick immediately on startup for all cases; no restart grace period
-            let mut ticker = time::interval_at(
-                time::Instant::now(),
-                time::Duration::from_secs(self.cfg.seconds),
+            let checkpoint_cadence = time::Duration::from_millis(
+                (crate::protocol::CURRENT.slots_per_epoch as u64)
+                    .saturating_mul(crate::protocol::CURRENT.slot_duration_ms)
+                    .max(1),
             );
+            let mut ticker = time::interval_at(time::Instant::now(), checkpoint_cadence);
             // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -801,10 +800,8 @@ impl Manager {
                                     eprintln!("⚠️  Failed to broadcast fast-path anchor: {}", e);
                                 }
                                 current_epoch = anchor.num.saturating_add(1);
-                                ticker = time::interval_at(
-                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                    time::Duration::from_secs(self.cfg.seconds)
-                                );
+                                ticker =
+                                    time::interval_at(time::Instant::now() + checkpoint_cadence, checkpoint_cadence);
                                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 continue;
                             }
@@ -824,10 +821,8 @@ impl Manager {
                                     eprintln!("⚠️  Failed to broadcast shared-state anchor: {}", e);
                                 }
                                 current_epoch = anchor.num.saturating_add(1);
-                                ticker = time::interval_at(
-                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                    time::Duration::from_secs(self.cfg.seconds)
-                                );
+                                ticker =
+                                    time::interval_at(time::Instant::now() + checkpoint_cadence, checkpoint_cadence);
                                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 continue;
                             }

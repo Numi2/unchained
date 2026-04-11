@@ -10,7 +10,7 @@ use crate::{
     node_identity::{
         build_client_config_with_alpn, build_server_config_with_alpn,
         load_local_ingress_key_material_in_dir, ExpectedPeerStore, IngressKeyMaterial,
-        NodeIdentity, NodeRecordV2,
+        NodeIdentity, NodeRecordV3,
     },
     wallet::RecipientHandle,
 };
@@ -226,8 +226,8 @@ pub struct DiscoveryServerStatus {
 #[derive(Clone)]
 pub struct DiscoveryClient {
     endpoint: Arc<Endpoint>,
-    server_record: NodeRecordV2,
-    mirror_records: Vec<NodeRecordV2>,
+    server_record: NodeRecordV3,
+    mirror_records: Vec<NodeRecordV3>,
     submit_timeout: Duration,
     max_request_bytes: usize,
     max_response_bytes: usize,
@@ -275,7 +275,7 @@ struct StoredSnapshotMetadata {
 pub struct DiscoverySnapshotBundle {
     pub version: u8,
     pub chain_id: [u8; 32],
-    pub source_server_record: NodeRecordV2,
+    pub source_server_record: NodeRecordV3,
     pub dataset_id: [u8; 32],
     pub snapshot_epoch: u64,
     pub record_count: u64,
@@ -475,8 +475,8 @@ impl OfflineReceiveDescriptor {
 
 impl DiscoveryClient {
     pub fn new(
-        server_record: NodeRecordV2,
-        mirror_records: Vec<NodeRecordV2>,
+        server_record: NodeRecordV3,
+        mirror_records: Vec<NodeRecordV3>,
         max_request_bytes: usize,
         max_response_bytes: usize,
         submit_timeout: Duration,
@@ -565,7 +565,7 @@ impl DiscoveryClient {
 
     async fn fetch_manifest_from_record(
         &self,
-        server_record: &NodeRecordV2,
+        server_record: &NodeRecordV3,
     ) -> Result<DiscoveryManifest> {
         let request_id = random_request_id();
         let response = self
@@ -666,7 +666,7 @@ impl DiscoveryClient {
 
     async fn resolve_locator_from_record(
         &self,
-        server_record: &NodeRecordV2,
+        server_record: &NodeRecordV3,
         locator_id: &[u8; 32],
     ) -> Result<DiscoveryRecord> {
         let manifest = self.fetch_manifest_from_record(server_record).await?;
@@ -964,7 +964,7 @@ impl DiscoveryClient {
     async fn exchange_request_to_record(
         &self,
         request: DiscoveryRequest,
-        server_record: &NodeRecordV2,
+        server_record: &NodeRecordV3,
     ) -> Result<DiscoveryResponse> {
         let request_label = request_tag(&request);
         let envelope = seal_request_to_server(&request, server_record, self.max_request_bytes)?;
@@ -2684,7 +2684,7 @@ fn random_request_id() -> [u8; 32] {
 
 fn seal_request_to_server(
     request: &DiscoveryRequest,
-    server_record: &NodeRecordV2,
+    server_record: &NodeRecordV3,
     max_request_bytes: usize,
 ) -> Result<Vec<u8>> {
     let plaintext = encode_request(request)?;
