@@ -301,7 +301,10 @@ impl WalletControlClient {
         chain_id: [u8; 32],
     ) -> Result<[u8; 32]> {
         match self
-            .call(WalletControlRequest::DeriveGenesisLockSecret { settlement_unit_id, chain_id })
+            .call(WalletControlRequest::DeriveGenesisLockSecret {
+                settlement_unit_id,
+                chain_id,
+            })
             .await?
         {
             WalletControlResponse::GenesisLockSecret { secret } => Ok(secret),
@@ -910,13 +913,14 @@ async fn handle_request(
             WalletControlRequest::MintInvoice { amount } => Ok(WalletControlResponse::Invoice {
                 invoice: service.mint_invoice(amount).await?,
             }),
-            WalletControlRequest::DeriveGenesisLockSecret { settlement_unit_id, chain_id } => {
-                Ok(WalletControlResponse::GenesisLockSecret {
-                    secret: service
-                        .wallet
-                        .compute_genesis_lock_secret(&settlement_unit_id, &chain_id),
-                })
-            }
+            WalletControlRequest::DeriveGenesisLockSecret {
+                settlement_unit_id,
+                chain_id,
+            } => Ok(WalletControlResponse::GenesisLockSecret {
+                secret: service
+                    .wallet
+                    .compute_genesis_lock_secret(&settlement_unit_id, &chain_id),
+            }),
             WalletControlRequest::Send { target, amount } => {
                 let outcome = service.send(target, amount).await?;
                 let _ = state_refresh_tx.send(());

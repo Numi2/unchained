@@ -352,7 +352,7 @@ pub fn spawn(
     });
 }
 
-// --- Headers-first skeleton sync: bounded pipeline scaffolding ---
+// --- Headers-first sync: bounded header prefetch pipeline ---
 #[derive(Debug, Clone)]
 struct RangeTask {
     start: u64,
@@ -364,7 +364,7 @@ struct HeaderSegment {
     headers: Vec<Anchor>,
 }
 
-pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown_rx: Receiver<()>) {
+pub async fn spawn_headers_pipeline(db: Arc<Store>, net: NetHandle, mut shutdown_rx: Receiver<()>) {
     let (range_tx, range_rx) = mpsc::channel::<RangeTask>(256);
     // Increase capacity to handle more concurrent header responses
     let (seg_tx, mut seg_rx) = mpsc::channel::<HeaderSegment>(512);
@@ -410,7 +410,7 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
         }
     });
 
-    // Segment consumer: validate, fork-choice, store, update cursor, keep window full
+    // Segment consumer: validate, store header-only checkpoints, update cursor, keep window full
     let db_headers = db.clone();
     let range_tx_consumer = range_tx.clone();
     task::spawn(async move {
@@ -425,7 +425,10 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
                             } else {
                                 match db_headers.get::<Anchor>("epoch", &(a.num - 1).to_le_bytes()) {
                                     Ok(Some(prev)) => Some(prev),
-                                    _ => { ok = false; break; }
+                                    _ => match db_headers.get_checkpoint_header(a.num - 1) {
+                                        Ok(Some(prev)) => Some(prev),
+                                        _ => { ok = false; break; }
+                                    },
                                 }
                             };
                             if !validate_anchor_for_sync(a, parent.as_ref(), db_headers.as_ref()) { ok = false; break; }
@@ -437,30 +440,15 @@ pub async fn spawn_headers_skeleton(db: Arc<Store>, net: NetHandle, mut shutdown
                     if !ok { crate::metrics::HEADERS_INVALID.inc(); continue; }
 
                     let current_best = db_headers.get::<Anchor>("epoch", b"latest").ok().flatten();
-                    // If we have no local epochs yet, allow genesis header to be accepted to seed tip.
-                    if current_best.is_none() {
-                        if let Some(first) = seg.headers.first() {
-                            if first.num == 0 {
-                                let _ = db_headers.store_validator_committee(&first.validator_set);
-                                let _ = db_headers.put("epoch", &0u64.to_le_bytes(), first);
-                                let _ = db_headers.put("anchor", &first.hash, first);
-                                let _ = db_headers.put("epoch", b"latest", first);
-                            }
-                        }
-                    }
                     if let Some(last) = seg.headers.last() {
                         if current_best.as_ref().map(|best| last.num > best.num).unwrap_or(true) {
                             for a in &seg.headers {
-                                if db_headers.store_validator_committee(&a.validator_set).is_err() {
-                                    crate::metrics::DB_WRITE_FAILS.inc();
-                                }
-                                if db_headers.put("epoch", &a.num.to_le_bytes(), a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
-                                if db_headers.put("anchor", &a.hash, a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
+                                if db_headers.put_checkpoint_header(a).is_err() { crate::metrics::DB_WRITE_FAILS.inc(); }
                                 crate::metrics::HEADERS_ANCHORS_STORED.inc();
                             }
                             if let Some(tip) = seg.headers.last() {
-                                // Do NOT advance canonical latest here; headers are skeleton only.
-                                // Track progress via headers cursors instead.
+                                // Header prefetch never advances canonical latest or writes canonical epoch rows.
+                                // Full checkpoint adoption still requires the body-backed anchor path.
                                 let (mut highest_req, mut highest_stored) = db_headers.get_headers_cursor().unwrap_or((0,0));
                                 if tip.num > highest_stored { highest_stored = tip.num; let _ = db_headers.put_headers_cursor(highest_req, highest_stored); }
                                 // Keep the headers window full by enqueueing additional ranges beyond highest_requested

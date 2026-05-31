@@ -8,8 +8,9 @@ use crate::{
     discovery::{self, DiscoveryClient, DiscoveryRecord, HandleResponsePlaintext},
     ingress::IngressClient,
     node_control::{
-        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
-        NodeControlClient, ShieldedRuntimeSnapshot, WalletSendRuntimeMaterial,
+        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta,
+        CompactWalletSyncHead, NodeControlClient, ShieldedRuntimeSnapshot,
+        WalletSendRuntimeMaterial,
     },
     proof,
     proof_assistant::ProofAssistantClient,
@@ -45,13 +46,12 @@ use chacha20poly1305::{
     aead::{Aead, NewAead},
     Key, XChaCha20Poly1305, XNonce,
 };
-use std::collections::BTreeSet;
-use std::sync::Arc;
-// no AEAD usage in deterministic OTP flow
-use atty;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use rpassword;
+use std::collections::BTreeSet;
+use std::io::IsTerminal;
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 const WALLET_SECRET_KEY: &[u8] = b"default_keypair";
 const WALLET_FORMAT_MAGIC: &[u8; 4] = b"UCW4";
@@ -61,6 +61,7 @@ const WALLET_FORMAT_VERSION: u8 = 1;
 // Tunable KDF parameters for wallet encryption
 const WALLET_KDF_MEM_KIB: u32 = 256 * 1024; // 256 MiB
 const WALLET_KDF_TIME_COST: u32 = 3; // iterations
+const WALLET_MIN_PASSPHRASE_CHARS: usize = 16;
 const SHIELDED_SYNC_ROUND_KEY: &[u8] = b"shielded_sync_round";
 const SHIELDED_REFRESH_OFFSET_DOMAIN: &str = "unchained-wallet-shielded-refresh-offset-v1";
 const SHIELDED_STORE_MAGIC: &[u8; 4] = b"UCS4";
@@ -897,19 +898,44 @@ impl Wallet {
 
     fn load_or_create_private_inner(wallet_db: Arc<WalletStore>) -> Result<Self> {
         // Helper to obtain a pass-phrase depending on environment
-        fn obtain_passphrase(prompt: &str) -> Result<String> {
+        fn obtain_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
             if let Ok(p) = std::env::var("WALLET_PASSPHRASE") {
-                return Ok(p);
+                let passphrase = Zeroizing::new(p);
+                validate_wallet_passphrase(&passphrase)?;
+                return Ok(passphrase);
             }
-            if atty::is(atty::Stream::Stdin) {
-                let pw =
-                    rpassword::prompt_password(prompt).context("Failed to read pass-phrase")?;
-                Ok(pw)
+            if std::io::stdin().is_terminal() {
+                crypto::prompt_hidden_line(prompt).context("Failed to read pass-phrase")
             } else {
                 // Non-interactive (prod/CI): require env var, fail fast if missing
                 std::env::var("WALLET_PASSPHRASE")
+                    .map(Zeroizing::new)
                     .map_err(|_| anyhow!("WALLET_PASSPHRASE is required in non-interactive mode"))
             }
+        }
+
+        fn validate_wallet_passphrase(passphrase: &str) -> Result<()> {
+            if passphrase.chars().count() < WALLET_MIN_PASSPHRASE_CHARS {
+                bail!(
+                    "wallet pass-phrase must contain at least {} characters",
+                    WALLET_MIN_PASSPHRASE_CHARS
+                );
+            }
+            Ok(())
+        }
+
+        fn obtain_new_wallet_passphrase() -> Result<Zeroizing<String>> {
+            let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
+            validate_wallet_passphrase(&passphrase)?;
+            if std::env::var("WALLET_PASSPHRASE").is_ok() || !std::io::stdin().is_terminal() {
+                return Ok(passphrase);
+            }
+            let confirmation = crypto::prompt_hidden_line("Confirm wallet pass-phrase: ")
+                .context("Failed to read pass-phrase confirmation")?;
+            if confirmation.as_str() != passphrase.as_str() {
+                bail!("wallet pass-phrase confirmation did not match");
+            }
+            Ok(passphrase)
         }
 
         if let Some(encoded) = wallet_db.get_raw_bytes("wallet_secret", WALLET_SECRET_KEY)? {
@@ -966,7 +992,7 @@ impl Wallet {
         }
 
         println!("✨ No wallet found, creating a new one...");
-        let passphrase = obtain_passphrase("Set a pass-phrase for your new wallet: ")?;
+        let passphrase = obtain_new_wallet_passphrase()?;
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
         let signing_key = crypto::ml_dsa_65_generate()?;
@@ -1566,7 +1592,9 @@ impl Wallet {
                     note_key,
                     checkpoint,
                     checkpoint_accumulator: None,
-                    source: OwnedShieldedNoteSource::Genesis { settlement_unit_id: settlement_unit.id },
+                    source: OwnedShieldedNoteSource::Genesis {
+                        settlement_unit_id: settlement_unit.id,
+                    },
                 };
                 self.store_owned_note_record(wallet_store.as_ref(), &owned)?;
                 self.store_checkpoint_record(wallet_store.as_ref(), &owned.checkpoint)?;
@@ -1827,7 +1855,8 @@ impl Wallet {
         match stored {
             Some(cursor)
                 if cursor.chain_id == head.chain_id
-                    && cursor.next_settlement_unit_index <= head.committed_settlement_unit_count
+                    && cursor.next_settlement_unit_index
+                        <= head.committed_settlement_unit_count
                     && cursor.next_output_index <= head.shielded_output_count =>
             {
                 cursor
@@ -1882,7 +1911,8 @@ impl Wallet {
                 bail!("compact wallet sync delta made no progress");
             }
 
-            cursor.next_settlement_unit_index = next_settlement_unit_index.min(delta.head.committed_settlement_unit_count);
+            cursor.next_settlement_unit_index =
+                next_settlement_unit_index.min(delta.head.committed_settlement_unit_count);
             cursor.next_output_index = next_output_index.min(delta.head.shielded_output_count);
             cursor.synced_through_anchor_num = delta.head.latest_finalized_anchor_num;
             self.store_compact_wallet_scan_cursor(wallet_store.as_ref(), &cursor)?;
@@ -2123,7 +2153,7 @@ impl Wallet {
                     )
                 },
             )
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok((input_witnesses, nullifiers))
     }
@@ -3108,7 +3138,7 @@ impl Wallet {
                 None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
-            ));
+            )?);
         }
 
         let mut outputs = Vec::new();
@@ -3278,7 +3308,7 @@ impl Wallet {
                 None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
-            ));
+            )?);
         }
 
         let mut outputs = Vec::new();
@@ -3431,7 +3461,7 @@ impl Wallet {
                 None,
                 owned.checkpoint_accumulator.as_ref(),
                 &current_nullifier,
-            ));
+            )?);
         }
 
         let payout_entropy = self.derive_output_entropy(&send_seed, 0);
@@ -3973,7 +4003,9 @@ mod tests {
             note_key: [1u8; 32],
             checkpoint: shielded::HistoricalUnspentCheckpoint::genesis(note.commitment, 3),
             checkpoint_accumulator: None,
-            source: OwnedShieldedNoteSource::Genesis { settlement_unit_id: [9u8; 32] },
+            source: OwnedShieldedNoteSource::Genesis {
+                settlement_unit_id: [9u8; 32],
+            },
         };
 
         wallet.store_owned_note_record(wallet_store.as_ref(), &owned)?;

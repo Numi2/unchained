@@ -1,16 +1,17 @@
+#![cfg_attr(not(feature = "local-prover"), allow(dead_code, unused_imports))]
+
 mod finality_support;
 
-use once_cell::sync::Lazy;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::Endpoint;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock as Lazy, Mutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
-use unchained::config::{Net, P2p};
+use unchained::config::Net;
 use unchained::consensus::{OrderingPath, Validator, ValidatorKeys};
 use unchained::crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign};
 use unchained::epoch::Anchor;
@@ -69,6 +70,7 @@ fn store_anchor(store: &Store, anchor: &Anchor) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 fn signed_shared_state_tx(
     store: &Store,
     wallet: &Wallet,
@@ -87,13 +89,10 @@ fn build_single_action_fee_wallet(
     genesis: &Anchor,
 ) -> anyhow::Result<Wallet> {
     std::env::set_var("WALLET_PASSPHRASE", "pq-network-passphrase");
-    std::env::set_var(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        finality_support::proof_fixture_dir(),
-    );
     let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
     let wallet = finality_support::deterministic_wallet(wallet_store)?;
-    let _ = finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
+    let _ =
+        finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
     Ok(wallet)
 }
 
@@ -104,7 +103,9 @@ fn mirror_wallet_settlement_unit_state(
     values: &[u64],
 ) -> anyhow::Result<()> {
     for store in stores {
-        let _ = finality_support::seed_wallet_with_settlement_unit_values(store, wallet, genesis, values)?;
+        let _ = finality_support::seed_wallet_with_settlement_unit_values(
+            store, wallet, genesis, values,
+        )?;
     }
     Ok(())
 }
@@ -143,16 +144,7 @@ fn build_net(port: u16, bootstrap: Vec<String>) -> Net {
         listen_port: port,
         bootstrap,
         trust_updates: Vec::new(),
-        strict_trust: false,
-        peer_exchange: true,
-        max_peers: 16,
-        connection_timeout_secs: 5,
-        idle_timeout_secs: 30,
-        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
-        sync_timeout_secs: 5,
-        banned_peer_ids: Vec::new(),
-        quiet_by_default: true,
     }
 }
 
@@ -165,15 +157,6 @@ fn bootstrap_to_leader(
         Vec::new()
     } else {
         vec![leader_bootstrap.to_string()]
-    }
-}
-
-fn build_p2p() -> P2p {
-    P2p {
-        max_validation_failures_per_peer: 8,
-        peer_ban_duration_secs: 60,
-        rate_limit_window_secs: 60,
-        max_messages_per_window: 10_000,
     }
 }
 
@@ -213,7 +196,7 @@ async fn spawn_test_node(
 ) -> anyhow::Result<(Arc<Store>, NetHandle, Arc<Mutex<SyncState>>)> {
     let db = Arc::new(Store::open(&tempdir.path().to_string_lossy())?);
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let net = network::spawn(net_cfg, build_p2p(), db.clone(), sync_state.clone()).await?;
+    let net = network::spawn(net_cfg, db.clone(), sync_state.clone()).await?;
     Ok((db, net, sync_state))
 }
 
@@ -257,7 +240,7 @@ async fn wait_for_condition(label: &str, timeout: Duration, mut condition: impl 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable(
+async fn deterministic_multivalidator_fee_paid_control_witness_digest_stays_stable(
 ) -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -306,80 +289,16 @@ async fn deterministic_multivalidator_fee_paid_control_fixture_id_stays_stable(
     let snapshot = unchained::node_control::build_shielded_runtime_snapshot(db.as_ref())?;
     let prepared = wallet
         .prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_profile_update_fee)?;
-    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
+    let witness_digest = proof::shielded_tx_witness_digest(prepared.witness())?;
     assert_eq!(
-        hex::encode(fixture_id),
+        hex::encode(witness_digest),
         "f1e522879e8df1ff55a6b78d43b37ef6aea02f0cce2bb905d06bbb77cd2e5695"
     );
-    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-    assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fixture mint for multivalidator fee-paid control submission proof"]
-async fn mint_multivalidator_fee_paid_control_submission_fixture() -> anyhow::Result<()> {
-    let _guard = test_guard();
-    std::env::set_var(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        finality_support::proof_fixture_dir(),
-    );
-    std::env::set_var("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT", "1");
-    network::set_quiet_logging(true);
-
-    let dir_a = TempDir::new()?;
-    let dir_b = TempDir::new()?;
-    let dir_c = TempDir::new()?;
-    let chain_id = protocol_chain_id();
-    let addr_a = "127.0.0.1:41001".to_string();
-    let addr_b = "127.0.0.1:41002".to_string();
-    let addr_c = "127.0.0.1:41003".to_string();
-
-    provision_deterministic_runtime_identity(&dir_a, Some(chain_id), vec![addr_a.clone()], 0)?;
-    provision_deterministic_runtime_identity(&dir_b, Some(chain_id), vec![addr_b.clone()], 1)?;
-    provision_deterministic_runtime_identity(&dir_c, Some(chain_id), vec![addr_c.clone()], 2)?;
-
-    let identity_a = NodeIdentity::load_runtime_in_dir(
-        dir_a.path(),
-        PROTOCOL.version,
-        Some(chain_id),
-        vec![addr_a],
-    )?;
-    let identity_b = NodeIdentity::load_runtime_in_dir(
-        dir_b.path(),
-        PROTOCOL.version,
-        Some(chain_id),
-        vec![addr_b],
-    )?;
-    let identity_c = NodeIdentity::load_runtime_in_dir(
-        dir_c.path(),
-        PROTOCOL.version,
-        Some(chain_id),
-        vec![addr_c],
-    )?;
-
-    let committee = finality_support::TestCommittee::from_weighted_identities(vec![
-        (identity_a, 101),
-        (identity_b, 101),
-        (identity_c, 100),
-    ]);
-    let genesis = committee.genesis_anchor();
-    let db = Arc::new(Store::open(&dir_a.path().to_string_lossy())?);
-    committee.seed_validator_state(db.as_ref(), genesis.position.epoch)?;
-    store_anchor(db.as_ref(), &genesis)?;
-    let wallet = build_single_action_fee_wallet(&dir_a, db.as_ref(), &genesis)?;
-    let snapshot = unchained::node_control::build_shielded_runtime_snapshot(db.as_ref())?;
-    let prepared = wallet
-        .prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_profile_update_fee)?;
-    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
-    let fixture_path = std::path::Path::new(&finality_support::proof_fixture_dir())
-        .join("shielded-spend")
-        .join(format!("{}.bin", hex::encode(fixture_id)));
-    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-    assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
-    assert!(fixture_path.exists());
-    std::env::remove_var("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT");
+    #[cfg(feature = "local-prover")]
+    {
+        let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
+        assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
+    }
 
     Ok(())
 }
@@ -606,6 +525,7 @@ async fn finalize_single_shared_state_action(
     Ok((tx_id, anchor))
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -718,7 +638,12 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
 
     let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: validator_a.id,
@@ -853,6 +778,7 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -965,7 +891,12 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
 
     let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: validator_a.id,
@@ -1114,14 +1045,11 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
-    std::env::set_var(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        finality_support::proof_fixture_dir(),
-    );
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;
@@ -1157,7 +1085,12 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
     let dummy_action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: genesis.validator_set.validators[0].id,
         commission_bps: 325,
@@ -1222,6 +1155,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -1341,7 +1275,12 @@ async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> any
     db_c.store_validator_pool(&pool)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
     let update = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: pool.validator.id,
         commission_bps: 325,
@@ -1389,6 +1328,7 @@ async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> any
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -1518,7 +1458,12 @@ async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyho
     db_c.store_validator_pool(&jailed_pool)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
     let tx = signed_shared_state_tx(
         db_a.as_ref(),
         &wallet_a,
@@ -1565,6 +1510,7 @@ async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyho
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_finalizes_fee_paid_penalty_admission_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
@@ -1695,7 +1641,12 @@ async fn pq_network_finalizes_fee_paid_penalty_admission_from_fresh_wallet() -> 
     let fault = LivenessFaultProof::new_missed_vote(&anchor1, slashed_validator.id)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(
+        &[db_b.as_ref(), db_c.as_ref()],
+        &wallet_a,
+        &genesis,
+        &[2],
+    )?;
     let evidence_id = SlashableEvidence::Liveness(fault.clone()).evidence_id()?;
     let tx = finality_support::fee_paid_shared_state_tx(
         db_a.as_ref(),
@@ -1836,14 +1787,11 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
-    std::env::set_var(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        finality_support::proof_fixture_dir(),
-    );
 
     let dir_a = TempDir::new()?;
     let dir_b = TempDir::new()?;

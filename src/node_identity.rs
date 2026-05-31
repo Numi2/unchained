@@ -1238,8 +1238,7 @@ pub fn build_server_config_with_alpn(
     alpn: &[u8],
     require_client_auth: bool,
 ) -> Result<rustls::ServerConfig> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let provider = hybrid_transport_crypto_provider();
 
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?;
@@ -1270,8 +1269,7 @@ pub fn build_client_config_with_alpn(
     expected_peers: Arc<ExpectedPeerStore>,
     alpn: &[u8],
 ) -> Result<rustls::ClientConfig> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let provider = hybrid_transport_crypto_provider();
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -1286,6 +1284,12 @@ pub fn build_client_config_with_alpn(
     };
     config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
+}
+
+fn hybrid_transport_crypto_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    provider
 }
 
 pub fn tls_peer_spki(peer_identity: Option<Box<dyn std::any::Any>>) -> Result<Vec<u8>> {

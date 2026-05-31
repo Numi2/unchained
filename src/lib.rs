@@ -3,7 +3,6 @@
 
 pub mod app;
 pub mod canonical;
-pub mod settlement_unit;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
@@ -19,6 +18,7 @@ pub mod node_identity;
 pub mod proof;
 pub mod proof_assistant;
 pub mod protocol;
+pub mod settlement_unit;
 pub mod shielded;
 pub mod staking;
 pub mod storage;
@@ -27,9 +27,9 @@ pub mod transaction;
 pub mod wallet;
 pub mod wallet_control;
 
-pub use settlement_unit::SettlementUnit;
 pub use crypto::{address_from_pk, blake3_hash, Address};
 pub use epoch::{Anchor, MerkleTree};
+pub use settlement_unit::SettlementUnit;
 pub use storage::Store;
 pub use wallet::Wallet;
 

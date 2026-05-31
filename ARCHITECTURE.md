@@ -240,6 +240,18 @@ Rules:
 The protocol should not depend on non-standard PQ randomness gadgets when a
 deterministic schedule is good enough.
 
+Operator configuration is not part of protocol policy. The runtime does not
+parse a config file; local storage path, listen/public address, bootstrap and
+trust records, and role endpoint records are compiled into the code-defined
+runtime profile. Consensus timing, validator/P2P limits, ingress padding and
+batching, discovery PIR/query-budget policy, proof-assistant limits, transport
+windows, metrics binding, and anti-abuse thresholds are fixed in code.
+
+Public node builds are verifier-only. They hardcode the canonical proof method
+IDs needed for transaction verification and do not compile the RISC0 prover or
+guest ELF embedding path. The dedicated proof-assistant build carries the
+current prover surface until the native transparent backend replaces it.
+
 ### Certificates
 
 Quorum certificates should use:
@@ -488,7 +500,8 @@ That gives the system two clean UX modes:
   descriptor
 - `policy-bound wallet-to-wallet mode`: locator, private discovery, negotiated
   handle
-- `merchant mode`: QR or link already contains a one-time `RecipientHandle`
+- `merchant mode`: invoice payload or link already contains a one-time
+  `RecipientHandle`
 
 This avoids making ordinary payments depend on live bilateral negotiation while
 preserving one-time explicit authorization for flows that need it.
@@ -733,7 +746,7 @@ This architecture is chosen partly because of what it feels like to use.
 
 The target user experience is:
 
-- share a short locator or a QR invoice
+- share a short locator or an invoice payload
 - wallet resolves privately or consumes the invoice directly
 - payment feels final in under a second when healthy
 - recipient balance remains shielded

@@ -1,14 +1,12 @@
 mod finality_support;
 
-use once_cell::sync::Lazy;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock as Lazy, Mutex};
 
 use tempfile::TempDir;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{timeout, Duration};
-use unchained::settlement_unit::SettlementUnit;
-use unchained::config::{Net, P2p};
+use unchained::config::Net;
 use unchained::consensus::OrderingPath;
 use unchained::epoch::Anchor;
 use unchained::network;
@@ -16,6 +14,7 @@ use unchained::node_control;
 use unchained::node_identity;
 use unchained::proof::{TransparentProof, TransparentProofStatement};
 use unchained::protocol::CURRENT as PROTOCOL;
+use unchained::settlement_unit::SettlementUnit;
 use unchained::shielded::ShieldedNoteKind;
 use unchained::storage::{Store, WalletStore};
 use unchained::sync::SyncState;
@@ -43,25 +42,7 @@ fn build_net(port: u16) -> Net {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
-        strict_trust: false,
-        peer_exchange: true,
-        max_peers: 8,
-        connection_timeout_secs: 5,
-        idle_timeout_secs: 30,
-        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
-        sync_timeout_secs: 3,
-        banned_peer_ids: Vec::new(),
-        quiet_by_default: true,
-    }
-}
-
-fn build_p2p() -> P2p {
-    P2p {
-        max_validation_failures_per_peer: 8,
-        peer_ban_duration_secs: 60,
-        rate_limit_window_secs: 60,
-        max_messages_per_window: 10_000,
     }
 }
 
@@ -142,7 +123,7 @@ async fn spawn_sender_network(
     let port = pick_udp_port();
     provision_runtime_identity(sender_dir, genesis.hash, format!("127.0.0.1:{port}"))?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    network::spawn(build_net(port), build_p2p(), sender_db, sync_state).await
+    network::spawn(build_net(port), sender_db, sync_state).await
 }
 
 async fn spawn_node_control(
@@ -239,7 +220,8 @@ async fn shielded_wallet_prepare_is_deterministic_and_receiver_visible() -> anyh
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -345,7 +327,8 @@ async fn wallet_can_sync_compact_state_over_remote_ingress_without_node_control(
 
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let _seeded = finality_support::seed_wallet_with_settlement_units(db.as_ref(), &wallet, &genesis, 260)?;
+    let _seeded =
+        finality_support::seed_wallet_with_settlement_units(db.as_ref(), &wallet, &genesis, 260)?;
 
     let net = spawn_sender_network(&wallet_dir, db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) =
@@ -385,7 +368,8 @@ async fn wallet_can_prepare_shielded_send_over_remote_ingress_without_node_contr
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -439,7 +423,8 @@ async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()>
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
     let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
 
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -514,7 +499,8 @@ async fn wallet_can_prepare_private_delegation_over_remote_ingress_without_node_
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -564,7 +550,8 @@ async fn private_delegation_updates_validator_pool_and_wallet_note_state() -> an
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -642,7 +629,8 @@ async fn private_undelegation_updates_pool_and_wallet_note_state() -> anyhow::Re
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -770,7 +758,8 @@ async fn wallet_cover_traffic_loop_does_not_persist_transactions_or_advance_fina
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 1)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 1)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -839,7 +828,8 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(
@@ -1008,7 +998,8 @@ async fn private_delegation_end_to_end_proving_soak() -> anyhow::Result<()> {
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
     let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units = seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
+    let _sender_settlement_units =
+        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
 
     let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
     let (node_control_shutdown, node_control_task) = spawn_node_control(

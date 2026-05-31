@@ -2113,6 +2113,7 @@ mod tests {
             historical_root_digest: proof_core::checkpoint_accumulator_historical_digest_from_pairs(
                 &[],
             ),
+            historical_accumulator_verifier_key_commitment: None,
         }];
         let output_bindings = vec![proof::output_binding(&transfer.outputs[0])];
         validate_transfer_against_journal(

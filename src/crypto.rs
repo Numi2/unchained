@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Result};
-use atty;
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::signature::{KeyPair as _, UnparsedPublicKey};
 use aws_lc_rs::unstable::signature::{PqdsaKeyPair, PqdsaPublicKey, ML_DSA_65, ML_DSA_65_SIGNING};
@@ -7,16 +6,14 @@ use blake3::Hasher;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::EncapsulateDeterministic;
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768, B32};
-use once_cell::sync::OnceCell;
 use rand::rngs::OsRng;
-use rcgen::{CertificateParams, KeyPair, SanType};
-use rpassword;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
-use std::sync::Arc;
-use webpki_roots;
+use std::{
+    io::{self, IsTerminal, Write},
+    process::{Command, Stdio},
+    sync::OnceLock,
+};
 use zeroize::Zeroizing;
 
 pub const ML_DSA_65_PK_BYTES: usize = 1952;
@@ -151,7 +148,26 @@ impl TaggedKemPublicKey {
 // -----------------------------------------------------------------------------
 // Unified passphrase handling (cached once per process)
 // -----------------------------------------------------------------------------
-static UNIFIED_PASSPHRASE: OnceCell<Zeroizing<String>> = OnceCell::new();
+static UNIFIED_PASSPHRASE: OnceLock<Zeroizing<String>> = OnceLock::new();
+
+struct TerminalEchoGuard {
+    active: bool,
+}
+
+impl TerminalEchoGuard {
+    fn disable() -> Result<Self> {
+        disable_terminal_echo()?;
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = enable_terminal_echo();
+        }
+    }
+}
 
 pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<String>> {
     if let Some(existing) = UNIFIED_PASSPHRASE.get() {
@@ -162,14 +178,81 @@ pub fn unified_passphrase(prompt: Option<&str>) -> anyhow::Result<Zeroizing<Stri
         let _ = UNIFIED_PASSPHRASE.set(z.clone());
         return Ok(z);
     }
-    if atty::is(atty::Stream::Stdin) {
+    if std::io::stdin().is_terminal() {
         let text = prompt.unwrap_or("Enter quantum pass-phrase: ");
-        let pw = rpassword::prompt_password(text)?;
-        let z = Zeroizing::new(pw);
+        let z = prompt_hidden_line(text)?;
         let _ = UNIFIED_PASSPHRASE.set(z.clone());
         return Ok(z);
     }
     bail!("QUANTUM_PASSPHRASE is required in non-interactive mode")
+}
+
+pub fn prompt_hidden_line(prompt: &str) -> Result<Zeroizing<String>> {
+    if !io::stdin().is_terminal() {
+        bail!("interactive secret input requires a terminal");
+    }
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let guard = TerminalEchoGuard::disable()?;
+    let mut secret = String::new();
+    let read_result = io::stdin().read_line(&mut secret);
+    drop(guard);
+    println!();
+    read_result?;
+    while secret.ends_with('\n') || secret.ends_with('\r') {
+        secret.pop();
+    }
+    Ok(Zeroizing::new(secret))
+}
+
+#[cfg(unix)]
+fn disable_terminal_echo() -> Result<()> {
+    run_stty(&["-echo"])
+}
+
+#[cfg(unix)]
+fn enable_terminal_echo() -> Result<()> {
+    run_stty(&["echo"])
+}
+
+#[cfg(unix)]
+fn run_stty(args: &[&str]) -> Result<()> {
+    const STTY_PATHS: &[&str] = &["/bin/stty", "/usr/bin/stty"];
+    let mut last_error = None;
+    for path in STTY_PATHS {
+        let status = Command::new(path)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => bail!("stty failed while preparing terminal secret input"),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                last_error = Some(err);
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to invoke stty for terminal secret input: {err}"
+                ));
+            }
+        }
+    }
+    let detail = last_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "not found".to_string());
+    bail!("failed to locate stty for terminal secret input: {detail}")
+}
+
+#[cfg(not(unix))]
+fn disable_terminal_echo() -> Result<()> {
+    bail!("interactive hidden secret input is unsupported on this platform; set the environment passphrase")
+}
+
+#[cfg(not(unix))]
+fn enable_terminal_echo() -> Result<()> {
+    Ok(())
 }
 
 pub fn address_from_pk(pk: &TaggedSigningPublicKey) -> Address {
@@ -324,56 +407,6 @@ pub fn stealth_seed_v3(
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&out.as_bytes()[..32]);
     seed
-}
-
-/// Generate a self-signed X.509 certificate.
-pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut params = CertificateParams::new(vec!["node.local".to_string()])?;
-    params.subject_alt_names = vec![
-        SanType::DnsName("node.local".try_into()?),
-        SanType::DnsName("p2p.local".try_into()?),
-    ];
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-
-    Ok((cert.der().to_vec(), key_pair.serialize_der()))
-}
-
-/// Create a post-quantum aware Rustls client configuration.
-pub fn create_pq_client_config() -> Result<Arc<ClientConfig>> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
-
-    Ok(Arc::new(config))
-}
-
-/// Create a post-quantum aware Rustls server configuration.
-pub fn create_pq_server_config(
-    cert_der: Vec<u8>,
-    private_key_der: Vec<u8>,
-) -> Result<Arc<ServerConfig>> {
-    let cert_chain = vec![CertificateDer::from(cert_der)];
-    let private_key = PrivateKeyDer::try_from(private_key_der)
-        .map_err(|e| anyhow!("Failed to parse private key: {}", e))?;
-
-    let mut config = ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(cert_chain, private_key)?;
-
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    Ok(Arc::new(config))
 }
 
 /// Compute preimage p for a payment.

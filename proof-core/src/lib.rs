@@ -49,6 +49,7 @@ const CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN: &str =
     "unchained-shielded-checkpoint-accumulator-stratum-v1";
 const CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN: &str =
     "unchained-shielded-checkpoint-accumulator-root-v1";
+const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str = "unchained-transparent-verifier-key-v1";
 const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
 
@@ -305,6 +306,7 @@ pub struct ProofShieldedInputBinding {
     pub historical_from_epoch: u64,
     pub historical_through_epoch: u64,
     pub historical_root_digest: [u8; 32],
+    pub historical_accumulator_verifier_key_commitment: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,7 +376,7 @@ pub struct ProofPrivateUndelegationJournal {
 fn validate_input_history(
     input: &ProofShieldedInputWitness,
     current_epoch: u64,
-) -> Result<(u64, u64, [u8; 32])> {
+) -> Result<(u64, u64, [u8; 32], Option<[u8; 32]>)> {
     let genesis_checkpoint =
         HistoricalUnspentCheckpoint::genesis(input.note.commitment, input.note.birth_epoch);
     let empty_historical_digest = checkpoint_accumulator_historical_digest_from_pairs(&[]);
@@ -385,7 +387,7 @@ fn validate_input_history(
         current_epoch.saturating_sub(1)
     };
 
-    let historical_root_digest = match (
+    let (historical_root_digest, verifier_key_commitment) = match (
         input.historical_extension.as_ref(),
         input.historical_accumulator.as_ref(),
     ) {
@@ -404,7 +406,7 @@ fn validate_input_history(
             if extended_checkpoint.covered_through_epoch != historical_through_epoch {
                 bail!("historical extension does not cover all prior epochs");
             }
-            extension.historical_root_digest
+            (extension.historical_root_digest, None)
         }
         (None, Some(accumulator)) => {
             if input
@@ -414,14 +416,22 @@ fn validate_input_history(
             {
                 bail!("historical accumulator receipt is missing");
             }
-            if input.historical_accumulator_verifier_hint.is_none() {
+            let Some(verifier_hint) = input.historical_accumulator_verifier_hint else {
                 bail!("historical accumulator verifier hint is missing");
+            };
+            let expected_verifier_key_commitment =
+                transparent_verifier_key_commitment_from_hint(verifier_hint);
+            if accumulator.accumulator_verifier_key_commitment != expected_verifier_key_commitment {
+                bail!("historical accumulator verifier key commitment mismatch");
             }
             accumulator.validate_against_checkpoint(&input.historical_checkpoint)?;
             if accumulator.covered_through_epoch != historical_through_epoch {
                 bail!("historical checkpoint does not cover all prior epochs");
             }
-            accumulator.historical_root_digest
+            (
+                accumulator.historical_root_digest,
+                Some(accumulator.accumulator_verifier_key_commitment),
+            )
         }
         (None, None) => {
             if input.historical_accumulator_verifier_hint.is_some() {
@@ -436,7 +446,7 @@ fn validate_input_history(
             if input.historical_checkpoint != genesis_checkpoint {
                 bail!("historical checkpoint mismatch");
             }
-            empty_historical_digest
+            (empty_historical_digest, None)
         }
     };
 
@@ -444,7 +454,16 @@ fn validate_input_history(
         historical_from_epoch,
         historical_through_epoch,
         historical_root_digest,
+        verifier_key_commitment,
     ))
+}
+
+pub fn transparent_verifier_key_commitment_from_hint(method_id: [u32; 8]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(&method_id));
+    for word in method_id {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    proof_hash_bytes(TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN, &bytes)
 }
 
 pub fn validate_shielded_tx_witness(
@@ -489,8 +508,12 @@ pub fn validate_shielded_tx_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
-            validate_input_history(input, witness.current_epoch)?;
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
+        ) = validate_input_history(input, witness.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.chain_id,
@@ -505,6 +528,7 @@ pub fn validate_shielded_tx_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -609,8 +633,12 @@ pub fn validate_private_delegation_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
-            validate_input_history(input, witness.shielded.current_epoch)?;
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
+        ) = validate_input_history(input, witness.shielded.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.shielded.chain_id,
@@ -625,6 +653,7 @@ pub fn validate_private_delegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -762,8 +791,12 @@ pub fn validate_private_undelegation_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
-            validate_input_history(input, witness.shielded.current_epoch)?;
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
+        ) = validate_input_history(input, witness.shielded.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.shielded.chain_id,
@@ -778,6 +811,7 @@ pub fn validate_private_undelegation_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -917,8 +951,12 @@ pub fn validate_unbonding_claim_witness(
         if input.historical_checkpoint.note_commitment != input.note.commitment {
             bail!("historical checkpoint note mismatch");
         }
-        let (historical_from_epoch, historical_through_epoch, historical_root_digest) =
-            validate_input_history(input, witness.current_epoch)?;
+        let (
+            historical_from_epoch,
+            historical_through_epoch,
+            historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
+        ) = validate_input_history(input, witness.current_epoch)?;
         let expected_nullifier = input.note.derive_evolving_nullifier(
             &input.note_key,
             &witness.chain_id,
@@ -933,6 +971,7 @@ pub fn validate_unbonding_claim_witness(
             historical_from_epoch,
             historical_through_epoch,
             historical_root_digest,
+            historical_accumulator_verifier_key_commitment,
         });
     }
 
@@ -1306,6 +1345,11 @@ impl CheckpointAccumulatorJournal {
 pub fn validate_checkpoint_accumulator_step_witness(
     witness: &CheckpointAccumulatorStepWitness,
 ) -> Result<CheckpointAccumulatorJournal> {
+    let expected_verifier_key_commitment =
+        transparent_verifier_key_commitment_from_hint(witness.accumulator_verifier_hint);
+    if witness.accumulator_verifier_key_commitment != expected_verifier_key_commitment {
+        bail!("checkpoint accumulator verifier key commitment does not match verifier hint");
+    }
     witness
         .stratum
         .verify_against_note(&witness.note_commitment)?;
@@ -2306,7 +2350,14 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
+        let verifier_hint = [9u32; 8];
+        let verifier_key_commitment = transparent_verifier_key_commitment_from_hint(verifier_hint);
+        let accumulator = sample_accumulator(
+            &checkpoint,
+            &extension,
+            verifier_key_commitment,
+            verifier_hint,
+        );
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2332,7 +2383,7 @@ mod tests {
                     historical_checkpoint: updated_checkpoint,
                     historical_extension: None,
                     historical_accumulator: Some(accumulator.clone()),
-                    historical_accumulator_verifier_hint: Some([9u32; 8]),
+                    historical_accumulator_verifier_hint: Some(verifier_hint),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
@@ -2367,6 +2418,10 @@ mod tests {
         assert_eq!(
             journal.inputs[0].historical_root_digest,
             accumulator.historical_root_digest
+        );
+        assert_eq!(
+            journal.inputs[0].historical_accumulator_verifier_key_commitment,
+            Some(accumulator.accumulator_verifier_key_commitment)
         );
         assert_eq!(
             journal.outputs[0].note_commitment,
@@ -2425,6 +2480,10 @@ mod tests {
             journal.inputs[0].historical_root_digest,
             extension.historical_root_digest
         );
+        assert_eq!(
+            journal.inputs[0].historical_accumulator_verifier_key_commitment,
+            None
+        );
     }
 
     #[test]
@@ -2468,7 +2527,14 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
+        let verifier_hint = [9u32; 8];
+        let verifier_key_commitment = transparent_verifier_key_commitment_from_hint(verifier_hint);
+        let accumulator = sample_accumulator(
+            &checkpoint,
+            &extension,
+            verifier_key_commitment,
+            verifier_hint,
+        );
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2500,7 +2566,7 @@ mod tests {
                     historical_checkpoint: updated_checkpoint,
                     historical_extension: None,
                     historical_accumulator: Some(accumulator),
-                    historical_accumulator_verifier_hint: Some([9u32; 8]),
+                    historical_accumulator_verifier_hint: Some(verifier_hint),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],
@@ -2538,7 +2604,14 @@ mod tests {
             &checkpoint,
             current_epoch - 1,
         );
-        let accumulator = sample_accumulator(&checkpoint, &extension, [8u8; 32], [9u32; 8]);
+        let verifier_hint = [9u32; 8];
+        let verifier_key_commitment = transparent_verifier_key_commitment_from_hint(verifier_hint);
+        let accumulator = sample_accumulator(
+            &checkpoint,
+            &extension,
+            verifier_key_commitment,
+            verifier_hint,
+        );
         let updated_checkpoint = HistoricalUnspentCheckpoint {
             version: checkpoint.version,
             note_commitment: checkpoint.note_commitment,
@@ -2578,7 +2651,7 @@ mod tests {
                     historical_checkpoint: updated_checkpoint,
                     historical_extension: None,
                     historical_accumulator: Some(accumulator),
-                    historical_accumulator_verifier_hint: Some([9u32; 8]),
+                    historical_accumulator_verifier_hint: Some(verifier_hint),
                     historical_accumulator_receipt: Some(vec![1u8; 8]),
                     current_nullifier,
                 }],

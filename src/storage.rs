@@ -4,7 +4,6 @@ use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 // use std::process; // removed unused
@@ -21,7 +20,6 @@ pub struct WalletStore {
 pub struct Store {
     pub db: DB,
     path: String,
-    mirror_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>)>>, // background mirroring
 }
 
 const STORE_COLUMN_FAMILIES: &[&str] = &[
@@ -34,6 +32,7 @@ const STORE_COLUMN_FAMILIES: &[&str] = &[
     "checkpoint_levels",
     "settlement_unit_checkpoint",
     "settlement_unit_checkpoint_index",
+    "checkpoint_header",
     "head",
     "anchor",
     "validator_pool",
@@ -63,10 +62,8 @@ const STORE_COLUMN_FAMILIES: &[&str] = &[
     "shielded_spent_note",
     "shielded_archive_provider",
     "shielded_archive_replica",
-    "shielded_archive_operator",
     "shielded_archive_accounting",
     "shielded_archive_custody",
-    "shielded_archive_receipt",
 ];
 
 fn build_cf_options() -> Options {
@@ -145,7 +142,9 @@ fn open_db_with_families(db_path: &str, cf_names: &[&str]) -> Result<DB> {
             if name == "settlement_unit_candidate" {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
                 opts.set_optimize_filters_for_hits(true);
-            } else if name == "checkpoint_settlement_units" || name == "settlement_unit_checkpoint_index" {
+            } else if name == "checkpoint_settlement_units"
+                || name == "settlement_unit_checkpoint_index"
+            {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 opts.set_optimize_filters_for_hits(true);
             }
@@ -308,11 +307,11 @@ impl Store {
 
     /// Create backup of critical blockchain data
     pub fn create_backup(&self) -> Result<String> {
-        let backup_dir = format!(
-            "{}/backups/{}",
-            self.path,
-            chrono::Utc::now().format("%Y%m%d_%H%M%S")
-        );
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let backup_dir = format!("{}/backups/{}", self.path, unix_secs);
         std::fs::create_dir_all(&backup_dir)
             .with_context(|| "Failed to create backup directory")?;
 
@@ -340,12 +339,6 @@ impl Store {
             }
         }
 
-        // Also back up the settlement-unit mirror directory when mirroring is enabled.
-        let settlement_units_backup = format!("{backup_dir}/settlement_units");
-        if let Err(e) = copy_dir_all(&self.settlement_units_dir(), &settlement_units_backup) {
-            eprintln!("Warning: Settlement unit backup failed: {e}");
-        }
-
         println!("Backup created at: {backup_dir}");
         Ok(backup_dir)
     }
@@ -371,6 +364,8 @@ impl Store {
             "settlement_unit_epoch_by_epoch",
             "shielded_checkpoint",
             "shielded_owned_note",
+            "shielded_archive_operator",
+            "shielded_archive_receipt",
             "delegation_share",
             "retarget_cache",
         ] {
@@ -381,40 +376,7 @@ impl Store {
             }
         }
 
-        // Create the settlement-unit mirror directory for optional loose-file exports.
-        let settlement_units_dir = format!("{db_path}/settlement_units");
-        fs::create_dir_all(&settlement_units_dir).ok();
-
-        // ----------------------------------------------------
-        // Optional background settlement unit mirroring for explicit operator opt-in.
-        // Disabled by default because it leaks canonical settlement unit data to loose files.
-        // ----------------------------------------------------
-        let mirror_enabled = std::env::var("SETTLEMENT_UNIT_MIRRORING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let mirror_tx = if mirror_enabled {
-            let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
-            std::thread::Builder::new()
-                .name("settlement-unit-mirror".into())
-                .spawn(move || {
-                    for (path, bytes) in rx {
-                        if let Some(parent) = std::path::Path::new(&path).parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(&path, &bytes);
-                    }
-                })
-                .expect("Failed to spawn settlement unit mirror thread");
-            Some(tx)
-        } else {
-            None
-        };
-
-        let store = Store {
-            db,
-            path: db_path,
-            mirror_tx,
-        };
+        let store = Store { db, path: db_path };
 
         // Perform initial health check
         store
@@ -441,17 +403,6 @@ impl Store {
             .put_cf_opt(handle, key, &data_to_store, &write_opts)
             .with_context(|| format!("Failed to PUT to database for key '{key:?}' in CF '{cf}'"))?;
 
-        // Queue settlement unit mirroring in background thread (feature-guarded via env); off by default.
-        if cf == "settlement_unit" {
-            if let Some(tx) = &self.mirror_tx {
-                let mirror_path = format!(
-                    "{}/settlement_units/settlement-unit-{}.bin",
-                    self.path,
-                    hex::encode(key)
-                );
-                let _ = tx.send((mirror_path, data_to_store.clone()));
-            }
-        }
         Ok(())
     }
 
@@ -519,11 +470,6 @@ impl Store {
         Ok(())
     }
 
-    /// Absolute path to the directory where individual settlement unit files are stored.
-    pub fn settlement_units_dir(&self) -> String {
-        format!("{}/settlement_units", self.path)
-    }
-
     /// Gets all settlement units owned by a specific address.
     pub fn get_settlement_units_by_owner(
         &self,
@@ -578,20 +524,30 @@ impl Store {
         };
         let mut committed = Vec::new();
         for checkpoint_num in 0..=latest.num {
-            for settlement_unit_id in self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)? {
+            for settlement_unit_id in
+                self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?
+            {
                 let settlement_unit = self
-                    .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
+                    .get::<crate::settlement_unit::SettlementUnit>(
+                        "settlement_unit",
+                        &settlement_unit_id,
+                    )?
                     .ok_or_else(|| {
-                        anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id))
+                        anyhow!(
+                            "missing committed settlement unit {}",
+                            hex::encode(settlement_unit_id)
+                        )
                     })?;
                 committed.push((checkpoint_num, settlement_unit));
             }
         }
-        committed.sort_by(|(checkpoint_a, settlement_unit_a), (checkpoint_b, settlement_unit_b)| {
-            checkpoint_a
-                .cmp(checkpoint_b)
-                .then(settlement_unit_a.id.cmp(&settlement_unit_b.id))
-        });
+        committed.sort_by(
+            |(checkpoint_a, settlement_unit_a), (checkpoint_b, settlement_unit_b)| {
+                checkpoint_a
+                    .cmp(checkpoint_b)
+                    .then(settlement_unit_a.id.cmp(&settlement_unit_b.id))
+            },
+        );
         Ok(committed)
     }
 
@@ -602,7 +558,8 @@ impl Store {
         let mut total = 0u64;
         for checkpoint_num in 0..=latest.num {
             total = total.saturating_add(
-                self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?.len() as u64,
+                self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?
+                    .len() as u64,
             );
         }
         Ok(total)
@@ -622,7 +579,8 @@ impl Store {
         let mut next_index = 0u64;
         let mut committed = Vec::with_capacity(limit);
         for checkpoint_num in 0..=latest.num {
-            let mut settlement_unit_ids = self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
+            let mut settlement_unit_ids =
+                self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
             settlement_unit_ids.sort();
             for settlement_unit_id in settlement_unit_ids {
                 if next_index < start_index {
@@ -630,9 +588,15 @@ impl Store {
                     continue;
                 }
                 let settlement_unit = self
-                    .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
+                    .get::<crate::settlement_unit::SettlementUnit>(
+                        "settlement_unit",
+                        &settlement_unit_id,
+                    )?
                     .ok_or_else(|| {
-                        anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id))
+                        anyhow!(
+                            "missing committed settlement unit {}",
+                            hex::encode(settlement_unit_id)
+                        )
                     })?;
                 committed.push((checkpoint_num, settlement_unit));
                 next_index = next_index.saturating_add(1);
@@ -645,7 +609,9 @@ impl Store {
     }
 
     /// Iterates over all settlement unit candidates in the database
-    pub fn iterate_settlement_unit_candidates(&self) -> Result<Vec<crate::settlement_unit::SettlementUnitCandidate>> {
+    pub fn iterate_settlement_unit_candidates(
+        &self,
+    ) -> Result<Vec<crate::settlement_unit::SettlementUnitCandidate>> {
         let cf = self
             .db
             .cf_handle("settlement_unit_candidate")
@@ -655,7 +621,9 @@ impl Store {
         let mut settlement_units = Vec::new();
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit_candidate(&value) {
+            if let Ok(settlement_unit) =
+                crate::settlement_unit::decode_settlement_unit_candidate(&value)
+            {
                 settlement_units.push(settlement_unit);
             }
         }
@@ -664,7 +632,10 @@ impl Store {
 
     /// Build the composite key for settlement unit candidates:
     /// parent_checkpoint_hash || settlement_unit_id.
-    pub fn candidate_key(parent_checkpoint_hash: &[u8; 32], settlement_unit_id: &[u8; 32]) -> Vec<u8> {
+    pub fn candidate_key(
+        parent_checkpoint_hash: &[u8; 32],
+        settlement_unit_id: &[u8; 32],
+    ) -> Vec<u8> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(parent_checkpoint_hash);
         key.extend_from_slice(settlement_unit_id);
@@ -701,7 +672,9 @@ impl Store {
             if &k[0..32] != &parent_checkpoint_hash[..] {
                 break;
             }
-            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit_candidate(&v) {
+            if let Ok(settlement_unit) =
+                crate::settlement_unit::decode_settlement_unit_candidate(&v)
+            {
                 settlement_units.push(settlement_unit);
             }
         }
@@ -764,7 +737,11 @@ impl Store {
     }
 
     /// Store sorted leaf hashes for a checkpoint for faster proof construction.
-    pub fn store_checkpoint_leaves(&self, checkpoint_num: u64, leaves: &Vec<[u8; 32]>) -> Result<()> {
+    pub fn store_checkpoint_leaves(
+        &self,
+        checkpoint_num: u64,
+        leaves: &Vec<[u8; 32]>,
+    ) -> Result<()> {
         let cf = self
             .db
             .cf_handle("checkpoint_leaves")
@@ -789,7 +766,11 @@ impl Store {
     }
 
     /// Store full Merkle levels for a checkpoint for O(log N) proof generation without recomputation.
-    pub fn store_checkpoint_levels(&self, checkpoint_num: u64, levels: &Vec<Vec<[u8; 32]>>) -> Result<()> {
+    pub fn store_checkpoint_levels(
+        &self,
+        checkpoint_num: u64,
+        levels: &Vec<Vec<[u8; 32]>>,
+    ) -> Result<()> {
         let cf = self
             .db
             .cf_handle("checkpoint_levels")
@@ -1638,35 +1619,6 @@ impl Store {
         Ok(replicas)
     }
 
-    pub fn store_shielded_archive_operator_scorecard(
-        &self,
-        scorecard: &crate::shielded::ArchiveOperatorScorecard,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_operator")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
-        let bytes = crate::canonical::encode_archive_operator_scorecard(scorecard)?;
-        self.db.put_cf(cf, &scorecard.provider_id, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_operator_scorecards(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveOperatorScorecard>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_operator")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_operator' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut scorecards = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            scorecards.push(crate::canonical::decode_archive_operator_scorecard(&value)?);
-        }
-        Ok(scorecards)
-    }
-
     pub fn store_shielded_archive_service_ledger(
         &self,
         ledger: &crate::shielded::ArchiveServiceLedger,
@@ -1748,35 +1700,6 @@ impl Store {
             commitments.push(crate::canonical::decode_archive_custody_commitment(&value)?);
         }
         Ok(commitments)
-    }
-
-    pub fn store_shielded_archive_retrieval_receipt(
-        &self,
-        receipt: &crate::shielded::ArchiveRetrievalReceipt,
-    ) -> Result<()> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_receipt")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
-        let bytes = crate::canonical::encode_archive_retrieval_receipt(receipt)?;
-        self.db.put_cf(cf, &receipt.receipt_digest, bytes)?;
-        Ok(())
-    }
-
-    pub fn load_shielded_archive_retrieval_receipts(
-        &self,
-    ) -> Result<Vec<crate::shielded::ArchiveRetrievalReceipt>> {
-        let cf = self
-            .db
-            .cf_handle("shielded_archive_receipt")
-            .ok_or_else(|| anyhow::anyhow!("'shielded_archive_receipt' column family missing"))?;
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut receipts = Vec::new();
-        for item in iter {
-            let (_key, value) = item?;
-            receipts.push(crate::canonical::decode_archive_retrieval_receipt(&value)?);
-        }
-        Ok(receipts)
     }
 
     pub fn store_shielded_output(
@@ -1890,11 +1813,16 @@ impl Store {
     }
 
     /// Gets settlement unit IDs selected by a checkpoint commitment.
-    pub fn get_selected_settlement_unit_ids_for_checkpoint(&self, checkpoint_num: u64) -> Result<Vec<[u8; 32]>> {
+    pub fn get_selected_settlement_unit_ids_for_checkpoint(
+        &self,
+        checkpoint_num: u64,
+    ) -> Result<Vec<[u8; 32]>> {
         let sel_cf = self
             .db
             .cf_handle("checkpoint_settlement_units")
-            .ok_or_else(|| anyhow::anyhow!("'checkpoint_settlement_units' column family missing"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("'checkpoint_settlement_units' column family missing")
+            })?;
         let mut ids = Vec::new();
         let start_key = checkpoint_num.to_le_bytes();
         let iter = self.db.iterator_cf(
@@ -1925,7 +1853,9 @@ impl Store {
         let cf = self
             .db
             .cf_handle("settlement_unit_checkpoint_index")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing")
+            })?;
         let mut key = Vec::with_capacity(8 + 32);
         key.extend_from_slice(&checkpoint_num.to_le_bytes());
         key.extend_from_slice(settlement_unit_id);
@@ -1934,11 +1864,16 @@ impl Store {
     }
 
     /// Gets fully recovered settlement unit IDs in checkpoint/id scan order.
-    pub fn get_committed_settlement_unit_ids_for_checkpoint(&self, checkpoint_num: u64) -> Result<Vec<[u8; 32]>> {
+    pub fn get_committed_settlement_unit_ids_for_checkpoint(
+        &self,
+        checkpoint_num: u64,
+    ) -> Result<Vec<[u8; 32]>> {
         let cf = self
             .db
             .cf_handle("settlement_unit_checkpoint_index")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing")
+            })?;
         let start_key = checkpoint_num.to_le_bytes();
         let iter = self.db.iterator_cf(
             cf,
@@ -1961,7 +1896,11 @@ impl Store {
     }
 
     /// Persist a mapping settlement_unit_id -> checkpoint number that committed it.
-    pub fn put_settlement_unit_checkpoint(&self, settlement_unit_id: &[u8; 32], checkpoint_num: u64) -> Result<()> {
+    pub fn put_settlement_unit_checkpoint(
+        &self,
+        settlement_unit_id: &[u8; 32],
+        checkpoint_num: u64,
+    ) -> Result<()> {
         let cf = self
             .db
             .cf_handle("settlement_unit_checkpoint")
@@ -1983,7 +1922,10 @@ impl Store {
     }
 
     /// Retrieve the checkpoint number that committed the given settlement unit, if known.
-    pub fn get_settlement_unit_checkpoint(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
+    pub fn get_settlement_unit_checkpoint(
+        &self,
+        settlement_unit_id: &[u8; 32],
+    ) -> Result<Option<u64>> {
         let cf = self
             .db
             .cf_handle("settlement_unit_checkpoint")
@@ -2002,7 +1944,10 @@ impl Store {
     }
 
     /// Retrieve the checkpoint number for a settlement unit from the committed index.
-    pub fn get_checkpoint_for_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
+    pub fn get_checkpoint_for_settlement_unit(
+        &self,
+        settlement_unit_id: &[u8; 32],
+    ) -> Result<Option<u64>> {
         self.get_settlement_unit_checkpoint(settlement_unit_id)
     }
 
@@ -2037,8 +1982,24 @@ impl Store {
         Ok((0, 0))
     }
 
+    /// Persist a header-only checkpoint fetched by the headers pipeline.
+    pub fn put_checkpoint_header(&self, header: &crate::epoch::Anchor) -> Result<()> {
+        self.put("checkpoint_header", &header.num.to_le_bytes(), header)
+    }
+
+    /// Fetch a header-only checkpoint by height.
+    pub fn get_checkpoint_header(
+        &self,
+        checkpoint_num: u64,
+    ) -> Result<Option<crate::epoch::Anchor>> {
+        self.get("checkpoint_header", &checkpoint_num.to_le_bytes())
+    }
+
     /// Convenience: fetch anchor by checkpoint number.
-    pub fn get_anchor_by_checkpoint_num(&self, checkpoint_num: u64) -> Result<Option<crate::epoch::Anchor>> {
+    pub fn get_anchor_by_checkpoint_num(
+        &self,
+        checkpoint_num: u64,
+    ) -> Result<Option<crate::epoch::Anchor>> {
         self.get("epoch", &checkpoint_num.to_le_bytes())
     }
 
@@ -2297,51 +2258,8 @@ pub struct DatabaseStats {
     pub epoch_count: u64,
 }
 
-/// Cross-platform directory copy function for backups
-fn copy_dir_all(src: &str, dst: &str) -> Result<()> {
-    use std::path::Path;
-
-    let src_path = Path::new(src);
-    let dst_path = Path::new(dst);
-
-    if !src_path.exists() {
-        return Ok(()); // Source doesn't exist, nothing to copy
-    }
-
-    std::fs::create_dir_all(dst_path)?;
-
-    for entry in std::fs::read_dir(src_path)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_file = entry.path();
-        let dst_file = dst_path.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_dir_all(&src_file.to_string_lossy(), &dst_file.to_string_lossy())?;
-        } else {
-            std::fs::copy(src_file, dst_file)?;
-        }
-    }
-    Ok(())
-}
-
-pub fn open(cfg: &crate::config::Storage) -> Arc<Store> {
-    match Store::open(&cfg.path) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!(
-                "❌ Critical: Database failed to open at '{}': {}",
-                cfg.path, e
-            );
-            eprintln!("💡 Possible solutions:");
-            eprintln!("   - Check if directory exists and is writable");
-            eprintln!("   - Verify no other instances are running");
-            eprintln!(
-                "   - If previous crash, try removing stale lock: rm {}/LOCK",
-                cfg.path
-            );
-            // For genesis deployment, propagate error instead of exiting in library
-            panic!("Database open failed: {}", e);
-        }
-    }
+pub fn open(cfg: &crate::config::Storage) -> Result<Arc<Store>> {
+    Store::open(&cfg.path)
+        .map(Arc::new)
+        .with_context(|| format!("database failed to open at '{}'", cfg.path))
 }

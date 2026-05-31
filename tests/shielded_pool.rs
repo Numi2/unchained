@@ -7,10 +7,9 @@ use unchained::{
     shielded::{
         assigned_archive_custodians, local_archive_custody_commitments,
         local_archive_provider_manifest, local_archive_replica_attestations,
-        route_checkpoint_requests, ArchiveDirectory, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
-        ArchiveServiceLedger, ArchivedNullifierEpoch, CheckpointExtensionRequest,
-        EvolvingNullifierQuery, HistoricalUnspentCheckpoint, HistoricalUnspentExtension,
-        NoteCommitmentTree, ShieldedNote, ShieldedSyncServer,
+        route_checkpoint_requests, ArchiveDirectory, ArchiveServiceLedger, ArchivedNullifierEpoch,
+        CheckpointExtensionRequest, EvolvingNullifierQuery, HistoricalUnspentCheckpoint,
+        HistoricalUnspentExtension, NoteCommitmentTree, ShieldedNote, ShieldedSyncServer,
     },
     Store,
 };
@@ -478,7 +477,7 @@ fn checkpoint_extensions_packetize_large_segment_sets() -> Result<()> {
 }
 
 #[test]
-fn archive_operator_scorecards_reward_long_retention() -> Result<()> {
+fn archive_provider_health_reports_reward_long_retention() -> Result<()> {
     let mut provider = ShieldedSyncServer::new();
     for epoch in 5u64..=8 {
         provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
@@ -521,16 +520,15 @@ fn archive_operator_scorecards_reward_long_retention() -> Result<()> {
         directory.replicas.clone(),
         Vec::new(),
         commitments,
-        Vec::new(),
     )?;
 
-    let mut scorecards = directory.operator_scorecards(2, 32);
-    scorecards.sort_by_key(|scorecard| scorecard.provider_id);
-    assert_eq!(scorecards.len(), 2);
-    let score_a = &scorecards[0];
-    let score_b = &scorecards[1];
+    let mut reports = directory.provider_health_reports(2, 32);
+    reports.sort_by_key(|report| report.provider_id);
+    assert_eq!(reports.len(), 2);
+    let score_a = &reports[0];
+    let score_b = &reports[1];
     assert!(score_b.retention_surplus_epochs > score_a.retention_surplus_epochs);
-    assert!(score_b.reward_weight > score_a.reward_weight);
+    assert!(score_b.routing_weight > score_a.routing_weight);
     Ok(())
 }
 
@@ -579,7 +577,6 @@ fn archive_service_ledgers_feed_availability_certificates() -> Result<()> {
         replica_directory.replicas.clone(),
         vec![ledger_a, ledger_b],
         commitments_b,
-        Vec::new(),
     )?;
 
     let shard_id = directory.shards.first().expect("shard").shard_id;
@@ -588,10 +585,10 @@ fn archive_service_ledgers_feed_availability_certificates() -> Result<()> {
         .expect("availability cert");
     assert!(cert.certified_providers.contains(&manifest_b.provider_id));
     assert!(!cert.certified_providers.contains(&manifest_a.provider_id));
-    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
-    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
+    let score_a = directory.provider_health(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.provider_health(&manifest_b.provider_id, 2, 32)?;
     assert!(score_b.service_success_bps > score_a.service_success_bps);
-    assert!(score_b.reward_weight > score_a.reward_weight);
+    assert!(score_b.routing_weight > score_a.routing_weight);
     Ok(())
 }
 
@@ -633,7 +630,6 @@ fn archive_custody_commitments_gate_certification_and_rewards() -> Result<()> {
         replicas,
         Vec::new(),
         commitments_b,
-        Vec::new(),
     )?;
 
     let shard_id = directory.shards.first().expect("shard").shard_id;
@@ -643,17 +639,17 @@ fn archive_custody_commitments_gate_certification_and_rewards() -> Result<()> {
     assert!(cert.certified_providers.contains(&manifest_b.provider_id));
     assert!(!cert.certified_providers.contains(&manifest_a.provider_id));
 
-    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
-    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
+    let score_a = directory.provider_health(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.provider_health(&manifest_b.provider_id, 2, 32)?;
     assert_eq!(score_a.committed_custody_count, 0);
     assert!(score_b.committed_custody_count > 0);
     assert!(score_b.availability_bps > score_a.availability_bps);
-    assert!(score_b.reward_weight > score_a.reward_weight);
+    assert!(score_b.routing_weight > score_a.routing_weight);
     Ok(())
 }
 
 #[test]
-fn archive_retrieval_receipts_override_local_service_bias() -> Result<()> {
+fn archive_service_ledgers_override_local_service_bias() -> Result<()> {
     let mut provider = ShieldedSyncServer::new();
     for epoch in 5u64..=8 {
         provider.archive_epoch(epoch, vec![[epoch as u8; 32]])?;
@@ -692,54 +688,24 @@ fn archive_retrieval_receipts_override_local_service_bias() -> Result<()> {
     let mut optimistic_ledger_a =
         ArchiveServiceLedger::new(manifest_a.provider_id, manifest_a.manifest_digest);
     optimistic_ledger_a.record_checkpoint_success(4, 12, 1_000);
-    let receipt_a = ArchiveRetrievalReceipt::new(
-        [9u8; 32],
-        manifest_a.provider_id,
-        manifest_a.manifest_digest,
-        ArchiveRetrievalKind::CheckpointBatch,
-        [1u8; 32],
-        None,
-        5,
-        8,
-        None,
-        0,
-        false,
-        21,
-        1_111,
-    );
-    let receipt_b = ArchiveRetrievalReceipt::new(
-        [9u8; 32],
-        manifest_b.provider_id,
-        manifest_b.manifest_digest,
-        ArchiveRetrievalKind::CheckpointBatch,
-        [2u8; 32],
-        Some([3u8; 32]),
-        5,
-        8,
-        None,
-        4,
-        true,
-        11,
-        1_112,
-    );
+    optimistic_ledger_a.record_archive_shard_failure();
+    let mut healthier_ledger_b =
+        ArchiveServiceLedger::new(manifest_b.provider_id, manifest_b.manifest_digest);
+    healthier_ledger_b.record_checkpoint_success(4, 11, 1_112);
+    healthier_ledger_b.record_archive_shard_success(4, 1_113);
     let directory = ArchiveDirectory::from_root_ledger_and_providers_and_replicas_and_evidence(
         provider.root_ledger(),
         2,
         vec![manifest_a.clone(), manifest_b.clone()],
         replicas,
-        vec![optimistic_ledger_a],
+        vec![optimistic_ledger_a, healthier_ledger_b],
         commitments,
-        vec![receipt_a, receipt_b],
     )?;
 
-    let score_a = directory.operator_scorecard(&manifest_a.provider_id, 2, 32)?;
-    let score_b = directory.operator_scorecard(&manifest_b.provider_id, 2, 32)?;
-    assert_eq!(score_a.successful_retrieval_receipts, 0);
-    assert_eq!(score_a.failed_retrieval_receipts, 1);
-    assert_eq!(score_a.service_success_bps, 0);
-    assert_eq!(score_b.successful_retrieval_receipts, 1);
-    assert_eq!(score_b.failed_retrieval_receipts, 0);
+    let score_a = directory.provider_health(&manifest_a.provider_id, 2, 32)?;
+    let score_b = directory.provider_health(&manifest_b.provider_id, 2, 32)?;
+    assert_eq!(score_a.service_success_bps, 5_000);
     assert_eq!(score_b.service_success_bps, 10_000);
-    assert!(score_b.reward_weight > score_a.reward_weight);
+    assert!(score_b.routing_weight > score_a.routing_weight);
     Ok(())
 }

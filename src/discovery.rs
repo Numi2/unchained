@@ -125,7 +125,7 @@ pub struct DiscoveryManifest {
     pub arity: u32,
     pub record_count: u64,
     pub record_bytes: u32,
-    pub query_budget_difficulty_bits: u8,
+    pub query_budget_work_bits: u8,
     pub issued_unix_ms: u64,
     pub manifest_id: [u8; 32],
     pub seed_mu: [u8; SEED_BYTE_LEN],
@@ -179,7 +179,7 @@ pub struct DiscoveryPolicy {
     pub max_pending_requests: usize,
     pub max_pending_responses: usize,
     pub pir_arity: u32,
-    pub query_budget_difficulty_bits: u8,
+    pub query_budget_work_bits: u8,
     pub allow_mutations: bool,
 }
 
@@ -193,7 +193,7 @@ impl Default for DiscoveryPolicy {
             max_pending_requests: 4096,
             max_pending_responses: 4096,
             pir_arity: 4,
-            query_budget_difficulty_bits: 0,
+            query_budget_work_bits: 0,
             allow_mutations: true,
         }
     }
@@ -210,7 +210,7 @@ pub struct DiscoveryServerStatus {
     pub record_count: u64,
     pub record_bytes: u32,
     pub pir_arity: u32,
-    pub query_budget_difficulty_bits: u8,
+    pub query_budget_work_bits: u8,
     pub allow_mutations: bool,
     pub record_ttl_secs: u64,
     pub max_request_bytes: u64,
@@ -280,7 +280,7 @@ pub struct DiscoverySnapshotBundle {
     pub snapshot_epoch: u64,
     pub record_count: u64,
     pub record_bytes: u32,
-    pub query_budget_difficulty_bits: u8,
+    pub query_budget_work_bits: u8,
     pub exported_unix_ms: u64,
     pub registrations: Vec<LocatorRegistration>,
     pub sig: Vec<u8>,
@@ -1034,7 +1034,7 @@ impl DiscoveryServer {
             chain_id,
             identity.node_id(),
             policy.pir_arity,
-            policy.query_budget_difficulty_bits,
+            policy.query_budget_work_bits,
             identity,
         )?));
         let server = Self {
@@ -1344,7 +1344,7 @@ impl DiscoveryServer {
             record_count: manifest.record_count,
             record_bytes: manifest.record_bytes,
             pir_arity: self.policy.pir_arity,
-            query_budget_difficulty_bits: manifest.query_budget_difficulty_bits,
+            query_budget_work_bits: manifest.query_budget_work_bits,
             allow_mutations: self.policy.allow_mutations,
             record_ttl_secs: self.policy.record_ttl.as_secs(),
             max_request_bytes: self.policy.max_request_bytes as u64,
@@ -1365,7 +1365,7 @@ impl DiscoveryServer {
             self.chain_id,
             self.server_node_id,
             self.policy.pir_arity,
-            self.policy.query_budget_difficulty_bits,
+            self.policy.query_budget_work_bits,
             &self.identity,
             &records,
             &metadata,
@@ -1422,7 +1422,7 @@ impl DiscoveryIndexState {
         chain_id: [u8; 32],
         server_node_id: [u8; 32],
         arity: u32,
-        query_budget_difficulty_bits: u8,
+        query_budget_work_bits: u8,
         identity: &NodeIdentity,
     ) -> Result<Self> {
         let manifest = build_manifest(
@@ -1432,7 +1432,7 @@ impl DiscoveryIndexState {
             0,
             arity,
             0,
-            query_budget_difficulty_bits,
+            query_budget_work_bits,
             [0u8; SEED_BYTE_LEN],
             Vec::new(),
             Vec::new(),
@@ -1448,7 +1448,7 @@ impl DiscoveryIndexState {
         chain_id: [u8; 32],
         server_node_id: [u8; 32],
         arity: u32,
-        query_budget_difficulty_bits: u8,
+        query_budget_work_bits: u8,
         identity: &NodeIdentity,
         registrations: &[LocatorRegistration],
         metadata: &StoredSnapshotMetadata,
@@ -1461,7 +1461,7 @@ impl DiscoveryIndexState {
                 metadata.snapshot_epoch,
                 arity,
                 0,
-                query_budget_difficulty_bits,
+                query_budget_work_bits,
                 [0u8; SEED_BYTE_LEN],
                 Vec::new(),
                 Vec::new(),
@@ -1500,7 +1500,7 @@ impl DiscoveryIndexState {
             metadata.snapshot_epoch,
             arity,
             registrations.len() as u64,
-            query_budget_difficulty_bits,
+            query_budget_work_bits,
             seed_mu,
             hint_bytes,
             filter_param_bytes,
@@ -1769,7 +1769,7 @@ pub fn export_snapshot_bundle(
         snapshot_epoch: metadata.snapshot_epoch,
         record_count: registrations.len() as u64,
         record_bytes: DISCOVERY_RECORD_BYTES as u32,
-        query_budget_difficulty_bits: policy.query_budget_difficulty_bits,
+        query_budget_work_bits: policy.query_budget_work_bits,
         exported_unix_ms,
         registrations,
         sig: Vec::new(),
@@ -1819,7 +1819,7 @@ pub fn decode_snapshot_bundle(bytes: &[u8]) -> Result<DiscoverySnapshotBundle> {
     let snapshot_epoch = body_reader.read_u64()?;
     let record_count = body_reader.read_u64()?;
     let record_bytes = body_reader.read_u32()?;
-    let query_budget_difficulty_bits = body_reader.read_u8()?;
+    let query_budget_work_bits = body_reader.read_u8()?;
     let exported_unix_ms = body_reader.read_u64()?;
     let registrations = body_reader.read_vec(|reader| {
         let record = decode_discovery_record(&reader.read_bytes()?)?;
@@ -1838,7 +1838,7 @@ pub fn decode_snapshot_bundle(bytes: &[u8]) -> Result<DiscoverySnapshotBundle> {
         snapshot_epoch,
         record_count,
         record_bytes,
-        query_budget_difficulty_bits,
+        query_budget_work_bits,
         exported_unix_ms,
         registrations,
         sig,
@@ -1856,7 +1856,7 @@ fn encode_snapshot_bundle_without_sig(bundle: &DiscoverySnapshotBundle) -> Resul
     writer.write_u64(bundle.snapshot_epoch);
     writer.write_u64(bundle.record_count);
     writer.write_u32(bundle.record_bytes);
-    writer.write_u8(bundle.query_budget_difficulty_bits);
+    writer.write_u8(bundle.query_budget_work_bits);
     writer.write_u64(bundle.exported_unix_ms);
     writer.write_vec(&bundle.registrations, |writer, registration| {
         writer.write_bytes(&encode_discovery_record(&registration.record)?)?;
@@ -2362,7 +2362,7 @@ fn build_manifest(
     snapshot_epoch: u64,
     arity: u32,
     record_count: u64,
-    query_budget_difficulty_bits: u8,
+    query_budget_work_bits: u8,
     seed_mu: [u8; SEED_BYTE_LEN],
     hint_bytes: Vec<u8>,
     filter_param_bytes: Vec<u8>,
@@ -2378,7 +2378,7 @@ fn build_manifest(
         arity,
         record_count,
         record_bytes: DISCOVERY_RECORD_BYTES as u32,
-        query_budget_difficulty_bits,
+        query_budget_work_bits,
         issued_unix_ms,
         manifest_id: [0u8; 32],
         seed_mu,
@@ -2407,7 +2407,7 @@ fn encode_manifest_without_id(manifest: &DiscoveryManifest) -> Result<Vec<u8>> {
     writer.write_u32(manifest.arity);
     writer.write_u64(manifest.record_count);
     writer.write_u32(manifest.record_bytes);
-    writer.write_u8(manifest.query_budget_difficulty_bits);
+    writer.write_u8(manifest.query_budget_work_bits);
     writer.write_u64(manifest.issued_unix_ms);
     writer.write_fixed(&manifest.seed_mu);
     writer.write_bytes(&manifest.hint_bytes)?;
@@ -2447,7 +2447,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<DiscoveryManifest> {
         arity: body_reader.read_u32()?,
         record_count: body_reader.read_u64()?,
         record_bytes: body_reader.read_u32()?,
-        query_budget_difficulty_bits: body_reader.read_u8()?,
+        query_budget_work_bits: body_reader.read_u8()?,
         issued_unix_ms: body_reader.read_u64()?,
         manifest_id: decoded_manifest_id,
         seed_mu: body_reader.read_fixed()?,
@@ -2504,7 +2504,7 @@ fn ensure_manifest_compatibility(
     if mirror.record_bytes != primary.record_bytes {
         bail!("discovery replica manifest record size mismatch");
     }
-    if mirror.query_budget_difficulty_bits != primary.query_budget_difficulty_bits {
+    if mirror.query_budget_work_bits != primary.query_budget_work_bits {
         bail!("discovery replica query-budget policy mismatch");
     }
     Ok(())
@@ -2550,7 +2550,7 @@ fn compute_query_budget_proof(
     loop {
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let digest = query_budget_digest(manifest, request_id, query, &nonce);
-        if leading_zero_bits(&digest) >= manifest.query_budget_difficulty_bits as u32 {
+        if leading_zero_bits(&digest) >= manifest.query_budget_work_bits as u32 {
             return DiscoveryQueryBudgetProof { nonce };
         }
     }
@@ -2563,8 +2563,8 @@ fn verify_query_budget_proof(
     proof: &DiscoveryQueryBudgetProof,
 ) -> Result<()> {
     let digest = query_budget_digest(manifest, request_id, query, &proof.nonce);
-    if leading_zero_bits(&digest) < manifest.query_budget_difficulty_bits as u32 {
-        bail!("discovery query budget proof is below the configured difficulty");
+    if leading_zero_bits(&digest) < manifest.query_budget_work_bits as u32 {
+        bail!("discovery query budget proof is below the configured work target");
     }
     Ok(())
 }
@@ -2943,7 +2943,7 @@ fn encode_response(response: &DiscoveryResponse) -> Result<Vec<u8>> {
             writer.write_u64(status.record_count);
             writer.write_u32(status.record_bytes);
             writer.write_u32(status.pir_arity);
-            writer.write_u8(status.query_budget_difficulty_bits);
+            writer.write_u8(status.query_budget_work_bits);
             writer.write_bool(status.allow_mutations);
             writer.write_u64(status.record_ttl_secs);
             writer.write_u64(status.max_request_bytes);
@@ -3032,7 +3032,7 @@ fn decode_response(bytes: &[u8]) -> Result<DiscoveryResponse> {
             let record_count = reader.read_u64()?;
             let record_bytes = reader.read_u32()?;
             let pir_arity = reader.read_u32()?;
-            let query_budget_difficulty_bits = reader.read_u8()?;
+            let query_budget_work_bits = reader.read_u8()?;
             let allow_mutations = reader.read_bool()?;
             let record_ttl_secs = reader.read_u64()?;
             let max_request_bytes = reader.read_u64()?;
@@ -3059,7 +3059,7 @@ fn decode_response(bytes: &[u8]) -> Result<DiscoveryResponse> {
                     record_count,
                     record_bytes,
                     pir_arity,
-                    query_budget_difficulty_bits,
+                    query_budget_work_bits,
                     allow_mutations,
                     record_ttl_secs,
                     max_request_bytes,
@@ -3728,7 +3728,7 @@ mod tests {
             initial_status.record_ttl_secs,
             DiscoveryPolicy::default().record_ttl.as_secs()
         );
-        assert_eq!(initial_status.query_budget_difficulty_bits, 0);
+        assert_eq!(initial_status.query_budget_work_bits, 0);
         assert!(initial_status.allow_mutations);
 
         let owner_key = crypto::ml_dsa_65_generate()?;
@@ -3806,7 +3806,7 @@ mod tests {
         let identity = test_runtime_identity(tempdir.path(), chain_id, listen_addr)?;
         let state_path = tempdir.path().join("discovery-state");
         let policy = DiscoveryPolicy {
-            query_budget_difficulty_bits: 8,
+            query_budget_work_bits: 8,
             ..DiscoveryPolicy::default()
         };
         let server = DiscoveryServer::bind(
@@ -3855,8 +3855,8 @@ mod tests {
 
         let manifest = client.fetch_manifest().await?;
         assert_eq!(
-            manifest.query_budget_difficulty_bits,
-            policy.query_budget_difficulty_bits
+            manifest.query_budget_work_bits,
+            policy.query_budget_work_bits
         );
         let mut pir_client = PirClient::setup(
             &manifest.seed_mu,
@@ -3948,7 +3948,7 @@ mod tests {
         let mirror_identity = test_runtime_identity(mirror_dir.path(), chain_id, mirror_addr)?;
         let primary_state_path = primary_dir.path().join("discovery-state");
         let primary_policy = DiscoveryPolicy {
-            query_budget_difficulty_bits: 6,
+            query_budget_work_bits: 6,
             ..DiscoveryPolicy::default()
         };
 
@@ -4012,7 +4012,7 @@ mod tests {
         import_snapshot_bundle(&mirror_state_path.to_string_lossy(), &bundle)?;
 
         let mirror_policy = DiscoveryPolicy {
-            query_budget_difficulty_bits: bundle.query_budget_difficulty_bits,
+            query_budget_work_bits: bundle.query_budget_work_bits,
             allow_mutations: false,
             ..DiscoveryPolicy::default()
         };
@@ -4037,8 +4037,8 @@ mod tests {
         assert_eq!(bundle.dataset_id, mirror_manifest.dataset_id);
         assert_eq!(bundle.snapshot_epoch, mirror_manifest.snapshot_epoch);
         assert_eq!(
-            bundle.query_budget_difficulty_bits,
-            mirror_manifest.query_budget_difficulty_bits
+            bundle.query_budget_work_bits,
+            mirror_manifest.query_budget_work_bits
         );
         let mirror_status = mirror_client.fetch_status().await?;
         assert!(!mirror_status.allow_mutations);

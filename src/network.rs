@@ -21,21 +21,19 @@ use crate::storage::{protocol_chain_id, Store};
 use crate::sync::SyncState;
 use crate::transaction::{FastPathBatch, SharedStateBatch, SharedStateDagBatch};
 use crate::{
-    settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     config,
+    settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     shielded::{
         local_archive_custody_commitments, local_archive_provider_manifest,
         local_archive_replica_attestations, route_checkpoint_requests, ArchiveCustodyCommitment,
-        ArchiveDirectory, ArchiveProviderManifest, ArchiveReplicaAttestation,
-        ArchiveRetrievalReceipt, ArchiveServiceLedger, ArchiveShardBundle, CheckpointBatchRequest,
-        CheckpointBatchResponse, CheckpointExtensionRequest, HistoricalUnspentExtension,
-        ShieldedSyncServer,
+        ArchiveDirectory, ArchiveProviderManifest, ArchiveReplicaAttestation, ArchiveServiceLedger,
+        ArchiveShardBundle, CheckpointBatchRequest, CheckpointBatchResponse,
+        CheckpointExtensionRequest, HistoricalUnspentExtension, ShieldedSyncServer,
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use aws_lc_rs::signature::UnparsedPublicKey;
 use aws_lc_rs::unstable::signature::ML_DSA_65;
-use once_cell::sync::Lazy;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint};
 use rand::RngCore;
@@ -46,13 +44,23 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock as Lazy, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 static QUIET_NET: AtomicBool = AtomicBool::new(false);
+const MAX_PEERS: usize = 512;
+const CONNECTION_TIMEOUT_SECS: u64 = 30;
+const P2P_IDLE_TIMEOUT_SECS: u64 = 120;
+const P2P_KEEP_ALIVE_SECS: u64 = 10;
+const ARCHIVE_SYNC_TIMEOUT_SECS: u64 = 180;
+const PEER_EXCHANGE_ENABLED: bool = true;
+const MAX_VALIDATION_FAILURES_PER_PEER: u32 = 10;
+const PEER_BAN_DURATION_SECS: u64 = 3600;
+const P2P_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const MAX_MESSAGES_PER_WINDOW: u32 = 100;
 
 pub fn set_quiet_logging(quiet: bool) {
     QUIET_NET.store(quiet, Ordering::Relaxed);
@@ -120,13 +128,6 @@ pub struct EpochHeadersRange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactEpoch {
-    pub anchor: Anchor,
-    pub short_ids: Vec<[u8; 8]>,
-    pub prefilled: Vec<(u32, SettlementUnit)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointGetSettlementUnitBatch {
     pub checkpoint_hash: [u8; 32],
     pub indexes: Vec<u32>,
@@ -152,7 +153,6 @@ pub struct EpochByHash {
 
 #[derive(Debug, Clone)]
 struct CheckpointBatchEvent {
-    message_id: [u8; 32],
     response_to_message_id: [u8; 32],
     provider_id: [u8; 32],
     response: CheckpointBatchResponse,
@@ -179,7 +179,6 @@ enum WireTopic {
     SharedStateDagBatch,
     SettlementUnitCandidate,
     Tx,
-    CompactEpoch,
     CheckpointLeaves,
     CheckpointSettlementUnitIds,
     CheckpointSettlementUnitCandidatesResponse,
@@ -202,7 +201,6 @@ enum WireTopic {
     RequestCheckpointBatch,
     CheckpointBatch,
     ArchiveCustodyCommitment,
-    ArchiveRetrievalReceipt,
     RequestFastPathBatch,
     RequestSharedStateDagBatch,
 }
@@ -228,7 +226,6 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::SharedStateDagBatch => 5,
         WireTopic::SettlementUnitCandidate => 6,
         WireTopic::Tx => 8,
-        WireTopic::CompactEpoch => 9,
         WireTopic::CheckpointLeaves => 10,
         WireTopic::CheckpointSettlementUnitIds => 11,
         WireTopic::CheckpointSettlementUnitCandidatesResponse => 12,
@@ -251,7 +248,6 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::RequestCheckpointBatch => 30,
         WireTopic::CheckpointBatch => 31,
         WireTopic::ArchiveCustodyCommitment => 32,
-        WireTopic::ArchiveRetrievalReceipt => 33,
         WireTopic::RequestFastPathBatch => 34,
         WireTopic::RequestSharedStateDagBatch => 35,
     }
@@ -266,7 +262,6 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         5 => WireTopic::SharedStateDagBatch,
         6 => WireTopic::SettlementUnitCandidate,
         8 => WireTopic::Tx,
-        9 => WireTopic::CompactEpoch,
         10 => WireTopic::CheckpointLeaves,
         11 => WireTopic::CheckpointSettlementUnitIds,
         12 => WireTopic::CheckpointSettlementUnitCandidatesResponse,
@@ -289,7 +284,6 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         30 => WireTopic::RequestCheckpointBatch,
         31 => WireTopic::CheckpointBatch,
         32 => WireTopic::ArchiveCustodyCommitment,
-        33 => WireTopic::ArchiveRetrievalReceipt,
         34 => WireTopic::RequestFastPathBatch,
         35 => WireTopic::RequestSharedStateDagBatch,
         other => bail!("unsupported wire topic {}", other),
@@ -502,12 +496,12 @@ struct P2pPolicy {
 }
 
 impl P2pPolicy {
-    fn from_config(cfg: &config::P2p) -> Self {
+    fn fixed() -> Self {
         Self {
-            max_validation_failures_per_peer: cfg.max_validation_failures_per_peer.max(1),
-            peer_ban_duration: Duration::from_secs(cfg.peer_ban_duration_secs.max(1)),
-            rate_limit_window: Duration::from_secs(cfg.rate_limit_window_secs.max(1)),
-            max_messages_per_window: cfg.max_messages_per_window.max(1),
+            max_validation_failures_per_peer: MAX_VALIDATION_FAILURES_PER_PEER,
+            peer_ban_duration: Duration::from_secs(PEER_BAN_DURATION_SECS),
+            rate_limit_window: Duration::from_secs(P2P_RATE_LIMIT_WINDOW_SECS),
+            max_messages_per_window: MAX_MESSAGES_PER_WINDOW,
         }
     }
 }
@@ -594,7 +588,6 @@ enum NetworkCommand {
     GossipTx(crate::transaction::Tx),
     GossipFastPathBatch(FastPathBatch),
     GossipSharedStateDagBatch(SharedStateDagBatch),
-    GossipCompactEpoch(CompactEpoch),
     ProposeAnchor {
         proposal: AnchorProposal,
         reply: oneshot::Sender<Result<QuorumCertificate>>,
@@ -616,40 +609,7 @@ enum NetworkCommand {
         request: CheckpointBatchRequest,
         reply: oneshot::Sender<Result<[u8; 32]>>,
     },
-    GossipArchiveRetrievalReceipt(ArchiveRetrievalReceipt),
     RedialBootstraps,
-}
-
-#[cfg(test)]
-pub fn testing_stub_handle() -> NetHandle {
-    let tempdir = tempfile::tempdir().expect("create tempdir for network stub");
-    let db = Arc::new(
-        Store::open(&tempdir.path().to_string_lossy()).expect("open temp store for network stub"),
-    );
-    std::mem::forget(tempdir);
-    let (tx_tx, _) = broadcast::channel(1);
-    let (anchor_tx, _) = broadcast::channel(1);
-    let (headers_tx, _) = broadcast::channel::<EpochHeadersBatch>(1);
-    let (checkpoint_tx, _) = broadcast::channel::<CheckpointBatchEvent>(1);
-    let (command_tx, _) = mpsc::unbounded_channel();
-    Arc::new(Network {
-        anchor_tx,
-        tx_tx,
-        headers_tx,
-        checkpoint_tx,
-        command_tx,
-        connected_peers: Arc::new(Mutex::new(HashSet::new())),
-        shutdown: CancellationToken::new(),
-        tasks: TaskTracker::new(),
-        endpoint: Arc::new(AsyncMutex::new(None)),
-        db,
-        identity: None,
-        archive_sync_timeout: Duration::from_secs(1),
-        local_node_id: [0u8; 32],
-        known_records: Arc::new(RwLock::new(HashMap::new())),
-        archive_manifests: Arc::new(RwLock::new(HashMap::new())),
-        archive_replicas: Arc::new(RwLock::new(HashMap::new())),
-    })
 }
 
 pub fn peer_id_string() -> Result<String> {
@@ -836,7 +796,6 @@ impl RuntimeState {
             .write()
             .await
             .insert(manifest.provider_id, manifest.clone());
-        let _ = self.refresh_archive_operator_scorecards().await;
         Ok(manifest)
     }
 
@@ -888,7 +847,6 @@ impl RuntimeState {
             guard.insert((replica.provider_id, replica.shard_id), replica.clone());
         }
         drop(guard);
-        let _ = self.refresh_archive_operator_scorecards().await;
         Ok(replicas)
     }
 
@@ -942,7 +900,6 @@ impl RuntimeState {
             self.db
                 .store_shielded_archive_custody_commitment(commitment)?;
         }
-        let _ = self.refresh_archive_operator_scorecards().await;
         Ok(commitments)
     }
 
@@ -979,20 +936,7 @@ impl RuntimeState {
             replicas,
             self.db.load_shielded_archive_service_ledgers()?,
             self.db.load_shielded_archive_custody_commitments()?,
-            self.db.load_shielded_archive_retrieval_receipts()?,
         )
-    }
-
-    async fn refresh_archive_operator_scorecards(&self) -> Result<()> {
-        let directory = self.local_archive_directory().await?;
-        for scorecard in directory.operator_scorecards(
-            PROTOCOL.archive_provider_replica_count as usize,
-            PROTOCOL.archive_retention_horizon_epochs,
-        ) {
-            self.db
-                .store_shielded_archive_operator_scorecard(&scorecard)?;
-        }
-        Ok(())
     }
 
     async fn update_archive_service_ledger(
@@ -1010,7 +954,6 @@ impl RuntimeState {
         }
         update(&mut ledger);
         self.db.store_shielded_archive_service_ledger(&ledger)?;
-        self.refresh_archive_operator_scorecards().await?;
         Ok(())
     }
 
@@ -1026,36 +969,7 @@ impl RuntimeState {
         commitment.validate(&directory)?;
         self.db
             .store_shielded_archive_custody_commitment(&commitment)?;
-        self.refresh_archive_operator_scorecards().await?;
         Ok(())
-    }
-
-    async fn ingest_archive_retrieval_receipt(
-        &self,
-        record: &NodeRecordV2,
-        receipt: ArchiveRetrievalReceipt,
-    ) -> Result<()> {
-        if receipt.requester_id != record.node_id {
-            bail!("archive retrieval receipt requester id does not match the envelope signer");
-        }
-        let directory = self.local_archive_directory().await?;
-        receipt.validate(&directory)?;
-        self.db.store_shielded_archive_retrieval_receipt(&receipt)?;
-        self.refresh_archive_operator_scorecards().await?;
-        Ok(())
-    }
-
-    async fn publish_archive_retrieval_receipt(
-        &self,
-        receipt: ArchiveRetrievalReceipt,
-    ) -> Result<()> {
-        self.db.store_shielded_archive_retrieval_receipt(&receipt)?;
-        self.refresh_archive_operator_scorecards().await?;
-        self.sign_and_broadcast(
-            WireTopic::ArchiveRetrievalReceipt,
-            canonical::encode_archive_retrieval_receipt(&receipt)?,
-        )
-        .await
     }
 
     async fn build_local_checkpoint_batch_response(
@@ -1119,7 +1033,6 @@ impl RuntimeState {
             .write()
             .await
             .insert(manifest.provider_id, manifest);
-        self.refresh_archive_operator_scorecards().await?;
         Ok(())
     }
 
@@ -1138,7 +1051,6 @@ impl RuntimeState {
             .write()
             .await
             .insert((replica.provider_id, replica.shard_id), replica);
-        self.refresh_archive_operator_scorecards().await?;
         Ok(())
     }
 
@@ -1959,14 +1871,14 @@ impl RuntimeState {
                 }
             }
             OrderingPath::DagBftSharedState => {
-                if let Some(missing_batch_id) =
-                    first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
-                {
+                let missing_batch_ids =
+                    missing_shared_state_dag_batches(&proposal, self.db.as_ref())?;
+                if !missing_batch_ids.is_empty() {
                     net_log!(
-                        "ℹ️  Queueing shared-state proposal for epoch {} slot {} until batch {} arrives",
+                        "ℹ️  Queueing shared-state proposal for epoch {} slot {} until {} DAG batch(es) arrive",
                         proposal.position.epoch,
                         proposal.position.slot,
-                        hex::encode(missing_batch_id)
+                        missing_batch_ids.len()
                     );
                     self.queue_shared_state_proposal(
                         proposer_record.clone(),
@@ -1978,11 +1890,13 @@ impl RuntimeState {
                         proposal.clone(),
                     )
                     .await;
-                    self.request_shared_state_dag_batch_from(
-                        proposer_record.clone(),
-                        missing_batch_id,
-                    )
-                    .await?;
+                    for missing_batch_id in missing_batch_ids {
+                        self.request_shared_state_dag_batch_from(
+                            proposer_record.clone(),
+                            missing_batch_id,
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
                 validate_shared_state_dag_plan_for_proposal(
@@ -2608,7 +2522,8 @@ impl RuntimeState {
                 let candidate = canonical::decode_settlement_unit_candidate(&frame.body)?;
                 match validate_settlement_unit_candidate(&candidate, &self.db) {
                     Ok(()) => {
-                        let key = Store::candidate_key(&candidate.parent_checkpoint_hash, &candidate.id);
+                        let key =
+                            Store::candidate_key(&candidate.parent_checkpoint_hash, &candidate.id);
                         self.db.put("settlement_unit_candidate", &key, &candidate)?;
                     }
                     Err(err) => {
@@ -2672,11 +2587,6 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::CompactEpoch => {
-                let compact = canonical::decode_compact_epoch(&frame.body)?;
-                metrics::COMPACT_EPOCHS_RECV.inc();
-                self.handle_anchor(compact.anchor).await?;
-            }
             WireTopic::NodeRecord => {
                 let discovered = canonical::decode_node_record(&frame.body)?;
                 let is_new = self.remember_record(discovered.clone()).await?;
@@ -2705,11 +2615,15 @@ impl RuntimeState {
                 self.repair_checkpoint_state(checkpoint_num).await?;
             }
             WireTopic::CheckpointSettlementUnitCandidatesResponse => {
-                let response = canonical::decode_checkpoint_settlement_unit_candidates_response(&frame.body)?;
+                let response =
+                    canonical::decode_checkpoint_settlement_unit_candidates_response(&frame.body)?;
                 for candidate in response.candidates {
                     match validate_settlement_unit_candidate(&candidate, &self.db) {
                         Ok(()) => {
-                            let key = Store::candidate_key(&candidate.parent_checkpoint_hash, &candidate.id);
+                            let key = Store::candidate_key(
+                                &candidate.parent_checkpoint_hash,
+                                &candidate.id,
+                            );
                             let _ = self.db.put("settlement_unit_candidate", &key, &candidate);
                         }
                         Err(err) => {
@@ -2812,13 +2726,17 @@ impl RuntimeState {
                     .db
                     .get::<Anchor>("anchor", &batch.checkpoint_hash)?
                     .map(|anchor| anchor.num)
-                    .ok_or_else(|| anyhow!("checkpoint settlement unit batch references unknown anchor"))?;
+                    .ok_or_else(|| {
+                        anyhow!("checkpoint settlement unit batch references unknown anchor")
+                    })?;
                 self.store_checkpoint_settlement_unit_batch(batch)?;
                 self.repair_checkpoint_state(checkpoint_num).await?;
             }
             WireTopic::RequestCheckpointSettlementUnitIds => {
                 let checkpoint_num = decode_u64_body(&frame.body)?;
-                let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
+                let ids = self
+                    .db
+                    .get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
                 if !ids.is_empty() {
                     let merkle_root = MerkleTree::build_root(&ids.iter().copied().collect());
                     let bundle = CheckpointSettlementUnitIdsBundle {
@@ -2838,7 +2756,10 @@ impl RuntimeState {
             }
             WireTopic::RequestCheckpointLeaves => {
                 let checkpoint_num = decode_u64_body(&frame.body)?;
-                if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes()) {
+                if let Ok(Some(anchor)) = self
+                    .db
+                    .get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())
+                {
                     if let Ok(Some(leaves)) = self.db.get_checkpoint_leaves(checkpoint_num) {
                         let bundle = CheckpointLeavesBundle {
                             checkpoint_num,
@@ -2860,7 +2781,9 @@ impl RuntimeState {
                 let parent_checkpoint_hash = decode_bytes32_body(&frame.body)?;
                 let candidates = self
                     .db
-                    .get_settlement_unit_candidates_by_parent_checkpoint_hash(&parent_checkpoint_hash)?;
+                    .get_settlement_unit_candidates_by_parent_checkpoint_hash(
+                        &parent_checkpoint_hash,
+                    )?;
                 if !candidates.is_empty() {
                     let response = CheckpointSettlementUnitCandidatesResponse {
                         parent_checkpoint_hash,
@@ -2870,7 +2793,9 @@ impl RuntimeState {
                         .sign_and_send_to_peer_related(
                             record.node_id,
                             WireTopic::CheckpointSettlementUnitCandidatesResponse,
-                            canonical::encode_checkpoint_settlement_unit_candidates_response(&response)?,
+                            canonical::encode_checkpoint_settlement_unit_candidates_response(
+                                &response,
+                            )?,
                             Some(message_id),
                         )
                         .await?;
@@ -2898,7 +2823,6 @@ impl RuntimeState {
                 let response_to_message_id = response_to_message_id
                     .ok_or_else(|| anyhow!("checkpoint batch response is missing correlation"))?;
                 let _ = self.checkpoint_tx.send(CheckpointBatchEvent {
-                    message_id,
                     response_to_message_id,
                     provider_id: response.provider_id,
                     response,
@@ -2919,11 +2843,6 @@ impl RuntimeState {
             WireTopic::ArchiveCustodyCommitment => {
                 let commitment = canonical::decode_archive_custody_commitment(&frame.body)?;
                 self.ingest_archive_custody_commitment(&record, commitment)
-                    .await?;
-            }
-            WireTopic::ArchiveRetrievalReceipt => {
-                let receipt = canonical::decode_archive_retrieval_receipt(&frame.body)?;
-                self.ingest_archive_retrieval_receipt(&record, receipt)
                     .await?;
             }
             WireTopic::RequestArchiveShard => {
@@ -2958,24 +2877,6 @@ impl RuntimeState {
                         |ledger| ledger.record_archive_shard_success(shard_count.max(1), unix_ms()),
                     )
                     .await;
-                if let Some(request_message_id) = response_to_message_id {
-                    let receipt = ArchiveRetrievalReceipt::new(
-                        self.local_node_id().await,
-                        manifest.provider_id,
-                        manifest.manifest_digest,
-                        crate::shielded::ArchiveRetrievalKind::ArchiveShard,
-                        request_message_id,
-                        Some(message_id),
-                        bundle.shard.first_epoch,
-                        bundle.shard.last_epoch,
-                        Some(bundle.shard.shard_id),
-                        shard_count.max(1).min(u32::MAX as u64) as u32,
-                        true,
-                        0,
-                        unix_ms(),
-                    );
-                    let _ = self.publish_archive_retrieval_receipt(receipt).await;
-                }
                 let _ = self.refresh_local_archive_manifest().await;
                 let _ = self.refresh_local_archive_replicas().await;
                 let _ = self.refresh_local_archive_custody_commitments().await;
@@ -3005,12 +2906,17 @@ impl RuntimeState {
                 settlement_units: Vec::new(),
             });
         };
-        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
+        let ids = self
+            .db
+            .get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
         let mut indexes = Vec::new();
         let mut settlement_units = Vec::new();
         for index in &req.indexes {
             if let Some(settlement_unit_id) = ids.get(*index as usize) {
-                if let Some(settlement_unit) = self.db.get::<SettlementUnit>("settlement_unit", settlement_unit_id)? {
+                if let Some(settlement_unit) = self
+                    .db
+                    .get::<SettlementUnit>("settlement_unit", settlement_unit_id)?
+                {
                     indexes.push(*index);
                     settlement_units.push(settlement_unit);
                 }
@@ -3039,12 +2945,17 @@ impl RuntimeState {
         self.db
             .store_checkpoint_leaves(bundle.checkpoint_num, &bundle.leaves)?;
         let levels = MerkleTree::build_levels_from_sorted_leaves(&bundle.leaves);
-        self.db.store_checkpoint_levels(bundle.checkpoint_num, &levels)?;
+        self.db
+            .store_checkpoint_levels(bundle.checkpoint_num, &levels)?;
         Ok(())
     }
 
-    fn store_checkpoint_settlement_unit_ids_bundle(&self, bundle: CheckpointSettlementUnitIdsBundle) -> Result<()> {
-        let computed_root = MerkleTree::build_root(&bundle.settlement_unit_ids.iter().copied().collect());
+    fn store_checkpoint_settlement_unit_ids_bundle(
+        &self,
+        bundle: CheckpointSettlementUnitIdsBundle,
+    ) -> Result<()> {
+        let computed_root =
+            MerkleTree::build_root(&bundle.settlement_unit_ids.iter().copied().collect());
         if computed_root != bundle.merkle_root {
             bail!("checkpoint settlement unit ids bundle merkle root mismatch");
         }
@@ -3074,10 +2985,15 @@ impl RuntimeState {
     }
 
     async fn repair_checkpoint_state(&self, checkpoint_num: u64) -> Result<()> {
-        let Some(anchor) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())? else {
+        let Some(anchor) = self
+            .db
+            .get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())?
+        else {
             return Ok(());
         };
-        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
+        let ids = self
+            .db
+            .get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
         if ids.is_empty() {
             let _ = self
                 .sign_and_send_to_targets(
@@ -3089,7 +3005,11 @@ impl RuntimeState {
         } else {
             let mut indexes = Vec::new();
             for (index, settlement_unit_id) in ids.iter().enumerate() {
-                if self.db.get::<SettlementUnit>("settlement_unit", settlement_unit_id)?.is_none() {
+                if self
+                    .db
+                    .get::<SettlementUnit>("settlement_unit", settlement_unit_id)?
+                    .is_none()
+                {
                     indexes.push(index as u32);
                 }
             }
@@ -3097,10 +3017,12 @@ impl RuntimeState {
                 let _ = self
                     .sign_and_send_to_targets(
                         WireTopic::RequestCheckpointSettlementUnitBatch,
-                        canonical::encode_checkpoint_get_settlement_unit_batch(&CheckpointGetSettlementUnitBatch {
-                            checkpoint_hash: anchor.hash,
-                            indexes,
-                        })?,
+                        canonical::encode_checkpoint_get_settlement_unit_batch(
+                            &CheckpointGetSettlementUnitBatch {
+                                checkpoint_hash: anchor.hash,
+                                indexes,
+                            },
+                        )?,
                         REQUEST_FANOUT_RECOVERY,
                     )
                     .await?;
@@ -3126,7 +3048,10 @@ impl RuntimeState {
             .num
             .saturating_sub(EPOCH_REPAIR_LOOKBACK.saturating_sub(1));
         for checkpoint_num in start..=latest.num {
-            let Some(anchor) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())? else {
+            let Some(anchor) = self
+                .db
+                .get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())?
+            else {
                 continue;
             };
             if anchor.settlement_unit_count == 0 {
@@ -3147,19 +3072,21 @@ impl RuntimeState {
         let Some(anchor) = self.db.get::<Anchor>("anchor", &batch.checkpoint_hash)? else {
             bail!("checkpoint settlement unit batch references unknown anchor");
         };
-        let expected_parent_hash = anchor
-            .parent_hash
-            .ok_or_else(|| {
-                anyhow!("genesis checkpoint cannot recover settlement units from a parent")
-            })?;
-        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
+        let expected_parent_hash = anchor.parent_hash.ok_or_else(|| {
+            anyhow!("genesis checkpoint cannot recover settlement units from a parent")
+        })?;
+        let ids = self
+            .db
+            .get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
         if ids.is_empty() {
             bail!("checkpoint settlement unit batch arrived before settlement unit ids were recovered");
         }
         let Some(settlement_unit_cf) = self.db.db.cf_handle("settlement_unit") else {
             bail!("settlement_unit column family missing");
         };
-        let Some(settlement_unit_checkpoint_cf) = self.db.db.cf_handle("settlement_unit_checkpoint") else {
+        let Some(settlement_unit_checkpoint_cf) =
+            self.db.db.cf_handle("settlement_unit_checkpoint")
+        else {
             bail!("settlement_unit_checkpoint column family missing");
         };
         let Some(rev_cf) = self.db.db.cf_handle("settlement_unit_checkpoint_index") else {
@@ -3174,7 +3101,10 @@ impl RuntimeState {
             .zip(batch.settlement_units.into_iter())
         {
             let Some(expected_settlement_unit_id) = ids.get(index as usize) else {
-                bail!("checkpoint settlement unit batch index {} is out of range", index);
+                bail!(
+                    "checkpoint settlement unit batch index {} is out of range",
+                    index
+                );
             };
             if &settlement_unit.id != expected_settlement_unit_id {
                 bail!("checkpoint settlement unit batch settlement unit id does not match checkpoint id bundle");
@@ -3194,8 +3124,16 @@ impl RuntimeState {
                 bail!("checkpoint settlement unit id mismatch");
             }
             let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
-            write_batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
-            write_batch.put_cf(settlement_unit_checkpoint_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
+            write_batch.put_cf(
+                settlement_unit_cf,
+                &settlement_unit.id,
+                &settlement_unit_bytes,
+            );
+            write_batch.put_cf(
+                settlement_unit_checkpoint_cf,
+                &settlement_unit.id,
+                &anchor.num.to_le_bytes(),
+            );
             let mut rev_key = Vec::with_capacity(8 + 32);
             rev_key.extend_from_slice(&anchor.num.to_le_bytes());
             rev_key.extend_from_slice(&settlement_unit.id);
@@ -3243,6 +3181,18 @@ impl RuntimeState {
             let mut adopted = false;
             let mut rejected = Vec::new();
             for pending in candidates {
+                if pending.anchor.ordering_path == OrderingPath::DagBftSharedState {
+                    let proposal = anchor_proposal_from_anchor(&pending.anchor);
+                    let missing_batch_ids =
+                        missing_shared_state_dag_batches(&proposal, self.db.as_ref())?;
+                    if !missing_batch_ids.is_empty() {
+                        for missing_batch_id in missing_batch_ids {
+                            let _ = self.request_shared_state_dag_batch(missing_batch_id).await;
+                        }
+                        rejected.push(pending);
+                        continue;
+                    }
+                }
                 if validate_anchor(&pending.anchor, &self.db).is_ok() {
                     if self
                         .db
@@ -3280,24 +3230,13 @@ impl RuntimeState {
                 return Ok(());
             }
         }
-        let proposal = AnchorProposal {
-            num: anchor.num,
-            hash: anchor.hash,
-            parent_hash: anchor.parent_hash,
-            position: anchor.position,
-            ordering_path: anchor.ordering_path,
-            merkle_root: anchor.merkle_root,
-            settlement_unit_count: anchor.settlement_unit_count,
-            dag_round: anchor.dag_round,
-            dag_frontier: anchor.dag_frontier.clone(),
-            ordered_batch_ids: anchor.ordered_batch_ids.clone(),
-            ordered_tx_root: anchor.ordered_tx_root,
-            ordered_tx_count: anchor.ordered_tx_count,
-            validator_set: anchor.validator_set.clone(),
-        };
+        let proposal = anchor_proposal_from_anchor(&anchor);
         if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
             if anchor.ordered_tx_count > 0
-                && self.db.load_fast_path_batch(&anchor.ordered_tx_root)?.is_none()
+                && self
+                    .db
+                    .load_fast_path_batch(&anchor.ordered_tx_root)?
+                    .is_none()
             {
                 let _ = self.request_fast_path_batch(anchor.ordered_tx_root).await;
                 self.buffer_anchor(anchor).await;
@@ -3312,25 +3251,11 @@ impl RuntimeState {
                     .map_err(anyhow::Error::msg)?;
             }
         } else if anchor.ordering_path == OrderingPath::DagBftSharedState {
-            let proposal = AnchorProposal {
-                num: anchor.num,
-                hash: anchor.hash,
-                parent_hash: anchor.parent_hash,
-                position: anchor.position,
-                ordering_path: anchor.ordering_path,
-                merkle_root: anchor.merkle_root,
-                settlement_unit_count: anchor.settlement_unit_count,
-                dag_round: anchor.dag_round,
-                dag_frontier: anchor.dag_frontier.clone(),
-                ordered_batch_ids: anchor.ordered_batch_ids.clone(),
-                ordered_tx_root: anchor.ordered_tx_root,
-                ordered_tx_count: anchor.ordered_tx_count,
-                validator_set: anchor.validator_set.clone(),
-            };
-            if let Some(missing_batch_id) =
-                first_missing_shared_state_dag_batch(&proposal, self.db.as_ref())?
-            {
-                let _ = self.request_shared_state_dag_batch(missing_batch_id).await;
+            let missing_batch_ids = missing_shared_state_dag_batches(&proposal, self.db.as_ref())?;
+            if !missing_batch_ids.is_empty() {
+                for missing_batch_id in missing_batch_ids {
+                    let _ = self.request_shared_state_dag_batch(missing_batch_id).await;
+                }
                 self.buffer_anchor(anchor).await;
                 return Ok(());
             }
@@ -3396,7 +3321,9 @@ impl RuntimeState {
                 Some(
                     self.db
                         .load_fast_path_batch(&anchor.ordered_tx_root)?
-                        .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is unavailable"))?
+                        .ok_or_else(|| {
+                            anyhow!("fast-path batch for finalized anchor is unavailable")
+                        })?
                         .txs,
                 )
             } else {
@@ -3441,14 +3368,9 @@ impl RuntimeState {
 
 pub async fn spawn(
     net_cfg: config::Net,
-    p2p_cfg: config::P2p,
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
 ) -> Result<NetHandle> {
-    if net_cfg.quiet_by_default {
-        set_quiet_logging(true);
-    }
-
     let published_addresses = published_addresses(&net_cfg);
     let identity = NodeIdentity::load_runtime_in_dir(
         db.base_path(),
@@ -3463,9 +3385,8 @@ pub async fn spawn(
     let rustls_server = build_server_config(&identity)?;
     let rustls_client = build_client_config(&identity, expected_peers.clone())?;
 
-    let idle_timeout_secs = net_cfg
-        .idle_timeout_secs
-        .max(net_cfg.keep_alive_interval_secs.saturating_add(1))
+    let idle_timeout_secs = P2P_IDLE_TIMEOUT_SECS
+        .max(P2P_KEEP_ALIVE_SECS.saturating_add(1))
         .max(1);
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.max_idle_timeout(Some(
@@ -3473,9 +3394,7 @@ pub async fn spawn(
             .try_into()
             .map_err(|_| anyhow!("invalid QUIC idle timeout"))?,
     ));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(
-        net_cfg.keep_alive_interval_secs.max(1),
-    )));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(P2P_KEEP_ALIVE_SECS.max(1))));
     let transport_config = Arc::new(transport_config);
 
     let mut server_config =
@@ -3490,16 +3409,10 @@ pub async fn spawn(
     endpoint.set_default_client_config(client_config.clone());
 
     let bootstrap_records = load_bootstrap_records(&net_cfg.bootstrap)?;
-    if net_cfg.strict_trust && bootstrap_records.is_empty() {
-        bail!("strict trust is enabled, but no bootstrap node records were configured");
-    }
+    let strict_root_pinning = !bootstrap_records.is_empty();
     let trust_policy = TrustPolicy::load(&bootstrap_records, &net_cfg.trust_updates)?
-        .with_strict_root_pinning(net_cfg.strict_trust);
-    let banned_node_ids = net_cfg
-        .banned_peer_ids
-        .iter()
-        .filter_map(|value| decode_node_id_hex(value).ok())
-        .collect::<HashSet<_>>();
+        .with_strict_root_pinning(strict_root_pinning);
+    let banned_node_ids = HashSet::new();
 
     let persisted_records = load_persisted_records(&db, &banned_node_ids)?;
     let persisted_archive_manifests = db.load_shielded_archive_providers()?;
@@ -3523,11 +3436,11 @@ pub async fn spawn(
         expected_peers,
         trust_policy,
         bootstrap_records: bootstrap_records.clone(),
-        max_peers: net_cfg.max_peers as usize,
-        connection_timeout: Duration::from_secs(net_cfg.connection_timeout_secs.max(1)),
+        max_peers: MAX_PEERS,
+        connection_timeout: Duration::from_secs(CONNECTION_TIMEOUT_SECS),
         published_addresses,
         banned_node_ids: banned_node_ids.clone(),
-        p2p_policy: P2pPolicy::from_config(&p2p_cfg),
+        p2p_policy: P2pPolicy::fixed(),
         peer_policy: Arc::new(AsyncMutex::new(HashMap::new())),
         known_records: Arc::new(RwLock::new(HashMap::new())),
         peers: Arc::new(RwLock::new(HashMap::new())),
@@ -3555,7 +3468,7 @@ pub async fn spawn(
                 .map(|replica| ((replica.provider_id, replica.shard_id), replica))
                 .collect(),
         )),
-        peer_exchange: net_cfg.peer_exchange,
+        peer_exchange: PEER_EXCHANGE_ENABLED,
     };
 
     {
@@ -3586,7 +3499,7 @@ pub async fn spawn(
         endpoint: Arc::new(AsyncMutex::new(Some(endpoint.clone()))),
         db: state.db.clone(),
         identity: Some(state.identity.clone()),
-        archive_sync_timeout: Duration::from_secs(net_cfg.sync_timeout_secs.max(1)),
+        archive_sync_timeout: Duration::from_secs(ARCHIVE_SYNC_TIMEOUT_SECS),
         local_node_id: local_record.node_id,
         known_records: state.known_records.clone(),
         archive_manifests: state.archive_manifests.clone(),
@@ -3847,14 +3760,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::GossipCompactEpoch(compact) => {
-            state
-                .sign_and_broadcast(
-                    WireTopic::CompactEpoch,
-                    canonical::encode_compact_epoch(&compact)?,
-                )
-                .await?;
-        }
         NetworkCommand::ProposeAnchor { proposal, reply } => {
             if let Err(err) = state.start_local_anchor_proposal(proposal, reply).await {
                 net_log!("⚠️  Failed to start local anchor proposal: {}", err);
@@ -3973,9 +3878,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
             .await;
             let _ = reply.send(result);
         }
-        NetworkCommand::GossipArchiveRetrievalReceipt(receipt) => {
-            state.publish_archive_retrieval_receipt(receipt).await?;
-        }
         NetworkCommand::RedialBootstraps => {
             for record in state.bootstrap_records.clone() {
                 let _ = state.dial_record(record).await;
@@ -4038,9 +3940,9 @@ impl Network {
     }
 
     pub async fn gossip_settlement_unit(&self, settlement_unit: &SettlementUnitCandidate) {
-        let _ = self
-            .command_tx
-            .send(NetworkCommand::GossipSettlementUnit(settlement_unit.clone()));
+        let _ = self.command_tx.send(NetworkCommand::GossipSettlementUnit(
+            settlement_unit.clone(),
+        ));
     }
 
     pub async fn gossip_tx(&self, tx: &crate::transaction::Tx) {
@@ -4058,12 +3960,6 @@ impl Network {
         let _ = self
             .command_tx
             .send(NetworkCommand::GossipSharedStateDagBatch(batch.clone()));
-    }
-
-    pub async fn gossip_compact_epoch(&self, compact: CompactEpoch) {
-        let _ = self
-            .command_tx
-            .send(NetworkCommand::GossipCompactEpoch(compact));
     }
 
     pub fn anchor_subscribe(&self) -> broadcast::Receiver<Anchor> {
@@ -4097,14 +3993,6 @@ impl Network {
         }
         update(&mut ledger);
         self.db.store_shielded_archive_service_ledger(&ledger)?;
-        let directory = self.local_archive_directory().await?;
-        for scorecard in directory.operator_scorecards(
-            PROTOCOL.archive_provider_replica_count as usize,
-            PROTOCOL.archive_retention_horizon_epochs,
-        ) {
-            self.db
-                .store_shielded_archive_operator_scorecard(&scorecard)?;
-        }
         Ok(())
     }
 
@@ -4530,7 +4418,9 @@ impl Network {
     pub async fn request_checkpoint_settlement_unit_ids(&self, checkpoint_num: u64) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestCheckpointSettlementUnitIds(checkpoint_num));
+            .send(NetworkCommand::RequestCheckpointSettlementUnitIds(
+                checkpoint_num,
+            ));
     }
 
     pub async fn request_checkpoint_settlement_unit_batch(
@@ -4540,16 +4430,23 @@ impl Network {
     ) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestCheckpointSettlementUnitBatch(CheckpointGetSettlementUnitBatch {
-                checkpoint_hash,
-                indexes,
-            }));
+            .send(NetworkCommand::RequestCheckpointSettlementUnitBatch(
+                CheckpointGetSettlementUnitBatch {
+                    checkpoint_hash,
+                    indexes,
+                },
+            ));
     }
 
-    pub async fn request_checkpoint_settlement_unit_candidates(&self, parent_checkpoint_hash: [u8; 32]) {
+    pub async fn request_checkpoint_settlement_unit_candidates(
+        &self,
+        parent_checkpoint_hash: [u8; 32],
+    ) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestCheckpointSettlementUnitCandidates(parent_checkpoint_hash));
+            .send(NetworkCommand::RequestCheckpointSettlementUnitCandidates(
+                parent_checkpoint_hash,
+            ));
     }
 
     pub async fn request_checkpoint_leaves(&self, checkpoint_num: u64) {
@@ -4662,7 +4559,6 @@ impl Network {
             replicas,
             self.db.load_shielded_archive_service_ledgers()?,
             custody_commitments,
-            self.db.load_shielded_archive_retrieval_receipts()?,
         )
     }
 
@@ -4770,23 +4666,9 @@ impl Network {
                     .collect(),
             };
             let started = Instant::now();
-            let receipt_from_epoch = batch
-                .requests
-                .iter()
-                .flat_map(|routed| routed.request.queries.iter().map(|query| query.epoch))
-                .min()
-                .unwrap_or(0);
-            let receipt_through_epoch = batch
-                .requests
-                .iter()
-                .flat_map(|routed| routed.request.queries.iter().map(|query| query.epoch))
-                .max()
-                .unwrap_or(receipt_from_epoch);
-            let mut request_message_id = None;
             let response_result: Result<CheckpointBatchEvent> = async {
                 if manifest.provider_id == self.local_node_id {
                     Ok(CheckpointBatchEvent {
-                        message_id: [0u8; 32],
                         response_to_message_id: [0u8; 32],
                         provider_id: manifest.provider_id,
                         response: self
@@ -4810,14 +4692,12 @@ impl Network {
                             reply: reply_tx,
                         })
                         .map_err(|_| anyhow!("checkpoint request channel closed"))?;
-                    request_message_id = Some(
-                        reply_rx
-                            .await
-                            .map_err(|_| anyhow!("checkpoint request sender dropped"))??,
-                    );
+                    let request_message_id = reply_rx
+                        .await
+                        .map_err(|_| anyhow!("checkpoint request sender dropped"))??;
                     self.await_checkpoint_batch_response(
                         &mut response_rx,
-                        request_message_id.expect("request message id"),
+                        request_message_id,
                         manifest.provider_id,
                         deadline,
                     )
@@ -4825,34 +4705,9 @@ impl Network {
                 }
             }
             .await;
-            let emit_failure_receipt = |latency_ms: u64| {
-                if let Some(request_message_id) = request_message_id {
-                    let _ = self
-                        .command_tx
-                        .send(NetworkCommand::GossipArchiveRetrievalReceipt(
-                            ArchiveRetrievalReceipt::new(
-                                self.local_node_id,
-                                manifest.provider_id,
-                                manifest.manifest_digest,
-                                crate::shielded::ArchiveRetrievalKind::CheckpointBatch,
-                                request_message_id,
-                                None,
-                                receipt_from_epoch,
-                                receipt_through_epoch,
-                                None,
-                                0,
-                                false,
-                                latency_ms,
-                                unix_ms(),
-                            ),
-                        ));
-                }
-            };
             let checkpoint_event = match response_result {
                 Ok(response) => response,
                 Err(err) => {
-                    let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    emit_failure_receipt(latency_ms);
                     let _ = self
                         .update_archive_service_ledger(
                             manifest.provider_id,
@@ -4863,12 +4718,9 @@ impl Network {
                     return Err(err);
                 }
             };
-            let response_message_id = checkpoint_event.message_id;
             let checkpoint_response = checkpoint_event.response;
 
             if let Err(err) = checkpoint_response.verify_against_manifest(&manifest, &directory) {
-                let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                emit_failure_receipt(latency_ms);
                 let _ = self
                     .update_archive_service_ledger(
                         manifest.provider_id,
@@ -4879,8 +4731,6 @@ impl Network {
                 return Err(err);
             }
             if checkpoint_response.responses.len() != batch.requests.len() {
-                let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                emit_failure_receipt(latency_ms);
                 bail!("checkpoint batch response length mismatch");
             }
             let served_segments = batch
@@ -4889,27 +4739,6 @@ impl Network {
                 .filter(|routed| routed.request_index.is_some())
                 .count() as u64;
             let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            if let Some(request_message_id) = request_message_id {
-                let _ = self
-                    .command_tx
-                    .send(NetworkCommand::GossipArchiveRetrievalReceipt(
-                        ArchiveRetrievalReceipt::new(
-                            self.local_node_id,
-                            manifest.provider_id,
-                            manifest.manifest_digest,
-                            crate::shielded::ArchiveRetrievalKind::CheckpointBatch,
-                            request_message_id,
-                            Some(response_message_id),
-                            receipt_from_epoch,
-                            receipt_through_epoch,
-                            None,
-                            served_segments.max(1).min(u32::MAX as u64) as u32,
-                            true,
-                            latency_ms,
-                            unix_ms(),
-                        ),
-                    ));
-            }
             let _ = self
                 .update_archive_service_ledger(
                     manifest.provider_id,
@@ -5013,16 +4842,6 @@ fn published_addresses(net_cfg: &config::Net) -> Vec<String> {
     vec![SocketAddr::new(ip, net_cfg.listen_port).to_string()]
 }
 
-fn decode_node_id_hex(value: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(value.trim())?;
-    if raw.len() != 32 {
-        bail!("node id must be 32 bytes");
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&raw);
-    Ok(out)
-}
-
 fn load_bootstrap_records(items: &[String]) -> Result<Vec<NodeRecordV2>> {
     let mut out = Vec::new();
     for item in items {
@@ -5092,7 +4911,6 @@ fn should_relay_topic(topic: WireTopic) -> bool {
             | WireTopic::SharedStateDagBatch
             | WireTopic::SettlementUnitCandidate
             | WireTopic::Tx
-            | WireTopic::CompactEpoch
             | WireTopic::NodeRecord
     )
 }
@@ -5413,7 +5231,10 @@ mod tests {
     }
 }
 
-fn validate_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate, db: &Store) -> Result<(), String> {
+fn validate_settlement_unit_candidate(
+    settlement_unit: &SettlementUnitCandidate,
+    db: &Store,
+) -> Result<(), String> {
     let _anchor: Anchor = db
         .get_checkpoint_for_settlement_unit(&settlement_unit.id)
         .ok()
@@ -5594,7 +5415,9 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
                 let batch = db
                     .load_fast_path_batch(&anchor.ordered_tx_root)
                     .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "fast-path batch for finalized anchor is unavailable".to_string())?;
+                    .ok_or_else(|| {
+                        "fast-path batch for finalized anchor is unavailable".to_string()
+                    })?;
                 validate_fast_path_batch_for_proposal(&proposal, &batch, db)?;
             }
         }
@@ -5623,7 +5446,9 @@ fn validate_fast_path_batch_for_proposal(
         return Err("fast-path ordered tx root does not match the proposal commitment".to_string());
     }
     if proposal.ordered_tx_count != batch_count {
-        return Err("fast-path ordered tx count does not match the proposal commitment".to_string());
+        return Err(
+            "fast-path ordered tx count does not match the proposal commitment".to_string(),
+        );
     }
     Ok(())
 }
@@ -5642,7 +5467,9 @@ fn checkpoint_settlement_unit_selection(
     Ok((candidates, root, count))
 }
 
-fn checkpoint_settlement_unit_commitment(candidates: &[SettlementUnitCandidate]) -> ([u8; 32], u32) {
+fn checkpoint_settlement_unit_commitment(
+    candidates: &[SettlementUnitCandidate],
+) -> ([u8; 32], u32) {
     let settlement_unit_ids = candidates
         .iter()
         .map(|candidate| candidate.id)
@@ -5755,11 +5582,30 @@ fn frontier_for_round(batches: &[SharedStateDagBatch]) -> Vec<[u8; 32]> {
     frontier
 }
 
-fn first_missing_shared_state_dag_batch(
+fn anchor_proposal_from_anchor(anchor: &Anchor) -> AnchorProposal {
+    AnchorProposal {
+        num: anchor.num,
+        hash: anchor.hash,
+        parent_hash: anchor.parent_hash,
+        position: anchor.position,
+        ordering_path: anchor.ordering_path,
+        merkle_root: anchor.merkle_root,
+        settlement_unit_count: anchor.settlement_unit_count,
+        dag_round: anchor.dag_round,
+        dag_frontier: anchor.dag_frontier.clone(),
+        ordered_batch_ids: anchor.ordered_batch_ids.clone(),
+        ordered_tx_root: anchor.ordered_tx_root,
+        ordered_tx_count: anchor.ordered_tx_count,
+        validator_set: anchor.validator_set.clone(),
+    }
+}
+
+fn missing_shared_state_dag_batches(
     proposal: &AnchorProposal,
     db: &Store,
-) -> Result<Option<[u8; 32]>> {
+) -> Result<Vec<[u8; 32]>> {
     let mut seen = BTreeSet::new();
+    let mut missing = Vec::new();
     for batch_id in proposal
         .dag_frontier
         .iter()
@@ -5769,10 +5615,10 @@ fn first_missing_shared_state_dag_batch(
             continue;
         }
         if db.load_shared_state_dag_batch(batch_id)?.is_none() {
-            return Ok(Some(*batch_id));
+            missing.push(*batch_id);
         }
     }
-    Ok(None)
+    Ok(missing)
 }
 
 fn validate_shared_state_dag_batch_basic(
@@ -6341,8 +6187,16 @@ fn persist_selected_candidates_for_anchor(
         }
         let settlement_unit = candidate.into_confirmed();
         let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
-        batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
-        batch.put_cf(settlement_unit_checkpoint_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
+        batch.put_cf(
+            settlement_unit_cf,
+            &settlement_unit.id,
+            &settlement_unit_bytes,
+        );
+        batch.put_cf(
+            settlement_unit_checkpoint_cf,
+            &settlement_unit.id,
+            &anchor.num.to_le_bytes(),
+        );
         let mut rev_key = Vec::with_capacity(8 + 32);
         rev_key.extend_from_slice(&anchor.num.to_le_bytes());
         rev_key.extend_from_slice(&settlement_unit.id);

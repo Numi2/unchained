@@ -43,7 +43,11 @@ pub struct SettlementUnitCandidate {
 
 impl SettlementUnit {
     /// Creates the canonical bytes that identify a bootstrap settlement unit.
-    pub fn header_bytes(parent_checkpoint_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> Vec<u8> {
+    pub fn header_bytes(
+        parent_checkpoint_hash: &[u8; 32],
+        nonce: u64,
+        creator_address: &Address,
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32 + 8 + 32);
         bytes.extend_from_slice(parent_checkpoint_hash);
         bytes.extend_from_slice(&nonce.to_le_bytes());
@@ -52,7 +56,11 @@ impl SettlementUnit {
     }
 
     /// Calculate the settlement unit ID from its components.
-    pub fn calculate_id(parent_checkpoint_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
+    pub fn calculate_id(
+        parent_checkpoint_hash: &[u8; 32],
+        nonce: u64,
+        creator_address: &Address,
+    ) -> [u8; 32] {
         let mut id_hasher = blake3::Hasher::new();
         id_hasher.update(parent_checkpoint_hash);
         id_hasher.update(&nonce.to_le_bytes());
@@ -156,6 +164,8 @@ pub fn decode_settlement_unit(bytes: &[u8]) -> Result<SettlementUnit, bincode::E
     bincode::deserialize::<SettlementUnit>(bytes)
 }
 
-pub fn decode_settlement_unit_candidate(bytes: &[u8]) -> Result<SettlementUnitCandidate, bincode::Error> {
+pub fn decode_settlement_unit_candidate(
+    bytes: &[u8],
+) -> Result<SettlementUnitCandidate, bincode::Error> {
     bincode::deserialize::<SettlementUnitCandidate>(bytes)
 }

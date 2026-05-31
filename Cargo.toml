@@ -15,66 +15,41 @@ risc0-zkp = { path = "vendor/risc0-zkp" }
 
 # Post-quantum cryptography is enabled via rustls features in dependencies
 
-[build-dependencies]
-cc = "1"
-
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 clap = { version = "4.5", features = ["derive"] }
 blake3 = "1.5"
-subtle = "2.5"
 argon2 = "0.5"
 rand = "0.8"
 chacha20poly1305 = { version = "0.9.1" }
-rpassword = "7"
-atty = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 quinn = { version = "0.11.8", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rocksdb = "0.21"
-prometheus = "0.13"
-futures = "0.3"
 anyhow = "1.0"
-toml = "0.8"
 bincode = "1.3"
 zstd = "0.13"
 hex = "0.4"
 serde-big-array = "0.5"
 ml-kem = { version = "0.2.1", features = ["deterministic"] }
 # Finalized NIST ML-KEM for wallet and asset-layer key encapsulation
-# AEAD for encrypting one-time secret keys in stealth outputs
-aes-gcm-siv = "0.11"
 base64 = "0.22"
-qrcode = "0.14"
-arboard = "3.4"
-# Dependencies for TLS certificate generation and post-quantum cryptography
-rcgen = "0.13"
+# Dependencies for TLS and post-quantum cryptography
 rustls = { version = "0.23.22", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 aws-lc-rs = { version = "1.13.3", features = ["unstable"] }
-webpki-roots = "0.26"
-tokio-rustls = "0.26"
-chrono = { version = "0.4", features = ["serde"] }
-postcard = "1.1.3"
-bytes = "1.10.1"
-log = "0.4.27"
-serde_bytes = "0.11.17"
-once_cell = "1.19"
 serde_json = "1.0"
-hyper = { version = "0.14", features = ["full"] }
-risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std", "prove", "disable-dev-mode"] }
-methods = { path = "methods" }
+risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std", "disable-dev-mode"] }
+methods = { path = "methods", optional = true }
 proof-core = { path = "proof-core" }
 chalamet_pir = "0.6.0"
 
-hickory-resolver = { version = "=0.25.0-alpha.4", default-features = false, features = ["tokio-runtime"] }
-hickory-proto = "=0.25.0-alpha.4"
-hickory-client = "=0.25.0-alpha.4"
 zeroize = "1.8.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 # liboqs removed; no runtime oqs dependency
 
 [features]
 default = []
+local-prover = ["dep:methods", "risc0-zkvm/prove"]
 
 [[bin]]
 name = "unchained_node"
@@ -83,6 +58,11 @@ path = "src/bin/unchained_node.rs"
 [[bin]]
 name = "unchained_wallet"
 path = "src/bin/unchained_wallet.rs"
+
+[[bin]]
+name = "unchained_proof_assistant"
+path = "src/bin/unchained_proof_assistant.rs"
+required-features = ["local-prover"]
 
 [[bin]]
 name = "inspect_db"

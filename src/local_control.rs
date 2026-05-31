@@ -5,7 +5,6 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -102,11 +101,23 @@ pub fn verify_capability(
     presented: &ControlCapability,
     label: &str,
 ) -> Result<()> {
-    if bool::from(expected.ct_eq(presented)) {
+    if constant_time_capability_eq(expected, presented) {
         Ok(())
     } else {
         bail!("unauthorized {label} request")
     }
+}
+
+#[inline(never)]
+fn constant_time_capability_eq(
+    expected: &ControlCapability,
+    presented: &ControlCapability,
+) -> bool {
+    let mut diff = 0u8;
+    for index in 0..expected.len() {
+        diff |= expected[index] ^ presented[index];
+    }
+    diff == 0
 }
 
 pub fn write_sync_frame<T: Serialize>(

@@ -1,14 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
-use methods::{
-    CHECKPOINT_ACCUMULATOR_METHOD_ELF, CHECKPOINT_ACCUMULATOR_METHOD_ID,
-    PRIVATE_DELEGATION_METHOD_ELF, PRIVATE_DELEGATION_METHOD_ID, PRIVATE_UNDELEGATION_METHOD_ELF,
-    PRIVATE_UNDELEGATION_METHOD_ID, SHIELDED_SPEND_METHOD_ELF, SHIELDED_SPEND_METHOD_ID,
-    UNBONDING_CLAIM_METHOD_ELF, UNBONDING_CLAIM_METHOD_ID,
-};
-use once_cell::sync::Lazy;
+#[cfg(feature = "local-prover")]
+use proof_core::CheckpointAccumulatorStepWitness;
 use proof_core::{
-    CheckpointAccumulatorJournal, CheckpointAccumulatorStepWitness,
-    HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
+    CheckpointAccumulatorJournal, HistoricalAbsenceRecord as ProofHistoricalAbsenceRecord,
     HistoricalUnspentCheckpoint as ProofHistoricalUnspentCheckpoint,
     HistoricalUnspentPacket as ProofHistoricalUnspentPacket,
     HistoricalUnspentSegment as ProofHistoricalUnspentSegment,
@@ -17,14 +11,19 @@ use proof_core::{
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
     NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofPrivateDelegationJournal,
     ProofPrivateDelegationWitness, ProofPrivateUndelegationJournal,
-    ProofPrivateUndelegationWitness, ProofShieldedInputWitness, ProofShieldedNote,
-    ProofShieldedNoteKind, ProofShieldedOutput, ProofShieldedOutputBinding,
+    ProofPrivateUndelegationWitness, ProofShieldedInputBinding, ProofShieldedInputWitness,
+    ProofShieldedNote, ProofShieldedNoteKind, ProofShieldedOutput, ProofShieldedOutputBinding,
     ProofShieldedOutputPlaintext, ProofShieldedOutputWitness, ProofShieldedTxJournal,
     ProofShieldedTxWitness,
 };
-use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, Prover, ProverOpts, Receipt};
+#[cfg(feature = "local-prover")]
+use risc0_zkvm::{default_prover, ExecutorEnv, Prover, ProverOpts};
+use risc0_zkvm::{InnerReceipt, Receipt};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{LazyLock as Lazy, Mutex},
+};
 
 use crate::{
     crypto::{TaggedKemPublicKey, TaggedSigningPublicKey},
@@ -38,12 +37,25 @@ use crate::{
 };
 
 mod native_transfer;
-use native_transfer::OrdinaryTransferBackend;
 
 const TRANSPARENT_PROOF_VERSION: u8 = 1;
 pub const MIN_TRANSPARENT_PROOF_SECURITY_BITS: u16 = 128;
-const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str = "unchained-transparent-verifier-key-v1";
 const TRANSPARENT_STATEMENT_DIGEST_DOMAIN: &str = "unchained-transparent-statement-digest-v1";
+const SHIELDED_SPEND_METHOD_ID: [u32; 8] = [
+    3353102763, 2520134818, 3834938281, 4278180704, 3365674720, 2539798266, 173425445, 2238720516,
+];
+const CHECKPOINT_ACCUMULATOR_METHOD_ID: [u32; 8] = [
+    368419174, 3286705957, 2949283656, 876407933, 2601491495, 1887936821, 960029887, 3256085236,
+];
+const PRIVATE_DELEGATION_METHOD_ID: [u32; 8] = [
+    2030932229, 9371597, 845142963, 1212657550, 1924367152, 2869045121, 1000522605, 620176408,
+];
+const PRIVATE_UNDELEGATION_METHOD_ID: [u32; 8] = [
+    678359658, 1102185965, 4086785271, 2372437024, 2818579157, 1921332819, 1610681682, 1290627891,
+];
+const UNBONDING_CLAIM_METHOD_ID: [u32; 8] = [
+    1424155339, 922815696, 3818321019, 816648079, 3397685264, 1829748803, 842567441, 3633824877,
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransparentProofStatement {
@@ -122,9 +134,6 @@ pub struct CheckpointAccumulatorProof {
     pub proof: TransparentProof,
 }
 
-const PROOF_FIXTURE_DIR_ENV: &str = "UNCHAINED_PROOF_FIXTURE_DIR";
-const PROOF_FIXTURE_MINT_ENV: &str = "UNCHAINED_ALLOW_PROOF_FIXTURE_MINT";
-
 static VERIFIED_SHIELDED_RECEIPTS: Lazy<Mutex<HashMap<[u8; 32], ProofShieldedTxJournal>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static VERIFIED_PRIVATE_DELEGATION_RECEIPTS: Lazy<
@@ -137,7 +146,6 @@ static VERIFIED_PRIVATE_UNDELEGATION_RECEIPTS: Lazy<
 struct TransparentBackendBinding {
     verifier_key_commitment: [u8; 32],
     method_id: [u32; 8],
-    elf: &'static [u8],
 }
 
 fn receipt_cache_key(bytes: &[u8]) -> [u8; 32] {
@@ -148,19 +156,12 @@ fn configured_backend_for_circuit(_circuit: TransparentCircuit) -> TransparentPr
     TransparentProofBackend::PrototypeRisc0StarkV1
 }
 
-fn verifier_key_commitment_from_method_id(method_id: [u32; 8]) -> [u8; 32] {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(&method_id));
-    for word in method_id {
-        bytes.extend_from_slice(&word.to_le_bytes());
-    }
-    proof_core::proof_hash_bytes(TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN, &bytes)
-}
-
-fn backend_binding(method_id: [u32; 8], elf: &'static [u8]) -> TransparentBackendBinding {
+fn backend_binding(method_id: [u32; 8]) -> TransparentBackendBinding {
     TransparentBackendBinding {
-        verifier_key_commitment: verifier_key_commitment_from_method_id(method_id),
+        verifier_key_commitment: proof_core::transparent_verifier_key_commitment_from_hint(
+            method_id,
+        ),
         method_id,
-        elf,
     }
 }
 
@@ -172,30 +173,35 @@ fn transparent_backend_binding(
         (
             TransparentCircuit::OrdinaryTransferV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => backend_binding(SHIELDED_SPEND_METHOD_ID, SHIELDED_SPEND_METHOD_ELF),
+        ) => backend_binding(SHIELDED_SPEND_METHOD_ID),
         (
             TransparentCircuit::PrivateDelegationV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => backend_binding(PRIVATE_DELEGATION_METHOD_ID, PRIVATE_DELEGATION_METHOD_ELF),
+        ) => backend_binding(PRIVATE_DELEGATION_METHOD_ID),
         (
             TransparentCircuit::PrivateUndelegationV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => backend_binding(
-            PRIVATE_UNDELEGATION_METHOD_ID,
-            PRIVATE_UNDELEGATION_METHOD_ELF,
-        ),
+        ) => backend_binding(PRIVATE_UNDELEGATION_METHOD_ID),
         (TransparentCircuit::UnbondingClaimV1, TransparentProofBackend::PrototypeRisc0StarkV1) => {
-            backend_binding(UNBONDING_CLAIM_METHOD_ID, UNBONDING_CLAIM_METHOD_ELF)
+            backend_binding(UNBONDING_CLAIM_METHOD_ID)
         }
         (
             TransparentCircuit::CheckpointAccumulatorV1,
             TransparentProofBackend::PrototypeRisc0StarkV1,
-        ) => backend_binding(
-            CHECKPOINT_ACCUMULATOR_METHOD_ID,
-            CHECKPOINT_ACCUMULATOR_METHOD_ELF,
-        ),
+        ) => backend_binding(CHECKPOINT_ACCUMULATOR_METHOD_ID),
     };
     Ok(binding)
+}
+
+#[cfg(feature = "local-prover")]
+fn prover_elf_for_circuit(circuit: TransparentCircuit) -> &'static [u8] {
+    match circuit {
+        TransparentCircuit::OrdinaryTransferV1 => methods::SHIELDED_SPEND_METHOD_ELF,
+        TransparentCircuit::PrivateDelegationV1 => methods::PRIVATE_DELEGATION_METHOD_ELF,
+        TransparentCircuit::PrivateUndelegationV1 => methods::PRIVATE_UNDELEGATION_METHOD_ELF,
+        TransparentCircuit::UnbondingClaimV1 => methods::UNBONDING_CLAIM_METHOD_ELF,
+        TransparentCircuit::CheckpointAccumulatorV1 => methods::CHECKPOINT_ACCUMULATOR_METHOD_ELF,
+    }
 }
 
 fn configured_backend_binding(circuit: TransparentCircuit) -> Result<TransparentBackendBinding> {
@@ -457,17 +463,6 @@ pub fn canonical_circuit_for_statement(statement: TransparentProofStatement) -> 
     }
 }
 
-fn proof_fixture_dir() -> Option<PathBuf> {
-    std::env::var_os(PROOF_FIXTURE_DIR_ENV).map(PathBuf::from)
-}
-
-fn proof_fixture_mint_allowed() -> bool {
-    matches!(
-        std::env::var(PROOF_FIXTURE_MINT_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
-}
-
 fn transparent_statement_tag(statement: TransparentProofStatement) -> u8 {
     match statement {
         TransparentProofStatement::ShieldedTransfer => 0,
@@ -518,6 +513,22 @@ fn ensure_statement_digest(
     Ok(())
 }
 
+fn ensure_canonical_accumulator_inputs(
+    inputs: &[ProofShieldedInputBinding],
+    context: &str,
+) -> Result<()> {
+    let canonical = configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)?
+        .verifier_key_commitment;
+    for input in inputs {
+        if let Some(actual) = input.historical_accumulator_verifier_key_commitment {
+            if actual != canonical {
+                bail!("{context} uses a non-canonical checkpoint accumulator verifier");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn shielded_journal_statement_digest(
     circuit: TransparentCircuit,
     journal: &ProofShieldedTxJournal,
@@ -543,47 +554,9 @@ fn checkpoint_accumulator_statement_digest(
     statement_digest_for_serializable(TransparentCircuit::CheckpointAccumulatorV1, journal)
 }
 
-fn shielded_receipt_fixture_path(id: &[u8; 32]) -> Option<PathBuf> {
-    proof_fixture_dir().map(|dir| {
-        dir.join("shielded-spend")
-            .join(format!("{}.bin", hex::encode(id)))
-    })
-}
-
-fn load_cached_shielded_proof_seal(id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-    let Some(path) = shielded_receipt_fixture_path(id) else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    Ok(Some(fs::read(&path).with_context(|| {
-        format!("read cached shielded receipt fixture {}", path.display())
-    })?))
-}
-
-fn store_cached_shielded_proof_seal(id: &[u8; 32], bytes: &[u8]) -> Result<()> {
-    let Some(path) = shielded_receipt_fixture_path(id) else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "create cached shielded receipt fixture directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    if path.exists() {
-        return Ok(());
-    }
-    fs::write(&path, bytes)
-        .with_context(|| format!("write cached shielded receipt fixture {}", path.display()))
-}
-
-pub fn shielded_tx_fixture_id(witness: &ProofShieldedTxWitness) -> Result<[u8; 32]> {
+pub fn shielded_tx_witness_digest(witness: &ProofShieldedTxWitness) -> Result<[u8; 32]> {
     Ok(crate::crypto::blake3_hash(
-        &bincode::serialize(witness).context("serialize shielded witness for fixture id")?,
+        &bincode::serialize(witness).context("serialize shielded witness for digest")?,
     ))
 }
 
@@ -602,33 +575,24 @@ fn verify_supported_receipt_kind(
     }
 }
 
+#[cfg(not(feature = "local-prover"))]
+fn local_prover_unavailable<T>() -> Result<T> {
+    bail!(
+        "local proof generation is not present in this verifier build; use the dedicated proof assistant build for proving"
+    )
+}
+
+#[cfg(feature = "local-prover")]
 pub fn prove_shielded_tx(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
     let circuit = TransparentCircuit::OrdinaryTransferV1;
     let binding = configured_backend_binding(circuit)?;
     let prepared = native_transfer::prepare_native_transfer_witness(witness)?;
-    let _native_transfer_scaffold =
-        native_transfer::build_native_transfer_stark_scaffold(&prepared);
-    let fixture_id = shielded_tx_fixture_id(witness)?;
-    if let Some(seal) = load_cached_shielded_proof_seal(&fixture_id)? {
-        let journal = verify_shielded_seal_bytes(&seal)?;
-        let proof = TransparentProof::new_for_circuit_with_digest(
-            circuit,
-            shielded_journal_statement_digest(circuit, &journal)?,
-            seal,
-        );
-        return Ok((proof, journal));
-    }
-    if let Some(path) = shielded_receipt_fixture_path(&fixture_id) {
-        if !proof_fixture_mint_allowed() {
-            bail!(
-                "missing cached shielded receipt fixture {}; set {}=1 to mint it",
-                path.display(),
-                PROOF_FIXTURE_MINT_ENV
-            );
-        }
-    }
+    ensure_canonical_accumulator_inputs(
+        &prepared.public_inputs.journal.inputs,
+        "shielded proof witness",
+    )?;
     let backend = native_transfer::PrototypeRisc0OrdinaryTransferBackend::new(binding);
     let (seal, journal) = backend.prove(&prepared)?;
     let proof = TransparentProof::new_for_circuit_with_digest(
@@ -636,8 +600,14 @@ pub fn prove_shielded_tx(
         shielded_journal_statement_digest(circuit, &journal)?,
         seal,
     );
-    store_cached_shielded_proof_seal(&fixture_id, &proof.seal)?;
     Ok((proof, journal))
+}
+
+#[cfg(not(feature = "local-prover"))]
+pub fn prove_shielded_tx(
+    _witness: &ProofShieldedTxWitness,
+) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
+    local_prover_unavailable()
 }
 
 pub fn verify_shielded_proof(proof: &TransparentProof) -> Result<ProofShieldedTxJournal> {
@@ -648,6 +618,7 @@ pub fn verify_shielded_proof(proof: &TransparentProof) -> Result<ProofShieldedTx
     )?;
     let _ = backend_binding_for_proof(proof)?;
     let journal = verify_shielded_seal_bytes(&proof.seal)?;
+    ensure_canonical_accumulator_inputs(&journal.inputs, "shielded proof")?;
     ensure_statement_digest(
         proof,
         shielded_journal_statement_digest(TransparentCircuit::OrdinaryTransferV1, &journal)?,
@@ -676,11 +647,13 @@ fn verify_shielded_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJournal> {
     Ok(journal)
 }
 
+#[cfg(feature = "local-prover")]
 pub fn prove_private_delegation(
     witness: &ProofPrivateDelegationWitness,
 ) -> Result<(TransparentProof, ProofPrivateDelegationJournal)> {
     let circuit = TransparentCircuit::PrivateDelegationV1;
     let binding = configured_backend_binding(circuit)?;
+    let elf = prover_elf_for_circuit(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -705,7 +678,7 @@ pub fn prove_private_delegation(
         .build()
         .context("build private delegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
+        .prove_with_opts(env, elf, &ProverOpts::fast())
         .context("prove private delegation witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "private delegation receipt", true)?;
@@ -723,6 +696,13 @@ pub fn prove_private_delegation(
     ))
 }
 
+#[cfg(not(feature = "local-prover"))]
+pub fn prove_private_delegation(
+    _witness: &ProofPrivateDelegationWitness,
+) -> Result<(TransparentProof, ProofPrivateDelegationJournal)> {
+    local_prover_unavailable()
+}
+
 pub fn verify_private_delegation_proof(
     proof: &TransparentProof,
 ) -> Result<ProofPrivateDelegationJournal> {
@@ -733,6 +713,7 @@ pub fn verify_private_delegation_proof(
     )?;
     let _ = backend_binding_for_proof(proof)?;
     let journal = verify_private_delegation_seal_bytes(&proof.seal)?;
+    ensure_canonical_accumulator_inputs(&journal.inputs, "private delegation proof")?;
     ensure_statement_digest(
         proof,
         private_delegation_statement_digest(&journal)?,
@@ -765,11 +746,13 @@ fn verify_private_delegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateDele
     Ok(journal)
 }
 
+#[cfg(feature = "local-prover")]
 pub fn prove_private_undelegation(
     witness: &ProofPrivateUndelegationWitness,
 ) -> Result<(TransparentProof, ProofPrivateUndelegationJournal)> {
     let circuit = TransparentCircuit::PrivateUndelegationV1;
     let binding = configured_backend_binding(circuit)?;
+    let elf = prover_elf_for_circuit(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.shielded.inputs {
         match (
@@ -794,7 +777,7 @@ pub fn prove_private_undelegation(
         .build()
         .context("build private undelegation executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
+        .prove_with_opts(env, elf, &ProverOpts::fast())
         .context("prove private undelegation witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "private undelegation receipt", true)?;
@@ -812,6 +795,13 @@ pub fn prove_private_undelegation(
     ))
 }
 
+#[cfg(not(feature = "local-prover"))]
+pub fn prove_private_undelegation(
+    _witness: &ProofPrivateUndelegationWitness,
+) -> Result<(TransparentProof, ProofPrivateUndelegationJournal)> {
+    local_prover_unavailable()
+}
+
 pub fn verify_private_undelegation_proof(
     proof: &TransparentProof,
 ) -> Result<ProofPrivateUndelegationJournal> {
@@ -822,6 +812,7 @@ pub fn verify_private_undelegation_proof(
     )?;
     let _ = backend_binding_for_proof(proof)?;
     let journal = verify_private_undelegation_seal_bytes(&proof.seal)?;
+    ensure_canonical_accumulator_inputs(&journal.inputs, "private undelegation proof")?;
     ensure_statement_digest(
         proof,
         private_undelegation_statement_digest(&journal)?,
@@ -854,11 +845,13 @@ fn verify_private_undelegation_seal_bytes(bytes: &[u8]) -> Result<ProofPrivateUn
     Ok(journal)
 }
 
+#[cfg(feature = "local-prover")]
 pub fn prove_unbonding_claim(
     witness: &ProofShieldedTxWitness,
 ) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
     let circuit = TransparentCircuit::UnbondingClaimV1;
     let binding = configured_backend_binding(circuit)?;
+    let elf = prover_elf_for_circuit(circuit);
     let mut builder = ExecutorEnv::builder();
     for input in &witness.inputs {
         match (
@@ -883,7 +876,7 @@ pub fn prove_unbonding_claim(
         .build()
         .context("build unbonding claim executor environment")?;
     let prove_info = default_prover()
-        .prove_with_opts(env, binding.elf, &ProverOpts::fast())
+        .prove_with_opts(env, elf, &ProverOpts::fast())
         .context("prove unbonding claim witness")?;
     let receipt = prove_info.receipt;
     verify_supported_receipt_kind(&receipt, "unbonding claim receipt", true)?;
@@ -901,6 +894,13 @@ pub fn prove_unbonding_claim(
     ))
 }
 
+#[cfg(not(feature = "local-prover"))]
+pub fn prove_unbonding_claim(
+    _witness: &ProofShieldedTxWitness,
+) -> Result<(TransparentProof, ProofShieldedTxJournal)> {
+    local_prover_unavailable()
+}
+
 pub fn verify_unbonding_claim_proof(proof: &TransparentProof) -> Result<ProofShieldedTxJournal> {
     require_transparent_statement(
         proof,
@@ -909,6 +909,7 @@ pub fn verify_unbonding_claim_proof(proof: &TransparentProof) -> Result<ProofShi
     )?;
     let _ = backend_binding_for_proof(proof)?;
     let journal = verify_unbonding_claim_seal_bytes(&proof.seal)?;
+    ensure_canonical_accumulator_inputs(&journal.inputs, "unbonding claim proof")?;
     ensure_statement_digest(
         proof,
         shielded_journal_statement_digest(TransparentCircuit::UnbondingClaimV1, &journal)?,
@@ -927,6 +928,7 @@ fn verify_unbonding_claim_seal_bytes(bytes: &[u8]) -> Result<ProofShieldedTxJour
     decode_shielded_tx_journal(&receipt)
 }
 
+#[cfg(feature = "local-prover")]
 fn receipt_to_seal_bytes(receipt: &Receipt) -> Result<Vec<u8>> {
     bincode::serialize(receipt).context("serialize shielded receipt")
 }
@@ -942,6 +944,7 @@ pub fn proof_from_bytes(bytes: &[u8]) -> Result<TransparentProof> {
     Ok(proof)
 }
 
+#[cfg(feature = "local-prover")]
 pub fn prove_checkpoint_accumulator(
     checkpoint: &HistoricalUnspentCheckpoint,
     extension: &HistoricalUnspentExtension,
@@ -949,6 +952,7 @@ pub fn prove_checkpoint_accumulator(
 ) -> Result<CheckpointAccumulatorProof> {
     let circuit = TransparentCircuit::CheckpointAccumulatorV1;
     let binding = configured_backend_binding(circuit)?;
+    let elf = prover_elf_for_circuit(circuit);
     if extension.strata.is_empty() {
         bail!("checkpoint accumulator requires a non-empty extension");
     }
@@ -995,7 +999,7 @@ pub fn prove_checkpoint_accumulator(
             .build()
             .context("build checkpoint accumulator executor environment")?;
         let prove_info = default_prover()
-            .prove_with_opts(env, binding.elf, &ProverOpts::fast())
+            .prove_with_opts(env, elf, &ProverOpts::fast())
             .context("prove checkpoint accumulator step")?;
         let receipt = prove_info.receipt;
         verify_supported_receipt_kind(&receipt, "checkpoint accumulator receipt", true)?;
@@ -1024,6 +1028,15 @@ pub fn prove_checkpoint_accumulator(
     })
 }
 
+#[cfg(not(feature = "local-prover"))]
+pub fn prove_checkpoint_accumulator(
+    _checkpoint: &HistoricalUnspentCheckpoint,
+    _extension: &HistoricalUnspentExtension,
+    _prior: Option<&CheckpointAccumulatorProof>,
+) -> Result<CheckpointAccumulatorProof> {
+    local_prover_unavailable()
+}
+
 pub fn verify_checkpoint_accumulator_proof(
     proof: &TransparentProof,
 ) -> Result<CheckpointAccumulatorJournal> {
@@ -1049,19 +1062,22 @@ fn verify_checkpoint_accumulator_seal_bytes(bytes: &[u8]) -> Result<CheckpointAc
     receipt
         .verify(binding.method_id)
         .context("verify checkpoint accumulator receipt")?;
-    decode_checkpoint_accumulator_journal(&receipt)
+    let journal = decode_checkpoint_accumulator_journal(&receipt)?;
+    if journal.accumulator_verifier_key_commitment != binding.verifier_key_commitment {
+        bail!("checkpoint accumulator proof uses a non-canonical verifier key commitment");
+    }
+    Ok(journal)
 }
 
-pub fn checkpoint_accumulator_verifier_hint() -> [u32; 8] {
-    configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)
-        .expect("configured checkpoint accumulator backend binding")
-        .method_id
+pub fn checkpoint_accumulator_verifier_hint() -> Result<[u32; 8]> {
+    Ok(configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)?.method_id)
 }
 
-pub fn checkpoint_accumulator_verifier_key_commitment() -> [u8; 32] {
-    configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)
-        .expect("configured checkpoint accumulator backend binding")
-        .verifier_key_commitment
+pub fn checkpoint_accumulator_verifier_key_commitment() -> Result<[u8; 32]> {
+    Ok(
+        configured_backend_binding(TransparentCircuit::CheckpointAccumulatorV1)?
+            .verifier_key_commitment,
+    )
 }
 
 pub fn output_binding(output: &ShieldedOutput) -> ProofShieldedOutputBinding {
@@ -1146,13 +1162,11 @@ pub fn input_witness_from_local(
     historical_extension: Option<&HistoricalUnspentExtension>,
     historical_accumulator: Option<&CheckpointAccumulatorProof>,
     current_nullifier: &[u8; 32],
-) -> ProofShieldedInputWitness {
-    let historical_accumulator_verifier_hint = historical_accumulator.map(|proof| {
-        backend_binding_for_proof(&proof.proof)
-            .expect("checkpoint accumulator proof must use the configured backend")
-            .method_id
-    });
-    ProofShieldedInputWitness {
+) -> Result<ProofShieldedInputWitness> {
+    let historical_accumulator_verifier_hint = historical_accumulator
+        .map(|proof| backend_binding_for_proof(&proof.proof).map(|binding| binding.method_id))
+        .transpose()?;
+    Ok(ProofShieldedInputWitness {
         note: note_to_proof(note),
         note_key: *note_key,
         membership_proof: membership_proof_to_proof(membership_proof),
@@ -1163,7 +1177,7 @@ pub fn input_witness_from_local(
         historical_accumulator_receipt: historical_accumulator
             .map(|proof| proof.proof.seal.clone()),
         current_nullifier: *current_nullifier,
-    }
+    })
 }
 
 fn require_transparent_statement(
@@ -1403,109 +1417,6 @@ mod tests {
         }
     }
 
-    fn sample_proof_note(seed: u8) -> ProofShieldedNote {
-        ProofShieldedNote {
-            version: proof_core::SHIELDED_NOTE_VERSION,
-            kind: ProofShieldedNoteKind::Payment,
-            value: seed as u64 + 10,
-            birth_epoch: 1,
-            owner_address: [seed; 32],
-            owner_signing_key_commitment: [seed.wrapping_add(6); 32],
-            owner_kem_key_commitment: [seed.wrapping_add(7); 32],
-            owner_signing_pk: vec![seed; 32],
-            owner_kem_pk: vec![seed.wrapping_add(1); 64],
-            rho: [seed.wrapping_add(2); 32],
-            note_randomizer: [seed.wrapping_add(3); 32],
-            note_key_commitment: [seed.wrapping_add(4); 32],
-            commitment: [seed.wrapping_add(5); 32],
-        }
-    }
-
-    fn sample_prepared_native_transfer() -> native_transfer::NativeTransferPreparedWitness {
-        let input_note = sample_proof_note(1);
-        let output_note = sample_proof_note(21);
-        let journal = ProofShieldedTxJournal {
-            chain_id: [7u8; 32],
-            current_epoch: 3,
-            note_tree_root: [9u8; 32],
-            fee_amount: 1,
-            inputs: vec![proof_core::ProofShieldedInputBinding {
-                current_nullifier: [11u8; 32],
-                historical_from_epoch: 1,
-                historical_through_epoch: 2,
-                historical_root_digest: [12u8; 32],
-            }],
-            outputs: vec![ProofShieldedOutputBinding {
-                note_commitment: output_note.commitment,
-                public_output_digest: [14u8; 32],
-            }],
-        };
-        native_transfer::NativeTransferPreparedWitness {
-            source_witness: ProofShieldedTxWitness {
-                chain_id: journal.chain_id,
-                current_epoch: journal.current_epoch,
-                note_tree_root: journal.note_tree_root,
-                fee_amount: journal.fee_amount,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-            },
-            public_inputs: native_transfer::NativeTransferPublicInputs {
-                statement_digest: [15u8; 32],
-                journal: journal.clone(),
-            },
-            private_inputs: native_transfer::NativeTransferPrivateInputs {
-                inputs: vec![native_transfer::NativeTransferPrivateInput {
-                    witness: ProofShieldedInputWitness {
-                        note: input_note.clone(),
-                        note_key: [16u8; 32],
-                        membership_proof: ProofNoteMembershipProof {
-                            note_commitment: input_note.commitment,
-                            root: journal.note_tree_root,
-                            proof: Vec::new(),
-                        },
-                        historical_checkpoint: ProofHistoricalUnspentCheckpoint {
-                            version: proof_core::SHIELDED_CHECKPOINT_VERSION,
-                            note_commitment: input_note.commitment,
-                            birth_epoch: 1,
-                            covered_through_epoch: 2,
-                            transcript_root: [17u8; 32],
-                            verified_epoch_count: 2,
-                        },
-                        historical_extension: None,
-                        historical_accumulator: None,
-                        historical_accumulator_verifier_hint: None,
-                        historical_accumulator_receipt: None,
-                        current_nullifier: [11u8; 32],
-                    },
-                }],
-                outputs: vec![native_transfer::NativeTransferPrivateOutput {
-                    plaintext: ProofShieldedOutputPlaintext {
-                        note: output_note.clone(),
-                        note_key: [18u8; 32],
-                        checkpoint: ProofHistoricalUnspentCheckpoint {
-                            version: proof_core::SHIELDED_CHECKPOINT_VERSION,
-                            note_commitment: output_note.commitment,
-                            birth_epoch: 3,
-                            covered_through_epoch: 2,
-                            transcript_root: [19u8; 32],
-                            verified_epoch_count: 0,
-                        },
-                    },
-                }],
-            },
-            envelope_bindings: vec![native_transfer::NativeTransferEnvelopeBinding {
-                binding: journal.outputs[0].clone(),
-                public_output: ProofShieldedOutput {
-                    note_commitment: output_note.commitment,
-                    kem_ct: vec![20u8; 32],
-                    nonce: [21u8; proof_core::SHIELDED_OUTPUT_NONCE_LEN],
-                    view_tag: 22,
-                    ciphertext: vec![23u8; 48],
-                },
-            }],
-        }
-    }
-
     #[test]
     fn transparent_circuit_inventory_is_statement_consistent() {
         for circuit in transparent_circuit_inventory() {
@@ -1520,6 +1431,28 @@ mod tests {
             assert!(!descriptor.name.is_empty());
             assert!(!descriptor.public_input_shape.is_empty());
         }
+    }
+
+    #[cfg(feature = "local-prover")]
+    #[test]
+    fn verifier_method_ids_match_embedded_prover_methods() {
+        assert_eq!(SHIELDED_SPEND_METHOD_ID, methods::SHIELDED_SPEND_METHOD_ID);
+        assert_eq!(
+            CHECKPOINT_ACCUMULATOR_METHOD_ID,
+            methods::CHECKPOINT_ACCUMULATOR_METHOD_ID
+        );
+        assert_eq!(
+            PRIVATE_DELEGATION_METHOD_ID,
+            methods::PRIVATE_DELEGATION_METHOD_ID
+        );
+        assert_eq!(
+            PRIVATE_UNDELEGATION_METHOD_ID,
+            methods::PRIVATE_UNDELEGATION_METHOD_ID
+        );
+        assert_eq!(
+            UNBONDING_CLAIM_METHOD_ID,
+            methods::UNBONDING_CLAIM_METHOD_ID
+        );
     }
 
     #[test]
@@ -1639,21 +1572,5 @@ mod tests {
         let err =
             ensure_statement_digest(&proof, expected, "test proof").expect_err("digest mismatch");
         assert!(err.to_string().contains("statement digest mismatch"));
-    }
-
-    #[test]
-    fn native_transfer_scaffold_tracks_arity_and_adapter_gaps() {
-        let prepared = sample_prepared_native_transfer();
-        let scaffold = native_transfer::build_native_transfer_stark_scaffold(&prepared);
-        assert_eq!(scaffold.public_inputs, prepared.public_inputs);
-        assert_eq!(scaffold.trace_layout.input_rows, 1);
-        assert_eq!(scaffold.trace_layout.output_rows, 1);
-        assert_eq!(scaffold.trace_layout.history_rows, 0);
-        assert_eq!(scaffold.trace_layout.finalize_rows, 2);
-        assert_eq!(scaffold.trace_layout.transition_rows, 4);
-        assert_eq!(scaffold.trace_layout.padded_rows, 4);
-        assert_eq!(scaffold.envelope_binding_count, 1);
-        assert!(scaffold.requires_ciphertext_adapter);
-        assert_eq!(scaffold.history_record_count, 0);
     }
 }

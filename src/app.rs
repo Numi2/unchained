@@ -1,9 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use qrcode::render::unicode;
-use qrcode::QrCode;
 use serde::{de::DeserializeOwned, Serialize};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -26,11 +24,12 @@ use crate::{
     transaction::{PenaltyEvidenceAdmission, SharedStateAction, SharedStateControlDocument, Tx},
 };
 
+const WALLET_COVER_TRAFFIC_INTERVAL_SECS: u64 = 30;
+const WALLET_DISCOVERY_PUBLISH_INTERVAL_SECS: u64 = 300;
+const WALLET_DISCOVERY_POLL_INTERVAL_SECS: u64 = 5;
+
 #[derive(Args, Clone)]
 struct CommonArgs {
-    #[arg(short, long, default_value = "config.toml")]
-    config: String,
-
     /// Suppress routine network gossip logs
     #[arg(long, default_value_t = false)]
     quiet_net: bool,
@@ -135,8 +134,6 @@ enum NodeCmd {
     StartAccessRelay,
     /// Start the submission gateway role for ordinary-path wallet ingress
     StartSubmissionGateway,
-    /// Start the remote proof-assistant role for sender wallets
-    StartProofAssistant,
     /// Start the PIR-backed discovery and mailbox service
     StartDiscovery,
     /// Query the live discovery service for manifest and queue status
@@ -171,8 +168,6 @@ struct ReceiveArgs {
     plain: bool,
     #[arg(long, default_value_t = false)]
     json: bool,
-    #[arg(long, default_value_t = false)]
-    copy: bool,
 }
 
 #[derive(Args, Clone)]
@@ -330,22 +325,6 @@ struct NetworkRuntime {
     shutdown_tx: broadcast::Sender<()>,
 }
 
-fn print_qr_to_terminal(data: &str) -> Result<()> {
-    let code = QrCode::new(data.as_bytes())?;
-    let image = code
-        .render::<unicode::Dense1x2>()
-        .dark_color(unicode::Dense1x2::Light)
-        .build();
-    println!("{image}");
-    Ok(())
-}
-
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = arboard::Clipboard::new()?;
-    clipboard.set_text(text.to_string())?;
-    Ok(())
-}
-
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{prompt}");
     io::stdout().flush()?;
@@ -391,31 +370,22 @@ fn short_text(value: &str) -> String {
     }
 }
 
-fn load_config(path: &str) -> Result<config::Config> {
-    config::load_resolved(path)
+fn load_config() -> Result<config::Config> {
+    Ok(config::load())
 }
 
-fn apply_quiet_logging(common: &CommonArgs, cfg: &config::Config) {
+fn apply_quiet_logging(common: &CommonArgs) {
     if common.quiet_net {
-        network::set_quiet_logging(true);
-    } else if cfg.net.quiet_by_default {
         network::set_quiet_logging(true);
     }
 }
 
 fn open_store(cfg: &config::Config) -> Result<Arc<Store>> {
-    match std::panic::catch_unwind(|| storage::open(&cfg.storage)) {
-        Ok(db) => Ok(db),
-        Err(_) => Err(anyhow!("failed to open database")),
-    }
+    storage::open(&cfg.storage)
 }
 
 fn open_wallet_store(cfg: &config::Config) -> Result<Arc<WalletStore>> {
-    match std::panic::catch_unwind(|| WalletStore::open(&cfg.storage.path)) {
-        Ok(Ok(db)) => Ok(Arc::new(db)),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(anyhow!("failed to open wallet database")),
-    }
+    WalletStore::open(&cfg.storage.path).map(Arc::new)
 }
 
 fn open_optional_node_control_client(
@@ -635,11 +605,12 @@ fn build_wallet_ingress_client(
             } else {
                 load_validated_service_record(gateway, "submission gateway")?
             };
+            let policy = ingress::AccessRelayPolicy::default();
             Ok(Some(ingress::IngressClient::new(
                 relay_record,
                 gateway_record,
-                cfg.ingress.wallet.envelope_size_bytes,
-                Duration::from_secs(cfg.ingress.wallet.submit_timeout_secs),
+                policy.envelope_size_bytes,
+                policy.submit_timeout,
             )?))
         }
     }
@@ -666,11 +637,12 @@ fn build_wallet_proof_assistant_client(
             );
         }
     }
+    let policy = proof_assistant::ProofAssistantPolicy::default();
     Ok(Some(proof_assistant::ProofAssistantClient::new(
         record,
-        cfg.proof_assistant.wallet.max_request_bytes,
-        cfg.proof_assistant.wallet.max_response_bytes,
-        Duration::from_secs(cfg.proof_assistant.wallet.submit_timeout_secs),
+        policy.max_request_bytes,
+        policy.max_response_bytes,
+        policy.submit_timeout,
     )?))
 }
 
@@ -714,71 +686,50 @@ fn build_wallet_discovery_client(
         }
         mirrors.push(mirror_record);
     }
+    let policy = discovery::DiscoveryPolicy::default();
     Ok(Some(discovery::DiscoveryClient::new(
         record,
         mirrors,
-        cfg.discovery.wallet.max_request_bytes,
-        cfg.discovery.wallet.max_response_bytes,
-        Duration::from_secs(cfg.discovery.wallet.submit_timeout_secs),
+        policy.max_request_bytes,
+        policy.max_response_bytes,
+        policy.submit_timeout,
     )?))
 }
 
 fn build_local_discovery_status_client(cfg: &config::Config) -> Result<discovery::DiscoveryClient> {
     let identity = load_runtime_identity(cfg)?;
+    let policy = discovery::DiscoveryPolicy::default();
     discovery::DiscoveryClient::new(
         identity.record().clone(),
         Vec::new(),
-        cfg.discovery.server.max_request_bytes,
-        cfg.discovery.server.max_response_bytes,
-        Duration::from_secs(cfg.discovery.server.submit_timeout_secs),
+        policy.max_request_bytes,
+        policy.max_response_bytes,
+        policy.submit_timeout,
     )
 }
 
 fn wallet_cover_traffic_enabled(cfg: &config::Config) -> bool {
     normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
         && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some()
-        && cfg.ingress.wallet.cover_traffic_interval_secs > 0
 }
 
-fn access_relay_policy(cfg: &config::Config) -> ingress::AccessRelayPolicy {
-    ingress::AccessRelayPolicy {
-        rate_limit_window: Duration::from_secs(cfg.ingress.access_relay.rate_limit_window_secs),
-        max_wallet_messages_per_window: cfg.ingress.access_relay.max_wallet_messages_per_window,
-        envelope_size_bytes: cfg.ingress.access_relay.envelope_size_bytes,
-        submit_timeout: Duration::from_secs(cfg.ingress.access_relay.submit_timeout_secs),
-    }
+fn access_relay_policy() -> ingress::AccessRelayPolicy {
+    ingress::AccessRelayPolicy::default()
 }
 
-fn submission_gateway_policy(cfg: &config::Config) -> ingress::SubmissionGatewayPolicy {
-    ingress::SubmissionGatewayPolicy {
-        release_window: Duration::from_millis(cfg.ingress.submission_gateway.release_window_ms),
-        max_batch_txs: cfg.ingress.submission_gateway.max_batch_txs,
-        max_queue_depth: cfg.ingress.submission_gateway.max_queue_depth,
-        envelope_size_bytes: cfg.ingress.submission_gateway.envelope_size_bytes,
-        submit_timeout: Duration::from_secs(cfg.ingress.submission_gateway.submit_timeout_secs),
-    }
+fn submission_gateway_policy() -> ingress::SubmissionGatewayPolicy {
+    ingress::SubmissionGatewayPolicy::default()
 }
 
-fn proof_assistant_policy(cfg: &config::Config) -> proof_assistant::ProofAssistantPolicy {
-    proof_assistant::ProofAssistantPolicy {
-        max_request_bytes: cfg.proof_assistant.server.max_request_bytes,
-        max_response_bytes: cfg.proof_assistant.server.max_response_bytes,
-        submit_timeout: Duration::from_secs(cfg.proof_assistant.server.submit_timeout_secs),
-    }
+#[cfg(feature = "local-prover")]
+fn proof_assistant_policy() -> proof_assistant::ProofAssistantPolicy {
+    proof_assistant::ProofAssistantPolicy::default()
 }
 
 fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
-    discovery::DiscoveryPolicy {
-        record_ttl: Duration::from_secs(cfg.discovery.server.record_ttl_secs),
-        submit_timeout: Duration::from_secs(cfg.discovery.server.submit_timeout_secs),
-        max_request_bytes: cfg.discovery.server.max_request_bytes,
-        max_response_bytes: cfg.discovery.server.max_response_bytes,
-        max_pending_requests: cfg.discovery.server.max_pending_requests,
-        max_pending_responses: cfg.discovery.server.max_pending_responses,
-        pir_arity: cfg.discovery.server.pir_arity,
-        query_budget_difficulty_bits: cfg.discovery.server.query_budget_difficulty_bits,
-        allow_mutations: !cfg.discovery.server.query_only_replica,
-    }
+    let mut policy = discovery::DiscoveryPolicy::default();
+    policy.allow_mutations = !cfg.discovery.server.query_only_replica;
+    policy
 }
 
 fn load_operator_node_record(
@@ -1075,7 +1026,6 @@ async fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Re
         NodeCmd::Start
         | NodeCmd::StartAccessRelay
         | NodeCmd::StartSubmissionGateway
-        | NodeCmd::StartProofAssistant
         | NodeCmd::StartDiscovery
         | NodeCmd::ReplayTransactions
         | NodeCmd::ExportAnchors { .. }
@@ -1087,19 +1037,13 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     let db = open_store(cfg)?;
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let net = network::spawn(
-        cfg.net.clone(),
-        cfg.p2p.clone(),
-        db.clone(),
-        sync_state.clone(),
-    )
-    .await?;
+    let net = network::spawn(cfg.net.clone(), db.clone(), sync_state.clone()).await?;
     {
         let db_h = db.clone();
         let net_h = net.clone();
         let shutdown_rx_h = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            sync::spawn_headers_skeleton(db_h, net_h, shutdown_rx_h).await;
+            sync::spawn_headers_pipeline(db_h, net_h, shutdown_rx_h).await;
         });
     }
     sync::spawn(
@@ -1111,7 +1055,6 @@ async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
     );
     let epoch_mgr = epoch::Manager::new(
         db.clone(),
-        cfg.epoch.clone(),
         cfg.net.clone(),
         net.clone(),
         shutdown_tx.subscribe(),
@@ -1179,7 +1122,7 @@ async fn run_send_flow(
     args: &SendArgs,
 ) -> Result<()> {
     let guided = (args.to.is_none() && args.invoice.is_none()) || args.amount.is_none();
-    if guided && !atty::is(atty::Stream::Stdin) {
+    if guided && !io::stdin().is_terminal() {
         bail!(
             "Interactive send requires a TTY. Pass --to or --invoice together with --amount in non-interactive mode."
         );
@@ -1292,11 +1235,6 @@ fn print_shareable_output(
     args: &ReceiveArgs,
 ) -> Result<()> {
     let value = value.to_string();
-    let copied = if args.copy {
-        copy_to_clipboard(&value).is_ok()
-    } else {
-        false
-    };
 
     if args.json {
         let mut obj = serde_json::Map::new();
@@ -1304,7 +1242,6 @@ fn print_shareable_output(
             json_key.to_string(),
             serde_json::Value::String(value.clone()),
         );
-        obj.insert("copied".to_string(), serde_json::Value::Bool(copied));
         println!("{}", serde_json::Value::Object(obj));
         return Ok(());
     }
@@ -1317,21 +1254,6 @@ fn print_shareable_output(
     println!("{label}");
     println!();
     println!("{value}");
-    println!();
-    if let Err(err) = print_qr_to_terminal(&value) {
-        eprintln!("QR unavailable: {err}");
-    }
-    if args.copy {
-        println!();
-        println!(
-            "{}",
-            if copied {
-                "Copied to clipboard."
-            } else {
-                "Clipboard unavailable."
-            }
-        );
-    }
     Ok(())
 }
 
@@ -1396,7 +1318,7 @@ fn print_discovery_status_output(
                 "record_count": status.record_count,
                 "record_bytes": status.record_bytes,
                 "pir_arity": status.pir_arity,
-                "query_budget_difficulty_bits": status.query_budget_difficulty_bits,
+                "query_budget_work_bits": status.query_budget_work_bits,
                 "allow_mutations": status.allow_mutations,
                 "record_ttl_secs": status.record_ttl_secs,
                 "max_request_bytes": status.max_request_bytes,
@@ -1424,10 +1346,7 @@ fn print_discovery_status_output(
     println!("Record count: {}", status.record_count);
     println!("Record bytes: {}", status.record_bytes);
     println!("PIR arity: {}", status.pir_arity);
-    println!(
-        "Query budget difficulty bits: {}",
-        status.query_budget_difficulty_bits
-    );
+    println!("Query budget work bits: {}", status.query_budget_work_bits);
     println!(
         "Mutations enabled: {}",
         if status.allow_mutations { "yes" } else { "no" }
@@ -1544,8 +1463,8 @@ async fn resync_wallet_state(client: &wallet_control::WalletControlClient) -> Re
 
 pub async fn run_node_cli() -> Result<()> {
     let cli = NodeCli::parse();
-    let cfg = load_config(&cli.common.config)?;
-    apply_quiet_logging(&cli.common, &cfg);
+    let cfg = load_config()?;
+    apply_quiet_logging(&cli.common);
 
     if handle_node_operator_command(&cli.cmd, &cfg).await? {
         return Ok(());
@@ -1605,7 +1524,7 @@ pub async fn run_node_cli() -> Result<()> {
                     .to_string();
             let node_control_task =
                 tokio::spawn(async move { node_control_server.serve(node_control_shutdown).await });
-            metrics::serve(cfg.metrics.clone())?;
+            metrics::serve()?;
             println!();
             println!("Unchained node is running.");
             println!("Listening on port {}", cfg.net.listen_port);
@@ -1614,11 +1533,20 @@ pub async fn run_node_cli() -> Result<()> {
             if let Some(public_ip) = cfg.net.public_ip.clone() {
                 println!("Public IP: {public_ip}");
             }
-            println!("Local checkpoint cadence: {} seconds", cfg.epoch.seconds);
+            println!(
+                "Local checkpoint cadence: {} ms",
+                epoch::checkpoint_cadence().as_millis()
+            );
             println!("Consensus foundation: validator/BFT runtime");
             println!("Settlement manager: enabled");
-            println!("Checkpoint settlement unit cap: {}", protocol::CURRENT.max_settlement_units_per_checkpoint);
-            println!("Fast-path transaction cap: {}", protocol::CURRENT.max_fast_path_txs_per_checkpoint);
+            println!(
+                "Checkpoint settlement unit cap: {}",
+                protocol::CURRENT.max_settlement_units_per_checkpoint
+            );
+            println!(
+                "Fast-path transaction cap: {}",
+                protocol::CURRENT.max_fast_path_txs_per_checkpoint
+            );
             let shutdown_result = wait_for_shutdown("Unchained node", runtime).await;
             let node_control_result = node_control_task.await.map_err(|err| anyhow!(err))?;
             shutdown_result?;
@@ -1638,7 +1566,7 @@ pub async fn run_node_cli() -> Result<()> {
                 &identity,
                 gateway_records,
                 listen_addr(&cfg),
-                access_relay_policy(&cfg),
+                access_relay_policy(),
             )?;
             let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
             println!("Access relay is running.");
@@ -1669,26 +1597,13 @@ pub async fn run_node_cli() -> Result<()> {
                 allowed_relays,
                 listen_addr(&cfg),
                 validator_control_base_path,
-                submission_gateway_policy(&cfg),
+                submission_gateway_policy(),
             )?;
             let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
             println!("Submission gateway is running.");
             println!("Listening on port {}", cfg.net.listen_port);
             println!("Validator control base path: {validator_control_base_path}");
             wait_for_service_shutdown("Unchained submission gateway", shutdown_tx, task).await
-        }
-        NodeCmd::StartProofAssistant => {
-            let identity = load_runtime_identity(&cfg)?;
-            let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-            let server = proof_assistant::ProofAssistantServer::bind(
-                &identity,
-                listen_addr(&cfg),
-                proof_assistant_policy(&cfg),
-            )?;
-            let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
-            println!("Proof assistant is running.");
-            println!("Listening on port {}", cfg.net.listen_port);
-            wait_for_service_shutdown("Unchained proof assistant", shutdown_tx, task).await
         }
         NodeCmd::StartDiscovery => {
             let identity = load_runtime_identity(&cfg)?;
@@ -1727,10 +1642,26 @@ pub async fn run_node_cli() -> Result<()> {
     }
 }
 
+#[cfg(feature = "local-prover")]
+pub async fn run_proof_assistant_cli() -> Result<()> {
+    let cfg = load_config()?;
+    let identity = load_runtime_identity(&cfg)?;
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = proof_assistant::ProofAssistantServer::bind(
+        &identity,
+        listen_addr(&cfg),
+        proof_assistant_policy(),
+    )?;
+    let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+    println!("Proof assistant is running.");
+    println!("Listening on port {}", cfg.net.listen_port);
+    wait_for_service_shutdown("Unchained proof assistant", shutdown_tx, task).await
+}
+
 pub async fn run_wallet_cli() -> Result<()> {
     let cli = WalletCli::parse();
-    let cfg = load_config(&cli.common.config)?;
-    apply_quiet_logging(&cli.common, &cfg);
+    let cfg = load_config()?;
+    apply_quiet_logging(&cli.common);
 
     match cli.cmd {
         WalletCmd::Serve => {
@@ -1786,7 +1717,7 @@ pub async fn run_wallet_cli() -> Result<()> {
             let cover_task = if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
                 let wallet = wallet.clone();
                 let shutdown_rx = shutdown_tx.subscribe();
-                let interval_secs = cfg.ingress.wallet.cover_traffic_interval_secs;
+                let interval_secs = WALLET_COVER_TRAFFIC_INTERVAL_SECS;
                 Some(tokio::spawn(async move {
                     wallet
                         .run_cover_traffic_loop(interval_secs, shutdown_rx)
@@ -1798,10 +1729,8 @@ pub async fn run_wallet_cli() -> Result<()> {
             let discovery_task = if wallet.has_discovery_client() {
                 let wallet = wallet.clone();
                 let shutdown_rx = shutdown_tx.subscribe();
-                let publish_interval =
-                    Duration::from_secs(cfg.discovery.wallet.publish_interval_secs.max(1));
-                let poll_interval =
-                    Duration::from_secs(cfg.discovery.wallet.poll_interval_secs.max(1));
+                let publish_interval = Duration::from_secs(WALLET_DISCOVERY_PUBLISH_INTERVAL_SECS);
+                let poll_interval = Duration::from_secs(WALLET_DISCOVERY_POLL_INTERVAL_SECS);
                 let record_ttl = publish_interval
                     .checked_mul(3)
                     .unwrap_or(publish_interval + publish_interval + publish_interval);
@@ -1825,7 +1754,7 @@ pub async fn run_wallet_cli() -> Result<()> {
             if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
                 println!(
                     "Wallet ingress cover cadence: {} seconds",
-                    cfg.ingress.wallet.cover_traffic_interval_secs
+                    WALLET_COVER_TRAFFIC_INTERVAL_SECS
                 );
             }
             if wallet.has_proof_assistant_client() {

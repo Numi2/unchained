@@ -2,8 +2,8 @@ use crate::{
     canonical::{self, CanonicalReader, CanonicalWriter},
     crypto::{self, ML_KEM_768_CT_BYTES},
     node_control::{
-        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
-        NodeControlClient, WalletSendRuntimeMaterial,
+        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta,
+        CompactWalletSyncHead, NodeControlClient, WalletSendRuntimeMaterial,
     },
     node_identity::{
         build_client_config_with_alpn, build_server_config_with_alpn,
@@ -734,7 +734,8 @@ impl SubmissionGatewayServer {
                     .request_compact_wallet_sync_delta_async(
                         next_settlement_unit_index,
                         next_output_index,
-                        max_settlement_units.min(LIGHT_CLIENT_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST),
+                        max_settlement_units
+                            .min(LIGHT_CLIENT_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST),
                         max_outputs.min(LIGHT_CLIENT_SYNC_MAX_OUTPUTS_PER_REQUEST),
                     )
                     .await?,
@@ -1053,11 +1054,15 @@ fn write_compact_committed_settlement_unit(
 ) -> Result<()> {
     writer.write_u64(settlement_unit.scan_index);
     writer.write_u64(settlement_unit.birth_epoch);
-    writer.write_bytes(&canonical::encode_settlement_unit(&settlement_unit.settlement_unit)?)?;
+    writer.write_bytes(&canonical::encode_settlement_unit(
+        &settlement_unit.settlement_unit,
+    )?)?;
     Ok(())
 }
 
-fn read_compact_committed_settlement_unit(reader: &mut CanonicalReader<'_>) -> Result<CompactCommittedSettlementUnit> {
+fn read_compact_committed_settlement_unit(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<CompactCommittedSettlementUnit> {
     Ok(CompactCommittedSettlementUnit {
         scan_index: reader.read_u64()?,
         birth_epoch: reader.read_u64()?,
@@ -1119,9 +1124,10 @@ fn decode_compact_wallet_sync_head(bytes: &[u8]) -> Result<CompactWalletSyncHead
 fn encode_compact_wallet_sync_delta(delta: &CompactWalletSyncDelta) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_bytes(&encode_compact_wallet_sync_head(&delta.head)?)?;
-    writer.write_vec(&delta.committed_settlement_units, |writer, settlement_unit| {
-        write_compact_committed_settlement_unit(writer, settlement_unit)
-    })?;
+    writer.write_vec(
+        &delta.committed_settlement_units,
+        |writer, settlement_unit| write_compact_committed_settlement_unit(writer, settlement_unit),
+    )?;
     writer.write_vec(&delta.shielded_outputs, |writer, output| {
         write_compact_shielded_output(writer, output)
     })?;
@@ -1252,8 +1258,8 @@ fn decode_ingress_accept(bytes: &[u8]) -> Result<IngressAccept> {
 mod tests {
     use super::*;
     use crate::{
-        settlement_unit::SettlementUnit,
         proof::{TransparentProof, TransparentProofStatement},
+        settlement_unit::SettlementUnit,
         shielded,
         transaction::{OrdinaryPrivateTransfer, ShieldedOutput, Tx},
         wallet::Wallet,

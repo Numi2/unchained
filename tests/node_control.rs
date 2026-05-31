@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 use unchained::{
-    config::{Net, P2p},
+    config::Net,
     consensus::{ConsensusPosition, OrderingPath, ValidatorVote, VoteTarget},
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
@@ -33,25 +33,7 @@ fn build_net(port: u16) -> Net {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
-        strict_trust: false,
-        peer_exchange: true,
-        max_peers: 8,
-        connection_timeout_secs: 5,
-        idle_timeout_secs: 30,
-        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
-        sync_timeout_secs: 3,
-        banned_peer_ids: Vec::new(),
-        quiet_by_default: true,
-    }
-}
-
-fn build_p2p() -> P2p {
-    P2p {
-        max_validation_failures_per_peer: 8,
-        peer_ban_duration_secs: 60,
-        rate_limit_window_secs: 60,
-        max_messages_per_window: 10_000,
     }
 }
 
@@ -101,7 +83,7 @@ async fn spawn_network(
     let port = pick_udp_port();
     provision_runtime_identity(tempdir, genesis.hash, format!("127.0.0.1:{port}"))?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    network::spawn(build_net(port), build_p2p(), db, sync_state).await
+    network::spawn(build_net(port), db, sync_state).await
 }
 
 struct EnvGuard {
@@ -298,8 +280,12 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
     let wallet = Wallet::load_or_create_private(wallet_store)?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let seeded_settlement_units =
-        finality_support::seed_wallet_with_settlement_unit_values(db.as_ref(), &wallet, &genesis, &[11, 13])?;
+    let seeded_settlement_units = finality_support::seed_wallet_with_settlement_unit_values(
+        db.as_ref(),
+        &wallet,
+        &genesis,
+        &[11, 13],
+    )?;
     let mut expected_settlement_units = seeded_settlement_units.clone();
     expected_settlement_units.sort_by(|a, b| a.id.cmp(&b.id));
     transaction::ensure_shielded_runtime_state(db.as_ref())?;
@@ -344,9 +330,14 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
     assert_eq!(first_delta.head, head);
     assert_eq!(first_delta.committed_settlement_units.len(), 1);
     assert_eq!(first_delta.committed_settlement_units[0].scan_index, 0);
-    assert_eq!(first_delta.committed_settlement_units[0].settlement_unit.id, expected_settlement_units[0].id);
     assert_eq!(
-        first_delta.committed_settlement_units[0].settlement_unit.value,
+        first_delta.committed_settlement_units[0].settlement_unit.id,
+        expected_settlement_units[0].id
+    );
+    assert_eq!(
+        first_delta.committed_settlement_units[0]
+            .settlement_unit
+            .value,
         expected_settlement_units[0].value
     );
     assert_eq!(first_delta.shielded_outputs.len(), 1);
@@ -365,11 +356,15 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
     assert_eq!(second_delta.committed_settlement_units.len(), 1);
     assert_eq!(second_delta.committed_settlement_units[0].scan_index, 1);
     assert_eq!(
-        second_delta.committed_settlement_units[0].settlement_unit.id,
+        second_delta.committed_settlement_units[0]
+            .settlement_unit
+            .id,
         expected_settlement_units[1].id
     );
     assert_eq!(
-        second_delta.committed_settlement_units[0].settlement_unit.value,
+        second_delta.committed_settlement_units[0]
+            .settlement_unit
+            .value,
         expected_settlement_units[1].value
     );
     assert_eq!(second_delta.shielded_outputs.len(), 1);

@@ -4,9 +4,9 @@ use unchained::{epoch::Anchor, storage};
 fn main() -> anyhow::Result<()> {
     println!("🔍 Inspecting unchained Database...");
 
-    let cfg = config::load_resolved("config.toml")?;
+    let cfg = config::load();
 
-    let db = storage::open(&cfg.storage);
+    let db = storage::open(&cfg.storage)?;
 
     // Check for latest epoch
     if let Ok(Some(latest_epoch)) = db.get::<Anchor>("epoch", b"latest") {

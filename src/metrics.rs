@@ -1,13 +1,10 @@
 use anyhow::Result;
-use bytes::Bytes;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request as HRequest, Response as HResponse, StatusCode};
-use once_cell::sync::Lazy;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::net::TcpListener as StdTcpListener;
-use std::sync::Mutex;
+use std::sync::{LazyLock as Lazy, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 // --- Lightweight in-process metrics that emit log events ---
 
@@ -151,7 +148,10 @@ impl MetricsAggregator {
                 }
             }};
         }
-        counter_delta!("unchained_settlement_unit_membership_proofs_served_total", MEMBERSHIP_PROOFS_SERVED);
+        counter_delta!(
+            "unchained_settlement_unit_membership_proofs_served_total",
+            MEMBERSHIP_PROOFS_SERVED
+        );
         counter_delta!(
             "unchained_validation_failures_anchor_total",
             VALIDATION_FAIL_ANCHOR
@@ -166,14 +166,10 @@ impl MetricsAggregator {
         );
         counter_delta!("unchained_v3_sends_total", V3_SENDS);
         counter_delta!("unchained_db_write_failures_total", DB_WRITE_FAILS);
-        counter_delta!("unchained_pruned_settlement_unit_candidates_total", PRUNED_SETTLEMENT_UNIT_CANDIDATES);
-        counter_delta!("unchained_compact_epochs_sent_total", COMPACT_EPOCHS_SENT);
         counter_delta!(
-            "unchained_compact_epochs_received_total",
-            COMPACT_EPOCHS_RECV
+            "unchained_pruned_settlement_unit_candidates_total",
+            PRUNED_SETTLEMENT_UNIT_CANDIDATES
         );
-        counter_delta!("unchained_compact_tx_requests_total", COMPACT_TX_REQ);
-        counter_delta!("unchained_compact_tx_responses_total", COMPACT_TX_RESP);
         counter_delta!(
             "unchained_headers_batches_received_total",
             HEADERS_BATCH_RECV
@@ -183,7 +179,6 @@ impl MetricsAggregator {
             HEADERS_ANCHORS_STORED
         );
         counter_delta!("unchained_headers_invalid_total", HEADERS_INVALID);
-        counter_delta!("unchained_compact_fallbacks_total", COMPACT_FALLBACKS);
         // Network command counters
         counter_delta!("unchained_net_cmd_enqueued_total", NET_CMDS_ENQUEUED);
         counter_delta!("unchained_net_cmd_dropped_dup_total", NET_CMDS_DROPPED_DUP);
@@ -419,34 +414,6 @@ pub static ADMISSION_CUTOFF_U64: Lazy<IntGauge> = Lazy::new(|| {
     )
     .unwrap()
 });
-pub static COMPACT_EPOCHS_SENT: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_compact_epochs_sent_total",
-        "Compact epochs gossiped",
-    )
-    .unwrap()
-});
-pub static COMPACT_EPOCHS_RECV: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_compact_epochs_received_total",
-        "Compact epochs received",
-    )
-    .unwrap()
-});
-pub static COMPACT_TX_REQ: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_compact_tx_requests_total",
-        "GetSettlementUnitBatch requests sent",
-    )
-    .unwrap()
-});
-pub static COMPACT_TX_RESP: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_compact_tx_responses_total",
-        "Txn responses received",
-    )
-    .unwrap()
-});
 pub static HEADERS_BATCH_RECV: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
         "unchained_headers_batches_received_total",
@@ -465,13 +432,6 @@ pub static HEADERS_INVALID: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
         "unchained_headers_invalid_total",
         "Invalid anchors in header batches",
-    )
-    .unwrap()
-});
-pub static COMPACT_FALLBACKS: Lazy<IntCounter> = Lazy::new(|| {
-    IntCounter::new(
-        "unchained_compact_fallbacks_total",
-        "Fallbacks to full bodies due to high missing %",
     )
     .unwrap()
 });
@@ -512,22 +472,22 @@ pub static NET_CMDS_PUBLISHED_OK: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
-pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
+pub fn serve() -> Result<()> {
     // Initialize some defaults
     PEERS.set(0);
 
     // Observability is loopback-only so the shipped product has no non-PQ remote service surface.
-    let bind_addr: SocketAddr = cfg.bind.parse().map_err(|_| {
-        anyhow::anyhow!("metrics.bind must be a socket address like 127.0.0.1:9100")
-    })?;
+    let bind_addr: SocketAddr = "127.0.0.1:9100"
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid fixed metrics socket address"))?;
     if !bind_addr.ip().is_loopback() {
-        anyhow::bail!("metrics.bind must use a loopback address");
+        anyhow::bail!("fixed metrics socket address must use a loopback address");
     }
     let bind_addr = bind_addr.to_string();
     tokio::spawn(async move {
         let mut addr = bind_addr.clone();
         let listener = loop {
-            match StdTcpListener::bind(&addr) {
+            match TcpListener::bind(&addr).await {
                 Ok(l) => break l,
                 Err(e) => {
                     let already = e.kind() == std::io::ErrorKind::AddrInUse
@@ -547,7 +507,6 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
                 }
             }
         };
-        listener.set_nonblocking(true).ok();
         // Periodic, compact metrics snapshot
         tokio::spawn(async move {
             use tokio::time::{sleep, Duration};
@@ -558,81 +517,70 @@ pub fn serve(cfg: crate::config::Metrics) -> Result<()> {
             }
         });
 
-        let service = make_service_fn(|_conn| async move {
-            Ok::<_, std::convert::Infallible>(service_fn(|req: HRequest<Body>| async move {
-                if req.method() == hyper::Method::GET && req.uri().path() == "/logs" {
-                    // Prepare SSE body
-                    let (mut tx, body) = Body::channel();
-                    let mut rx = LOG_BUS.tx.subscribe();
-                    // Send current snapshot first
-                    let mut snapshot = LOG_BUS.snapshot();
-                    let start = snapshot.len().saturating_sub(INITIAL_SNAPSHOT_LINES);
-                    let snapshot = snapshot.split_off(start);
-                    // Send in a separate task to keep the response return non-blocking
+        loop {
+            match listener.accept().await {
+                Ok((socket, _peer)) => {
                     tokio::spawn(async move {
-                        // Helper to send one event line
-                        async fn send_line(
-                            tx: &mut hyper::body::Sender,
-                            line: &str,
-                        ) -> Result<(), ()> {
-                            let data = format!("data: {}\n\n", line);
-                            tx.send_data(Bytes::from(data)).await.map_err(|_| ())
-                        }
-                        for line in snapshot {
-                            if send_line(&mut tx, &line).await.is_err() {
-                                return;
-                            }
-                        }
-                        loop {
-                            match rx.recv().await {
-                                Ok(line) => {
-                                    if send_line(&mut tx, &line).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    continue
-                                }
-                            }
+                        if let Err(err) = handle_logs_socket(socket).await {
+                            eprintln!("🔥 Logs API connection error: {err}");
                         }
                     });
-
-                    let mut resp = HResponse::new(body);
-                    let headers = resp.headers_mut();
-                    headers.insert(
-                        hyper::header::CONTENT_TYPE,
-                        hyper::header::HeaderValue::from_static("text/event-stream"),
-                    );
-                    headers.insert(
-                        hyper::header::CACHE_CONTROL,
-                        hyper::header::HeaderValue::from_static("no-cache"),
-                    );
-                    headers.insert(
-                        hyper::header::CONNECTION,
-                        hyper::header::HeaderValue::from_static("keep-alive"),
-                    );
-                    Ok::<_, std::convert::Infallible>(resp)
-                } else {
-                    Ok::<_, std::convert::Infallible>(
-                        HResponse::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Body::from("not found"))
-                            .unwrap(),
-                    )
                 }
-            }))
-        });
-
-        match hyper::Server::from_tcp(listener)
-            .unwrap()
-            .serve(service)
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => eprintln!("🔥 Logs API error: {}", e),
+                Err(err) => eprintln!("🔥 Logs API accept error: {err}"),
+            }
         }
     });
 
     Ok(())
+}
+
+async fn handle_logs_socket(mut socket: TcpStream) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buf))
+        .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or_default();
+    if !first_line.starts_with("GET /logs ") {
+        socket
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+            )
+            .await?;
+        return Ok(());
+    }
+
+    socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await?;
+
+    let mut snapshot = LOG_BUS.snapshot();
+    let start = snapshot.len().saturating_sub(INITIAL_SNAPSHOT_LINES);
+    let snapshot = snapshot.split_off(start);
+    for line in snapshot {
+        write_sse_line(&mut socket, &line).await?;
+    }
+
+    let mut rx = LOG_BUS.tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(line) => write_sse_line(&mut socket, &line).await?,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+        }
+    }
+    Ok(())
+}
+
+async fn write_sse_line(socket: &mut TcpStream, line: &str) -> std::io::Result<()> {
+    socket.write_all(b"data: ").await?;
+    socket
+        .write_all(line.replace('\n', "\\n").as_bytes())
+        .await?;
+    socket.write_all(b"\n\n").await
 }

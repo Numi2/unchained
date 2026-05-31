@@ -2,12 +2,20 @@ use crate::consensus::{
     ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorSet, VoteTarget,
     DEFAULT_SLOTS_PER_EPOCH, MAX_SETTLEMENT_UNITS_PER_CHECKPOINT,
 };
+use crate::protocol::CURRENT as PROTOCOL;
 use crate::sync::SyncState;
-use crate::{settlement_unit::SettlementUnit, network::NetHandle, storage::Store};
+use crate::{network::NetHandle, settlement_unit::SettlementUnit, storage::Store};
 use anyhow::{bail, Result as AnyResult};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use tokio::{sync::broadcast, time};
+
+const INITIAL_NETWORK_SYNC_TIMEOUT_SECS: u64 = 180;
+
+pub fn checkpoint_cadence() -> time::Duration {
+    let ms = u64::from(PROTOCOL.slots_per_epoch).saturating_mul(PROTOCOL.slot_duration_ms);
+    time::Duration::from_millis(ms.max(1))
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct AnchorProposal {
@@ -521,7 +529,10 @@ impl MerkleTree {
         if settlement_unit_ids.is_empty() {
             return [0u8; 32];
         }
-        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids.iter().map(SettlementUnit::id_to_leaf_hash).collect();
+        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids
+            .iter()
+            .map(SettlementUnit::id_to_leaf_hash)
+            .collect();
         leaves.sort();
         Self::compute_root_from_sorted_leaves(&leaves)
     }
@@ -553,7 +564,10 @@ impl MerkleTree {
         if settlement_unit_ids.is_empty() {
             return None;
         }
-        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids.iter().map(SettlementUnit::id_to_leaf_hash).collect();
+        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids
+            .iter()
+            .map(SettlementUnit::id_to_leaf_hash)
+            .collect();
         leaves.sort();
         let leaf_hash = SettlementUnit::id_to_leaf_hash(target_id);
         let mut index = leaves.iter().position(|h| h == &leaf_hash)?;
@@ -654,7 +668,6 @@ impl MerkleTree {
 
 pub struct Manager {
     db: Arc<Store>,
-    cfg: crate::config::Epoch,
     net_cfg: crate::config::Net,
     net: NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
@@ -664,7 +677,6 @@ pub struct Manager {
 impl Manager {
     pub fn new(
         db: Arc<Store>,
-        cfg: crate::config::Epoch,
         net_cfg: crate::config::Net,
         net: NetHandle,
         shutdown_rx: broadcast::Receiver<()>,
@@ -673,7 +685,6 @@ impl Manager {
         let anchor_tx = net.anchor_sender();
         Self {
             db,
-            cfg,
             net_cfg,
             net,
             anchor_tx,
@@ -694,7 +705,8 @@ impl Manager {
                 println!("🔄 Initial network synchronization phase...");
                 self.net.request_latest_epoch().await;
 
-                let sync_timeout = tokio::time::Duration::from_secs(self.net_cfg.sync_timeout_secs);
+                let sync_timeout =
+                    tokio::time::Duration::from_secs(INITIAL_NETWORK_SYNC_TIMEOUT_SECS);
                 let sync_start = tokio::time::Instant::now();
 
                 while sync_start.elapsed() < sync_timeout {
@@ -721,10 +733,7 @@ impl Manager {
             }
 
             // Tick immediately on startup for all cases; no restart grace period
-            let mut ticker = time::interval_at(
-                time::Instant::now(),
-                time::Duration::from_secs(self.cfg.seconds),
-            );
+            let mut ticker = time::interval_at(time::Instant::now(), checkpoint_cadence());
             // Prevent bursty catch-up ticks from causing multiple seals in quick succession.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -806,8 +815,8 @@ impl Manager {
                                 }
                                 current_epoch = anchor.num.saturating_add(1);
                                 ticker = time::interval_at(
-                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                    time::Duration::from_secs(self.cfg.seconds)
+                                    time::Instant::now() + checkpoint_cadence(),
+                                    checkpoint_cadence()
                                 );
                                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 continue;
@@ -829,8 +838,8 @@ impl Manager {
                                 }
                                 current_epoch = anchor.num.saturating_add(1);
                                 ticker = time::interval_at(
-                                    time::Instant::now() + time::Duration::from_secs(self.cfg.seconds),
-                                    time::Duration::from_secs(self.cfg.seconds)
+                                    time::Instant::now() + checkpoint_cadence(),
+                                    checkpoint_cadence()
                                 );
                                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 continue;
@@ -860,7 +869,8 @@ pub fn select_settlement_unit_candidates_for_checkpoint(
     buffer: Option<&std::collections::HashSet<[u8; 32]>>,
 ) -> AnyResult<(Vec<crate::settlement_unit::SettlementUnitCandidate>, usize)> {
     // Collect candidates for this parent checkpoint and optionally merge locally buffered ids.
-    let mut candidates = db.get_settlement_unit_candidates_by_parent_checkpoint_hash(&parent.hash)?;
+    let mut candidates =
+        db.get_settlement_unit_candidates_by_parent_checkpoint_hash(&parent.hash)?;
     // Track existing candidate IDs to avoid O(n^2) scans during merge
     let mut candidate_ids: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::from_iter(candidates.iter().map(|c| c.id));
@@ -870,12 +880,10 @@ pub fn select_settlement_unit_candidates_for_checkpoint(
                 continue;
             }
             let key = crate::storage::Store::candidate_key(&parent.hash, id);
-            if let Some(c) = db
-                .get::<crate::settlement_unit::SettlementUnitCandidate>(
-                    "settlement_unit_candidate",
-                    &key,
-                )?
-            {
+            if let Some(c) = db.get::<crate::settlement_unit::SettlementUnitCandidate>(
+                "settlement_unit_candidate",
+                &key,
+            )? {
                 candidate_ids.insert(c.id);
                 candidates.push(c);
             }

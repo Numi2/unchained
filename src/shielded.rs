@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    settlement_unit::SettlementUnit,
     crypto::{Address, TaggedKemPublicKey, TaggedSigningPublicKey},
+    settlement_unit::SettlementUnit,
 };
 
 pub const SHIELDED_NOTE_VERSION: u8 = 1;
@@ -42,7 +42,6 @@ const ARCHIVE_CUSTODY_ASSIGN_DOMAIN: &str = "unchained-shielded-archive-custody-
 const ARCHIVE_CUSTODY_COMMITMENT_DOMAIN: &str = "unchained-shielded-archive-custody-commit-v1";
 const ARCHIVE_SERVICE_LEDGER_DOMAIN: &str = "unchained-shielded-archive-service-ledger-v1";
 const ARCHIVE_AVAILABILITY_CERT_DOMAIN: &str = "unchained-shielded-archive-availability-v1";
-const ARCHIVE_RETRIEVAL_RECEIPT_DOMAIN: &str = "unchained-shielded-archive-retrieval-receipt-v1";
 const GENESIS_NOTE_KEY_DOMAIN: &str = "unchained-shielded-genesis-note-key-v1";
 const GENESIS_NOTE_RHO_DOMAIN: &str = "unchained-shielded-genesis-note-rho-v1";
 const GENESIS_NOTE_RANDOMIZER_DOMAIN: &str = "unchained-shielded-genesis-note-randomizer-v1";
@@ -291,7 +290,7 @@ pub struct ArchiveCustodyAssignment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ArchiveOperatorScorecard {
+pub struct ArchiveProviderHealth {
     pub provider_id: [u8; 32],
     pub provider_manifest_digest: [u8; 32],
     pub advertised_shard_count: u32,
@@ -302,13 +301,11 @@ pub struct ArchiveOperatorScorecard {
     pub retention_surplus_epochs: u64,
     pub availability_bps: u16,
     pub service_success_bps: u16,
-    pub successful_retrieval_receipts: u64,
-    pub failed_retrieval_receipts: u64,
     pub served_checkpoint_batches: u64,
     pub served_checkpoint_segments: u64,
     pub served_archive_shards: u64,
     pub mean_checkpoint_latency_ms: u32,
-    pub reward_weight: u64,
+    pub routing_weight: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,12 +334,6 @@ pub struct ArchiveAvailabilityCertificate {
     pub certificate_digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ArchiveRetrievalKind {
-    CheckpointBatch,
-    ArchiveShard,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveCustodyCommitment {
     pub provider_id: [u8; 32],
@@ -351,24 +342,6 @@ pub struct ArchiveCustodyCommitment {
     pub shard_digest: [u8; 32],
     pub retention_through_epoch: u64,
     pub commitment_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ArchiveRetrievalReceipt {
-    pub requester_id: [u8; 32],
-    pub provider_id: [u8; 32],
-    pub provider_manifest_digest: [u8; 32],
-    pub retrieval_kind: ArchiveRetrievalKind,
-    pub request_message_id: [u8; 32],
-    pub response_message_id: Option<[u8; 32]>,
-    pub from_epoch: u64,
-    pub through_epoch: u64,
-    pub shard_id: Option<u64>,
-    pub served_units: u32,
-    pub success: bool,
-    pub latency_ms: u64,
-    pub observed_unix_ms: u64,
-    pub receipt_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,7 +386,6 @@ pub struct ArchiveDirectory {
     pub replicas: Vec<ArchiveReplicaAttestation>,
     pub accounting: Vec<ArchiveServiceLedger>,
     pub custody_commitments: Vec<ArchiveCustodyCommitment>,
-    pub retrieval_receipts: Vec<ArchiveRetrievalReceipt>,
     pub availability_certificates: Vec<ArchiveAvailabilityCertificate>,
 }
 
@@ -1934,7 +1906,6 @@ impl ArchiveDirectory {
             replicas,
             accounting,
             Vec::new(),
-            Vec::new(),
         )
     }
 
@@ -1945,7 +1916,6 @@ impl ArchiveDirectory {
         replicas: Vec<ArchiveReplicaAttestation>,
         accounting: Vec<ArchiveServiceLedger>,
         custody_commitments: Vec<ArchiveCustodyCommitment>,
-        retrieval_receipts: Vec<ArchiveRetrievalReceipt>,
     ) -> Result<Self> {
         let shards = Self::shards_from_root_ledger(ledger, shard_span)?;
         let validation_directory = Self {
@@ -1955,7 +1925,6 @@ impl ArchiveDirectory {
             replicas: Vec::new(),
             accounting: Vec::new(),
             custody_commitments: Vec::new(),
-            retrieval_receipts: Vec::new(),
             availability_certificates: Vec::new(),
         };
         let providers: Vec<ArchiveProviderManifest> = providers
@@ -1969,7 +1938,6 @@ impl ArchiveDirectory {
             replicas: Vec::new(),
             accounting: Vec::new(),
             custody_commitments: Vec::new(),
-            retrieval_receipts: Vec::new(),
             availability_certificates: Vec::new(),
         };
         let replicas: Vec<ArchiveReplicaAttestation> = replicas
@@ -1992,7 +1960,6 @@ impl ArchiveDirectory {
             replicas: replicas.clone(),
             accounting: accounting.clone(),
             custody_commitments: Vec::new(),
-            retrieval_receipts: Vec::new(),
             availability_certificates: Vec::new(),
         };
         let custody_commitments = custody_commitments
@@ -2003,20 +1970,6 @@ impl ArchiveDirectory {
                     .is_ok()
             })
             .collect::<Vec<_>>();
-        let receipt_validation_directory = Self {
-            shard_span,
-            shards: shards.clone(),
-            providers: providers.clone(),
-            replicas: replicas.clone(),
-            accounting: accounting.clone(),
-            custody_commitments: custody_commitments.clone(),
-            retrieval_receipts: Vec::new(),
-            availability_certificates: Vec::new(),
-        };
-        let retrieval_receipts = retrieval_receipts
-            .into_iter()
-            .filter(|receipt| receipt.validate(&receipt_validation_directory).is_ok())
-            .collect::<Vec<_>>();
         let mut directory = Self {
             shard_span,
             shards,
@@ -2024,7 +1977,6 @@ impl ArchiveDirectory {
             replicas,
             accounting,
             custody_commitments,
-            retrieval_receipts,
             availability_certificates: Vec::new(),
         };
         directory.availability_certificates = directory.derive_availability_certificates(
@@ -2112,16 +2064,6 @@ impl ArchiveDirectory {
             .unwrap_or(false)
     }
 
-    pub fn retrieval_receipts_for_provider(
-        &self,
-        provider_id: &[u8; 32],
-    ) -> Vec<&ArchiveRetrievalReceipt> {
-        self.retrieval_receipts
-            .iter()
-            .filter(|receipt| &receipt.provider_id == provider_id)
-            .collect()
-    }
-
     pub fn availability_certificate(
         &self,
         shard_id: u64,
@@ -2194,8 +2136,8 @@ impl ArchiveDirectory {
                         .certified_providers
                         .contains(&provider.provider_id)
                 }) as u8;
-            let scorecard = self
-                .operator_scorecard(
+            let provider_health = self
+                .provider_health(
                     &provider.provider_id,
                     crate::protocol::CURRENT.archive_provider_replica_count as usize,
                     crate::protocol::CURRENT.archive_retention_horizon_epochs,
@@ -2204,7 +2146,11 @@ impl ArchiveDirectory {
             (
                 commitment_penalty,
                 certificate_penalty,
-                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
+                u64::MAX.saturating_sub(
+                    provider_health
+                        .as_ref()
+                        .map_or(0, |health| health.routing_weight),
+                ),
                 provider_selection_score(
                     &provider.provider_id,
                     &provider.schedule_seed,
@@ -2228,11 +2174,11 @@ impl ArchiveDirectory {
             .unwrap_or(0)
     }
 
-    pub fn operator_scorecards(
+    pub fn provider_health_reports(
         &self,
         replica_count: usize,
         retention_horizon_epochs: u64,
-    ) -> Vec<ArchiveOperatorScorecard> {
+    ) -> Vec<ArchiveProviderHealth> {
         let mut candidate_nodes = self
             .providers
             .iter()
@@ -2294,97 +2240,33 @@ impl ArchiveDirectory {
                         .min(10_000) as u16
                 };
                 let accounting = self.accounting_for_provider(&provider.provider_id);
-                let receipts = self.retrieval_receipts_for_provider(&provider.provider_id);
-                let successful_retrieval_receipts =
-                    receipts.iter().filter(|receipt| receipt.success).count() as u64;
-                let failed_retrieval_receipts =
-                    receipts.iter().filter(|receipt| !receipt.success).count() as u64;
-                let total_receipts =
-                    successful_retrieval_receipts.saturating_add(failed_retrieval_receipts);
-                let service_success_bps = if total_receipts == 0 {
-                    accounting
-                        .map(ArchiveServiceLedger::success_bps)
-                        .unwrap_or(10_000)
-                } else {
-                    ((successful_retrieval_receipts.saturating_mul(10_000)) / total_receipts)
-                        .min(10_000) as u16
-                };
-                let receipt_checkpoint_batches = receipts
-                    .iter()
-                    .filter(|receipt| {
-                        receipt.success
-                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
-                    })
-                    .count() as u64;
-                let receipt_checkpoint_segments = receipts
-                    .iter()
-                    .filter(|receipt| {
-                        receipt.success
-                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
-                    })
-                    .map(|receipt| receipt.served_units as u64)
-                    .sum::<u64>();
-                let receipt_archive_shards = receipts
-                    .iter()
-                    .filter(|receipt| {
-                        receipt.success
-                            && receipt.retrieval_kind == ArchiveRetrievalKind::ArchiveShard
-                    })
-                    .map(|receipt| receipt.served_units as u64)
-                    .sum::<u64>();
-                let receipt_checkpoint_latency_ms = receipts
-                    .iter()
-                    .filter(|receipt| {
-                        receipt.success
-                            && receipt.retrieval_kind == ArchiveRetrievalKind::CheckpointBatch
-                    })
-                    .map(|receipt| receipt.latency_ms)
-                    .sum::<u64>();
-                let served_checkpoint_batches = if total_receipts == 0 {
-                    accounting
-                        .map(|ledger| ledger.served_checkpoint_batches)
-                        .unwrap_or(0)
-                } else {
-                    receipt_checkpoint_batches
-                };
-                let served_checkpoint_segments = if total_receipts == 0 {
-                    accounting
-                        .map(|ledger| ledger.served_checkpoint_segments)
-                        .unwrap_or(0)
-                } else {
-                    receipt_checkpoint_segments
-                };
-                let served_archive_shards = if total_receipts == 0 {
-                    accounting
-                        .map(|ledger| ledger.served_archive_shards)
-                        .unwrap_or(0)
-                } else {
-                    receipt_archive_shards
-                };
-                let mean_checkpoint_latency_ms = if total_receipts == 0 {
-                    accounting
-                        .map(ArchiveServiceLedger::mean_checkpoint_latency_ms)
-                        .unwrap_or(0)
-                } else if served_checkpoint_batches == 0 {
-                    0
-                } else {
-                    (receipt_checkpoint_latency_ms / served_checkpoint_batches).min(u32::MAX as u64)
-                        as u32
-                };
-                let reward_weight = 1u64
+                let service_success_bps = accounting
+                    .map(ArchiveServiceLedger::success_bps)
+                    .unwrap_or(10_000);
+                let served_checkpoint_batches = accounting
+                    .map(|ledger| ledger.served_checkpoint_batches)
+                    .unwrap_or(0);
+                let served_checkpoint_segments = accounting
+                    .map(|ledger| ledger.served_checkpoint_segments)
+                    .unwrap_or(0);
+                let served_archive_shards = accounting
+                    .map(|ledger| ledger.served_archive_shards)
+                    .unwrap_or(0);
+                let mean_checkpoint_latency_ms = accounting
+                    .map(ArchiveServiceLedger::mean_checkpoint_latency_ms)
+                    .unwrap_or(0);
+                let routing_weight = 1u64
                     .saturating_add((effective_custody_count as u64).saturating_mul(1_000_000))
                     .saturating_add((committed_custody_count as u64).saturating_mul(500_000))
                     .saturating_add((retention_surplus_epochs.min(u32::MAX as u64)) * 1_000)
                     .saturating_add((service_success_bps as u64).saturating_mul(100))
-                    .saturating_add(successful_retrieval_receipts.saturating_mul(100))
                     .saturating_add(served_checkpoint_segments)
                     .saturating_add(served_archive_shards.saturating_mul(10))
                     .saturating_add(advertised_shard_count as u64)
                     .saturating_sub(
                         (missing_custody_commitment_count as u64).saturating_mul(750_000),
-                    )
-                    .saturating_sub(failed_retrieval_receipts.saturating_mul(500));
-                ArchiveOperatorScorecard {
+                    );
+                ArchiveProviderHealth {
                     provider_id: provider.provider_id,
                     provider_manifest_digest: provider.manifest_digest,
                     advertised_shard_count,
@@ -2395,28 +2277,26 @@ impl ArchiveDirectory {
                     retention_surplus_epochs,
                     availability_bps,
                     service_success_bps,
-                    successful_retrieval_receipts,
-                    failed_retrieval_receipts,
                     served_checkpoint_batches,
                     served_checkpoint_segments,
                     served_archive_shards,
                     mean_checkpoint_latency_ms,
-                    reward_weight,
+                    routing_weight,
                 }
             })
             .collect()
     }
 
-    pub fn operator_scorecard(
+    pub fn provider_health(
         &self,
         provider_id: &[u8; 32],
         replica_count: usize,
         retention_horizon_epochs: u64,
-    ) -> Result<ArchiveOperatorScorecard> {
-        self.operator_scorecards(replica_count, retention_horizon_epochs)
+    ) -> Result<ArchiveProviderHealth> {
+        self.provider_health_reports(replica_count, retention_horizon_epochs)
             .into_iter()
-            .find(|scorecard| &scorecard.provider_id == provider_id)
-            .ok_or_else(|| anyhow!("missing archive operator scorecard"))
+            .find(|health| &health.provider_id == provider_id)
+            .ok_or_else(|| anyhow!("missing archive provider health report"))
     }
 
     fn derive_availability_certificates(
@@ -2424,10 +2304,10 @@ impl ArchiveDirectory {
         replica_count: usize,
         retention_horizon_epochs: u64,
     ) -> Vec<ArchiveAvailabilityCertificate> {
-        let scorecards = self
-            .operator_scorecards(replica_count, retention_horizon_epochs)
+        let health_reports = self
+            .provider_health_reports(replica_count, retention_horizon_epochs)
             .into_iter()
-            .map(|scorecard| (scorecard.provider_id, scorecard))
+            .map(|health| (health.provider_id, health))
             .collect::<BTreeMap<_, _>>();
         self.shards
             .iter()
@@ -2439,7 +2319,7 @@ impl ArchiveDirectory {
                     .filter(|provider| {
                         let retention = self
                             .provider_retention_for_shard(&provider.provider_id, shard.shard_id);
-                        let Some(scorecard) = scorecards.get(&provider.provider_id) else {
+                        let Some(health) = health_reports.get(&provider.provider_id) else {
                             return false;
                         };
                         let required_retention =
@@ -2450,8 +2330,8 @@ impl ArchiveDirectory {
                                 shard.shard_id,
                                 required_retention,
                             )
-                            && scorecard.availability_bps >= 9_000
-                            && scorecard.service_success_bps >= 9_000
+                            && health.availability_bps >= 9_000
+                            && health.service_success_bps >= 9_000
                     })
                     .map(|provider| provider.provider_id)
                     .collect::<Vec<_>>();
@@ -2499,8 +2379,8 @@ impl ArchiveDirectory {
         eligible.sort_by_key(|provider| {
             let used_penalty = used_providers.contains(&provider.provider_id) as u8;
             let provider_load = *provider_loads.get(&provider.provider_id).unwrap_or(&0) as u32;
-            let scorecard = self
-                .operator_scorecard(
+            let provider_health = self
+                .provider_health(
                     &provider.provider_id,
                     crate::protocol::CURRENT.archive_provider_replica_count as usize,
                     crate::protocol::CURRENT.archive_retention_horizon_epochs,
@@ -2543,7 +2423,11 @@ impl ArchiveDirectory {
                 provider_load,
                 commitment_penalty,
                 certificate_penalty,
-                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
+                u64::MAX.saturating_sub(
+                    provider_health
+                        .as_ref()
+                        .map_or(0, |health| health.routing_weight),
+                ),
                 u64::MAX.saturating_sub(min_retention),
                 u32::MAX.saturating_sub(min_replica_count),
                 provider_selection_score(
@@ -2603,8 +2487,8 @@ impl ArchiveDirectory {
         }
         eligible.sort_by_key(|provider| {
             let retention = self.provider_retention_for_shard(&provider.provider_id, shard_id);
-            let scorecard = self
-                .operator_scorecard(
+            let provider_health = self
+                .provider_health(
                     &provider.provider_id,
                     crate::protocol::CURRENT.archive_provider_replica_count as usize,
                     crate::protocol::CURRENT.archive_retention_horizon_epochs,
@@ -2628,7 +2512,11 @@ impl ArchiveDirectory {
             (
                 commitment_penalty,
                 certificate_penalty,
-                u64::MAX.saturating_sub(scorecard.as_ref().map_or(0, |score| score.reward_weight)),
+                u64::MAX.saturating_sub(
+                    provider_health
+                        .as_ref()
+                        .map_or(0, |health| health.routing_weight),
+                ),
                 u64::MAX.saturating_sub(retention),
                 provider_selection_score(
                     &provider.provider_id,
@@ -3559,57 +3447,6 @@ fn archive_availability_certificate_digest(
     *hasher.finalize().as_bytes()
 }
 
-fn archive_retrieval_receipt_digest(
-    requester_id: &[u8; 32],
-    provider_id: &[u8; 32],
-    provider_manifest_digest: &[u8; 32],
-    retrieval_kind: ArchiveRetrievalKind,
-    request_message_id: &[u8; 32],
-    response_message_id: &Option<[u8; 32]>,
-    from_epoch: u64,
-    through_epoch: u64,
-    shard_id: &Option<u64>,
-    served_units: u32,
-    success: bool,
-    latency_ms: u64,
-    observed_unix_ms: u64,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(ARCHIVE_RETRIEVAL_RECEIPT_DOMAIN);
-    hasher.update(requester_id);
-    hasher.update(provider_id);
-    hasher.update(provider_manifest_digest);
-    hasher.update(&[match retrieval_kind {
-        ArchiveRetrievalKind::CheckpointBatch => 1,
-        ArchiveRetrievalKind::ArchiveShard => 2,
-    }]);
-    hasher.update(request_message_id);
-    match response_message_id {
-        Some(message_id) => {
-            hasher.update(&[1]);
-            hasher.update(message_id);
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    hasher.update(&from_epoch.to_le_bytes());
-    hasher.update(&through_epoch.to_le_bytes());
-    match shard_id {
-        Some(shard_id) => {
-            hasher.update(&[1]);
-            hasher.update(&shard_id.to_le_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    hasher.update(&served_units.to_le_bytes());
-    hasher.update(&[success as u8]);
-    hasher.update(&latency_ms.to_le_bytes());
-    hasher.update(&observed_unix_ms.to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
 fn archive_provider_manifest_digest(
     provider_id: &[u8; 32],
     schedule_seed: &[u8; 32],
@@ -3963,119 +3800,6 @@ impl ArchiveCustodyCommitment {
     }
 }
 
-impl ArchiveRetrievalReceipt {
-    pub fn new(
-        requester_id: [u8; 32],
-        provider_id: [u8; 32],
-        provider_manifest_digest: [u8; 32],
-        retrieval_kind: ArchiveRetrievalKind,
-        request_message_id: [u8; 32],
-        response_message_id: Option<[u8; 32]>,
-        from_epoch: u64,
-        through_epoch: u64,
-        shard_id: Option<u64>,
-        served_units: u32,
-        success: bool,
-        latency_ms: u64,
-        observed_unix_ms: u64,
-    ) -> Self {
-        Self {
-            requester_id,
-            provider_id,
-            provider_manifest_digest,
-            retrieval_kind,
-            request_message_id,
-            response_message_id,
-            from_epoch,
-            through_epoch,
-            shard_id,
-            served_units,
-            success,
-            latency_ms,
-            observed_unix_ms,
-            receipt_digest: archive_retrieval_receipt_digest(
-                &requester_id,
-                &provider_id,
-                &provider_manifest_digest,
-                retrieval_kind,
-                &request_message_id,
-                &response_message_id,
-                from_epoch,
-                through_epoch,
-                &shard_id,
-                served_units,
-                success,
-                latency_ms,
-                observed_unix_ms,
-            ),
-        }
-    }
-
-    pub fn validate(&self, directory: &ArchiveDirectory) -> Result<()> {
-        let provider = directory.provider(&self.provider_id)?;
-        if provider.manifest_digest != self.provider_manifest_digest {
-            bail!("archive retrieval receipt manifest digest mismatch");
-        }
-        if self.from_epoch > self.through_epoch {
-            bail!("archive retrieval receipt range is inverted");
-        }
-        if self.success {
-            if self.served_units == 0 {
-                bail!("successful archive retrieval receipt must serve at least one unit");
-            }
-            if self.response_message_id.is_none() {
-                bail!("successful archive retrieval receipt must bind a response message");
-            }
-        } else if self.response_message_id.is_some() {
-            bail!("failed archive retrieval receipt cannot bind a response message");
-        }
-        match self.retrieval_kind {
-            ArchiveRetrievalKind::CheckpointBatch => {
-                if self.shard_id.is_some() {
-                    bail!("checkpoint retrieval receipt must not name a shard");
-                }
-                if !provider.covers_range(directory, self.from_epoch, self.through_epoch)? {
-                    bail!("checkpoint retrieval receipt references an uncovered range");
-                }
-            }
-            ArchiveRetrievalKind::ArchiveShard => {
-                let shard_id = self
-                    .shard_id
-                    .ok_or_else(|| anyhow!("archive-shard receipt is missing the shard id"))?;
-                let shard = directory
-                    .shard(shard_id)
-                    .ok_or_else(|| anyhow!("unknown archive shard {}", shard_id))?;
-                if shard.first_epoch != self.from_epoch || shard.last_epoch != self.through_epoch {
-                    bail!("archive-shard receipt range does not match the shard");
-                }
-                if !provider.serves_shard(shard_id, &shard.root_digest) {
-                    bail!("archive-shard receipt references an unserved shard");
-                }
-            }
-        }
-        if self.receipt_digest
-            != archive_retrieval_receipt_digest(
-                &self.requester_id,
-                &self.provider_id,
-                &self.provider_manifest_digest,
-                self.retrieval_kind,
-                &self.request_message_id,
-                &self.response_message_id,
-                self.from_epoch,
-                self.through_epoch,
-                &self.shard_id,
-                self.served_units,
-                self.success,
-                self.latency_ms,
-                self.observed_unix_ms,
-            )
-        {
-            bail!("archive retrieval receipt digest mismatch");
-        }
-        Ok(())
-    }
-}
-
 impl ArchiveAvailabilityCertificate {
     pub fn new(
         shard_id: u64,
@@ -4238,7 +3962,10 @@ fn validate_leaf_levels(leaves: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> Result
     Ok(())
 }
 
-pub fn deterministic_genesis_note_key(settlement_unit: &SettlementUnit, chain_id: &[u8; 32]) -> [u8; 32] {
+pub fn deterministic_genesis_note_key(
+    settlement_unit: &SettlementUnit,
+    chain_id: &[u8; 32],
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_KEY_DOMAIN);
     hasher.update(chain_id);
     hasher.update(&settlement_unit.id);
@@ -4247,7 +3974,11 @@ pub fn deterministic_genesis_note_key(settlement_unit: &SettlementUnit, chain_id
     *hasher.finalize().as_bytes()
 }
 
-fn deterministic_genesis_rho(settlement_unit: &SettlementUnit, birth_epoch: u64, chain_id: &[u8; 32]) -> [u8; 32] {
+fn deterministic_genesis_rho(
+    settlement_unit: &SettlementUnit,
+    birth_epoch: u64,
+    chain_id: &[u8; 32],
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_RHO_DOMAIN);
     hasher.update(chain_id);
     hasher.update(&settlement_unit.id);

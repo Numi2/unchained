@@ -1,7 +1,6 @@
 use unchained::{config, epoch::Anchor, storage};
 
 fn main() -> anyhow::Result<()> {
-    // Parse optional N from CLI: default to config.metrics.last_epochs_to_show (or 10)
     let args: Vec<String> = std::env::args().collect();
     let n_arg: Option<u64> = if args.len() > 1 {
         args[1].parse::<u64>().ok()
@@ -9,12 +8,11 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let cfg = config::load_resolved("config.toml")?;
+    let cfg = config::load();
 
-    let db = storage::open(&cfg.storage);
+    let db = storage::open(&cfg.storage)?;
 
-    let default_n = cfg.metrics.last_epochs_to_show;
-    let show_n = n_arg.unwrap_or(default_n.max(1));
+    let show_n = n_arg.unwrap_or(10);
 
     println!("📚 Listing last {} epoch(s)", show_n);
 
@@ -47,7 +45,10 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| "none".to_string())
             );
             println!("   ordering_path: {:?}", anchor.ordering_path);
-            println!("   settlement_unit_root: {}", hex::encode(anchor.merkle_root));
+            println!(
+                "   settlement_unit_root: {}",
+                hex::encode(anchor.merkle_root)
+            );
             println!("   bootstrap_units: {}", anchor.settlement_unit_count);
             println!(
                 "   validator_set_hash: {}",

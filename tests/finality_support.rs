@@ -9,7 +9,6 @@ use std::{
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use unchained::{
-    settlement_unit::SettlementUnit,
     consensus::{
         OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys, ValidatorSet,
         ValidatorVote, VoteTarget,
@@ -19,6 +18,7 @@ use unchained::{
     ingress, node_control,
     node_identity::{validator_from_record, NodeIdentity},
     proof, proof_assistant, protocol,
+    settlement_unit::SettlementUnit,
     staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
     storage::WalletStore,
     transaction::{
@@ -282,7 +282,12 @@ impl TestCommittee {
     }
 
     #[allow(dead_code)]
-    pub fn child_anchor(&self, parent: &Anchor, merkle_root: [u8; 32], settlement_unit_count: u32) -> Anchor {
+    pub fn child_anchor(
+        &self,
+        parent: &Anchor,
+        merkle_root: [u8; 32],
+        settlement_unit_count: u32,
+    ) -> Anchor {
         self.anchor(
             parent.num.saturating_add(1),
             Some(parent),
@@ -526,11 +531,6 @@ pub async fn spawn_test_proof_assistant(
 }
 
 #[allow(dead_code)]
-pub fn proof_fixture_dir() -> String {
-    format!("{}/tests/proof-fixtures", env!("CARGO_MANIFEST_DIR"))
-}
-
-#[allow(dead_code)]
 pub fn seed_wallet_with_settlement_units(
     store: &Store,
     wallet: &Wallet,
@@ -566,7 +566,8 @@ pub fn seed_wallet_with_settlement_unit_values(
     genesis: &Anchor,
     values: &[u64],
 ) -> anyhow::Result<Vec<SettlementUnit>> {
-    let mut settlement_units = seed_wallet_with_settlement_units(store, wallet, genesis, values.len() as u64)?;
+    let mut settlement_units =
+        seed_wallet_with_settlement_units(store, wallet, genesis, values.len() as u64)?;
     for (settlement_unit, value) in settlement_units.iter_mut().zip(values.iter().copied()) {
         settlement_unit.value = value;
         store.put("settlement_unit", &settlement_unit.id, settlement_unit)?;

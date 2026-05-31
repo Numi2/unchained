@@ -36,6 +36,10 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
 - **Wallet Sync**: Optimized for privacy-preserving compact light-client sync.
 - **Proof System**: Introduced remote proof-assistant and canonical proof objects.
 - **Testing**: Established multi-validator network and privacy-invariant tests.
+- **Archive Economy Removal**: Removed requester-linked archive retrieval
+  receipts and persisted archive operator scorecards from the wire protocol,
+  canonical archive accounting, and storage. Historical nullifier replication
+  remains as wallet-sync infrastructure, not a public archive-receipt economy.
 
 ---
 
@@ -48,6 +52,11 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
 
 - `[~]` Remove PoW-specific terminology from CLI help, config, metrics, and
   tests
+  Discovery query-budget abuse controls now expose `query_budget_work_bits`
+  and “work target” language instead of mining-shaped naming, so the surface
+  no longer reads like a chain PoW parameter. The operator config file surface
+  has been removed, so PoW, epoch-cadence, P2P, metrics, PIR, ingress-size,
+  batching, and transport policy knobs are not externally tuneable.
 - `[~]` Replace PoW bootstrap assumptions in persistence and replay code with
   validator-set bootstrap assumptions
 
@@ -150,8 +159,12 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   checkpoint history bindings now commit to backend-agnostic verifier-key
   digests instead of leaking raw zkVM method IDs into transaction-visible
   journals. Proof envelopes also bind a canonical statement digest for the
-  decoded public journal, but the underlying proving backend is still the
-  prototype engine and has not yet been replaced.
+  decoded public journal, and the proof-fixture receipt cache / minting
+  environment switch has been removed from the runtime prover path. Public node
+  builds are now verifier-only: they hardcode canonical method IDs and do not
+  compile the RISC0 prover or guest ELF embedding path. The dedicated
+  `unchained_proof_assistant` build still carries the prototype prover until the
+  native backend replaces it.
 - `[~]` Define a native transparent STARK-family proving architecture
   The canonical proof layer now has an explicit circuit inventory for ordinary
   transfer, private delegation, private undelegation, unbonding claim, and
@@ -160,20 +173,22 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   transport now also carry explicit backend identity and capability manifests.
   Proof-facing note/nullifier/Merkle/checkpoint commitments now route through
   an algebraic proof-hash adapter in `proof-core` and `src/shielded.rs`, and
-  ordinary transfer now prepares an explicit native-backend scaffold with
-  separated public inputs, private witness material, envelope bindings, and
-  trace layout before dispatching to the prototype backend. Ordinary transfer
-  witnesses now also use deterministic full-history extensions from genesis
-  rather than hidden checkpoint-accumulator receipts, and transfer journals no
-  longer leak an accumulator verifier-key binding. The backend swap itself is
-  still open.
-- `[ ]` Set and document a conservative `>= 128-bit` security budget
+  ordinary transfer now prepares an explicit native-backend boundary with
+  prepared public inputs and output binding checks before dispatching to the
+  prototype backend. Ordinary transfer witnesses now also use deterministic
+  full-history extensions from genesis rather than hidden checkpoint-accumulator
+  receipts, and transfer journals no longer leak an accumulator verifier-key
+  binding. The backend swap itself is still open.
+- `[x]` Set and document a conservative `>= 128-bit` security budget
+  `src/proof.rs` defines `MIN_TRANSPARENT_PROOF_SECURITY_BITS = 128`,
+  validates circuit descriptors, backend descriptors, proof metadata, and
+  proof-assistant capability manifests against that floor, and the architecture
+  / README documents the same target.
 - `[~]` Implement native circuits for transfer
   Ordinary transfer now has the first extracted native-backend boundary in
-  `src/proof/native_transfer.rs`, including prepared public inputs, hidden
-  witness plumbing, deterministic direct-history witness construction, and
-  trace-layout scaffolding over extension record counts. The actual AIR,
-  prover, and verifier are still missing.
+  `src/proof/native_transfer.rs`, including prepared public inputs, output
+  binding validation, and deterministic direct-history witness construction.
+  The actual AIR, prover, and verifier are still missing.
 - `[ ]` Implement native circuits for staking flows
 - `[ ]` Implement native circuits for issuance and redemption
 - `[ ]` Remove general-purpose zkVM assumptions from the steady-state critical
@@ -181,8 +196,14 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
 
 ## 8. Cryptography And Key Management
 
-- `[ ]` Change the default transport profile to hybrid `X25519MLKEM768`
-- `[ ]` Standardize online validator voting and authentication on `ML-DSA`
+- `[x]` Change the default transport profile to hybrid `X25519MLKEM768`
+  Node, ingress, proof-assistant, and discovery transports now share the
+  `node_identity` TLS builders, which pin TLS 1.3 key exchange to the hybrid
+  `X25519MLKEM768` group rather than pure `MLKEM768`.
+- `[x]` Standardize online validator voting and authentication on `ML-DSA`
+  Validator hot keys are carried as ML-DSA SPKI in `ValidatorKeys`, quorum
+  certificates verify votes with `ML_DSA_65`, and the node-record auth key is
+  the runtime validator identity used for consensus signing.
 - `[ ]` Standardize cold recovery and emergency governance on `SLH-DSA`
 - `[ ]` Separate discovery, mailbox, payment-capability, validator-hot, and
   validator-cold keys throughout the codebase
@@ -193,36 +214,58 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
 - `[~]` Define the exact native action set for v1:
   private transfer, private staking, issuance/redemption, governed actions,
   and optional batch settlement
-- `[ ]` Remove or quarantine abstractions that assume Unchained is a generic
+- `[x]` Remove or quarantine abstractions that assume Unchained is a generic
   programmable L1
+  The consensus transaction surface is a closed native enum:
+  ordinary private transfer plus shared-state actions for validator
+  registration/profile updates, private delegation, private undelegation,
+  unbonding claims, penalty-evidence admission, and validator reactivation.
+  Static scans find no EVM/WASM/bytecode/gas/contract deployment surface in
+  consensus code.
 
 ## 10. Config, CLI, And Operator Surface
 
-- `[~]` Redesign config around validators, relays, gateways, and wallet
-  services rather than miners and epoch PoW knobs
-  Wallet ingress now has explicit `[ingress.wallet]`,
-  `[ingress.access_relay]`, and `[ingress.submission_gateway]` config sections,
-  and remote proving now has explicit `[proof_assistant.wallet]` and
-  `[proof_assistant.server]` config sections, but broader validator/product
-  cleanup is still open.
+- `[x]` Remove runtime config-file parsing
+  Nodes and wallets now boot from a code-defined runtime profile, with no
+  `config.toml`, TOML parser, or deployment-facts file. Protocol, privacy,
+  consensus cadence, P2P admission/rate limits, transport windows, ingress
+  padding/batching, proof assistant limits, discovery PIR/query-budget policy,
+  metrics binding, local storage path, listen address, bootstrap/trust records,
+  and role endpoint records are all compiled into code.
+- `[x]` Prune unused dependency surface
+  The current pruning batch removes TOML parsing, QR rendering, clipboard
+  integration, Hyper/Bytes metrics serving, Prometheus export scaffolding,
+  Hickory DNS crates, rcgen/webpki helper code, postcard/serde_bytes leftovers,
+  chrono backup timestamps, atty terminal checks, tokio-rustls, aes-gcm-siv,
+  futures, log, rpassword, once_cell, subtle, the settlement-unit loose-file
+  mirroring switch, the unused build-time `cc` dependency, and the default
+  node dependency on `methods` plus `risc0-zkvm/prove`. Wallet and node
+  passphrase prompts now use the in-house hidden terminal reader, and local
+  control capability checks use an in-house fixed-width constant-time compare.
 - `[~]` Redesign CLI language around validator operation and private settlement
   The CLI now has explicit `start-access-relay` and
-  `start-submission-gateway` / `start-proof-assistant` commands alongside
-  cold-signed validator control document flows, but broader operator-language
+  `start-submission-gateway` commands alongside cold-signed validator control
+  document flows. The proof assistant is now a dedicated `unchained_proof_assistant`
+  binary instead of a public-node subcommand, but broader operator-language
   cleanup is still open.
-- `[~]` Remove legacy config keys that control PoW, epoch seconds, archive
+- `[x]` Remove legacy config keys that control PoW, epoch seconds, archive
   provider behavior, or mining workflows
+  The config schema no longer accepts `p2p`, `epoch`, `metrics`, `compact`,
+  orphan, archive-reward, mining, or policy-tuning sections. Unknown legacy
+  keys now fail fast while code-defined defaults keep nodes bootable without a
+  config file.
 - `[~]` Define operational ceremonies for validator hot/cold keys and ingress
   operator separation
   Runtime role separation is now enforced by distinct ingress services and
   identity checks, but the operator ceremony docs are still missing.
-- `[~]` Add discovery-directory operator config, PIR parameter selection, and
-  signed snapshot publication ceremonies
+- `[~]` Add discovery-directory deployment facts, fixed PIR policy, and signed
+  snapshot publication ceremonies
   Discovery now exposes live operator status over the discovery transport and
   the node CLI can inspect manifest / queue depth / PIR envelope state from a
   running service. The node CLI can also export signed snapshot bundles and
-  import them into query-only replicas; broader operator rollout policy and
-  mobile parameter tuning are still open.
+  import them into query-only replicas. PIR arity, query-budget work target,
+  record TTL, request/response limits, and queue caps are no longer
+  operator-tunable; broader operator rollout ceremony docs are still open.
 
 ## 11. Tests And Verification
 

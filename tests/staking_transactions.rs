@@ -1,8 +1,11 @@
+#![cfg_attr(not(feature = "local-prover"), allow(dead_code, unused_imports))]
+
 mod finality_support;
 
 use anyhow::Result;
 use aws_lc_rs::{signature::UnparsedPublicKey, unstable::signature::ML_DSA_65};
 use rocksdb::WriteBatch;
+#[cfg(feature = "local-prover")]
 use std::sync::Arc;
 use tempfile::TempDir;
 use unchained::{
@@ -20,11 +23,11 @@ use unchained::{
         ValidatorPenaltyEvent, ValidatorPool, ValidatorProfileUpdate, ValidatorReactivation,
         ValidatorRegistration, ValidatorStatus,
     },
-    storage::WalletStore,
     transaction::{PenaltyEvidenceAdmission, SharedStateAction, Tx},
-    wallet::Wallet,
     Store,
 };
+#[cfg(feature = "local-prover")]
+use unchained::{storage::WalletStore, wallet::Wallet};
 
 fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> Result<Anchor> {
     let genesis = committee.genesis_anchor();
@@ -69,6 +72,7 @@ fn build_active_validator_pool(
     Ok((pool, hot_key, cold_key))
 }
 
+#[cfg(feature = "local-prover")]
 fn signed_shared_state_tx(
     store: &Store,
     wallet: &Wallet,
@@ -268,19 +272,17 @@ fn apply_control_action_without_fee(
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 fn build_single_action_fee_wallet(
     dir: &TempDir,
     store: &Store,
     genesis: &Anchor,
 ) -> Result<Wallet> {
     std::env::set_var("WALLET_PASSPHRASE", "staking-transactions-passphrase");
-    std::env::set_var(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        finality_support::proof_fixture_dir(),
-    );
     let wallet_store = Arc::new(WalletStore::open(&dir.path().to_string_lossy())?);
     let wallet = finality_support::deterministic_wallet(wallet_store)?;
-    let _ = finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
+    let _ =
+        finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
     Ok(wallet)
 }
 
@@ -398,6 +400,7 @@ fn finalized_fast_path_anchor(
     )?)
 }
 
+#[cfg(feature = "local-prover")]
 #[test]
 fn validator_registration_transaction_updates_pools_and_future_committee() -> Result<()> {
     let dir = TempDir::new()?;
@@ -433,6 +436,7 @@ fn validator_registration_transaction_updates_pools_and_future_committee() -> Re
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[test]
 fn validator_profile_update_transaction_applies_from_fresh_fee_paid_control_submission(
 ) -> Result<()> {
@@ -638,6 +642,7 @@ fn liveness_fault_admission_slashes_pool_without_changing_share_ownership() -> R
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[test]
 fn validator_reactivation_transaction_applies_from_fresh_fee_paid_control_submission() -> Result<()>
 {

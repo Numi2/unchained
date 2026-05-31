@@ -1,11 +1,11 @@
 use crate::{
-    settlement_unit::SettlementUnit,
     consensus::ValidatorSet,
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
     evidence::ConsensusEvidenceRecord,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     network::NetHandle,
+    settlement_unit::SettlementUnit,
     shielded::{ArchivedNullifierEpoch, NoteCommitmentTree, NullifierRootLedger},
     staking::{ValidatorPool, ValidatorRewardEvent},
     storage::Store,
@@ -187,14 +187,19 @@ pub fn build_compact_wallet_sync_delta(
 ) -> Result<CompactWalletSyncDelta> {
     let head = build_compact_wallet_sync_head(db)?;
     let committed_settlement_units = db
-        .load_committed_settlement_unit_slice(next_settlement_unit_index, max_settlement_units as usize)?
+        .load_committed_settlement_unit_slice(
+            next_settlement_unit_index,
+            max_settlement_units as usize,
+        )?
         .into_iter()
         .enumerate()
-        .map(|(offset, (birth_epoch, settlement_unit))| CompactCommittedSettlementUnit {
-            scan_index: next_settlement_unit_index.saturating_add(offset as u64),
-            birth_epoch,
-            settlement_unit,
-        })
+        .map(
+            |(offset, (birth_epoch, settlement_unit))| CompactCommittedSettlementUnit {
+                scan_index: next_settlement_unit_index.saturating_add(offset as u64),
+                birth_epoch,
+                settlement_unit,
+            },
+        )
         .collect();
     let shielded_outputs = db
         .load_shielded_output_slice(next_output_index, max_outputs as usize)?

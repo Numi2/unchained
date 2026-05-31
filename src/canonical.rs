@@ -1,7 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::{
-    settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     consensus::{
         ConsensusPosition, OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys,
         ValidatorSet, ValidatorVote,
@@ -17,10 +16,9 @@ use crate::{
         VoteEquivocationEvidence,
     },
     network::{
-        CheckpointGetSettlementUnitBatch, CheckpointLeavesBundle,
-        CheckpointSettlementUnitBatch, CheckpointSettlementUnitCandidatesResponse,
-        CheckpointSettlementUnitIdsBundle, CompactEpoch, EpochByHash, EpochHeadersBatch,
-        EpochHeadersRange,
+        CheckpointGetSettlementUnitBatch, CheckpointLeavesBundle, CheckpointSettlementUnitBatch,
+        CheckpointSettlementUnitCandidatesResponse, CheckpointSettlementUnitIdsBundle, EpochByHash,
+        EpochHeadersBatch, EpochHeadersRange,
     },
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
@@ -28,9 +26,9 @@ use crate::{
     proof::{
         TransparentCircuit, TransparentProof, TransparentProofBackend, TransparentProofStatement,
     },
+    settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     shielded::{
-        ArchiveCustodyCommitment, ArchiveOperatorScorecard, ArchiveProviderManifest,
-        ArchiveReplicaAttestation, ArchiveRetrievalKind, ArchiveRetrievalReceipt,
+        ArchiveCustodyCommitment, ArchiveProviderManifest, ArchiveReplicaAttestation,
         ArchiveServiceLedger, ArchiveShard, ArchiveShardBundle, ArchivedNullifierEpoch,
         CheckpointBatchRequest, CheckpointBatchResponse, CheckpointExtensionRequest,
         CheckpointPresentation, EvolvingNullifierQuery, HistoricalAbsenceRecord,
@@ -1361,7 +1359,10 @@ pub fn decode_anchor_proposal(bytes: &[u8]) -> Result<AnchorProposal> {
     Ok(proposal)
 }
 
-pub fn write_settlement_unit(writer: &mut CanonicalWriter, settlement_unit: &SettlementUnit) -> Result<()> {
+pub fn write_settlement_unit(
+    writer: &mut CanonicalWriter,
+    settlement_unit: &SettlementUnit,
+) -> Result<()> {
     writer.write_fixed(&settlement_unit.id);
     writer.write_u64(settlement_unit.value);
     writer.write_fixed(&settlement_unit.parent_checkpoint_hash);
@@ -1412,7 +1413,9 @@ pub fn write_settlement_unit_candidate(
     Ok(())
 }
 
-pub fn read_settlement_unit_candidate(reader: &mut CanonicalReader<'_>) -> Result<SettlementUnitCandidate> {
+pub fn read_settlement_unit_candidate(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<SettlementUnitCandidate> {
     Ok(SettlementUnitCandidate {
         id: reader.read_fixed()?,
         value: reader.read_u64()?,
@@ -1425,7 +1428,9 @@ pub fn read_settlement_unit_candidate(reader: &mut CanonicalReader<'_>) -> Resul
     })
 }
 
-pub fn encode_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate) -> Result<Vec<u8>> {
+pub fn encode_settlement_unit_candidate(
+    settlement_unit: &SettlementUnitCandidate,
+) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     write_settlement_unit_candidate(&mut writer, settlement_unit)?;
     Ok(writer.into_vec())
@@ -1605,7 +1610,9 @@ pub fn decode_checkpoint_leaves_bundle(bytes: &[u8]) -> Result<CheckpointLeavesB
     Ok(bundle)
 }
 
-pub fn encode_checkpoint_settlement_unit_ids_bundle(bundle: &CheckpointSettlementUnitIdsBundle) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_settlement_unit_ids_bundle(
+    bundle: &CheckpointSettlementUnitIdsBundle,
+) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_u64(bundle.checkpoint_num);
     writer.write_fixed(&bundle.merkle_root);
@@ -1616,7 +1623,9 @@ pub fn encode_checkpoint_settlement_unit_ids_bundle(bundle: &CheckpointSettlemen
     Ok(writer.into_vec())
 }
 
-pub fn decode_checkpoint_settlement_unit_ids_bundle(bytes: &[u8]) -> Result<CheckpointSettlementUnitIdsBundle> {
+pub fn decode_checkpoint_settlement_unit_ids_bundle(
+    bytes: &[u8],
+) -> Result<CheckpointSettlementUnitIdsBundle> {
     let mut reader = CanonicalReader::new(bytes);
     let bundle = CheckpointSettlementUnitIdsBundle {
         checkpoint_num: reader.read_u64()?,
@@ -1667,36 +1676,9 @@ pub fn decode_epoch_headers_range(bytes: &[u8]) -> Result<EpochHeadersRange> {
     Ok(range)
 }
 
-pub fn encode_compact_epoch(compact: &CompactEpoch) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    write_anchor(&mut writer, &compact.anchor)?;
-    writer.write_vec(&compact.short_ids, |writer, short_id| {
-        writer.write_fixed(short_id);
-        Ok(())
-    })?;
-    writer.write_vec(&compact.prefilled, |writer, (index, settlement_unit)| {
-        writer.write_u32(*index);
-        write_settlement_unit(writer, settlement_unit)
-    })?;
-    Ok(writer.into_vec())
-}
-
-pub fn decode_compact_epoch(bytes: &[u8]) -> Result<CompactEpoch> {
-    let mut reader = CanonicalReader::new(bytes);
-    let compact = CompactEpoch {
-        anchor: read_anchor(&mut reader)?,
-        short_ids: reader.read_vec(|reader| reader.read_fixed())?,
-        prefilled: reader.read_vec(|reader| {
-            let index = reader.read_u32()?;
-            let settlement_unit = read_settlement_unit(reader)?;
-            Ok((index, settlement_unit))
-        })?,
-    };
-    reader.finish()?;
-    Ok(compact)
-}
-
-pub fn encode_checkpoint_get_settlement_unit_batch(request: &CheckpointGetSettlementUnitBatch) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_get_settlement_unit_batch(
+    request: &CheckpointGetSettlementUnitBatch,
+) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_fixed(&request.checkpoint_hash);
     writer.write_vec(&request.indexes, |writer, index| {
@@ -1706,7 +1688,9 @@ pub fn encode_checkpoint_get_settlement_unit_batch(request: &CheckpointGetSettle
     Ok(writer.into_vec())
 }
 
-pub fn decode_checkpoint_get_settlement_unit_batch(bytes: &[u8]) -> Result<CheckpointGetSettlementUnitBatch> {
+pub fn decode_checkpoint_get_settlement_unit_batch(
+    bytes: &[u8],
+) -> Result<CheckpointGetSettlementUnitBatch> {
     let mut reader = CanonicalReader::new(bytes);
     let request = CheckpointGetSettlementUnitBatch {
         checkpoint_hash: reader.read_fixed()?,
@@ -1716,7 +1700,9 @@ pub fn decode_checkpoint_get_settlement_unit_batch(bytes: &[u8]) -> Result<Check
     Ok(request)
 }
 
-pub fn encode_checkpoint_settlement_unit_batch(response: &CheckpointSettlementUnitBatch) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_settlement_unit_batch(
+    response: &CheckpointSettlementUnitBatch,
+) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_fixed(&response.checkpoint_hash);
     writer.write_vec(&response.indexes, |writer, index| {
@@ -1729,7 +1715,9 @@ pub fn encode_checkpoint_settlement_unit_batch(response: &CheckpointSettlementUn
     Ok(writer.into_vec())
 }
 
-pub fn decode_checkpoint_settlement_unit_batch(bytes: &[u8]) -> Result<CheckpointSettlementUnitBatch> {
+pub fn decode_checkpoint_settlement_unit_batch(
+    bytes: &[u8],
+) -> Result<CheckpointSettlementUnitBatch> {
     let mut reader = CanonicalReader::new(bytes);
     let response = CheckpointSettlementUnitBatch {
         checkpoint_hash: reader.read_fixed()?,
@@ -2233,72 +2221,6 @@ pub fn decode_archive_custody_commitment(bytes: &[u8]) -> Result<ArchiveCustodyC
     Ok(commitment)
 }
 
-pub fn encode_archive_operator_scorecard(scorecard: &ArchiveOperatorScorecard) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&scorecard.provider_id);
-    writer.write_fixed(&scorecard.provider_manifest_digest);
-    writer.write_u32(scorecard.advertised_shard_count);
-    writer.write_u32(scorecard.assigned_shard_count);
-    writer.write_u32(scorecard.fulfilled_custody_count);
-    writer.write_u32(scorecard.committed_custody_count);
-    writer.write_u32(scorecard.missing_custody_commitment_count);
-    writer.write_u64(scorecard.retention_surplus_epochs);
-    writer.write_u32(scorecard.availability_bps as u32);
-    writer.write_u32(scorecard.service_success_bps as u32);
-    writer.write_u64(scorecard.successful_retrieval_receipts);
-    writer.write_u64(scorecard.failed_retrieval_receipts);
-    writer.write_u64(scorecard.served_checkpoint_batches);
-    writer.write_u64(scorecard.served_checkpoint_segments);
-    writer.write_u64(scorecard.served_archive_shards);
-    writer.write_u32(scorecard.mean_checkpoint_latency_ms);
-    writer.write_u64(scorecard.reward_weight);
-    Ok(writer.into_vec())
-}
-
-pub fn decode_archive_operator_scorecard(bytes: &[u8]) -> Result<ArchiveOperatorScorecard> {
-    let mut reader = CanonicalReader::new(bytes);
-    let provider_id = reader.read_fixed()?;
-    let provider_manifest_digest = reader.read_fixed()?;
-    let advertised_shard_count = reader.read_u32()?;
-    let assigned_shard_count = reader.read_u32()?;
-    let fulfilled_custody_count = reader.read_u32()?;
-    let committed_custody_count = reader.read_u32()?;
-    let missing_custody_commitment_count = reader.read_u32()?;
-    let retention_surplus_epochs = reader.read_u64()?;
-    let availability_bps = reader.read_u32()?;
-    let service_success_bps = reader.read_u32()?;
-    let successful_retrieval_receipts = reader.read_u64()?;
-    let failed_retrieval_receipts = reader.read_u64()?;
-    let served_checkpoint_batches = reader.read_u64()?;
-    let served_checkpoint_segments = reader.read_u64()?;
-    let served_archive_shards = reader.read_u64()?;
-    let mean_checkpoint_latency_ms = reader.read_u32()?;
-    let reward_weight = reader.read_u64()?;
-    let scorecard = ArchiveOperatorScorecard {
-        provider_id,
-        provider_manifest_digest,
-        advertised_shard_count,
-        assigned_shard_count,
-        fulfilled_custody_count,
-        committed_custody_count,
-        missing_custody_commitment_count,
-        retention_surplus_epochs,
-        availability_bps: u16::try_from(availability_bps)
-            .map_err(|_| anyhow!("archive operator availability does not fit in u16"))?,
-        service_success_bps: u16::try_from(service_success_bps)
-            .map_err(|_| anyhow!("archive operator service availability does not fit in u16"))?,
-        successful_retrieval_receipts,
-        failed_retrieval_receipts,
-        served_checkpoint_batches,
-        served_checkpoint_segments,
-        served_archive_shards,
-        mean_checkpoint_latency_ms,
-        reward_weight,
-    };
-    reader.finish()?;
-    Ok(scorecard)
-}
-
 pub fn encode_archive_service_ledger(ledger: &ArchiveServiceLedger) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_fixed(&ledger.provider_id);
@@ -2330,75 +2252,6 @@ pub fn decode_archive_service_ledger(bytes: &[u8]) -> Result<ArchiveServiceLedge
     };
     reader.finish()?;
     Ok(ledger)
-}
-
-pub fn encode_archive_retrieval_receipt(receipt: &ArchiveRetrievalReceipt) -> Result<Vec<u8>> {
-    let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&receipt.requester_id);
-    writer.write_fixed(&receipt.provider_id);
-    writer.write_fixed(&receipt.provider_manifest_digest);
-    writer.write_u8(match receipt.retrieval_kind {
-        ArchiveRetrievalKind::CheckpointBatch => 1,
-        ArchiveRetrievalKind::ArchiveShard => 2,
-    });
-    writer.write_fixed(&receipt.request_message_id);
-    write_option_fixed32(&mut writer, &receipt.response_message_id);
-    writer.write_u64(receipt.from_epoch);
-    writer.write_u64(receipt.through_epoch);
-    writer.write_bool(receipt.shard_id.is_some());
-    if let Some(shard_id) = receipt.shard_id {
-        writer.write_u64(shard_id);
-    }
-    writer.write_u32(receipt.served_units);
-    writer.write_bool(receipt.success);
-    writer.write_u64(receipt.latency_ms);
-    writer.write_u64(receipt.observed_unix_ms);
-    writer.write_fixed(&receipt.receipt_digest);
-    Ok(writer.into_vec())
-}
-
-pub fn decode_archive_retrieval_receipt(bytes: &[u8]) -> Result<ArchiveRetrievalReceipt> {
-    let mut reader = CanonicalReader::new(bytes);
-    let requester_id = reader.read_fixed()?;
-    let provider_id = reader.read_fixed()?;
-    let provider_manifest_digest = reader.read_fixed()?;
-    let retrieval_kind = match reader.read_u8()? {
-        1 => ArchiveRetrievalKind::CheckpointBatch,
-        2 => ArchiveRetrievalKind::ArchiveShard,
-        other => bail!("unsupported archive retrieval kind {}", other),
-    };
-    let request_message_id = reader.read_fixed()?;
-    let response_message_id = read_option_fixed32(&mut reader)?;
-    let from_epoch = reader.read_u64()?;
-    let through_epoch = reader.read_u64()?;
-    let shard_id = if reader.read_bool()? {
-        Some(reader.read_u64()?)
-    } else {
-        None
-    };
-    let served_units = reader.read_u32()?;
-    let success = reader.read_bool()?;
-    let latency_ms = reader.read_u64()?;
-    let observed_unix_ms = reader.read_u64()?;
-    let receipt_digest = reader.read_fixed()?;
-    let receipt = ArchiveRetrievalReceipt {
-        requester_id,
-        provider_id,
-        provider_manifest_digest,
-        retrieval_kind,
-        request_message_id,
-        response_message_id,
-        from_epoch,
-        through_epoch,
-        shard_id,
-        served_units,
-        success,
-        latency_ms,
-        observed_unix_ms,
-        receipt_digest,
-    };
-    reader.finish()?;
-    Ok(receipt)
 }
 
 pub fn encode_archive_shard_bundle(bundle: &ArchiveShardBundle) -> Result<Vec<u8>> {

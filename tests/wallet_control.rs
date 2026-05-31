@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "local-prover"), allow(dead_code, unused_imports))]
+
 mod finality_support;
 
 use anyhow::{Context, Result};
@@ -6,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use unchained::{
-    settlement_unit::SettlementUnit,
-    config::{Net, P2p},
+    config::Net,
     discovery,
     epoch::Anchor,
     network, node_control, node_identity, proof,
     protocol::CURRENT as PROTOCOL,
+    settlement_unit::SettlementUnit,
     staking::{ValidatorMetadata, ValidatorPool, ValidatorRegistration, ValidatorStatus},
     storage::{Store, WalletStore},
     sync::SyncState,
@@ -56,25 +58,7 @@ fn build_net(port: u16) -> Net {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
-        strict_trust: false,
-        peer_exchange: true,
-        max_peers: 8,
-        connection_timeout_secs: 5,
-        idle_timeout_secs: 30,
-        keep_alive_interval_secs: 2,
         public_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()),
-        sync_timeout_secs: 3,
-        banned_peer_ids: Vec::new(),
-        quiet_by_default: true,
-    }
-}
-
-fn build_p2p() -> P2p {
-    P2p {
-        max_validation_failures_per_peer: 8,
-        peer_ban_duration_secs: 60,
-        rate_limit_window_secs: 60,
-        max_messages_per_window: 10_000,
     }
 }
 
@@ -87,7 +71,11 @@ fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> R
     Ok(genesis)
 }
 
-fn seed_sender_settlement_unit(store: &Store, wallet: &Wallet, genesis: &Anchor) -> Result<SettlementUnit> {
+fn seed_sender_settlement_unit(
+    store: &Store,
+    wallet: &Wallet,
+    genesis: &Anchor,
+) -> Result<SettlementUnit> {
     let chain_id = genesis.hash;
     let nonce = 7;
     let candidate_id = SettlementUnit::calculate_id(&genesis.hash, nonce, &wallet.address());
@@ -133,10 +121,10 @@ async fn spawn_network(
     let port = pick_udp_port();
     provision_runtime_identity(tempdir, genesis.hash, format!("127.0.0.1:{port}"))?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    network::spawn(build_net(port), build_p2p(), db, sync_state).await
+    network::spawn(build_net(port), db, sync_state).await
 }
 
-fn deterministic_fee_payment_fixture_components(
+fn deterministic_fee_payment_components(
     tempdir: &TempDir,
 ) -> Result<(Arc<Store>, Arc<WalletStore>, Wallet, Anchor)> {
     let base_path = tempdir.path().to_string_lossy().to_string();
@@ -145,8 +133,12 @@ fn deterministic_fee_payment_fixture_components(
     let wallet = finality_support::deterministic_wallet(wallet_store.clone())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let _settlement_units =
-        finality_support::seed_wallet_with_settlement_unit_values(db.as_ref(), &wallet, &genesis, &[2])?;
+    let _settlement_units = finality_support::seed_wallet_with_settlement_unit_values(
+        db.as_ref(),
+        &wallet,
+        &genesis,
+        &[2],
+    )?;
     Ok((db, wallet_store, wallet, genesis))
 }
 
@@ -205,7 +197,9 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
 
     let settlement_unit_id = [3u8; 32];
     let chain_id = [7u8; 32];
-    let derived = client.derive_genesis_lock_secret(settlement_unit_id, chain_id).await?;
+    let derived = client
+        .derive_genesis_lock_secret(settlement_unit_id, chain_id)
+        .await?;
     assert_eq!(
         derived,
         wallet.compute_genesis_lock_secret(&settlement_unit_id, &chain_id)
@@ -389,27 +383,25 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> {
+async fn deterministic_fee_paid_control_witness_digest_stays_stable() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    let _proof_fixture_dir = EnvGuard::set(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        &finality_support::proof_fixture_dir(),
-    );
     network::set_quiet_logging(true);
 
     let tempdir = TempDir::new()?;
-    let (db, wallet_store, wallet, _genesis) =
-        deterministic_fee_payment_fixture_components(&tempdir)?;
+    let (db, wallet_store, wallet, _genesis) = deterministic_fee_payment_components(&tempdir)?;
     let snapshot = node_control::build_shielded_runtime_snapshot(db.as_ref())?;
     let prepared =
         wallet.prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_registration_fee)?;
-    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
+    let witness_digest = proof::shielded_tx_witness_digest(prepared.witness())?;
     assert_eq!(
-        hex::encode(fixture_id),
+        hex::encode(witness_digest),
         "71f17d493d661275fb9086bef0121afcbc74a334e6e85de46f19453d2a3cd11e"
     );
-    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-    assert_eq!(journal.fee_amount, PROTOCOL.validator_registration_fee);
+    #[cfg(feature = "local-prover")]
+    {
+        let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
+        assert_eq!(journal.fee_amount, PROTOCOL.validator_registration_fee);
+    }
 
     drop(wallet);
     wallet_store.close()?;
@@ -417,51 +409,16 @@ async fn deterministic_fee_paid_control_fixture_id_stays_stable() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "fixture mint for fee-paid control submission proof"]
-async fn mint_fee_paid_control_submission_fixture() -> Result<()> {
-    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    let _proof_fixture_dir = EnvGuard::set(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        &finality_support::proof_fixture_dir(),
-    );
-    let _proof_fixture_mint = EnvGuard::set("UNCHAINED_ALLOW_PROOF_FIXTURE_MINT", "1");
-    network::set_quiet_logging(true);
-
-    let tempdir = TempDir::new()?;
-    let (db, wallet_store, wallet, _genesis) =
-        deterministic_fee_payment_fixture_components(&tempdir)?;
-    let snapshot = node_control::build_shielded_runtime_snapshot(db.as_ref())?;
-    let prepared =
-        wallet.prepare_fee_payment_for_snapshot(&snapshot, PROTOCOL.validator_registration_fee)?;
-    let fixture_id = proof::shielded_tx_fixture_id(prepared.witness())?;
-    let fixture_path = std::path::Path::new(&finality_support::proof_fixture_dir())
-        .join("shielded-spend")
-        .join(format!("{}.bin", hex::encode(fixture_id)));
-    let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-    assert_eq!(journal.fee_amount, PROTOCOL.validator_registration_fee);
-    assert!(fixture_path.exists());
-
-    drop(wallet);
-    wallet_store.close()?;
-    db.close()?;
-    Ok(())
-}
-
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
 async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_node_control(
 ) -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    let _proof_fixture_dir = EnvGuard::set(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        &finality_support::proof_fixture_dir(),
-    );
     network::set_quiet_logging(true);
 
     let tempdir = TempDir::new()?;
     let base_path = tempdir.path().to_string_lossy().to_string();
-    let (db, wallet_store, wallet, genesis) =
-        deterministic_fee_payment_fixture_components(&tempdir)?;
+    let (db, wallet_store, wallet, genesis) = deterministic_fee_payment_components(&tempdir)?;
 
     let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
@@ -543,6 +500,7 @@ async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
 async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()> {
     network::set_quiet_logging(true);
@@ -560,19 +518,15 @@ async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
 async fn wallet_control_submits_fee_paid_validator_registration_documents() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    let _proof_fixture_dir = EnvGuard::set(
-        "UNCHAINED_PROOF_FIXTURE_DIR",
-        &finality_support::proof_fixture_dir(),
-    );
     network::set_quiet_logging(true);
 
     let tempdir = TempDir::new()?;
     let base_path = tempdir.path().to_string_lossy().to_string();
-    let (db, wallet_store, wallet, genesis) =
-        deterministic_fee_payment_fixture_components(&tempdir)?;
+    let (db, wallet_store, wallet, genesis) = deterministic_fee_payment_components(&tempdir)?;
 
     let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));

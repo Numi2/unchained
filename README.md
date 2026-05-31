@@ -58,9 +58,19 @@ Transaction validity is enforced through purpose-built, transparent STARK-family
 
 ## Repository Status and Build Instructions
 
-The repository is currently transitioning toward the architecture defined above. Legacy components (e.g., Proof-of-Work artifacts, archive-receipt accounting) are deprecated. `ARCHITECTURE.md` serves as the definitive specification.
+The repository is currently transitioning toward the architecture defined above.
+Legacy Proof-of-Work artifacts are deprecated, and requester-linked archive
+receipt accounting has been removed from the live protocol. `ARCHITECTURE.md`
+serves as the definitive specification.
 
+## Configuration Posture
 
+Unchained is intentionally not a tuneable protocol kit. The node and wallet do
+not parse a config file. Local storage, listen address, bootstrap trust records,
+role endpoint records, consensus timing, validator/P2P limits, transport
+windows, privacy padding, batching, proof-assistant limits, discovery
+PIR/query-budget policy, metrics binding, and anti-abuse thresholds are
+code-defined.
 
 ## Product Definition
 
@@ -203,7 +213,7 @@ or a general-purpose zkVM in the steady-state critical path.
 
 The target experience is simple:
 
-- share a short locator or invoice QR
+- share a short locator or invoice payload
 - wallet resolves privately, optionally cross-checks discovery mirrors, or
   consumes the invoice directly
 - payment finalizes in under a second when the network is healthy
@@ -240,9 +250,12 @@ The following are not part of the road ahead:
 
 The repository is in transition toward this design.
 
-Legacy archive-accounting and some documentation surfaces still exist, but the
-canonical chain-state path is no longer PoW- or miner-shaped and should be
-read as validator/finality-first.
+Requester-linked archive receipts, public archive-reward accounting, and
+persisted archive operator scorecards have been removed from the live protocol
+surface. The remaining historical nullifier machinery is a replication and
+wallet-sync service, not a public query economy. Some documentation surfaces
+still need a final terminology audit, but the canonical chain-state path is no
+longer PoW- or miner-shaped and should be read as validator/finality-first.
 
 `ARCHITECTURE.md` is the source of truth for the road ahead.
 
@@ -364,9 +377,9 @@ on a local zero-fee exception.
 The fee-paid control-path test harness is now deterministic as well. Fresh
 single-action staking tests can seed a single high-value genesis note, internal
 change keys are derived deterministically, the single-validator and
-deterministic multivalidator shielded fee witnesses now have committed cached
-transparent receipts, and fresh fee-paid staking-control tests can execute
-without re-proving those witnesses on every run. Routine verification now uses
+deterministic multivalidator shielded fee witnesses now have committed witness
+digests. The old proof-fixture receipt cache and minting environment switch
+have been removed from the runtime prover path. Routine verification now uses
 fast local staking state-machine tests for accountability and pool-state
 transitions, multivalidator ordered-control coverage in `pq_network`, and the
 wallet-control end-to-end fee-paid registration flow. The validator transport
@@ -394,18 +407,18 @@ head, validator pools, note-tree root state, root ledger, and archived
 nullifier epochs over either node control or relay/gateway ingress, so normal
 wallet prepare/prove/submit flows no longer depend on a local node-control
 socket either. Sender-side proving can now also be offloaded to a distinct
-`unchained_node start-proof-assistant` role over a separate hybrid-encrypted
-transport, so remote/mobile wallets no longer need a colocated prover to build
-ordinary sends, private staking flows, shared-state fee payments, or
+`unchained_proof_assistant` build over a separate hybrid-encrypted transport,
+so public node builds stay verifier-only while remote/mobile wallets can still
+build ordinary sends, private staking flows, shared-state fee payments, or
 checkpoint-accumulator receipts. The heavyweight full shielded runtime snapshot
 remains only as an explicit local/test utility.
 
 Those send, staking, ingress, and proof-assistant paths now also use a
 canonical `TransparentProof` object with an explicit statement kind instead of
 passing raw backend receipt bytes through transaction and wallet state. Receipt
-decoding, adapter-local verifier artifacts, and prototype-proof cache
-serialization now live behind `src/proof.rs`, which keeps the steady-state
-protocol and wallet model stable while the proving backend is replaced.
+decoding and adapter-local verifier artifacts now live behind `src/proof.rs`,
+which keeps the steady-state protocol and wallet model stable while the
+proving backend is replaced.
 
 That proof boundary now carries an explicit canonical circuit inventory as
 well: ordinary transfer, private delegation, private undelegation, unbonding
@@ -422,12 +435,15 @@ metadata, and the remote proof assistant can advertise the exact backend and
 supported circuit inventory before serving witness requests. Canonical proof
 metadata also treats seal bytes as opaque adapter output rather than naming a
 specific receipt serialization format, and each proof now commits to a
-backend-agnostic statement digest of the decoded public journal. That keeps
-the wallet and transport model stable while the first native transparent
-backend is introduced behind the same interface.
+backend-agnostic statement digest of the decoded public journal. Public node
+builds hardcode verifier method IDs and do not compile the RISC0 prover or
+guest ELF embedding path; the dedicated proof-assistant build carries that
+heavier dependency surface until the native transparent backend replaces it.
+That keeps the wallet and transport model stable while the first native
+transparent backend is introduced behind the same interface.
 
 Backend selection is now also routed through a canonical per-circuit backend
-policy inside `src/proof.rs` rather than hard-coded directly into every
+policy inside `src/proof.rs` rather than being duplicated across every
 prove/verify path. The current policy still maps every supported circuit to the
 prototype backend, but swapping in the first native backend no longer requires
 rewiring wallet, assistant, or transaction logic.
@@ -437,16 +453,16 @@ backend’s actual primitive stack. `proof-core` and the shielded runtime now
 route note-key commitments, note commitments, evolving nullifiers, Merkle
 parents, and checkpoint/history transcript digests through an algebraic
 proof-hash adapter rather than raw BLAKE3 calls at the circuit boundary.
-Ordinary transfer proving now prepares an explicit `native_transfer` scaffold
-with separated public inputs, private witness material, envelope bindings, and
-trace sizing before dispatching to the current prototype backend. Ordinary
-transfer inputs are also no longer shaped around hidden checkpoint-accumulator
-receipts: the wallet now builds deterministic full-history extension witnesses
-from genesis for each spent note, and transfer journals no longer expose an
-accumulator verifier-key binding just to support recursive zkVM assumptions.
-The remaining gap is the real one: replacing the adapter-local zkVM execution
-with an actual native STARK AIR/prover over that direct history witness model
-and pulling ciphertext/KEM checks out of that critical path.
+Ordinary transfer proving now prepares an explicit `native_transfer` backend boundary
+with prepared public inputs and output binding checks before dispatching to the
+current prototype backend. Ordinary transfer inputs are also no longer shaped
+around hidden checkpoint-accumulator receipts: the wallet now builds
+deterministic full-history extension witnesses from genesis for each spent
+note, and transfer journals no longer expose an accumulator verifier-key
+binding just to support recursive zkVM assumptions. The remaining gap is the
+real one: replacing the adapter-local zkVM execution with an actual native
+STARK AIR/prover over that direct history witness model and pulling
+ciphertext/KEM checks out of that critical path.
 
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`
