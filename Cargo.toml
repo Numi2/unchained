@@ -5,13 +5,8 @@ edition = "2021"
 autobins = false
 
 [workspace]
-members = ["methods", "proof-core"]
+members = ["proof-core"]
 resolver = "2"
-
-[patch.crates-io]
-risc0-circuit-rv32im-sys = { path = "vendor/risc0-circuit-rv32im-sys" }
-risc0-sys = { path = "vendor/risc0-sys" }
-risc0-zkp = { path = "vendor/risc0-zkp" }
 
 # Post-quantum cryptography is enabled via rustls features in dependencies
 
@@ -38,8 +33,6 @@ base64 = "0.22"
 rustls = { version = "0.23.22", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 aws-lc-rs = { version = "1.13.3", features = ["unstable"] }
 serde_json = "1.0"
-risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std", "disable-dev-mode"] }
-methods = { path = "methods", optional = true }
 proof-core = { path = "proof-core" }
 chalamet_pir = "0.6.0"
 
@@ -49,7 +42,6 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [features]
 default = []
-local-prover = ["dep:methods", "risc0-zkvm/prove"]
 
 [[bin]]
 name = "unchained_node"
@@ -58,11 +50,6 @@ path = "src/bin/unchained_node.rs"
 [[bin]]
 name = "unchained_wallet"
 path = "src/bin/unchained_wallet.rs"
-
-[[bin]]
-name = "unchained_proof_assistant"
-path = "src/bin/unchained_proof_assistant.rs"
-required-features = ["local-prover"]
 
 [[bin]]
 name = "inspect_db"

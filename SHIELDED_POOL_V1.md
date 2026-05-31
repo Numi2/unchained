@@ -146,11 +146,11 @@ column families defined in `src/storage.rs`.
 The spend path is proof-carrying in the checked-in runtime:
 
 - `proof-core` defines the witness and journal schema
-- `methods/guest` verifies shielded spend witnesses in the zkVM
-- `methods/checkpoint-guest` verifies checkpoint accumulator steps
-- `src/proof.rs` produces and verifies succinct receipts
+- the native transparent backend is the only accepted proof-system slot
+- `src/proof.rs` currently fails proof generation and verification closed until
+  that backend is implemented
 - `src/wallet.rs` assembles witness data and produces the spend proof
-- `src/transaction.rs` accepts the transaction only if the receipt journal
+- `src/transaction.rs` accepts the transaction only if the proof journal
   matches live chain state
 
 Private witness material includes:
@@ -165,8 +165,8 @@ Public transaction material includes:
 
 - current-epoch nullifiers
 - encrypted shielded outputs
-- the succinct receipt bytes
-- the receipt journal bindings validated against local state
+- the succinct proof bytes
+- the proof journal bindings validated against local state
 
 ## Storage
 

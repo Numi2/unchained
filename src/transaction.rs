@@ -12,6 +12,7 @@ use crate::{
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
     evidence::SlashableEvidence,
+    external_asset::{self, ExternalAsset},
     proof,
     protocol::CURRENT as PROTOCOL,
     shielded::{
@@ -82,6 +83,16 @@ pub struct ClaimUnbonding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateExternalStake {
+    pub asset: ExternalAsset,
+    pub activation_epoch: u64,
+    pub external_nullifier: [u8; 32],
+    pub stake_position_commitment: [u8; 32],
+    pub receipt_output: ShieldedOutput,
+    pub proof: proof::TransparentProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PenaltyEvidenceAdmission {
     pub evidence: SlashableEvidence,
 }
@@ -115,6 +126,7 @@ pub enum SharedStateAction {
     PrivateDelegation(PrivateDelegation),
     PrivateUndelegation(PrivateUndelegation),
     ClaimUnbonding(ClaimUnbonding),
+    PrivateExternalStake(PrivateExternalStake),
     AdmitPenaltyEvidence(PenaltyEvidenceAdmission),
     ReactivateValidator(ValidatorReactivation),
 }
@@ -150,6 +162,7 @@ pub fn shared_state_action_fee_amount(action: &SharedStateAction) -> u64 {
         SharedStateAction::PrivateDelegation(_) => PROTOCOL.private_delegation_fee,
         SharedStateAction::PrivateUndelegation(_) => PROTOCOL.private_undelegation_fee,
         SharedStateAction::ClaimUnbonding(_) => PROTOCOL.unbonding_claim_fee,
+        SharedStateAction::PrivateExternalStake(_) => PROTOCOL.private_external_stake_fee,
         SharedStateAction::AdmitPenaltyEvidence(_) => PROTOCOL.penalty_evidence_admission_fee,
         SharedStateAction::ReactivateValidator(_) => PROTOCOL.validator_reactivation_fee,
     }
@@ -164,6 +177,7 @@ fn shared_state_action_embedded_transfer(
         SharedStateAction::ClaimUnbonding(claim) => Some(&claim.transfer),
         SharedStateAction::RegisterValidator(_)
         | SharedStateAction::UpdateValidatorProfile(_)
+        | SharedStateAction::PrivateExternalStake(_)
         | SharedStateAction::AdmitPenaltyEvidence(_)
         | SharedStateAction::ReactivateValidator(_) => None,
     }
@@ -418,6 +432,20 @@ impl SharedStateBatch {
                                 &claim.transfer,
                                 &mut note_tree,
                                 &mut active,
+                            )?;
+                        }
+                        SharedStateAction::PrivateExternalStake(stake) => {
+                            let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                            if journal.asset_id != stake.asset.asset_id() {
+                                bail!("private external stake proof asset mismatch");
+                            }
+                            append_external_stake_to_overlay(
+                                db,
+                                &mut write_batch,
+                                &tx_id,
+                                stake,
+                                &journal,
+                                &mut note_tree,
                             )?;
                         }
                         SharedStateAction::AdmitPenaltyEvidence(admission) => {
@@ -814,6 +842,7 @@ impl Tx {
             SharedStateAction::PrivateDelegation(_)
                 | SharedStateAction::PrivateUndelegation(_)
                 | SharedStateAction::ClaimUnbonding(_)
+                | SharedStateAction::PrivateExternalStake(_)
                 | SharedStateAction::AdmitPenaltyEvidence(_)
         ) {
             bail!("this shared-state action is not authorized by governance signatures");
@@ -874,6 +903,10 @@ impl Tx {
                 &undelegation.validator_id.0,
             )]),
             SharedStateAction::ClaimUnbonding(_) => Ok(Vec::new()),
+            SharedStateAction::PrivateExternalStake(stake) => Ok(vec![conflict_key(
+                b"external-stake-nullifier",
+                &external_stake_nullifier_key_material(stake),
+            )]),
             SharedStateAction::AdmitPenaltyEvidence(admission) => Ok(vec![
                 conflict_key(b"validator-id", &admission.evidence.validator_id().0),
                 conflict_key(b"penalty-evidence", &admission.evidence.evidence_id()?),
@@ -1215,6 +1248,51 @@ impl Tx {
                     &journal.outputs,
                 )?;
             }
+            SharedStateAction::PrivateExternalStake(stake) => {
+                if !shared.authorization.signature.is_empty() {
+                    bail!(
+                        "private external stake does not accept an external authorization signature"
+                    );
+                }
+                external_asset::validate_external_stake_shape(
+                    stake.asset,
+                    current_epoch,
+                    stake.activation_epoch,
+                    &stake.external_nullifier,
+                    &stake.stake_position_commitment,
+                )?;
+                ensure_external_stake_nullifier_is_new(db, stake)?;
+                let tree = db.load_shielded_note_tree()?.unwrap_or_default();
+                if tree.contains_commitment(&stake.receipt_output.note_commitment) {
+                    bail!("private external stake receipt output commitment already exists");
+                }
+
+                let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                if journal.chain_id != chain_id {
+                    bail!("private external stake proof chain id mismatch");
+                }
+                if journal.current_epoch != current_epoch {
+                    bail!("private external stake proof epoch mismatch");
+                }
+                if journal.asset_id != stake.asset.asset_id() {
+                    bail!("private external stake proof asset mismatch");
+                }
+                if journal.activation_epoch != stake.activation_epoch {
+                    bail!("private external stake activation epoch mismatch");
+                }
+                if journal.external_nullifier != stake.external_nullifier {
+                    bail!("private external stake nullifier mismatch");
+                }
+                if journal.stake_position_commitment != stake.stake_position_commitment {
+                    bail!("private external stake position commitment mismatch");
+                }
+                if journal.receipt_note_commitment != stake.receipt_output.note_commitment {
+                    bail!("private external stake receipt commitment mismatch");
+                }
+                if journal.receipt_output != proof::output_binding(&stake.receipt_output) {
+                    bail!("private external stake receipt output binding mismatch");
+                }
+            }
             SharedStateAction::AdmitPenaltyEvidence(admission) => {
                 if !shared.authorization.signature.is_empty() {
                     bail!(
@@ -1335,6 +1413,10 @@ impl Tx {
             }
             SharedStateAction::ClaimUnbonding(claim) => {
                 append_shielded_transfer_to_batch(db, &mut batch, &tx_id, &claim.transfer)?;
+            }
+            SharedStateAction::PrivateExternalStake(stake) => {
+                let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                append_external_stake_to_batch(db, &mut batch, &tx_id, stake, &journal)?;
             }
             SharedStateAction::AdmitPenaltyEvidence(admission) => {
                 committee_state_changed = true;
@@ -1539,6 +1621,22 @@ fn append_shielded_transfer_to_batch(
     Ok(())
 }
 
+fn append_external_stake_to_batch(
+    db: &Store,
+    batch: &mut rocksdb::WriteBatch,
+    tx_id: &[u8; 32],
+    stake: &PrivateExternalStake,
+    journal: &proof_core::ProofPrivateExternalStakeJournal,
+) -> Result<()> {
+    let mut tree = db.load_shielded_note_tree()?.unwrap_or_default();
+    append_external_stake_to_overlay(db, batch, tx_id, stake, journal, &mut tree)?;
+    let active = db
+        .load_shielded_active_nullifier_epoch()?
+        .ok_or_else(|| anyhow!("missing active shielded nullifier epoch"))?;
+    persist_shielded_runtime_overlay(db, batch, &tree, &active)?;
+    Ok(())
+}
+
 fn append_shielded_transfer_to_overlay(
     db: &Store,
     batch: &mut rocksdb::WriteBatch,
@@ -1569,6 +1667,51 @@ fn append_shielded_transfer_to_overlay(
     Ok(())
 }
 
+fn append_external_stake_to_overlay(
+    db: &Store,
+    batch: &mut rocksdb::WriteBatch,
+    tx_id: &[u8; 32],
+    stake: &PrivateExternalStake,
+    journal: &proof_core::ProofPrivateExternalStakeJournal,
+    tree: &mut NoteCommitmentTree,
+) -> Result<()> {
+    if journal.asset_id != stake.asset.asset_id()
+        || journal.external_nullifier != stake.external_nullifier
+        || journal.stake_position_commitment != stake.stake_position_commitment
+        || journal.receipt_note_commitment != stake.receipt_output.note_commitment
+        || journal.receipt_output != proof::output_binding(&stake.receipt_output)
+    {
+        bail!("private external stake journal does not match transaction");
+    }
+    ensure_external_stake_nullifier_is_new(db, stake)?;
+    tree.append(stake.receipt_output.note_commitment)?;
+
+    let output_cf = db
+        .db
+        .cf_handle("shielded_output")
+        .ok_or_else(|| anyhow!("'shielded_output' column family missing"))?;
+    let mut output_key = Vec::with_capacity(36);
+    output_key.extend_from_slice(tx_id);
+    output_key.extend_from_slice(&0u32.to_le_bytes());
+    batch.put_cf(
+        output_cf,
+        &output_key,
+        bincode::serialize(&stake.receipt_output)
+            .context("serialize private external stake receipt output")?,
+    );
+
+    let external_cf = db
+        .db
+        .cf_handle("external_stake_nullifier")
+        .ok_or_else(|| anyhow!("'external_stake_nullifier' column family missing"))?;
+    batch.put_cf(
+        external_cf,
+        external_stake_nullifier_key_material(stake),
+        stake.stake_position_commitment,
+    );
+    Ok(())
+}
+
 fn persist_shielded_runtime_overlay(
     db: &Store,
     batch: &mut rocksdb::WriteBatch,
@@ -1594,6 +1737,26 @@ fn persist_shielded_runtime_overlay(
         b"active",
         bincode::serialize(active).context("serialize active nullifier epoch")?,
     );
+    Ok(())
+}
+
+fn external_stake_nullifier_key_material(stake: &PrivateExternalStake) -> Vec<u8> {
+    let mut key = Vec::with_capacity(64);
+    key.extend_from_slice(&stake.asset.asset_id());
+    key.extend_from_slice(&stake.external_nullifier);
+    key
+}
+
+fn ensure_external_stake_nullifier_is_new(db: &Store, stake: &PrivateExternalStake) -> Result<()> {
+    if db
+        .get_raw_bytes(
+            "external_stake_nullifier",
+            &external_stake_nullifier_key_material(stake),
+        )?
+        .is_some()
+    {
+        bail!("private external stake nullifier is already finalized");
+    }
     Ok(())
 }
 
@@ -1701,7 +1864,7 @@ fn resolve_penalty_event(
     Ok((updated_pool, event))
 }
 
-fn conflict_key(prefix: &[u8], value: &[u8; 32]) -> Vec<u8> {
+fn conflict_key(prefix: &[u8], value: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + value.len());
     key.extend_from_slice(prefix);
     key.extend_from_slice(value);
@@ -1820,6 +1983,7 @@ mod tests {
     use crate::{
         consensus::{Validator, ValidatorKeys},
         crypto::{ml_dsa_65_generate, ml_dsa_65_public_key, ml_dsa_65_public_key_spki},
+        external_asset::ExternalAsset,
         proof::{TransparentProof, TransparentProofStatement},
         staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
     };
@@ -1961,6 +2125,39 @@ mod tests {
     }
 
     #[test]
+    fn private_external_stake_round_trips_and_requires_fee_sidecar() {
+        let stake = PrivateExternalStake {
+            asset: ExternalAsset::ZcashShieldedZec,
+            activation_epoch: 64,
+            external_nullifier: [3u8; 32],
+            stake_position_commitment: [4u8; 32],
+            receipt_output: shielded_output(55),
+            proof: dummy_proof(TransparentProofStatement::PrivateExternalStake, &[8, 9, 10]),
+        };
+        let tx = Tx::new_shared_state_with_fee_payment(
+            SharedStateAction::PrivateExternalStake(stake.clone()),
+            Vec::new(),
+            Some(control_fee_payment(82)),
+        );
+
+        assert_eq!(
+            tx.required_fee_amount(),
+            PROTOCOL.private_external_stake_fee
+        );
+        assert_eq!(
+            tx.shared_state_conflict_keys().unwrap(),
+            vec![conflict_key(
+                b"external-stake-nullifier",
+                &external_stake_nullifier_key_material(&stake)
+            )]
+        );
+
+        let encoded = crate::canonical::encode_tx(&tx).unwrap();
+        let decoded = crate::canonical::decode_tx(&encoded).unwrap();
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
     fn control_shared_state_exposes_fee_payment_transfer() {
         let fee_payment = control_fee_payment(61);
         let tx = Tx::new_shared_state_with_fee_payment(
@@ -2037,6 +2234,29 @@ mod tests {
         )
         .sign(&key)
         .expect_err("penalty evidence must not accept governance signing");
+        assert!(err
+            .to_string()
+            .contains("not authorized by governance signatures"));
+    }
+
+    #[test]
+    fn shared_state_control_document_rejects_signing_private_external_stake() {
+        let key = ml_dsa_65_generate().unwrap();
+        let stake = PrivateExternalStake {
+            asset: ExternalAsset::ZcashShieldedZec,
+            activation_epoch: 64,
+            external_nullifier: [9u8; 32],
+            stake_position_commitment: [10u8; 32],
+            receipt_output: shielded_output(88),
+            proof: dummy_proof(TransparentProofStatement::PrivateExternalStake, &[1, 3, 5]),
+        };
+        let err = SharedStateControlDocument::new(
+            [1u8; 32],
+            SharedStateAction::PrivateExternalStake(stake),
+            Vec::new(),
+        )
+        .sign(&key)
+        .expect_err("private external stake must not accept governance signing");
         assert!(err
             .to_string()
             .contains("not authorized by governance signatures"));

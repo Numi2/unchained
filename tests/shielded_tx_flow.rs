@@ -405,7 +405,7 @@ async fn wallet_can_prepare_shielded_send_over_remote_ingress_without_node_contr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expensive zkVM proving soak"]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -985,7 +985,7 @@ async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expensive zkVM proving soak"]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn private_delegation_end_to_end_proving_soak() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);

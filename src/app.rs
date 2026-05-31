@@ -708,22 +708,12 @@ fn build_local_discovery_status_client(cfg: &config::Config) -> Result<discovery
     )
 }
 
-fn wallet_cover_traffic_enabled(cfg: &config::Config) -> bool {
-    normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
-        && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some()
-}
-
 fn access_relay_policy() -> ingress::AccessRelayPolicy {
     ingress::AccessRelayPolicy::default()
 }
 
 fn submission_gateway_policy() -> ingress::SubmissionGatewayPolicy {
     ingress::SubmissionGatewayPolicy::default()
-}
-
-#[cfg(feature = "local-prover")]
-fn proof_assistant_policy() -> proof_assistant::ProofAssistantPolicy {
-    proof_assistant::ProofAssistantPolicy::default()
 }
 
 fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
@@ -1642,22 +1632,6 @@ pub async fn run_node_cli() -> Result<()> {
     }
 }
 
-#[cfg(feature = "local-prover")]
-pub async fn run_proof_assistant_cli() -> Result<()> {
-    let cfg = load_config()?;
-    let identity = load_runtime_identity(&cfg)?;
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let server = proof_assistant::ProofAssistantServer::bind(
-        &identity,
-        listen_addr(&cfg),
-        proof_assistant_policy(),
-    )?;
-    let task = tokio::spawn(async move { server.serve(shutdown_rx).await });
-    println!("Proof assistant is running.");
-    println!("Listening on port {}", cfg.net.listen_port);
-    wait_for_service_shutdown("Unchained proof assistant", shutdown_tx, task).await
-}
-
 pub async fn run_wallet_cli() -> Result<()> {
     let cli = WalletCli::parse();
     let cfg = load_config()?;
@@ -1699,9 +1673,9 @@ pub async fn run_wallet_cli() -> Result<()> {
                     "wallet serve requires [discovery.wallet].server; PIR-native locator discovery is a canonical runtime dependency"
                 );
             }
-            if node_client.is_none() && !wallet.has_ingress_client() {
+            if !wallet.has_ingress_client() {
                 bail!(
-                    "wallet serve requires either a reachable local node control socket or configured [ingress.wallet] relay/gateway services"
+                    "wallet serve requires canonical ingress relay/gateway services; direct node-control-only wallet service is not privacy-ready"
                 );
             }
             let wallet = Arc::new(wallet);
@@ -1714,7 +1688,7 @@ pub async fn run_wallet_cli() -> Result<()> {
                 .display()
                 .to_string();
             let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
-            let cover_task = if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
+            let cover_task = {
                 let wallet = wallet.clone();
                 let shutdown_rx = shutdown_tx.subscribe();
                 let interval_secs = WALLET_COVER_TRAFFIC_INTERVAL_SECS;
@@ -1723,8 +1697,6 @@ pub async fn run_wallet_cli() -> Result<()> {
                         .run_cover_traffic_loop(interval_secs, shutdown_rx)
                         .await
                 }))
-            } else {
-                None
             };
             let discovery_task = if wallet.has_discovery_client() {
                 let wallet = wallet.clone();
@@ -1751,12 +1723,10 @@ pub async fn run_wallet_cli() -> Result<()> {
             println!("Wallet control socket: {socket_path}");
             println!("Wallet control capability: {capability_path}");
             println!("Wallet control runtime is running.");
-            if wallet_cover_traffic_enabled(&cfg) && wallet.has_ingress_client() {
-                println!(
-                    "Wallet ingress cover cadence: {} seconds",
-                    WALLET_COVER_TRAFFIC_INTERVAL_SECS
-                );
-            }
+            println!(
+                "Wallet ingress cover cadence: {} seconds",
+                WALLET_COVER_TRAFFIC_INTERVAL_SECS
+            );
             if wallet.has_proof_assistant_client() {
                 println!("Wallet remote proof assistant: enabled");
             }

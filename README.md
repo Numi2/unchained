@@ -54,7 +54,19 @@ Transaction validity is enforced through purpose-built, transparent STARK-family
 
 - **Security Budget**: The proof system targets a conservative minimum security level of $\ge 128$ bits.
 - **Trusted Setup**: The architecture strictly requires transparent proof systems, eliminating the need for a trusted setup phase.
-- **Native Circuits**: To maintain sub-second proving latency, Unchained utilizes highly optimized native circuits for core operations (transfer, delegation, unbonding, issuance) rather than relying on general-purpose zkVM execution in the critical path.
+- **Native Circuits**: To maintain sub-second proving latency, Unchained uses highly optimized native circuits for core operations (transfer, delegation, unbonding, issuance) rather than relying on a general-purpose proof VM in the critical path.
+
+## 7. Private Zcash Stake Intake
+
+Unchained now has a protocol-native external-stake action shape for shielded
+ZEC. The action commits to the external Zcash stake nullifier, a hidden stake
+position, and a shielded Unchained receipt note. Validators can use the external
+nullifier as a public double-stake prevention key without learning the Zcash
+address, ZEC amount, or Unchained receipt owner.
+
+This path is intentionally not live until the native transparent backend can
+prove the Zcash-side lock and receipt binding. The checked-in code fails closed
+rather than accepting attestation-only staking.
 
 ## Repository Status and Build Instructions
 
@@ -207,7 +219,7 @@ scanning.
 - transaction proofs: transparent STARK-family proofs
 
 Unchained does not depend on a trusted setup, a pure-PQ-only transport posture,
-or a general-purpose zkVM in the steady-state critical path.
+or a general-purpose proof VM in the steady-state critical path.
 
 ## User Experience Targets
 
@@ -405,64 +417,54 @@ requires a colocated node-control socket. Sender-side proving and checkpoint
 refresh now use a smaller send-runtime material bundle carrying the compact
 head, validator pools, note-tree root state, root ledger, and archived
 nullifier epochs over either node control or relay/gateway ingress, so normal
-wallet prepare/prove/submit flows no longer depend on a local node-control
-socket either. Sender-side proving can now also be offloaded to a distinct
-`unchained_proof_assistant` build over a separate hybrid-encrypted transport,
-so public node builds stay verifier-only while remote/mobile wallets can still
-build ordinary sends, private staking flows, shared-state fee payments, or
-checkpoint-accumulator receipts. The heavyweight full shielded runtime snapshot
-remains only as an explicit local/test utility.
+wallet prepare/submit flows no longer depend on a local node-control socket
+either. The heavyweight full shielded runtime snapshot remains only as an
+explicit local/test utility.
 
 Those send, staking, ingress, and proof-assistant paths now also use a
 canonical `TransparentProof` object with an explicit statement kind instead of
-passing raw backend receipt bytes through transaction and wallet state. Receipt
-decoding and adapter-local verifier artifacts now live behind `src/proof.rs`,
-which keeps the steady-state protocol and wallet model stable while the
-proving backend is replaced.
+passing raw backend seal bytes through transaction and wallet state. Proof
+metadata validation now lives behind `src/proof.rs`, which keeps the
+steady-state protocol and wallet model stable while the native proving backend
+is implemented.
 
 That proof boundary now carries an explicit canonical circuit inventory as
 well: ordinary transfer, private delegation, private undelegation, unbonding
 claim, and checkpoint accumulator are named circuit slots with a conservative
 `128-bit` minimum security budget and explicit public-input shapes. The
-prototype backend is still internal to `src/proof.rs`, but the rest of the
-system now reasons about circuit identity rather than backend method constants.
-Checkpoint history bindings also commit only to a verifier-key digest, so raw
-zkVM method identifiers no longer leak into transaction-visible journals.
+native backend slot is code-defined in `src/proof.rs`, and the rest of the
+system reasons about circuit identity rather than backend method constants.
+Checkpoint history bindings also commit only to a verifier-key digest instead
+of exposing backend-specific identifiers in transaction-visible journals.
 
 The proof layer now also carries explicit backend identity and capability
 manifests. Canonical proofs include their backend, circuit, and statement
-metadata, and the remote proof assistant can advertise the exact backend and
-supported circuit inventory before serving witness requests. Canonical proof
-metadata also treats seal bytes as opaque adapter output rather than naming a
-specific receipt serialization format, and each proof now commits to a
-backend-agnostic statement digest of the decoded public journal. Public node
-builds hardcode verifier method IDs and do not compile the RISC0 prover or
-guest ELF embedding path; the dedicated proof-assistant build carries that
-heavier dependency surface until the native transparent backend replaces it.
-That keeps the wallet and transport model stable while the first native
-transparent backend is introduced behind the same interface.
+metadata. Canonical proof metadata also treats seal bytes as opaque adapter
+output rather than naming a specific receipt serialization format, and each
+proof now commits to a backend-agnostic statement digest of the decoded public
+journal. There is intentionally no installed prover/verifier adapter in this
+tree until the native transparent backend is implemented; proof-bearing
+transactions fail closed instead of accepting placeholder proofs.
 
-Backend selection is now also routed through a canonical per-circuit backend
-policy inside `src/proof.rs` rather than being duplicated across every
-prove/verify path. The current policy still maps every supported circuit to the
-prototype backend, but swapping in the first native backend no longer requires
-rewiring wallet, assistant, or transaction logic.
+Backend selection is routed through a canonical per-circuit backend policy
+inside `src/proof.rs` rather than being duplicated across every prove/verify
+path. The current policy maps every supported circuit to the native transparent
+backend slot, but generation and verification remain unavailable until that
+backend exists.
 
 Proof-facing transfer commitments have also started moving onto the native
 backend’s actual primitive stack. `proof-core` and the shielded runtime now
 route note-key commitments, note commitments, evolving nullifiers, Merkle
 parents, and checkpoint/history transcript digests through an algebraic
 proof-hash adapter rather than raw BLAKE3 calls at the circuit boundary.
-Ordinary transfer proving now prepares an explicit `native_transfer` backend boundary
-with prepared public inputs and output binding checks before dispatching to the
-current prototype backend. Ordinary transfer inputs are also no longer shaped
-around hidden checkpoint-accumulator receipts: the wallet now builds
+Ordinary transfer inputs are no longer shaped around hidden
+checkpoint-accumulator receipts: the wallet now builds
 deterministic full-history extension witnesses from genesis for each spent
 note, and transfer journals no longer expose an accumulator verifier-key
-binding just to support recursive zkVM assumptions. The remaining gap is the
-real one: replacing the adapter-local zkVM execution with an actual native
-STARK AIR/prover over that direct history witness model and pulling
-ciphertext/KEM checks out of that critical path.
+binding just to support recursive proof-backend assumptions. The remaining gap
+is the real one: implementing an actual native STARK AIR/prover over that
+direct history witness model and pulling ciphertext/KEM checks out of that
+critical path.
 
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`

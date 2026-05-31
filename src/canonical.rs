@@ -15,6 +15,7 @@ use crate::{
         LivenessFaultProof, ProposalEquivocationEvidence, SlashableEvidence,
         VoteEquivocationEvidence,
     },
+    external_asset::ExternalAsset,
     network::{
         CheckpointGetSettlementUnitBatch, CheckpointLeavesBundle, CheckpointSettlementUnitBatch,
         CheckpointSettlementUnitCandidatesResponse, CheckpointSettlementUnitIdsBundle, EpochByHash,
@@ -43,9 +44,9 @@ use crate::{
         ValidatorReactivation, ValidatorRegistration, ValidatorStatus,
     },
     transaction::{
-        FastPathBatch, OrdinaryPrivateTransfer, PenaltyEvidenceAdmission, SharedStateAction,
-        SharedStateAuthorization, SharedStateBatch, SharedStateDagBatch, SharedStateTx,
-        ShieldedOutput, ShieldedOutputPlaintext, Tx,
+        FastPathBatch, OrdinaryPrivateTransfer, PenaltyEvidenceAdmission, PrivateExternalStake,
+        SharedStateAction, SharedStateAuthorization, SharedStateBatch, SharedStateDagBatch,
+        SharedStateTx, ShieldedOutput, ShieldedOutputPlaintext, Tx,
     },
     wallet::RecipientHandle,
 };
@@ -796,6 +797,43 @@ fn read_penalty_evidence_admission(
     })
 }
 
+fn write_external_asset(writer: &mut CanonicalWriter, asset: ExternalAsset) {
+    match asset {
+        ExternalAsset::ZcashShieldedZec => writer.write_u8(1),
+    }
+}
+
+fn read_external_asset(reader: &mut CanonicalReader<'_>) -> Result<ExternalAsset> {
+    match reader.read_u8()? {
+        1 => Ok(ExternalAsset::ZcashShieldedZec),
+        other => bail!("unsupported external asset tag {}", other),
+    }
+}
+
+fn write_private_external_stake(
+    writer: &mut CanonicalWriter,
+    stake: &PrivateExternalStake,
+) -> Result<()> {
+    write_external_asset(writer, stake.asset);
+    writer.write_u64(stake.activation_epoch);
+    writer.write_fixed(&stake.external_nullifier);
+    writer.write_fixed(&stake.stake_position_commitment);
+    writer.write_bytes(&encode_shielded_output(&stake.receipt_output)?)?;
+    writer.write_bytes(&encode_transparent_proof(&stake.proof)?)?;
+    Ok(())
+}
+
+fn read_private_external_stake(reader: &mut CanonicalReader<'_>) -> Result<PrivateExternalStake> {
+    Ok(PrivateExternalStake {
+        asset: read_external_asset(reader)?,
+        activation_epoch: reader.read_u64()?,
+        external_nullifier: reader.read_fixed()?,
+        stake_position_commitment: reader.read_fixed()?,
+        receipt_output: decode_shielded_output(&reader.read_bytes()?)?,
+        proof: decode_transparent_proof(&reader.read_bytes()?)?,
+    })
+}
+
 fn write_shared_state_action(
     writer: &mut CanonicalWriter,
     action: &SharedStateAction,
@@ -822,6 +860,10 @@ fn write_shared_state_action(
         SharedStateAction::ClaimUnbonding(claim) => {
             writer.write_u8(5);
             write_ordinary_private_transfer(writer, &claim.transfer)?;
+        }
+        SharedStateAction::PrivateExternalStake(stake) => {
+            writer.write_u8(8);
+            write_private_external_stake(writer, stake)?;
         }
         SharedStateAction::AdmitPenaltyEvidence(admission) => {
             writer.write_u8(6);
@@ -860,6 +902,9 @@ fn read_shared_state_action(reader: &mut CanonicalReader<'_>) -> Result<SharedSt
                 transfer: read_ordinary_private_transfer(reader)?,
             },
         )),
+        8 => Ok(SharedStateAction::PrivateExternalStake(
+            read_private_external_stake(reader)?,
+        )),
         6 => Ok(SharedStateAction::AdmitPenaltyEvidence(
             read_penalty_evidence_admission(reader)?,
         )),
@@ -894,17 +939,19 @@ pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
         TransparentProofStatement::PrivateDelegation => 1,
         TransparentProofStatement::PrivateUndelegation => 2,
         TransparentProofStatement::UnbondingClaim => 3,
-        TransparentProofStatement::CheckpointAccumulator => 4,
+        TransparentProofStatement::PrivateExternalStake => 4,
+        TransparentProofStatement::CheckpointAccumulator => 5,
     });
     writer.write_u8(match proof.circuit {
         TransparentCircuit::OrdinaryTransferV1 => 0,
         TransparentCircuit::PrivateDelegationV1 => 1,
         TransparentCircuit::PrivateUndelegationV1 => 2,
         TransparentCircuit::UnbondingClaimV1 => 3,
-        TransparentCircuit::CheckpointAccumulatorV1 => 4,
+        TransparentCircuit::ZcashShieldedStakeV1 => 4,
+        TransparentCircuit::CheckpointAccumulatorV1 => 5,
     });
     writer.write_u8(match proof.backend {
-        TransparentProofBackend::PrototypeRisc0StarkV1 => 0,
+        TransparentProofBackend::NativeTransparentStarkV1 => 0,
     });
     writer.write_fixed(&proof.statement_digest);
     writer.write_bytes(&proof.seal)?;
@@ -920,7 +967,8 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             1 => TransparentProofStatement::PrivateDelegation,
             2 => TransparentProofStatement::PrivateUndelegation,
             3 => TransparentProofStatement::UnbondingClaim,
-            4 => TransparentProofStatement::CheckpointAccumulator,
+            4 => TransparentProofStatement::PrivateExternalStake,
+            5 => TransparentProofStatement::CheckpointAccumulator,
             other => bail!("unsupported transparent proof statement {}", other),
         },
         circuit: match reader.read_u8()? {
@@ -928,11 +976,12 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             1 => TransparentCircuit::PrivateDelegationV1,
             2 => TransparentCircuit::PrivateUndelegationV1,
             3 => TransparentCircuit::UnbondingClaimV1,
-            4 => TransparentCircuit::CheckpointAccumulatorV1,
+            4 => TransparentCircuit::ZcashShieldedStakeV1,
+            5 => TransparentCircuit::CheckpointAccumulatorV1,
             other => bail!("unsupported transparent proof circuit {}", other),
         },
         backend: match reader.read_u8()? {
-            0 => TransparentProofBackend::PrototypeRisc0StarkV1,
+            0 => TransparentProofBackend::NativeTransparentStarkV1,
             other => bail!("unsupported transparent proof backend {}", other),
         },
         statement_digest: reader.read_fixed()?,
@@ -1905,6 +1954,14 @@ fn write_shielded_note_kind(writer: &mut CanonicalWriter, kind: &ShieldedNoteKin
             writer.write_fixed(validator_id);
             writer.write_u64(*release_epoch);
         }
+        ShieldedNoteKind::ExternalStakeReceipt {
+            asset_id,
+            stake_position_commitment,
+        } => {
+            writer.write_u8(3);
+            writer.write_fixed(asset_id);
+            writer.write_fixed(stake_position_commitment);
+        }
     }
 }
 
@@ -1917,6 +1974,10 @@ fn read_shielded_note_kind(reader: &mut CanonicalReader<'_>) -> Result<ShieldedN
         2 => Ok(ShieldedNoteKind::UnbondingClaim {
             validator_id: reader.read_fixed()?,
             release_epoch: reader.read_u64()?,
+        }),
+        3 => Ok(ShieldedNoteKind::ExternalStakeReceipt {
+            asset_id: reader.read_fixed()?,
+            stake_position_commitment: reader.read_fixed()?,
         }),
         other => bail!("unsupported shielded note kind {}", other),
     }

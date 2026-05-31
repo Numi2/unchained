@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod epoch;
 pub mod evidence;
+pub mod external_asset;
 pub mod ingress;
 pub mod local_control;
 pub mod metrics;

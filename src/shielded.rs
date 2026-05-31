@@ -56,6 +56,10 @@ pub enum ShieldedNoteKind {
         validator_id: [u8; 32],
         release_epoch: u64,
     },
+    ExternalStakeReceipt {
+        asset_id: [u8; 32],
+        stake_position_commitment: [u8; 32],
+    },
 }
 
 impl ShieldedNoteKind {
@@ -93,26 +97,50 @@ impl ShieldedNoteKind {
         }
     }
 
-    fn commitment_bytes(&self) -> [u8; 41] {
-        let mut out = [0u8; 41];
+    pub fn is_external_stake_receipt_for(
+        &self,
+        asset_id: &[u8; 32],
+        stake_position_commitment: &[u8; 32],
+    ) -> bool {
+        matches!(
+            self,
+            Self::ExternalStakeReceipt {
+                asset_id: note_asset_id,
+                stake_position_commitment: note_position
+            } if note_asset_id == asset_id && note_position == stake_position_commitment
+        )
+    }
+
+    fn commitment_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Payment => {
-                out[0] = 0;
-            }
+            Self::Payment => vec![0],
             Self::DelegationShare { validator_id } => {
-                out[0] = 1;
-                out[1..33].copy_from_slice(validator_id);
+                let mut out = Vec::with_capacity(33);
+                out.push(1);
+                out.extend_from_slice(validator_id);
+                out
             }
             Self::UnbondingClaim {
                 validator_id,
                 release_epoch,
             } => {
-                out[0] = 2;
-                out[1..33].copy_from_slice(validator_id);
-                out[33..41].copy_from_slice(&release_epoch.to_le_bytes());
+                let mut out = Vec::with_capacity(41);
+                out.push(2);
+                out.extend_from_slice(validator_id);
+                out.extend_from_slice(&release_epoch.to_le_bytes());
+                out
+            }
+            Self::ExternalStakeReceipt {
+                asset_id,
+                stake_position_commitment,
+            } => {
+                let mut out = Vec::with_capacity(65);
+                out.push(3);
+                out.extend_from_slice(asset_id);
+                out.extend_from_slice(stake_position_commitment);
+                out
             }
         }
-        out
     }
 }
 

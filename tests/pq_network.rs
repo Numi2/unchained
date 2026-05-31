@@ -1,5 +1,3 @@
-#![cfg_attr(not(feature = "local-prover"), allow(dead_code, unused_imports))]
-
 mod finality_support;
 
 use quinn::crypto::rustls::QuicClientConfig;
@@ -70,7 +68,6 @@ fn store_anchor(store: &Store, anchor: &Anchor) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 fn signed_shared_state_tx(
     store: &Store,
     wallet: &Wallet,
@@ -294,11 +291,11 @@ async fn deterministic_multivalidator_fee_paid_control_witness_digest_stays_stab
         hex::encode(witness_digest),
         "f1e522879e8df1ff55a6b78d43b37ef6aea02f0cce2bb905d06bbb77cd2e5695"
     );
-    #[cfg(feature = "local-prover")]
-    {
-        let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-        assert_eq!(journal.fee_amount, PROTOCOL.validator_profile_update_fee);
-    }
+    let err = proof::prove_shielded_tx(prepared.witness())
+        .expect_err("native proof backend is intentionally absent");
+    assert!(err
+        .to_string()
+        .contains("native transparent proof backend is not implemented"));
 
     Ok(())
 }
@@ -525,8 +522,8 @@ async fn finalize_single_shared_state_action(
     Ok((tx_id, anchor))
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -778,8 +775,8 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -1045,8 +1042,8 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -1155,8 +1152,8 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(false);
@@ -1328,8 +1325,8 @@ async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> any
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -1510,8 +1507,8 @@ async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyho
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_finalizes_fee_paid_penalty_admission_from_fresh_wallet() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);
@@ -1787,8 +1784,8 @@ async fn pq_network_restart_preserves_identity_and_reloads_persisted_peers() -> 
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Result<()> {
     let _guard = test_guard();
     network::set_quiet_logging(true);

@@ -676,14 +676,14 @@ Canonical requirements:
 - no trusted setup
 - conservative `>= 128-bit` security target
 - native circuits for native actions
-- no general-purpose zkVM in the steady-state critical path
+- no general-purpose proof VM in the steady-state critical path
 
 The reason is straightforward:
 
 - Unchained is not trying to support arbitrary contracts
 - native circuits are faster to prove
 - native circuits are easier to audit
-- zkVM convenience is not worth weaker latency or weaker confidence here
+- proof-VM convenience is not worth weaker latency or weaker confidence here
 
 ### Native Circuits
 
@@ -692,11 +692,28 @@ The base chain should have native circuits for:
 - private transfer
 - private delegation
 - private undelegation
+- private Zcash shielded stake intake
 - stake claim or reward realization
 - issuance and redemption
 - optional batch settlement primitives
 
 This keeps proving latency low enough for ordinary users.
+
+### Private External Stake
+
+The first external asset is code-defined as shielded ZEC. A stake transaction
+publishes only:
+
+- the canonical external asset id
+- an external stake nullifier for double-stake prevention
+- a stake-position commitment
+- a shielded Unchained receipt output
+
+The Zcash address, note details, amount, and receipt owner remain private. The
+native proof backend must prove that the external Zcash-side lock and the
+Unchained receipt are bound to the same hidden stake position before validators
+accept the action. Until that backend exists, the transaction type is present
+but verification fails closed.
 
 ## 6. Execution Scope
 
@@ -775,7 +792,7 @@ The following are outside the architecture:
 - reusable public payment addresses
 - long-lived wallet-global outward payment identities
 - general-purpose smart contracts in the base protocol
-- general-purpose zkVM execution in the base protocol
+- general-purpose proof-VM execution in the base protocol
 
 ## 10. Repository Direction
 

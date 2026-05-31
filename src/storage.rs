@@ -60,6 +60,7 @@ const STORE_COLUMN_FAMILIES: &[&str] = &[
     "shielded_output",
     "shielded_active_nullifier",
     "shielded_spent_note",
+    "external_stake_nullifier",
     "shielded_archive_provider",
     "shielded_archive_replica",
     "shielded_archive_accounting",
@@ -1783,6 +1784,31 @@ impl Store {
             }
         }
         Ok(outputs)
+    }
+
+    pub fn external_stake_nullifier_exists(
+        &self,
+        asset_id: &[u8; 32],
+        external_nullifier: &[u8; 32],
+    ) -> Result<bool> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(asset_id);
+        key.extend_from_slice(external_nullifier);
+        Ok(self
+            .get_raw_bytes("external_stake_nullifier", &key)?
+            .is_some())
+    }
+
+    pub fn store_external_stake_nullifier(
+        &self,
+        asset_id: &[u8; 32],
+        external_nullifier: &[u8; 32],
+        stake_position_commitment: &[u8; 32],
+    ) -> Result<()> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(asset_id);
+        key.extend_from_slice(external_nullifier);
+        self.put("external_stake_nullifier", &key, stake_position_commitment)
     }
 
     pub fn store_shielded_active_nullifier_epoch(

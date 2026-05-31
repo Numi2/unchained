@@ -485,14 +485,9 @@ impl ProofAssistantServer {
 fn handle_request_blocking(request: ProofAssistantRequest) -> Result<ProofAssistantResponse> {
     let request_id = request.request_id();
     let result: Result<ProofAssistantResponse> = match request {
-        ProofAssistantRequest::Capabilities { request_id } => {
-            let capabilities = bincode::serialize(&proof::current_prover_capabilities())
-                .context("serialize proof assistant capabilities")?;
-            Ok(ProofAssistantResponse::Capabilities {
-                request_id,
-                capabilities,
-            })
-        }
+        ProofAssistantRequest::Capabilities { .. } => Err(anyhow!(
+            "native transparent proof backend is not implemented; proof assistant has no installed prover"
+        )),
         ProofAssistantRequest::ShieldedTx {
             request_id,
             witness,

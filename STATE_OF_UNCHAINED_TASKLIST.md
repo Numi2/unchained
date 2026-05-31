@@ -151,20 +151,16 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   target architecture
 - `[~]` Remove dependence on the current prototype proving backend as the
   long-term integrity anchor
-  Backend-specific receipt parsing and method/image identifiers are now
-  contained within `src/proof.rs`, the canonical proof model now carries
-  explicit backend identity, and the proof assistant now advertises backend
-  capabilities and supported circuits. Proof routing now also runs through a
-  canonical per-circuit backend policy instead of direct method wiring, and
-  checkpoint history bindings now commit to backend-agnostic verifier-key
-  digests instead of leaking raw zkVM method IDs into transaction-visible
-  journals. Proof envelopes also bind a canonical statement digest for the
-  decoded public journal, and the proof-fixture receipt cache / minting
-  environment switch has been removed from the runtime prover path. Public node
-  builds are now verifier-only: they hardcode canonical method IDs and do not
-  compile the RISC0 prover or guest ELF embedding path. The dedicated
-  `unchained_proof_assistant` build still carries the prototype prover until the
-  native backend replaces it.
+  The old proof-VM workspace and vendored proof-backend crates have been
+  removed. The canonical proof model still carries explicit backend identity
+  and circuit inventory, but proof generation and verification now fail closed
+  until the native transparent backend is implemented. Proof routing runs
+  through a canonical per-circuit backend policy instead of direct method
+  wiring, and checkpoint history bindings commit to backend-agnostic
+  verifier-key digests instead of leaking backend-specific identifiers into
+  transaction-visible journals. Proof envelopes also bind a canonical statement
+  digest for the decoded public journal, and the proof-fixture receipt cache /
+  minting environment switch has been removed from the runtime prover path.
 - `[~]` Define a native transparent STARK-family proving architecture
   The canonical proof layer now has an explicit circuit inventory for ordinary
   transfer, private delegation, private undelegation, unbonding claim, and
@@ -172,26 +168,28 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   conservative `128-bit` minimum security budget. Proofs and proof-assistant
   transport now also carry explicit backend identity and capability manifests.
   Proof-facing note/nullifier/Merkle/checkpoint commitments now route through
-  an algebraic proof-hash adapter in `proof-core` and `src/shielded.rs`, and
-  ordinary transfer now prepares an explicit native-backend boundary with
-  prepared public inputs and output binding checks before dispatching to the
-  prototype backend. Ordinary transfer witnesses now also use deterministic
-  full-history extensions from genesis rather than hidden checkpoint-accumulator
-  receipts, and transfer journals no longer leak an accumulator verifier-key
-  binding. The backend swap itself is still open.
+  an algebraic proof-hash adapter in `proof-core` and `src/shielded.rs`.
+  Ordinary transfer witnesses now also use deterministic full-history
+  extensions from genesis rather than hidden checkpoint-accumulator receipts,
+  and transfer journals no longer leak an accumulator verifier-key binding.
+  The native AIR/prover/verifier implementation itself is still open.
 - `[x]` Set and document a conservative `>= 128-bit` security budget
   `src/proof.rs` defines `MIN_TRANSPARENT_PROOF_SECURITY_BITS = 128`,
   validates circuit descriptors, backend descriptors, proof metadata, and
   proof-assistant capability manifests against that floor, and the architecture
   / README documents the same target.
-- `[~]` Implement native circuits for transfer
-  Ordinary transfer now has the first extracted native-backend boundary in
-  `src/proof/native_transfer.rs`, including prepared public inputs, output
-  binding validation, and deterministic direct-history witness construction.
-  The actual AIR, prover, and verifier are still missing.
-- `[ ]` Implement native circuits for staking flows
+- `[ ]` Implement native circuits for transfer
+  The RISC0 adapter was removed instead of kept as a temporary backend.
+  Ordinary transfer has deterministic direct-history witness construction, but
+  the actual AIR, prover, and verifier are still missing.
+- `[~]` Implement native circuits for staking flows
+  The transaction layer now has a code-defined `PrivateExternalStake` action
+  and a Zcash-only external asset policy. It commits to an external stake
+  nullifier, a hidden stake-position commitment, and a shielded Unchained
+  receipt output. Verification still fails closed until the native backend can
+  prove the Zcash-side lock and receipt binding.
 - `[ ]` Implement native circuits for issuance and redemption
-- `[ ]` Remove general-purpose zkVM assumptions from the steady-state critical
+- `[x]` Remove general-purpose proof-VM assumptions from the steady-state critical
   path
 
 ## 8. Cryptography And Key Management
@@ -239,15 +237,14 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   chrono backup timestamps, atty terminal checks, tokio-rustls, aes-gcm-siv,
   futures, log, rpassword, once_cell, subtle, the settlement-unit loose-file
   mirroring switch, the unused build-time `cc` dependency, and the default
-  node dependency on `methods` plus `risc0-zkvm/prove`. Wallet and node
-  passphrase prompts now use the in-house hidden terminal reader, and local
-  control capability checks use an in-house fixed-width constant-time compare.
+  node dependency on the old proof-VM prover path, its workspace, and vendored
+  proof-backend crates. Wallet and node passphrase prompts now use the in-house
+  hidden terminal reader, and local control capability checks use an in-house
+  fixed-width constant-time compare.
 - `[~]` Redesign CLI language around validator operation and private settlement
   The CLI now has explicit `start-access-relay` and
   `start-submission-gateway` commands alongside cold-signed validator control
-  document flows. The proof assistant is now a dedicated `unchained_proof_assistant`
-  binary instead of a public-node subcommand, but broader operator-language
-  cleanup is still open.
+  document flows. Broader operator-language cleanup is still open.
 - `[x]` Remove legacy config keys that control PoW, epoch seconds, archive
   provider behavior, or mining workflows
   The config schema no longer accepts `p2p`, `epoch`, `metrics`, `compact`,

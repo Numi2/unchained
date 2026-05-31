@@ -1,5 +1,3 @@
-#![cfg_attr(not(feature = "local-prover"), allow(dead_code, unused_imports))]
-
 mod finality_support;
 
 use anyhow::{Context, Result};
@@ -397,11 +395,11 @@ async fn deterministic_fee_paid_control_witness_digest_stays_stable() -> Result<
         hex::encode(witness_digest),
         "71f17d493d661275fb9086bef0121afcbc74a334e6e85de46f19453d2a3cd11e"
     );
-    #[cfg(feature = "local-prover")]
-    {
-        let (_receipt, journal) = proof::prove_shielded_tx(prepared.witness())?;
-        assert_eq!(journal.fee_amount, PROTOCOL.validator_registration_fee);
-    }
+    let err = proof::prove_shielded_tx(prepared.witness())
+        .expect_err("native proof backend is intentionally absent");
+    assert!(err
+        .to_string()
+        .contains("native transparent proof backend is not implemented"));
 
     drop(wallet);
     wallet_store.close()?;
@@ -409,8 +407,8 @@ async fn deterministic_fee_paid_control_witness_digest_stays_stable() -> Result<
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_node_control(
 ) -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
@@ -500,8 +498,8 @@ async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()> {
     network::set_quiet_logging(true);
     let tempdir = TempDir::new()?;
@@ -518,8 +516,8 @@ async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()
     Ok(())
 }
 
-#[cfg(feature = "local-prover")]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "native transparent proof backend is not implemented"]
 async fn wallet_control_submits_fee_paid_validator_registration_documents() -> Result<()> {
     let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
     network::set_quiet_logging(true);
