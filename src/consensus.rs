@@ -9,7 +9,7 @@ pub const DEFAULT_SLOTS_PER_EPOCH: u32 = PROTOCOL.slots_per_epoch;
 pub const DEFAULT_SLOT_DURATION_MS: u64 = PROTOCOL.slot_duration_ms;
 pub const FAST_PATH_TIMEOUT_MS: u64 = PROTOCOL.fast_path_timeout_ms;
 pub const DAG_BFT_TIMEOUT_MS: u64 = PROTOCOL.dag_bft_timeout_ms;
-pub const MAX_COINS_PER_CHECKPOINT: u32 = PROTOCOL.max_coins_per_epoch;
+pub const MAX_SETTLEMENT_UNITS_PER_CHECKPOINT: u32 = PROTOCOL.max_settlement_units_per_epoch;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValidatorId(pub [u8; 32]);
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(DEFAULT_SLOT_DURATION_MS, 250);
         assert_eq!(FAST_PATH_TIMEOUT_MS, 450);
         assert_eq!(DAG_BFT_TIMEOUT_MS, 10_000);
-        assert_eq!(MAX_COINS_PER_CHECKPOINT, 111);
+        assert_eq!(MAX_SETTLEMENT_UNITS_PER_CHECKPOINT, 111);
     }
 
     #[test]

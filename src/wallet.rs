@@ -8,7 +8,7 @@ use crate::{
     discovery::{self, DiscoveryClient, DiscoveryRecord, HandleResponsePlaintext},
     ingress::IngressClient,
     node_control::{
-        CompactCommittedCoin, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
+        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
         NodeControlClient, ShieldedRuntimeSnapshot, WalletSendRuntimeMaterial,
     },
     proof,
@@ -78,7 +78,7 @@ const LOCAL_EXTENSION_BLINDING_DOMAIN: &str = "unchained-wallet-local-extension-
 const LOCAL_EXTENSION_REQUEST_BLINDING_DOMAIN: &str =
     "unchained-wallet-local-extension-request-blinding-v1";
 const COMPACT_WALLET_SYNC_CURSOR_KEY: &[u8] = b"compact_wallet_sync_cursor";
-const COMPACT_WALLET_SYNC_MAX_COINS_PER_REQUEST: u32 = 512;
+const COMPACT_WALLET_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST: u32 = 512;
 const COMPACT_WALLET_SYNC_MAX_OUTPUTS_PER_REQUEST: u32 = 2048;
 
 #[derive(Serialize, Deserialize)]
@@ -90,7 +90,7 @@ struct WalletSecrets {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OwnedShieldedNoteSource {
-    Genesis { coin_id: [u8; 32] },
+    Genesis { settlement_unit_id: [u8; 32] },
     Received { tx_id: [u8; 32], output_index: u32 },
 }
 
@@ -115,7 +115,7 @@ struct SentShieldedTxRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CompactWalletScanCursor {
     chain_id: [u8; 32],
-    next_coin_index: u64,
+    next_settlement_unit_index: u64,
     next_output_index: u64,
     synced_through_anchor_num: u64,
 }
@@ -791,24 +791,24 @@ impl Wallet {
 
     fn request_compact_wallet_sync_delta(
         &self,
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     ) -> Result<CompactWalletSyncDelta> {
         if let Some(node_client) = &self.node_client {
             return node_client.request_compact_wallet_sync_delta(
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             );
         }
         if let Some(ingress_client) = &self.ingress_client {
             return ingress_client.request_compact_wallet_sync_delta_blocking(
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             );
         }
@@ -1054,13 +1054,13 @@ impl Wallet {
         &self.signing_pk
     }
 
-    /// INTERNAL: compute genesis lock secret deterministically for a coin we created.
+    /// INTERNAL: compute genesis lock secret deterministically for a settlement unit we created.
     pub fn compute_genesis_lock_secret(
         &self,
-        coin_id: &[u8; 32],
+        settlement_unit_id: &[u8; 32],
         chain_id32: &[u8; 32],
     ) -> [u8; 32] {
-        crate::crypto::derive_genesis_lock_secret(&self.lock_seed, coin_id, chain_id32)
+        crate::crypto::derive_genesis_lock_secret(&self.lock_seed, settlement_unit_id, chain_id32)
     }
 
     fn shielded_storage_key(&self) -> [u8; 32] {
@@ -1545,18 +1545,18 @@ impl Wallet {
         Ok(handle)
     }
 
-    fn materialize_owned_genesis_notes_from_coins(
+    fn materialize_owned_genesis_notes_from_settlement_units(
         &self,
         chain_id: [u8; 32],
-        committed_coins: &[(u64, crate::coin::Coin)],
+        committed_settlement_units: &[(u64, crate::settlement_unit::SettlementUnit)],
     ) -> Result<()> {
         let wallet_store = self.wallet_store()?;
-        for (birth_epoch, coin) in committed_coins {
-            if coin.creator_address != self.address {
+        for (birth_epoch, settlement_unit) in committed_settlement_units {
+            if settlement_unit.creator_address != self.address {
                 continue;
             }
             let (note, note_key, checkpoint) =
-                shielded::deterministic_genesis_note(coin, *birth_epoch, &chain_id);
+                shielded::deterministic_genesis_note(settlement_unit, *birth_epoch, &chain_id);
             if self
                 .load_owned_note_record(wallet_store.as_ref(), &note.commitment)?
                 .is_none()
@@ -1566,7 +1566,7 @@ impl Wallet {
                     note_key,
                     checkpoint,
                     checkpoint_accumulator: None,
-                    source: OwnedShieldedNoteSource::Genesis { coin_id: coin.id },
+                    source: OwnedShieldedNoteSource::Genesis { settlement_unit_id: settlement_unit.id },
                 };
                 self.store_owned_note_record(wallet_store.as_ref(), &owned)?;
                 self.store_checkpoint_record(wallet_store.as_ref(), &owned.checkpoint)?;
@@ -1576,22 +1576,22 @@ impl Wallet {
     }
 
     fn materialize_owned_genesis_notes(&self, snapshot: &ShieldedRuntimeSnapshot) -> Result<()> {
-        self.materialize_owned_genesis_notes_from_coins(
+        self.materialize_owned_genesis_notes_from_settlement_units(
             snapshot.chain_id,
-            &snapshot.committed_coins,
+            &snapshot.committed_settlement_units,
         )
     }
 
-    fn materialize_owned_genesis_notes_from_compact_coins(
+    fn materialize_owned_genesis_notes_from_compact_settlement_units(
         &self,
         chain_id: [u8; 32],
-        committed_coins: &[CompactCommittedCoin],
+        committed_settlement_units: &[CompactCommittedSettlementUnit],
     ) -> Result<()> {
-        let owned = committed_coins
+        let owned = committed_settlement_units
             .iter()
-            .map(|record| (record.birth_epoch, record.coin.clone()))
+            .map(|record| (record.birth_epoch, record.settlement_unit.clone()))
             .collect::<Vec<_>>();
-        self.materialize_owned_genesis_notes_from_coins(chain_id, &owned)
+        self.materialize_owned_genesis_notes_from_settlement_units(chain_id, &owned)
     }
 
     fn decrypt_shielded_payload(
@@ -1812,9 +1812,9 @@ impl Wallet {
     }
 
     fn apply_compact_wallet_sync_delta(&self, delta: &CompactWalletSyncDelta) -> Result<()> {
-        self.materialize_owned_genesis_notes_from_compact_coins(
+        self.materialize_owned_genesis_notes_from_compact_settlement_units(
             delta.head.chain_id,
-            &delta.committed_coins,
+            &delta.committed_settlement_units,
         )?;
         self.rescan_compact_shielded_outputs(&delta.shielded_outputs)
     }
@@ -1827,14 +1827,14 @@ impl Wallet {
         match stored {
             Some(cursor)
                 if cursor.chain_id == head.chain_id
-                    && cursor.next_coin_index <= head.committed_coin_count
+                    && cursor.next_settlement_unit_index <= head.committed_settlement_unit_count
                     && cursor.next_output_index <= head.shielded_output_count =>
             {
                 cursor
             }
             _ => CompactWalletScanCursor {
                 chain_id: head.chain_id,
-                next_coin_index: 0,
+                next_settlement_unit_index: 0,
                 next_output_index: 0,
                 synced_through_anchor_num: 0,
             },
@@ -1849,13 +1849,13 @@ impl Wallet {
             self.load_compact_wallet_scan_cursor(wallet_store.as_ref())?,
         );
 
-        while cursor.next_coin_index < target_head.committed_coin_count
+        while cursor.next_settlement_unit_index < target_head.committed_settlement_unit_count
             || cursor.next_output_index < target_head.shielded_output_count
         {
             let delta = self.request_compact_wallet_sync_delta(
-                cursor.next_coin_index,
+                cursor.next_settlement_unit_index,
                 cursor.next_output_index,
-                COMPACT_WALLET_SYNC_MAX_COINS_PER_REQUEST,
+                COMPACT_WALLET_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST,
                 COMPACT_WALLET_SYNC_MAX_OUTPUTS_PER_REQUEST,
             )?;
             if delta.head.chain_id != target_head.chain_id {
@@ -1863,26 +1863,26 @@ impl Wallet {
             }
             self.apply_compact_wallet_sync_delta(&delta)?;
 
-            let next_coin_index = delta
-                .committed_coins
+            let next_settlement_unit_index = delta
+                .committed_settlement_units
                 .last()
-                .map(|coin| coin.scan_index.saturating_add(1))
-                .unwrap_or(cursor.next_coin_index);
+                .map(|settlement_unit| settlement_unit.scan_index.saturating_add(1))
+                .unwrap_or(cursor.next_settlement_unit_index);
             let next_output_index = delta
                 .shielded_outputs
                 .last()
                 .map(|output| output.scan_index.saturating_add(1))
                 .unwrap_or(cursor.next_output_index);
 
-            if next_coin_index == cursor.next_coin_index
+            if next_settlement_unit_index == cursor.next_settlement_unit_index
                 && next_output_index == cursor.next_output_index
-                && (cursor.next_coin_index < delta.head.committed_coin_count
+                && (cursor.next_settlement_unit_index < delta.head.committed_settlement_unit_count
                     || cursor.next_output_index < delta.head.shielded_output_count)
             {
                 bail!("compact wallet sync delta made no progress");
             }
 
-            cursor.next_coin_index = next_coin_index.min(delta.head.committed_coin_count);
+            cursor.next_settlement_unit_index = next_settlement_unit_index.min(delta.head.committed_settlement_unit_count);
             cursor.next_output_index = next_output_index.min(delta.head.shielded_output_count);
             cursor.synced_through_anchor_num = delta.head.latest_finalized_anchor_num;
             self.store_compact_wallet_scan_cursor(wallet_store.as_ref(), &cursor)?;
@@ -2718,7 +2718,7 @@ impl Wallet {
             &ShieldedRuntimeSnapshot {
                 chain_id: material.compact_wallet_sync.chain_id,
                 current_nullifier_epoch: material.compact_wallet_sync.current_nullifier_epoch,
-                committed_coins: Vec::new(),
+                committed_settlement_units: Vec::new(),
                 shielded_outputs: Vec::new(),
                 note_tree: material.note_tree,
                 root_ledger: material.root_ledger,
@@ -3839,7 +3839,7 @@ impl Wallet {
 
         for record in self.sent_tx_records(store)? {
             history.push(TransactionRecord {
-                coin_id: record.tx_id,
+                settlement_unit_id: record.tx_id,
                 transfer_hash: record.tx_id,
                 commit_epoch: record.commit_epoch,
                 is_sender: true,
@@ -3852,7 +3852,7 @@ impl Wallet {
         for owned in self.iterate_owned_note_records(store)? {
             if let OwnedShieldedNoteSource::Received { tx_id, .. } = owned.source {
                 history.push(TransactionRecord {
-                    coin_id: owned.note.commitment,
+                    settlement_unit_id: owned.note.commitment,
                     transfer_hash: tx_id,
                     commit_epoch: owned.note.birth_epoch,
                     is_sender: false,
@@ -3866,7 +3866,7 @@ impl Wallet {
         history.sort_by(|a, b| {
             b.commit_epoch
                 .cmp(&a.commit_epoch)
-                .then(b.coin_id.cmp(&a.coin_id))
+                .then(b.settlement_unit_id.cmp(&a.settlement_unit_id))
         });
         Ok(history)
     }
@@ -3895,7 +3895,7 @@ impl Wallet {
 /// Represents a transaction record for wallet history
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransactionRecord {
-    pub coin_id: [u8; 32],
+    pub settlement_unit_id: [u8; 32],
     pub transfer_hash: [u8; 32],
     pub commit_epoch: u64,
     pub is_sender: bool,
@@ -3973,7 +3973,7 @@ mod tests {
             note_key: [1u8; 32],
             checkpoint: shielded::HistoricalUnspentCheckpoint::genesis(note.commitment, 3),
             checkpoint_accumulator: None,
-            source: OwnedShieldedNoteSource::Genesis { coin_id: [9u8; 32] },
+            source: OwnedShieldedNoteSource::Genesis { settlement_unit_id: [9u8; 32] },
         };
 
         wallet.store_owned_note_record(wallet_store.as_ref(), &owned)?;

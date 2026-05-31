@@ -111,20 +111,20 @@ impl MetricsAggregator {
                 EPOCH_HEIGHT.value.load(Ordering::Relaxed),
             ),
             (
-                "unchained_candidate_coins",
-                CANDIDATE_COINS.value.load(Ordering::Relaxed),
+                "unchained_candidate_settlement_units",
+                CANDIDATE_SETTLEMENT_UNITS.value.load(Ordering::Relaxed),
             ),
             (
-                "unchained_selected_coins",
-                SELECTED_COINS.value.load(Ordering::Relaxed),
+                "unchained_committed_settlement_units",
+                COMMITTED_SETTLEMENT_UNITS.value.load(Ordering::Relaxed),
             ),
             (
                 "unchained_orphan_buffer_len",
                 ORPHAN_BUFFER_LEN.value.load(Ordering::Relaxed),
             ),
             (
-                "unchained_selection_threshold_u64",
-                SELECTION_THRESHOLD_U64.value.load(Ordering::Relaxed),
+                "unchained_settlement_unit_admission_cutoff_u64",
+                ADMISSION_CUTOFF_U64.value.load(Ordering::Relaxed),
             ),
             (
                 "unchained_net_pending_cmds",
@@ -151,14 +151,14 @@ impl MetricsAggregator {
                 }
             }};
         }
-        counter_delta!("unchained_coin_proofs_served_total", PROOFS_SERVED);
+        counter_delta!("unchained_settlement_unit_membership_proofs_served_total", MEMBERSHIP_PROOFS_SERVED);
         counter_delta!(
             "unchained_validation_failures_anchor_total",
             VALIDATION_FAIL_ANCHOR
         );
         counter_delta!(
-            "unchained_validation_failures_coin_total",
-            VALIDATION_FAIL_COIN
+            "unchained_validation_failures_settlement_unit_total",
+            VALIDATION_FAIL_SETTLEMENT_UNIT
         );
         counter_delta!(
             "unchained_validation_failures_transfer_total",
@@ -166,7 +166,7 @@ impl MetricsAggregator {
         );
         counter_delta!("unchained_v3_sends_total", V3_SENDS);
         counter_delta!("unchained_db_write_failures_total", DB_WRITE_FAILS);
-        counter_delta!("unchained_pruned_candidates_total", PRUNED_CANDIDATES);
+        counter_delta!("unchained_pruned_settlement_unit_candidates_total", PRUNED_SETTLEMENT_UNIT_CANDIDATES);
         counter_delta!("unchained_compact_epochs_sent_total", COMPACT_EPOCHS_SENT);
         counter_delta!(
             "unchained_compact_epochs_received_total",
@@ -340,31 +340,31 @@ pub static PEERS: Lazy<IntGauge> =
     Lazy::new(|| IntGauge::new("unchained_peer_count", "Connected PQ transport peers").unwrap());
 pub static EPOCH_HEIGHT: Lazy<IntGauge> =
     Lazy::new(|| IntGauge::new("unchained_epoch_height", "Current epoch height").unwrap());
-pub static CANDIDATE_COINS: Lazy<IntGauge> = Lazy::new(|| {
+pub static CANDIDATE_SETTLEMENT_UNITS: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::new(
-        "unchained_candidate_coins",
-        "Candidate coins observed for current epoch",
+        "unchained_candidate_settlement_units",
+        "Pending bootstrap settlement units observed for current epoch",
     )
     .unwrap()
 });
-pub static SELECTED_COINS: Lazy<IntGauge> = Lazy::new(|| {
+pub static COMMITTED_SETTLEMENT_UNITS: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::new(
-        "unchained_selected_coins",
-        "Selected coins in last finalized epoch",
+        "unchained_committed_settlement_units",
+        "Bootstrap settlement units committed in last finalized epoch",
     )
     .unwrap()
 });
-pub static PROOFS_SERVED: Lazy<IntCounter> = Lazy::new(|| {
+pub static MEMBERSHIP_PROOFS_SERVED: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
-        "unchained_coin_proofs_served_total",
-        "Number of coin proofs served",
+        "unchained_settlement_unit_membership_proofs_served_total",
+        "Number of checkpoint membership proofs served",
     )
     .unwrap()
 });
-pub static PROOF_LATENCY_MS: Lazy<Histogram> = Lazy::new(|| {
+pub static MEMBERSHIP_PROOF_LATENCY_MS: Lazy<Histogram> = Lazy::new(|| {
     Histogram::new(
-        "unchained_coin_proof_latency_ms",
-        "Proof serving latency (ms)",
+        "unchained_settlement_unit_membership_proof_latency_ms",
+        "Checkpoint membership proof serving latency (ms)",
     )
 });
 pub static ORPHAN_BUFFER_LEN: Lazy<IntGauge> = Lazy::new(|| {
@@ -381,10 +381,10 @@ pub static VALIDATION_FAIL_ANCHOR: Lazy<IntCounter> = Lazy::new(|| {
     )
     .unwrap()
 });
-pub static VALIDATION_FAIL_COIN: Lazy<IntCounter> = Lazy::new(|| {
+pub static VALIDATION_FAIL_SETTLEMENT_UNIT: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
-        "unchained_validation_failures_coin_total",
-        "Count of invalid coin candidates received",
+        "unchained_validation_failures_settlement_unit_total",
+        "Count of invalid bootstrap settlement candidates received",
     )
     .unwrap()
 });
@@ -405,17 +405,17 @@ pub static DB_WRITE_FAILS: Lazy<IntCounter> = Lazy::new(|| {
     )
     .unwrap()
 });
-pub static PRUNED_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| {
+pub static PRUNED_SETTLEMENT_UNIT_CANDIDATES: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
-        "unchained_pruned_candidates_total",
+        "unchained_pruned_settlement_unit_candidates_total",
         "Total candidate entries pruned",
     )
     .unwrap()
 });
-pub static SELECTION_THRESHOLD_U64: Lazy<IntGauge> = Lazy::new(|| {
+pub static ADMISSION_CUTOFF_U64: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::new(
-        "unchained_selection_threshold_u64",
-        "Threshold (first 8 bytes of candidate admission digest) for last selected coin",
+        "unchained_settlement_unit_admission_cutoff_u64",
+        "Last checkpoint admission cutoff from the candidate digest order",
     )
     .unwrap()
 });
@@ -436,7 +436,7 @@ pub static COMPACT_EPOCHS_RECV: Lazy<IntCounter> = Lazy::new(|| {
 pub static COMPACT_TX_REQ: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
         "unchained_compact_tx_requests_total",
-        "GetTxn requests sent",
+        "GetSettlementUnitBatch requests sent",
     )
     .unwrap()
 });

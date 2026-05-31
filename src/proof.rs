@@ -393,6 +393,14 @@ impl TransparentProverCapabilities {
                 self.proof_family
             );
         }
+        if descriptor.target_security_bits != self.target_security_bits {
+            bail!(
+                "transparent prover backend {:?} advertised {} security bits, expected {}",
+                self.backend,
+                self.target_security_bits,
+                descriptor.target_security_bits
+            );
+        }
         if descriptor.seal_encoding != self.seal_encoding {
             bail!(
                 "transparent prover backend {:?} does not match seal encoding {:?}",
@@ -403,11 +411,31 @@ impl TransparentProverCapabilities {
         if self.target_security_bits < MIN_TRANSPARENT_PROOF_SECURITY_BITS {
             bail!("transparent prover capability budget is below canonical minimum");
         }
-        for circuit in &self.supported_circuits {
+        if self.supported_circuits.is_empty() {
+            bail!("transparent prover capability list is empty");
+        }
+        for (index, circuit) in self.supported_circuits.iter().enumerate() {
+            if self.supported_circuits[..index].contains(circuit) {
+                bail!("transparent prover capability list contains duplicate circuits");
+            }
             let circuit_descriptor = transparent_circuit_descriptor(*circuit);
             if circuit_descriptor.proof_family != self.proof_family {
                 bail!(
                     "transparent prover backend {:?} cannot serve circuit {:?}",
+                    self.backend,
+                    circuit
+                );
+            }
+            if circuit_descriptor.target_security_bits > self.target_security_bits {
+                bail!(
+                    "transparent prover backend {:?} undershoots circuit {:?} security budget",
+                    self.backend,
+                    circuit
+                );
+            }
+            if configured_backend_for_circuit(*circuit) != self.backend {
+                bail!(
+                    "transparent prover backend {:?} is not canonical for circuit {:?}",
                     self.backend,
                     circuit
                 );
@@ -1543,6 +1571,29 @@ mod tests {
             seal: vec![1],
         };
         proof.validate_metadata().expect("valid proof");
+    }
+
+    #[test]
+    fn transparent_prover_capabilities_reject_empty_and_duplicate_inventory() {
+        let mut empty = current_prover_capabilities();
+        empty.supported_circuits.clear();
+        let err = empty.validate().expect_err("empty inventory");
+        assert!(err.to_string().contains("capability list is empty"));
+
+        let mut duplicate = current_prover_capabilities();
+        duplicate
+            .supported_circuits
+            .push(TransparentCircuit::OrdinaryTransferV1);
+        let err = duplicate.validate().expect_err("duplicate inventory");
+        assert!(err.to_string().contains("duplicate circuits"));
+    }
+
+    #[test]
+    fn transparent_prover_capabilities_reject_security_budget_mismatch() {
+        let mut capabilities = current_prover_capabilities();
+        capabilities.target_security_bits = capabilities.target_security_bits.saturating_add(1);
+        let err = capabilities.validate().expect_err("budget mismatch");
+        assert!(err.to_string().contains("advertised"));
     }
 
     #[test]

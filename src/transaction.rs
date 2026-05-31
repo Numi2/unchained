@@ -1742,8 +1742,8 @@ pub fn materialize_genesis_note_commitments(db: &Store) -> Result<()> {
         .load_shielded_note_tree()?
         .unwrap_or_else(NoteCommitmentTree::new);
     let mut changed = false;
-    for (birth_epoch, coin) in db.iterate_committed_coins()? {
-        let (note, _, _) = deterministic_genesis_note(&coin, birth_epoch, &chain_id);
+    for (birth_epoch, settlement_unit) in db.iterate_committed_settlement_units()? {
+        let (note, _, _) = deterministic_genesis_note(&settlement_unit, birth_epoch, &chain_id);
         if !tree.contains_commitment(&note.commitment) {
             tree.append(note.commitment)?;
             changed = true;

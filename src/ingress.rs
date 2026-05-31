@@ -2,7 +2,7 @@ use crate::{
     canonical::{self, CanonicalReader, CanonicalWriter},
     crypto::{self, ML_KEM_768_CT_BYTES},
     node_control::{
-        CompactCommittedCoin, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
+        CompactCommittedSettlementUnit, CompactShieldedOutput, CompactWalletSyncDelta, CompactWalletSyncHead,
         NodeControlClient, WalletSendRuntimeMaterial,
     },
     node_identity::{
@@ -43,7 +43,7 @@ const INGRESS_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const INGRESS_SEND_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 const INGRESS_IDLE_TIMEOUT_SECS: u64 = 30;
 const INGRESS_KEEP_ALIVE_SECS: u64 = 5;
-const LIGHT_CLIENT_SYNC_MAX_COINS_PER_REQUEST: u32 = 512;
+const LIGHT_CLIENT_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST: u32 = 512;
 const LIGHT_CLIENT_SYNC_MAX_OUTPUTS_PER_REQUEST: u32 = 256;
 
 #[derive(Debug, Clone)]
@@ -57,9 +57,9 @@ enum GatewaySubmission {
     },
     CompactWalletSyncDelta {
         request_id: [u8; 32],
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     },
     WalletSendRuntimeMaterial {
@@ -249,9 +249,9 @@ impl IngressClient {
 
     pub async fn request_compact_wallet_sync_delta(
         &self,
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     ) -> Result<CompactWalletSyncDelta> {
         let mut request_id = [0u8; 32];
@@ -259,9 +259,9 @@ impl IngressClient {
         match self
             .exchange_submission(GatewaySubmission::CompactWalletSyncDelta {
                 request_id,
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             })
             .await?
@@ -317,9 +317,9 @@ impl IngressClient {
 
     pub fn request_compact_wallet_sync_delta_blocking(
         &self,
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     ) -> Result<CompactWalletSyncDelta> {
         let client = self.clone();
@@ -331,9 +331,9 @@ impl IngressClient {
                     .build()
                     .context("build ingress compact-sync-delta runtime")?
                     .block_on(client.request_compact_wallet_sync_delta(
-                        next_coin_index,
+                        next_settlement_unit_index,
                         next_output_index,
-                        max_coins,
+                        max_settlement_units,
                         max_outputs,
                     ))
             })
@@ -723,18 +723,18 @@ impl SubmissionGatewayServer {
             }
             GatewaySubmission::CompactWalletSyncDelta {
                 request_id,
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             } => Ok(IngressAccept::CompactWalletSyncDelta {
                 request_id,
                 delta: self
                     .validator_client
                     .request_compact_wallet_sync_delta_async(
-                        next_coin_index,
+                        next_settlement_unit_index,
                         next_output_index,
-                        max_coins.min(LIGHT_CLIENT_SYNC_MAX_COINS_PER_REQUEST),
+                        max_settlement_units.min(LIGHT_CLIENT_SYNC_MAX_SETTLEMENT_UNITS_PER_REQUEST),
                         max_outputs.min(LIGHT_CLIENT_SYNC_MAX_OUTPUTS_PER_REQUEST),
                     )
                     .await?,
@@ -979,16 +979,16 @@ fn encode_gateway_submission(submission: &GatewaySubmission) -> Result<Vec<u8>> 
         }
         GatewaySubmission::CompactWalletSyncDelta {
             request_id,
-            next_coin_index,
+            next_settlement_unit_index,
             next_output_index,
-            max_coins,
+            max_settlement_units,
             max_outputs,
         } => {
             writer.write_u8(4);
             writer.write_fixed(request_id);
-            writer.write_u64(*next_coin_index);
+            writer.write_u64(*next_settlement_unit_index);
             writer.write_u64(*next_output_index);
-            writer.write_u32(*max_coins);
+            writer.write_u32(*max_settlement_units);
             writer.write_u32(*max_outputs);
         }
         GatewaySubmission::WalletSendRuntimeMaterial { request_id } => {
@@ -1015,9 +1015,9 @@ fn decode_gateway_submission(bytes: &[u8]) -> Result<GatewaySubmission> {
         },
         4 => GatewaySubmission::CompactWalletSyncDelta {
             request_id: reader.read_fixed()?,
-            next_coin_index: reader.read_u64()?,
+            next_settlement_unit_index: reader.read_u64()?,
             next_output_index: reader.read_u64()?,
-            max_coins: reader.read_u32()?,
+            max_settlement_units: reader.read_u32()?,
             max_outputs: reader.read_u32()?,
         },
         5 => GatewaySubmission::WalletSendRuntimeMaterial {
@@ -1047,21 +1047,21 @@ fn decode_gateway_forward(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(envelope)
 }
 
-fn write_compact_committed_coin(
+fn write_compact_committed_settlement_unit(
     writer: &mut CanonicalWriter,
-    coin: &CompactCommittedCoin,
+    settlement_unit: &CompactCommittedSettlementUnit,
 ) -> Result<()> {
-    writer.write_u64(coin.scan_index);
-    writer.write_u64(coin.birth_epoch);
-    writer.write_bytes(&canonical::encode_coin(&coin.coin)?)?;
+    writer.write_u64(settlement_unit.scan_index);
+    writer.write_u64(settlement_unit.birth_epoch);
+    writer.write_bytes(&canonical::encode_settlement_unit(&settlement_unit.settlement_unit)?)?;
     Ok(())
 }
 
-fn read_compact_committed_coin(reader: &mut CanonicalReader<'_>) -> Result<CompactCommittedCoin> {
-    Ok(CompactCommittedCoin {
+fn read_compact_committed_settlement_unit(reader: &mut CanonicalReader<'_>) -> Result<CompactCommittedSettlementUnit> {
+    Ok(CompactCommittedSettlementUnit {
         scan_index: reader.read_u64()?,
         birth_epoch: reader.read_u64()?,
-        coin: canonical::decode_coin(&reader.read_bytes()?)?,
+        settlement_unit: canonical::decode_settlement_unit(&reader.read_bytes()?)?,
     })
 }
 
@@ -1098,7 +1098,7 @@ fn encode_compact_wallet_sync_head(head: &CompactWalletSyncHead) -> Result<Vec<u
     writer.write_fixed(&head.chain_id);
     writer.write_u64(head.current_nullifier_epoch);
     writer.write_u64(head.latest_finalized_anchor_num);
-    writer.write_u64(head.committed_coin_count);
+    writer.write_u64(head.committed_settlement_unit_count);
     writer.write_u64(head.shielded_output_count);
     Ok(writer.into_vec())
 }
@@ -1109,7 +1109,7 @@ fn decode_compact_wallet_sync_head(bytes: &[u8]) -> Result<CompactWalletSyncHead
         chain_id: reader.read_fixed()?,
         current_nullifier_epoch: reader.read_u64()?,
         latest_finalized_anchor_num: reader.read_u64()?,
-        committed_coin_count: reader.read_u64()?,
+        committed_settlement_unit_count: reader.read_u64()?,
         shielded_output_count: reader.read_u64()?,
     };
     reader.finish()?;
@@ -1119,8 +1119,8 @@ fn decode_compact_wallet_sync_head(bytes: &[u8]) -> Result<CompactWalletSyncHead
 fn encode_compact_wallet_sync_delta(delta: &CompactWalletSyncDelta) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
     writer.write_bytes(&encode_compact_wallet_sync_head(&delta.head)?)?;
-    writer.write_vec(&delta.committed_coins, |writer, coin| {
-        write_compact_committed_coin(writer, coin)
+    writer.write_vec(&delta.committed_settlement_units, |writer, settlement_unit| {
+        write_compact_committed_settlement_unit(writer, settlement_unit)
     })?;
     writer.write_vec(&delta.shielded_outputs, |writer, output| {
         write_compact_shielded_output(writer, output)
@@ -1132,7 +1132,7 @@ fn decode_compact_wallet_sync_delta(bytes: &[u8]) -> Result<CompactWalletSyncDel
     let mut reader = CanonicalReader::new(bytes);
     let delta = CompactWalletSyncDelta {
         head: decode_compact_wallet_sync_head(&reader.read_bytes()?)?,
-        committed_coins: reader.read_vec(read_compact_committed_coin)?,
+        committed_settlement_units: reader.read_vec(read_compact_committed_settlement_unit)?,
         shielded_outputs: reader.read_vec(read_compact_shielded_output)?,
     };
     reader.finish()?;
@@ -1252,7 +1252,7 @@ fn decode_ingress_accept(bytes: &[u8]) -> Result<IngressAccept> {
 mod tests {
     use super::*;
     use crate::{
-        coin::Coin,
+        settlement_unit::SettlementUnit,
         proof::{TransparentProof, TransparentProofStatement},
         shielded,
         transaction::{OrdinaryPrivateTransfer, ShieldedOutput, Tx},
@@ -1328,7 +1328,7 @@ mod tests {
         assert_eq!(record.ingress_kem_pk, ingress_keys.kem_public);
         assert_eq!(record.ingress_x25519_pk, ingress_keys.x25519_public);
         let _ = wallet.address();
-        let _ = Coin::new([0u8; 32], 0, [0u8; 32]);
+        let _ = SettlementUnit::new([0u8; 32], 0, [0u8; 32]);
         let _ = shielded::ShieldedNoteKind::payment();
         let _ = OrdinaryPrivateTransfer {
             nullifiers: vec![],

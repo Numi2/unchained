@@ -21,7 +21,7 @@ use crate::storage::{protocol_chain_id, Store};
 use crate::sync::SyncState;
 use crate::transaction::{FastPathBatch, SharedStateBatch, SharedStateDagBatch};
 use crate::{
-    coin::{Coin, CoinCandidate},
+    settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     config,
     shielded::{
         local_archive_custody_commitments, local_archive_provider_manifest,
@@ -101,16 +101,16 @@ pub struct EpochLeavesBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelectedIdsBundle {
+pub struct SettlementUnitIdsBundle {
     pub epoch_num: u64,
     pub merkle_root: [u8; 32],
-    pub coin_ids: Vec<[u8; 32]>,
+    pub settlement_unit_ids: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochCandidatesResponse {
     pub epoch_hash: [u8; 32],
-    pub candidates: Vec<CoinCandidate>,
+    pub candidates: Vec<SettlementUnitCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,20 +123,20 @@ pub struct EpochHeadersRange {
 pub struct CompactEpoch {
     pub anchor: Anchor,
     pub short_ids: Vec<[u8; 8]>,
-    pub prefilled: Vec<(u32, Coin)>,
+    pub prefilled: Vec<(u32, SettlementUnit)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochGetTxn {
+pub struct EpochGetSettlementUnitBatch {
     pub epoch_hash: [u8; 32],
     pub indexes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochTxn {
+pub struct EpochSettlementUnitBatch {
     pub epoch_hash: [u8; 32],
     pub indexes: Vec<u32>,
-    pub coins: Vec<Coin>,
+    pub settlement_units: Vec<SettlementUnit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,23 +177,23 @@ enum WireTopic {
     ValidatorVote,
     FastPathBatch,
     SharedStateDagBatch,
-    CoinCandidate,
-    Coin,
+    SettlementUnitCandidate,
+    SettlementUnit,
     Tx,
     CompactEpoch,
     EpochLeaves,
-    EpochSelectedResponse,
+    EpochSettlementUnitIds,
     EpochCandidatesResponse,
     EpochHeadersResponse,
     EpochByHashResponse,
     RequestEpoch,
     RequestEpochHeadersRange,
     RequestEpochByHash,
-    RequestCoin,
+    RequestSettlementUnit,
     RequestLatestEpoch,
-    RequestEpochTxn,
-    EpochTxn,
-    RequestEpochSelected,
+    RequestEpochSettlementUnitBatch,
+    EpochSettlementUnitBatch,
+    RequestEpochSettlementUnitIds,
     RequestEpochLeaves,
     RequestEpochCandidates,
     NodeRecord,
@@ -228,23 +228,23 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::ValidatorVote => 3,
         WireTopic::FastPathBatch => 4,
         WireTopic::SharedStateDagBatch => 5,
-        WireTopic::CoinCandidate => 6,
-        WireTopic::Coin => 7,
+        WireTopic::SettlementUnitCandidate => 6,
+        WireTopic::SettlementUnit => 7,
         WireTopic::Tx => 8,
         WireTopic::CompactEpoch => 9,
         WireTopic::EpochLeaves => 10,
-        WireTopic::EpochSelectedResponse => 11,
+        WireTopic::EpochSettlementUnitIds => 11,
         WireTopic::EpochCandidatesResponse => 12,
         WireTopic::EpochHeadersResponse => 13,
         WireTopic::EpochByHashResponse => 14,
         WireTopic::RequestEpoch => 15,
         WireTopic::RequestEpochHeadersRange => 16,
         WireTopic::RequestEpochByHash => 17,
-        WireTopic::RequestCoin => 18,
+        WireTopic::RequestSettlementUnit => 18,
         WireTopic::RequestLatestEpoch => 19,
-        WireTopic::RequestEpochTxn => 20,
-        WireTopic::EpochTxn => 21,
-        WireTopic::RequestEpochSelected => 22,
+        WireTopic::RequestEpochSettlementUnitBatch => 20,
+        WireTopic::EpochSettlementUnitBatch => 21,
+        WireTopic::RequestEpochSettlementUnitIds => 22,
         WireTopic::RequestEpochLeaves => 23,
         WireTopic::RequestEpochCandidates => 24,
         WireTopic::NodeRecord => 25,
@@ -268,23 +268,23 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         3 => WireTopic::ValidatorVote,
         4 => WireTopic::FastPathBatch,
         5 => WireTopic::SharedStateDagBatch,
-        6 => WireTopic::CoinCandidate,
-        7 => WireTopic::Coin,
+        6 => WireTopic::SettlementUnitCandidate,
+        7 => WireTopic::SettlementUnit,
         8 => WireTopic::Tx,
         9 => WireTopic::CompactEpoch,
         10 => WireTopic::EpochLeaves,
-        11 => WireTopic::EpochSelectedResponse,
+        11 => WireTopic::EpochSettlementUnitIds,
         12 => WireTopic::EpochCandidatesResponse,
         13 => WireTopic::EpochHeadersResponse,
         14 => WireTopic::EpochByHashResponse,
         15 => WireTopic::RequestEpoch,
         16 => WireTopic::RequestEpochHeadersRange,
         17 => WireTopic::RequestEpochByHash,
-        18 => WireTopic::RequestCoin,
+        18 => WireTopic::RequestSettlementUnit,
         19 => WireTopic::RequestLatestEpoch,
-        20 => WireTopic::RequestEpochTxn,
-        21 => WireTopic::EpochTxn,
-        22 => WireTopic::RequestEpochSelected,
+        20 => WireTopic::RequestEpochSettlementUnitBatch,
+        21 => WireTopic::EpochSettlementUnitBatch,
+        22 => WireTopic::RequestEpochSettlementUnitIds,
         23 => WireTopic::RequestEpochLeaves,
         24 => WireTopic::RequestEpochCandidates,
         25 => WireTopic::NodeRecord,
@@ -596,7 +596,7 @@ pub struct Network {
 
 enum NetworkCommand {
     GossipAnchor(Anchor),
-    GossipCoin(CoinCandidate),
+    GossipSettlementUnit(SettlementUnitCandidate),
     GossipTx(crate::transaction::Tx),
     GossipFastPathBatch(FastPathBatch),
     GossipSharedStateDagBatch(SharedStateDagBatch),
@@ -609,10 +609,10 @@ enum NetworkCommand {
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
-    RequestCoin([u8; 32]),
+    RequestSettlementUnit([u8; 32]),
     RequestLatestEpoch,
-    RequestEpochTxn(EpochGetTxn),
-    RequestEpochSelected(u64),
+    RequestEpochSettlementUnitBatch(EpochGetSettlementUnitBatch),
+    RequestEpochSettlementUnitIds(u64),
     RequestEpochLeaves(u64),
     GossipEpochLeaves(EpochLeavesBundle),
     RequestEpochCandidates([u8; 32]),
@@ -2608,22 +2608,22 @@ impl RuntimeState {
                 self.ingest_shared_state_dag_batch(&record, batch, &envelope)
                     .await?;
             }
-            WireTopic::CoinCandidate => {
-                let candidate = canonical::decode_coin_candidate(&frame.body)?;
-                match validate_coin_candidate(&candidate, &self.db) {
+            WireTopic::SettlementUnitCandidate => {
+                let candidate = canonical::decode_settlement_unit_candidate(&frame.body)?;
+                match validate_settlement_unit_candidate(&candidate, &self.db) {
                     Ok(()) => {
                         let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-                        self.db.put("coin_candidate", &key, &candidate)?;
+                        self.db.put("settlement_unit_candidate", &key, &candidate)?;
                     }
                     Err(err) => {
-                        metrics::VALIDATION_FAIL_COIN.inc();
-                        bail!("rejecting invalid coin candidate: {err}");
+                        metrics::VALIDATION_FAIL_SETTLEMENT_UNIT.inc();
+                        bail!("rejecting invalid settlement unit candidate: {err}");
                     }
                 }
             }
-            WireTopic::Coin => {
-                let _ = canonical::decode_coin(&frame.body)?;
-                bail!("unsolicited committed coin frames are not part of the canonical protocol");
+            WireTopic::SettlementUnit => {
+                let _ = canonical::decode_settlement_unit(&frame.body)?;
+                bail!("unsolicited committed settlement unit frames are not part of the canonical protocol");
             }
             WireTopic::Tx => {
                 let tx = canonical::decode_tx(&frame.body)?;
@@ -2706,22 +2706,22 @@ impl RuntimeState {
                 self.store_epoch_leaves_bundle(bundle)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
-            WireTopic::EpochSelectedResponse => {
-                let bundle = canonical::decode_selected_ids_bundle(&frame.body)?;
+            WireTopic::EpochSettlementUnitIds => {
+                let bundle = canonical::decode_settlement_unit_ids_bundle(&frame.body)?;
                 let epoch_num = bundle.epoch_num;
-                self.store_selected_ids_bundle(bundle)?;
+                self.store_settlement_unit_ids_bundle(bundle)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
             WireTopic::EpochCandidatesResponse => {
                 let response = canonical::decode_epoch_candidates_response(&frame.body)?;
                 for candidate in response.candidates {
-                    match validate_coin_candidate(&candidate, &self.db) {
+                    match validate_settlement_unit_candidate(&candidate, &self.db) {
                         Ok(()) => {
                             let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
-                            let _ = self.db.put("coin_candidate", &key, &candidate);
+                            let _ = self.db.put("settlement_unit_candidate", &key, &candidate);
                         }
                         Err(err) => {
-                            metrics::VALIDATION_FAIL_COIN.inc();
+                            metrics::VALIDATION_FAIL_SETTLEMENT_UNIT.inc();
                             bail!("rejecting invalid epoch candidate response: {err}");
                         }
                     }
@@ -2787,9 +2787,9 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::RequestCoin => {
+            WireTopic::RequestSettlementUnit => {
                 let _ = decode_bytes32_body(&frame.body)?;
-                bail!("coin-by-id recovery is unsupported; use epoch transaction recovery only");
+                bail!("settlement-unit-by-id recovery is unsupported; use epoch transaction recovery only");
             }
             WireTopic::RequestLatestEpoch => {
                 decode_empty_body(&frame.body)?;
@@ -2804,45 +2804,45 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::RequestEpochTxn => {
-                let req = canonical::decode_epoch_get_txn(&frame.body)?;
+            WireTopic::RequestEpochSettlementUnitBatch => {
+                let req = canonical::decode_epoch_get_settlement_unit_batch(&frame.body)?;
                 let txn = self.lookup_epoch_txn(&req)?;
-                if !txn.coins.is_empty() {
+                if !txn.settlement_units.is_empty() {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
-                            WireTopic::EpochTxn,
-                            canonical::encode_epoch_txn(&txn)?,
+                            WireTopic::EpochSettlementUnitBatch,
+                            canonical::encode_epoch_settlement_unit_batch(&txn)?,
                             Some(message_id),
                         )
                         .await?;
                 }
             }
-            WireTopic::EpochTxn => {
-                let txn = canonical::decode_epoch_txn(&frame.body)?;
+            WireTopic::EpochSettlementUnitBatch => {
+                let txn = canonical::decode_epoch_settlement_unit_batch(&frame.body)?;
                 let epoch_num = self
                     .db
                     .get::<Anchor>("anchor", &txn.epoch_hash)?
                     .map(|anchor| anchor.num)
-                    .ok_or_else(|| anyhow!("epoch txn references unknown anchor"))?;
+                    .ok_or_else(|| anyhow!("epoch settlement unit batch references unknown anchor"))?;
                 self.store_epoch_txn(txn)?;
                 self.repair_epoch_state(epoch_num).await?;
             }
-            WireTopic::RequestEpochSelected => {
+            WireTopic::RequestEpochSettlementUnitIds => {
                 let epoch_num = decode_u64_body(&frame.body)?;
-                let ids = self.db.get_selected_coin_ids_for_epoch(epoch_num)?;
+                let ids = self.db.get_settlement_unit_ids_for_epoch(epoch_num)?;
                 if !ids.is_empty() {
                     let merkle_root = MerkleTree::build_root(&ids.iter().copied().collect());
-                    let bundle = SelectedIdsBundle {
+                    let bundle = SettlementUnitIdsBundle {
                         epoch_num,
                         merkle_root,
-                        coin_ids: ids,
+                        settlement_unit_ids: ids,
                     };
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
-                            WireTopic::EpochSelectedResponse,
-                            canonical::encode_selected_ids_bundle(&bundle)?,
+                            WireTopic::EpochSettlementUnitIds,
+                            canonical::encode_settlement_unit_ids_bundle(&bundle)?,
                             Some(message_id),
                         )
                         .await?;
@@ -2870,7 +2870,7 @@ impl RuntimeState {
             }
             WireTopic::RequestEpochCandidates => {
                 let epoch_hash = decode_bytes32_body(&frame.body)?;
-                let candidates = self.db.get_coin_candidates_by_epoch_hash(&epoch_hash)?;
+                let candidates = self.db.get_settlement_unit_candidates_by_epoch_hash(&epoch_hash)?;
                 if !candidates.is_empty() {
                     let response = EpochCandidatesResponse {
                         epoch_hash,
@@ -3004,29 +3004,29 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn lookup_epoch_txn(&self, req: &EpochGetTxn) -> Result<EpochTxn> {
+    fn lookup_epoch_txn(&self, req: &EpochGetSettlementUnitBatch) -> Result<EpochSettlementUnitBatch> {
         let Some(anchor) = self.db.get::<Anchor>("anchor", &req.epoch_hash)? else {
-            return Ok(EpochTxn {
+            return Ok(EpochSettlementUnitBatch {
                 epoch_hash: req.epoch_hash,
                 indexes: Vec::new(),
-                coins: Vec::new(),
+                settlement_units: Vec::new(),
             });
         };
-        let ids = self.db.get_selected_coin_ids_for_epoch(anchor.num)?;
+        let ids = self.db.get_settlement_unit_ids_for_epoch(anchor.num)?;
         let mut indexes = Vec::new();
-        let mut coins = Vec::new();
+        let mut settlement_units = Vec::new();
         for index in &req.indexes {
-            if let Some(coin_id) = ids.get(*index as usize) {
-                if let Some(coin) = self.db.get::<Coin>("coin", coin_id)? {
+            if let Some(settlement_unit_id) = ids.get(*index as usize) {
+                if let Some(settlement_unit) = self.db.get::<SettlementUnit>("settlement_unit", settlement_unit_id)? {
                     indexes.push(*index);
-                    coins.push(coin);
+                    settlement_units.push(settlement_unit);
                 }
             }
         }
-        Ok(EpochTxn {
+        Ok(EpochSettlementUnitBatch {
             epoch_hash: req.epoch_hash,
             indexes,
-            coins,
+            settlement_units,
         })
     }
 
@@ -3050,30 +3050,30 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn store_selected_ids_bundle(&self, bundle: SelectedIdsBundle) -> Result<()> {
-        let computed_root = MerkleTree::build_root(&bundle.coin_ids.iter().copied().collect());
+    fn store_settlement_unit_ids_bundle(&self, bundle: SettlementUnitIdsBundle) -> Result<()> {
+        let computed_root = MerkleTree::build_root(&bundle.settlement_unit_ids.iter().copied().collect());
         if computed_root != bundle.merkle_root {
-            bail!("selected ids bundle merkle root mismatch");
+            bail!("settlement unit ids bundle merkle root mismatch");
         }
         if let Some(anchor) = self
             .db
             .get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes())?
         {
             if anchor.merkle_root != bundle.merkle_root {
-                bail!("selected ids bundle does not match local anchor");
+                bail!("settlement unit ids bundle does not match local anchor");
             }
-            if anchor.coin_count as usize != bundle.coin_ids.len() {
-                bail!("selected ids bundle coin count does not match local anchor");
+            if anchor.settlement_unit_count as usize != bundle.settlement_unit_ids.len() {
+                bail!("settlement unit ids bundle settlement unit count does not match local anchor");
             }
         }
         let mut batch = WriteBatch::default();
-        let Some(sel_cf) = self.db.db.cf_handle("epoch_selected") else {
-            bail!("epoch_selected column family missing");
+        let Some(sel_cf) = self.db.db.cf_handle("epoch_settlement_units") else {
+            bail!("epoch_settlement_units column family missing");
         };
-        for coin_id in bundle.coin_ids {
+        for settlement_unit_id in bundle.settlement_unit_ids {
             let mut key = Vec::with_capacity(8 + 32);
             key.extend_from_slice(&bundle.epoch_num.to_le_bytes());
-            key.extend_from_slice(&coin_id);
+            key.extend_from_slice(&settlement_unit_id);
             batch.put_cf(sel_cf, &key, &[]);
         }
         self.db.write_batch(batch)?;
@@ -3084,27 +3084,27 @@ impl RuntimeState {
         let Some(anchor) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes())? else {
             return Ok(());
         };
-        let ids = self.db.get_selected_coin_ids_for_epoch(epoch_num)?;
+        let ids = self.db.get_settlement_unit_ids_for_epoch(epoch_num)?;
         if ids.is_empty() {
             let _ = self
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochSelected,
+                    WireTopic::RequestEpochSettlementUnitIds,
                     encode_u64_body(epoch_num),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
         } else {
             let mut indexes = Vec::new();
-            for (index, coin_id) in ids.iter().enumerate() {
-                if self.db.get::<Coin>("coin", coin_id)?.is_none() {
+            for (index, settlement_unit_id) in ids.iter().enumerate() {
+                if self.db.get::<SettlementUnit>("settlement_unit", settlement_unit_id)?.is_none() {
                     indexes.push(index as u32);
                 }
             }
             if !indexes.is_empty() {
                 let _ = self
                     .sign_and_send_to_targets(
-                        WireTopic::RequestEpochTxn,
-                        canonical::encode_epoch_get_txn(&EpochGetTxn {
+                        WireTopic::RequestEpochSettlementUnitBatch,
+                        canonical::encode_epoch_get_settlement_unit_batch(&EpochGetSettlementUnitBatch {
                             epoch_hash: anchor.hash,
                             indexes,
                         })?,
@@ -3136,7 +3136,7 @@ impl RuntimeState {
             let Some(anchor) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes())? else {
                 continue;
             };
-            if anchor.coin_count == 0 {
+            if anchor.settlement_unit_count == 0 {
                 continue;
             }
             self.repair_epoch_state(epoch_num).await?;
@@ -3144,44 +3144,44 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn store_epoch_txn(&self, txn: EpochTxn) -> Result<Vec<[u8; 32]>> {
-        if txn.indexes.len() != txn.coins.len() {
-            bail!("epoch txn indexes length does not match coin payloads");
+    fn store_epoch_txn(&self, txn: EpochSettlementUnitBatch) -> Result<Vec<[u8; 32]>> {
+        if txn.indexes.len() != txn.settlement_units.len() {
+            bail!("epoch settlement unit batch indexes length does not match settlement unit payloads");
         }
         let Some(anchor) = self.db.get::<Anchor>("anchor", &txn.epoch_hash)? else {
-            bail!("epoch txn references unknown anchor");
+            bail!("epoch settlement unit batch references unknown anchor");
         };
-        let ids = self.db.get_selected_coin_ids_for_epoch(anchor.num)?;
+        let ids = self.db.get_settlement_unit_ids_for_epoch(anchor.num)?;
         if ids.is_empty() {
-            bail!("epoch txn arrived before selected ids were recovered");
+            bail!("epoch settlement unit batch arrived before settlement unit ids were recovered");
         }
-        let Some(coin_cf) = self.db.db.cf_handle("coin") else {
-            bail!("coin column family missing");
+        let Some(settlement_unit_cf) = self.db.db.cf_handle("settlement_unit") else {
+            bail!("settlement_unit column family missing");
         };
-        let Some(coin_epoch_cf) = self.db.db.cf_handle("coin_epoch") else {
-            bail!("coin_epoch column family missing");
+        let Some(settlement_unit_epoch_cf) = self.db.db.cf_handle("settlement_unit_epoch") else {
+            bail!("settlement_unit_epoch column family missing");
         };
-        let Some(rev_cf) = self.db.db.cf_handle("coin_epoch_by_epoch") else {
-            bail!("coin_epoch_by_epoch column family missing");
+        let Some(rev_cf) = self.db.db.cf_handle("settlement_unit_epoch_by_epoch") else {
+            bail!("settlement_unit_epoch_by_epoch column family missing");
         };
 
         let mut batch = WriteBatch::default();
-        let mut recovered = Vec::with_capacity(txn.coins.len());
-        for (index, coin) in txn.indexes.into_iter().zip(txn.coins.into_iter()) {
-            let Some(expected_coin_id) = ids.get(index as usize) else {
-                bail!("epoch txn index {} is out of range", index);
+        let mut recovered = Vec::with_capacity(txn.settlement_units.len());
+        for (index, settlement_unit) in txn.indexes.into_iter().zip(txn.settlement_units.into_iter()) {
+            let Some(expected_settlement_unit_id) = ids.get(index as usize) else {
+                bail!("epoch settlement unit batch index {} is out of range", index);
             };
-            if &coin.id != expected_coin_id {
-                bail!("epoch txn coin id does not match selected ids bundle");
+            if &settlement_unit.id != expected_settlement_unit_id {
+                bail!("epoch settlement unit batch settlement unit id does not match settlement unit ids bundle");
             }
-            let coin_bytes = bincode::serialize(&coin)?;
-            batch.put_cf(coin_cf, &coin.id, &coin_bytes);
-            batch.put_cf(coin_epoch_cf, &coin.id, &anchor.num.to_le_bytes());
+            let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
+            batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
+            batch.put_cf(settlement_unit_epoch_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
             let mut rev_key = Vec::with_capacity(8 + 32);
             rev_key.extend_from_slice(&anchor.num.to_le_bytes());
-            rev_key.extend_from_slice(&coin.id);
+            rev_key.extend_from_slice(&settlement_unit.id);
             batch.put_cf(rev_cf, &rev_key, &[]);
-            recovered.push(coin.id);
+            recovered.push(settlement_unit.id);
         }
         self.db.write_batch(batch)?;
         Ok(recovered)
@@ -3268,7 +3268,7 @@ impl RuntimeState {
             position: anchor.position,
             ordering_path: anchor.ordering_path,
             merkle_root: anchor.merkle_root,
-            coin_count: anchor.coin_count,
+            settlement_unit_count: anchor.settlement_unit_count,
             dag_round: anchor.dag_round,
             dag_frontier: anchor.dag_frontier.clone(),
             ordered_batch_ids: anchor.ordered_batch_ids.clone(),
@@ -3296,7 +3296,7 @@ impl RuntimeState {
                 position: anchor.position,
                 ordering_path: anchor.ordering_path,
                 merkle_root: anchor.merkle_root,
-                coin_count: anchor.coin_count,
+                settlement_unit_count: anchor.settlement_unit_count,
                 dag_round: anchor.dag_round,
                 dag_frontier: anchor.dag_frontier.clone(),
                 ordered_batch_ids: anchor.ordered_batch_ids.clone(),
@@ -3398,7 +3398,7 @@ impl RuntimeState {
             let _ = ();
         } else if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
             net_log!(
-                "⚠️  Unable to reconstruct selected coins for epoch {}: {}",
+                "⚠️  Unable to reconstruct selected settlement_units for epoch {}: {}",
                 anchor.num,
                 e
             );
@@ -3793,11 +3793,11 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 .sign_and_broadcast(WireTopic::Anchor, canonical::encode_anchor(&anchor)?)
                 .await?;
         }
-        NetworkCommand::GossipCoin(coin) => {
+        NetworkCommand::GossipSettlementUnit(settlement_unit) => {
             state
                 .sign_and_broadcast(
-                    WireTopic::CoinCandidate,
-                    canonical::encode_coin_candidate(&coin)?,
+                    WireTopic::SettlementUnitCandidate,
+                    canonical::encode_settlement_unit_candidate(&settlement_unit)?,
                 )
                 .await?;
         }
@@ -3874,9 +3874,9 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::RequestCoin(coin_id) => {
-            let _ = coin_id;
-            bail!("coin-by-id recovery is unsupported; use epoch transaction recovery only");
+        NetworkCommand::RequestSettlementUnit(settlement_unit_id) => {
+            let _ = settlement_unit_id;
+            bail!("settlement-unit-by-id recovery is unsupported; use epoch transaction recovery only");
         }
         NetworkCommand::RequestLatestEpoch => {
             let _ = state
@@ -3887,19 +3887,19 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochTxn(req) => {
+        NetworkCommand::RequestEpochSettlementUnitBatch(req) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochTxn,
-                    canonical::encode_epoch_get_txn(&req)?,
+                    WireTopic::RequestEpochSettlementUnitBatch,
+                    canonical::encode_epoch_get_settlement_unit_batch(&req)?,
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochSelected(epoch_num) => {
+        NetworkCommand::RequestEpochSettlementUnitIds(epoch_num) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochSelected,
+                    WireTopic::RequestEpochSettlementUnitIds,
                     encode_u64_body(epoch_num),
                     REQUEST_FANOUT_DEFAULT,
                 )
@@ -4016,10 +4016,10 @@ impl Network {
             .send(NetworkCommand::GossipAnchor(anchor.clone()));
     }
 
-    pub async fn gossip_coin(&self, coin: &CoinCandidate) {
+    pub async fn gossip_settlement_unit(&self, settlement_unit: &SettlementUnitCandidate) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::GossipCoin(coin.clone()));
+            .send(NetworkCommand::GossipSettlementUnit(settlement_unit.clone()));
     }
 
     pub async fn gossip_tx(&self, tx: &crate::transaction::Tx) {
@@ -4096,7 +4096,7 @@ impl Network {
         num: u64,
         parent: Option<&Anchor>,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         dag_round: u64,
         dag_frontier: Vec<[u8; 32]>,
         ordered_batch_ids: Vec<[u8; 32]>,
@@ -4125,7 +4125,7 @@ impl Network {
             parent.map(|parent| parent.hash),
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             dag_round,
             dag_frontier,
             ordered_batch_ids,
@@ -4480,24 +4480,24 @@ impl Network {
         }
     }
 
-    pub async fn request_coin(&self, coin_id: [u8; 32]) {
-        let _ = self.command_tx.send(NetworkCommand::RequestCoin(coin_id));
+    pub async fn request_settlement_unit(&self, settlement_unit_id: [u8; 32]) {
+        let _ = self.command_tx.send(NetworkCommand::RequestSettlementUnit(settlement_unit_id));
     }
 
     pub async fn request_latest_epoch(&self) {
         let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch);
     }
 
-    pub async fn request_epoch_selected(&self, epoch_num: u64) {
+    pub async fn request_epoch_settlement_units(&self, epoch_num: u64) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochSelected(epoch_num));
+            .send(NetworkCommand::RequestEpochSettlementUnitIds(epoch_num));
     }
 
     pub async fn request_epoch_txn(&self, epoch_hash: [u8; 32], indexes: Vec<u32>) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochTxn(EpochGetTxn {
+            .send(NetworkCommand::RequestEpochSettlementUnitBatch(EpochGetSettlementUnitBatch {
                 epoch_hash,
                 indexes,
             }));
@@ -5047,7 +5047,7 @@ fn should_relay_topic(topic: WireTopic) -> bool {
             | WireTopic::AnchorProposal
             | WireTopic::FastPathBatch
             | WireTopic::SharedStateDagBatch
-            | WireTopic::CoinCandidate
+            | WireTopic::SettlementUnitCandidate
             | WireTopic::Tx
             | WireTopic::CompactEpoch
             | WireTopic::NodeRecord
@@ -5370,39 +5370,39 @@ mod tests {
     }
 }
 
-fn validate_coin_candidate(coin: &CoinCandidate, db: &Store) -> Result<(), String> {
+fn validate_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate, db: &Store) -> Result<(), String> {
     let _anchor: Anchor = db
-        .get_epoch_for_coin(&coin.id)
+        .get_epoch_for_settlement_unit(&settlement_unit.id)
         .ok()
         .flatten()
         .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
-        .or_else(|| db.get::<Anchor>("anchor", &coin.epoch_hash).ok().flatten())
+        .or_else(|| db.get::<Anchor>("anchor", &settlement_unit.epoch_hash).ok().flatten())
         .ok_or_else(|| {
             format!(
-                "Coin references non-existent committed epoch (coin_id={})",
-                hex::encode(coin.id)
+                "SettlementUnit references non-existent committed epoch (settlement_unit_id={})",
+                hex::encode(settlement_unit.id)
             )
         })?;
 
-    if coin.creator_address == [0u8; 32] {
+    if settlement_unit.creator_address == [0u8; 32] {
         return Err("Invalid creator address".into());
     }
-    if coin.creator_pk.address() != coin.creator_address {
+    if settlement_unit.creator_pk.address() != settlement_unit.creator_address {
         return Err("Creator public key/address mismatch".into());
     }
 
-    let expected_digest = CoinCandidate::admission_digest(
-        &coin.epoch_hash,
-        coin.nonce,
-        &coin.creator_address,
-        &coin.creator_pk,
-        &coin.lock_hash,
+    let expected_digest = SettlementUnitCandidate::admission_digest(
+        &settlement_unit.epoch_hash,
+        settlement_unit.nonce,
+        &settlement_unit.creator_address,
+        &settlement_unit.creator_pk,
+        &settlement_unit.lock_hash,
     );
-    if coin.admission_digest != expected_digest {
+    if settlement_unit.admission_digest != expected_digest {
         return Err("candidate admission digest mismatch".into());
     }
-    if Coin::calculate_id(&coin.epoch_hash, coin.nonce, &coin.creator_address) != coin.id {
-        return Err("Coin ID mismatch".into());
+    if SettlementUnit::calculate_id(&settlement_unit.epoch_hash, settlement_unit.nonce, &settlement_unit.creator_address) != settlement_unit.id {
+        return Err("SettlementUnit ID mismatch".into());
     }
     Ok(())
 }
@@ -5514,7 +5514,7 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
             position: anchor.position,
             ordering_path: anchor.ordering_path,
             merkle_root: anchor.merkle_root,
-            coin_count: anchor.coin_count,
+            settlement_unit_count: anchor.settlement_unit_count,
             dag_round: anchor.dag_round,
             dag_frontier: anchor.dag_frontier.clone(),
             ordered_batch_ids: anchor.ordered_batch_ids.clone(),
@@ -5532,7 +5532,7 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
         position: anchor.position,
         ordering_path: anchor.ordering_path,
         merkle_root: anchor.merkle_root,
-        coin_count: anchor.coin_count,
+        settlement_unit_count: anchor.settlement_unit_count,
         dag_round: anchor.dag_round,
         dag_frontier: anchor.dag_frontier.clone(),
         ordered_batch_ids: anchor.ordered_batch_ids.clone(),
@@ -5572,7 +5572,7 @@ fn validate_fast_path_batch_for_proposal(
     if proposal.merkle_root != batch.ordered_tx_root {
         return Err("fast-path batch root does not match the proposal commitment".to_string());
     }
-    if proposal.coin_count != batch_count {
+    if proposal.settlement_unit_count != batch_count {
         return Err("fast-path batch count does not match the proposal commitment".to_string());
     }
     Ok(())
@@ -5638,7 +5638,7 @@ fn select_pending_fast_path_batch(db: &Store) -> Result<Option<FastPathBatch>> {
             seen_nullifiers.insert(*nullifier);
         }
         selected.push(tx);
-        if selected.len() >= PROTOCOL.max_coins_per_epoch as usize {
+        if selected.len() >= PROTOCOL.max_settlement_units_per_epoch as usize {
             break;
         }
     }
@@ -5944,7 +5944,7 @@ fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
         position: anchor.position,
         ordering_path: anchor.ordering_path,
         merkle_root: anchor.merkle_root,
-        coin_count: anchor.coin_count,
+        settlement_unit_count: anchor.settlement_unit_count,
         dag_round: anchor.dag_round,
         dag_frontier: anchor.dag_frontier.clone(),
         ordered_batch_ids: anchor.ordered_batch_ids.clone(),
@@ -6201,34 +6201,34 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
         .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
         .ok_or_else(|| anyhow!("missing parent anchor"))?;
     let (candidates, _) =
-        crate::epoch::select_candidates_for_epoch(db, &parent, anchor.coin_count as usize, None);
-    let selected_ids = candidates
+        crate::epoch::select_candidates_for_epoch(db, &parent, anchor.settlement_unit_count as usize, None);
+    let settlement_unit_ids = candidates
         .iter()
         .map(|candidate| candidate.id)
         .collect::<HashSet<_>>();
-    let mut leaves = selected_ids
+    let mut leaves = settlement_unit_ids
         .iter()
-        .map(Coin::id_to_leaf_hash)
+        .map(SettlementUnit::id_to_leaf_hash)
         .collect::<Vec<_>>();
     leaves.sort();
     if MerkleTree::compute_root_from_sorted_leaves(&leaves) != anchor.merkle_root
-        || selected_ids.len() as u32 != anchor.coin_count
+        || settlement_unit_ids.len() as u32 != anchor.settlement_unit_count
     {
         bail!("candidate reconstruction does not match anchor merkle root");
     }
     let levels = MerkleTree::build_levels_from_sorted_leaves(&leaves);
 
-    let Some(coin_cf) = db.db.cf_handle("coin") else {
-        bail!("coin column family missing");
+    let Some(settlement_unit_cf) = db.db.cf_handle("settlement_unit") else {
+        bail!("settlement_unit column family missing");
     };
-    let Some(coin_epoch_cf) = db.db.cf_handle("coin_epoch") else {
-        bail!("coin_epoch column family missing");
+    let Some(settlement_unit_epoch_cf) = db.db.cf_handle("settlement_unit_epoch") else {
+        bail!("settlement_unit_epoch column family missing");
     };
-    let Some(rev_cf) = db.db.cf_handle("coin_epoch_by_epoch") else {
-        bail!("coin_epoch_by_epoch column family missing");
+    let Some(rev_cf) = db.db.cf_handle("settlement_unit_epoch_by_epoch") else {
+        bail!("settlement_unit_epoch_by_epoch column family missing");
     };
-    let Some(sel_cf) = db.db.cf_handle("epoch_selected") else {
-        bail!("epoch_selected column family missing");
+    let Some(sel_cf) = db.db.cf_handle("epoch_settlement_units") else {
+        bail!("epoch_settlement_units column family missing");
     };
     let Some(leaves_cf) = db.db.cf_handle("epoch_leaves") else {
         bail!("epoch_leaves column family missing");
@@ -6239,17 +6239,17 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
 
     let mut batch = WriteBatch::default();
     for candidate in candidates {
-        let coin = candidate.into_confirmed();
-        let coin_bytes = bincode::serialize(&coin)?;
-        batch.put_cf(coin_cf, &coin.id, &coin_bytes);
-        batch.put_cf(coin_epoch_cf, &coin.id, &anchor.num.to_le_bytes());
+        let settlement_unit = candidate.into_confirmed();
+        let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
+        batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
+        batch.put_cf(settlement_unit_epoch_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
         let mut rev_key = Vec::with_capacity(8 + 32);
         rev_key.extend_from_slice(&anchor.num.to_le_bytes());
-        rev_key.extend_from_slice(&coin.id);
+        rev_key.extend_from_slice(&settlement_unit.id);
         batch.put_cf(rev_cf, &rev_key, &[]);
         let mut selected_key = Vec::with_capacity(8 + 32);
         selected_key.extend_from_slice(&anchor.num.to_le_bytes());
-        selected_key.extend_from_slice(&coin.id);
+        selected_key.extend_from_slice(&settlement_unit.id);
         batch.put_cf(sel_cf, &selected_key, &[]);
     }
     batch.put_cf(
@@ -6263,6 +6263,6 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
         &bincode::serialize(&levels)?,
     );
     db.write_batch(batch)?;
-    metrics::SELECTED_COINS.set(anchor.coin_count as i64);
+    metrics::COMMITTED_SETTLEMENT_UNITS.set(anchor.settlement_unit_count as i64);
     Ok(())
 }

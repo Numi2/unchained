@@ -379,7 +379,7 @@ pub fn create_pq_server_config(
 /// Compute preimage p for a payment.
 pub fn compute_preimage_v1(
     chain_id32: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     amount_le: u64,
     shared_secret: &[u8],
     note_s: &[u8],
@@ -390,7 +390,7 @@ pub fn compute_preimage_v1(
     let mut h = Hasher::new();
     h.update(b"pre");
     h.update(chain_id32);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&amount_le.to_le_bytes());
     h.update(&lp(shared_secret.len()));
     h.update(shared_secret);
@@ -402,7 +402,7 @@ pub fn compute_preimage_v1(
 /// Compute lock hash from preimage.
 pub fn lock_hash_from_preimage(
     chain_id32: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     preimage: &[u8],
 ) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
@@ -411,7 +411,7 @@ pub fn lock_hash_from_preimage(
     let mut h = Hasher::new();
     h.update(b"lh");
     h.update(chain_id32);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&lp(preimage.len()));
     h.update(preimage);
     *h.finalize().as_bytes()
@@ -420,7 +420,7 @@ pub fn lock_hash_from_preimage(
 /// Compute nullifier from preimage.
 pub fn nullifier_from_preimage(
     chain_id32: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     preimage: &[u8],
 ) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
@@ -429,7 +429,7 @@ pub fn nullifier_from_preimage(
     let mut h = Hasher::new();
     h.update(b"nf");
     h.update(chain_id32);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&lp(preimage.len()));
     h.update(preimage);
     *h.finalize().as_bytes()
@@ -438,7 +438,7 @@ pub fn nullifier_from_preimage(
 /// Commitment hash for HTLC preimages.
 pub fn commitment_hash_from_preimage(
     chain_id32: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     preimage: &[u8],
 ) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
@@ -447,7 +447,7 @@ pub fn commitment_hash_from_preimage(
     let mut h = Hasher::new();
     h.update(b"ch");
     h.update(chain_id32);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&lp(preimage.len()));
     h.update(preimage);
     *h.finalize().as_bytes()
@@ -456,7 +456,7 @@ pub fn commitment_hash_from_preimage(
 /// HTLC lock hash committing to both paths and timeout epoch.
 pub fn htlc_lock_hash(
     chain_id32: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     timeout_epoch: u64,
     ch_claim: &[u8; 32],
     ch_refund: &[u8; 32],
@@ -464,7 +464,7 @@ pub fn htlc_lock_hash(
     let mut h = Hasher::new();
     h.update(b"htlc");
     h.update(chain_id32);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&timeout_epoch.to_le_bytes());
     h.update(ch_claim);
     h.update(ch_refund);
@@ -488,7 +488,7 @@ pub fn derive_next_lock_secret(
     shared: &[u8],
     ml_kem_ct_bytes: &[u8],
     amount_le: u64,
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     chain_id32: &[u8; 32],
 ) -> [u8; 32] {
     fn lp(len: usize) -> [u8; 4] {
@@ -501,7 +501,7 @@ pub fn derive_next_lock_secret(
     h.update(&lp(ml_kem_ct_bytes.len()));
     h.update(ml_kem_ct_bytes);
     h.update(&amount_le.to_le_bytes());
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(chain_id32);
     *h.finalize().as_bytes()
 }
@@ -510,7 +510,7 @@ pub fn derive_next_lock_secret_with_note(
     shared: &[u8],
     ml_kem_ct_bytes: &[u8],
     amount_le: u64,
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     chain_id32: &[u8; 32],
     note_s: &[u8],
 ) -> [u8; 32] {
@@ -524,7 +524,7 @@ pub fn derive_next_lock_secret_with_note(
     h.update(&lp(ml_kem_ct_bytes.len()));
     h.update(ml_kem_ct_bytes);
     h.update(&amount_le.to_le_bytes());
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(chain_id32);
     h.update(&lp(note_s.len()));
     h.update(note_s);
@@ -582,13 +582,13 @@ pub fn ml_kem_768_decapsulate(
 
 pub fn derive_genesis_lock_secret(
     lock_seed: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     chain_id32: &[u8; 32],
 ) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(b"unchained.lockseed.genesis.v2");
     h.update(lock_seed);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(chain_id32);
     *h.finalize().as_bytes()
 }
@@ -597,7 +597,7 @@ pub fn commitment_id_v1(
     one_time_pk: &[u8; OTP_PK_BYTES],
     ml_kem_ct: &[u8; ML_KEM_768_CT_BYTES],
     next_lock_hash: &[u8; 32],
-    coin_id: &[u8; 32],
+    settlement_unit_id: &[u8; 32],
     amount_le: u64,
     chain_id32: &[u8; 32],
 ) -> [u8; 32] {
@@ -606,7 +606,7 @@ pub fn commitment_id_v1(
     h.update(one_time_pk);
     h.update(ml_kem_ct);
     h.update(next_lock_hash);
-    h.update(coin_id);
+    h.update(settlement_unit_id);
     h.update(&amount_le.to_le_bytes());
     h.update(chain_id32);
     *h.finalize().as_bytes()

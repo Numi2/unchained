@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
             );
             println!("   ordering_path: {:?}", anchor.ordering_path);
             println!("   merkle_root: {}", hex::encode(anchor.merkle_root));
-            println!("   coin_count: {}", anchor.coin_count);
+            println!("   bootstrap_units: {}", anchor.settlement_unit_count);
             println!(
                 "   validator_set_hash: {}",
                 hex::encode(anchor.validator_set.committee_hash())
@@ -56,11 +56,11 @@ fn main() -> anyhow::Result<()> {
             println!("   qc_votes: {}", anchor.qc.votes.len());
             println!("   qc_signed_power: {}", anchor.qc.signed_voting_power);
 
-            // Selected coin IDs recorded for this epoch (if any)
-            match db.get_selected_coin_ids_for_epoch(anchor.num) {
+            // Bootstrap settlement unit IDs recorded for this epoch (if any)
+            match db.get_settlement_unit_ids_for_epoch(anchor.num) {
                 Ok(ids) => {
                     let len = ids.len();
-                    println!("   selected_ids: {}", len);
+                    println!("   committed_bootstrap_unit_ids: {}", len);
                     if len > 0 {
                         let preview = len.min(5);
                         for (i, id) in ids.iter().take(preview).enumerate() {
@@ -73,12 +73,12 @@ fn main() -> anyhow::Result<()> {
                         // Show creator distribution for this epoch
                         let mut creators = std::collections::HashSet::new();
                         for id in &ids {
-                            if let Ok(Some(coin)) = db.get::<unchained::coin::Coin>("coin", id) {
-                                creators.insert(coin.creator_address);
+                            if let Ok(Some(settlement_unit)) = db.get::<unchained::settlement_unit::SettlementUnit>("settlement_unit", id) {
+                                creators.insert(settlement_unit.creator_address);
                             }
                         }
                         println!(
-                            "   unique_creators: {} ({}% of selected)",
+                            "   unique_bootstrap_creators: {} ({}% of committed units)",
                             creators.len(),
                             if len > 0 {
                                 (creators.len() * 100) / len
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    println!("   selected_ids: n/a ({})", e);
+                    println!("   committed_bootstrap_unit_ids: n/a ({})", e);
                 }
             }
 
@@ -97,11 +97,11 @@ fn main() -> anyhow::Result<()> {
             match db.get_epoch_leaves(anchor.num) {
                 Ok(Some(leaves)) => {
                     println!("   leaves: {} ({} bytes each)", leaves.len(), 32);
-                    if leaves.len() as u32 != anchor.coin_count {
+                    if leaves.len() as u32 != anchor.settlement_unit_count {
                         println!(
-                            "   ⚠️  leaves/coin_count mismatch: {} vs {}",
+                            "   ⚠️  leaves/bootstrap_units mismatch: {} vs {}",
                             leaves.len(),
-                            anchor.coin_count
+                            anchor.settlement_unit_count
                         );
                     }
                 }

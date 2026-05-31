@@ -1,11 +1,14 @@
 use crate::crypto::{Address, TaggedSigningPublicKey};
 use serde::{Deserialize, Serialize};
 
-const CANDIDATE_ADMISSION_DOMAIN: &str = "unchained.coin-candidate.admission.v1";
+const CANDIDATE_ADMISSION_DOMAIN: &str = "unchained.settlement-unit-candidate.admission.v1";
 
-/// Confirmed coin committed in a finalized settlement checkpoint.
+/// Bootstrap settlement unit committed in a finalized checkpoint.
+///
+/// Settlement units are genesis/bootstrap inputs that materialize into the
+/// shielded note ledger. Ordinary user balances live as shielded notes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Coin {
+pub struct SettlementUnit {
     pub id: [u8; 32],
     pub value: u64,
     pub epoch_hash: [u8; 32],
@@ -19,9 +22,12 @@ pub struct Coin {
     pub lock_hash: [u8; 32],
 }
 
-/// Unconfirmed coin candidate used during checkpoint selection.
+/// Pending bootstrap settlement unit awaiting deterministic checkpoint admission.
+///
+/// Admission is digest-ordered by finalized checkpoint state and carries no
+/// work target or public ordering market.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct CoinCandidate {
+pub struct SettlementUnitCandidate {
     pub id: [u8; 32],
     pub value: u64,
     pub epoch_hash: [u8; 32],
@@ -35,8 +41,8 @@ pub struct CoinCandidate {
     pub admission_digest: [u8; 32],
 }
 
-impl Coin {
-    /// Creates the raw input to hash with Argon2id.
+impl SettlementUnit {
+    /// Creates the canonical bytes that identify a bootstrap settlement unit.
     pub fn header_bytes(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32 + 8 + 32);
         bytes.extend_from_slice(epoch_hash);
@@ -45,7 +51,7 @@ impl Coin {
         bytes
     }
 
-    /// Calculate the coin ID from its components.
+    /// Calculate the settlement unit ID from its components.
     pub fn calculate_id(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
         let mut id_hasher = blake3::Hasher::new();
         id_hasher.update(epoch_hash);
@@ -54,7 +60,7 @@ impl Coin {
         *id_hasher.finalize().as_bytes()
     }
 
-    /// Creates a new confirmed coin (value=1) from raw fields.
+    /// Creates a new confirmed settlement unit (value=1) from raw fields.
     pub fn new_with_creator_pk_and_lock(
         epoch_hash: [u8; 32],
         nonce: u64,
@@ -63,7 +69,7 @@ impl Coin {
         lock_hash: [u8; 32],
     ) -> Self {
         let id = Self::calculate_id(&epoch_hash, nonce, &creator_address);
-        Coin {
+        SettlementUnit {
             id,
             value: 1,
             epoch_hash,
@@ -84,13 +90,13 @@ impl Coin {
         )
     }
 
-    /// Convert coin ID to a leaf hash for the Merkle tree.
-    pub fn id_to_leaf_hash(coin_id: &[u8; 32]) -> [u8; 32] {
-        crate::crypto::blake3_hash(coin_id)
+    /// Convert settlement unit ID to a leaf hash for the Merkle tree.
+    pub fn id_to_leaf_hash(settlement_unit_id: &[u8; 32]) -> [u8; 32] {
+        crate::crypto::blake3_hash(settlement_unit_id)
     }
 }
 
-impl CoinCandidate {
+impl SettlementUnitCandidate {
     pub fn admission_digest(
         epoch_hash: &[u8; 32],
         nonce: u64,
@@ -114,8 +120,8 @@ impl CoinCandidate {
         creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
     ) -> Self {
-        let id = Coin::calculate_id(&epoch_hash, nonce, &creator_address);
-        CoinCandidate {
+        let id = SettlementUnit::calculate_id(&epoch_hash, nonce, &creator_address);
+        SettlementUnitCandidate {
             id,
             value: 1,
             epoch_hash,
@@ -133,8 +139,8 @@ impl CoinCandidate {
         }
     }
 
-    pub fn into_confirmed(self) -> Coin {
-        Coin {
+    pub fn into_confirmed(self) -> SettlementUnit {
+        SettlementUnit {
             id: self.id,
             value: self.value,
             epoch_hash: self.epoch_hash,
@@ -146,10 +152,10 @@ impl CoinCandidate {
     }
 }
 
-pub fn decode_coin(bytes: &[u8]) -> Result<Coin, bincode::Error> {
-    bincode::deserialize::<Coin>(bytes)
+pub fn decode_settlement_unit(bytes: &[u8]) -> Result<SettlementUnit, bincode::Error> {
+    bincode::deserialize::<SettlementUnit>(bytes)
 }
 
-pub fn decode_candidate(bytes: &[u8]) -> Result<CoinCandidate, bincode::Error> {
-    bincode::deserialize::<CoinCandidate>(bytes)
+pub fn decode_settlement_unit_candidate(bytes: &[u8]) -> Result<SettlementUnitCandidate, bincode::Error> {
+    bincode::deserialize::<SettlementUnitCandidate>(bytes)
 }

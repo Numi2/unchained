@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use unchained::{
-    coin::Coin,
+    settlement_unit::SettlementUnit,
     consensus::{
         OrderingPath, QuorumCertificate, Validator, ValidatorId, ValidatorKeys, ValidatorSet,
         ValidatorVote, VoteTarget,
@@ -213,7 +213,7 @@ impl TestCommittee {
         num: u64,
         parent: Option<&Anchor>,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         ordering_path: OrderingPath,
     ) -> Anchor {
         let position = Anchor::position_for_num(num);
@@ -224,7 +224,7 @@ impl TestCommittee {
             position,
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             0,
             &[],
             &[],
@@ -261,7 +261,7 @@ impl TestCommittee {
             parent.map(|anchor| anchor.hash),
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             0,
             Vec::new(),
             Vec::new(),
@@ -282,12 +282,12 @@ impl TestCommittee {
     }
 
     #[allow(dead_code)]
-    pub fn child_anchor(&self, parent: &Anchor, merkle_root: [u8; 32], coin_count: u32) -> Anchor {
+    pub fn child_anchor(&self, parent: &Anchor, merkle_root: [u8; 32], settlement_unit_count: u32) -> Anchor {
         self.anchor(
             parent.num.saturating_add(1),
             Some(parent),
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             OrderingPath::FastPathPrivateTransfer,
         )
     }
@@ -531,47 +531,47 @@ pub fn proof_fixture_dir() -> String {
 }
 
 #[allow(dead_code)]
-pub fn seed_wallet_with_coins(
+pub fn seed_wallet_with_settlement_units(
     store: &Store,
     wallet: &Wallet,
     genesis: &Anchor,
     count: u64,
-) -> anyhow::Result<Vec<Coin>> {
+) -> anyhow::Result<Vec<SettlementUnit>> {
     let chain_id = genesis.hash;
-    let mut coins = Vec::with_capacity(count as usize);
+    let mut settlement_units = Vec::with_capacity(count as usize);
     for nonce in 7..(7 + count) {
-        let candidate_id = Coin::calculate_id(&genesis.hash, nonce, &wallet.address());
+        let candidate_id = SettlementUnit::calculate_id(&genesis.hash, nonce, &wallet.address());
         let lock_secret = wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
         let lock_hash =
             unchained::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &lock_secret);
-        let coin = Coin::new_with_creator_pk_and_lock(
+        let settlement_unit = SettlementUnit::new_with_creator_pk_and_lock(
             genesis.hash,
             nonce,
             wallet.address(),
             wallet.public_key().clone(),
             lock_hash,
         );
-        store.put("coin", &coin.id, &coin)?;
-        store.put_coin_epoch(&coin.id, genesis.num)?;
-        store.put_coin_epoch_rev(genesis.num, &coin.id)?;
-        coins.push(coin);
+        store.put("settlement_unit", &settlement_unit.id, &settlement_unit)?;
+        store.put_settlement_unit_epoch(&settlement_unit.id, genesis.num)?;
+        store.put_settlement_unit_epoch_rev(genesis.num, &settlement_unit.id)?;
+        settlement_units.push(settlement_unit);
     }
-    Ok(coins)
+    Ok(settlement_units)
 }
 
 #[allow(dead_code)]
-pub fn seed_wallet_with_coin_values(
+pub fn seed_wallet_with_settlement_unit_values(
     store: &Store,
     wallet: &Wallet,
     genesis: &Anchor,
     values: &[u64],
-) -> anyhow::Result<Vec<Coin>> {
-    let mut coins = seed_wallet_with_coins(store, wallet, genesis, values.len() as u64)?;
-    for (coin, value) in coins.iter_mut().zip(values.iter().copied()) {
-        coin.value = value;
-        store.put("coin", &coin.id, coin)?;
+) -> anyhow::Result<Vec<SettlementUnit>> {
+    let mut settlement_units = seed_wallet_with_settlement_units(store, wallet, genesis, values.len() as u64)?;
+    for (settlement_unit, value) in settlement_units.iter_mut().zip(values.iter().copied()) {
+        settlement_unit.value = value;
+        store.put("settlement_unit", &settlement_unit.id, settlement_unit)?;
     }
-    Ok(coins)
+    Ok(settlement_units)
 }
 
 #[allow(dead_code)]

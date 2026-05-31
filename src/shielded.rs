@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    coin::Coin,
+    settlement_unit::SettlementUnit,
     crypto::{Address, TaggedKemPublicKey, TaggedSigningPublicKey},
 };
 
@@ -4238,50 +4238,50 @@ fn validate_leaf_levels(leaves: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> Result
     Ok(())
 }
 
-pub fn deterministic_genesis_note_key(coin: &Coin, chain_id: &[u8; 32]) -> [u8; 32] {
+pub fn deterministic_genesis_note_key(settlement_unit: &SettlementUnit, chain_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_KEY_DOMAIN);
     hasher.update(chain_id);
-    hasher.update(&coin.id);
-    hasher.update(&coin.epoch_hash);
-    hasher.update(&coin.creator_pk.bytes);
+    hasher.update(&settlement_unit.id);
+    hasher.update(&settlement_unit.epoch_hash);
+    hasher.update(&settlement_unit.creator_pk.bytes);
     *hasher.finalize().as_bytes()
 }
 
-fn deterministic_genesis_rho(coin: &Coin, birth_epoch: u64, chain_id: &[u8; 32]) -> [u8; 32] {
+fn deterministic_genesis_rho(settlement_unit: &SettlementUnit, birth_epoch: u64, chain_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_RHO_DOMAIN);
     hasher.update(chain_id);
-    hasher.update(&coin.id);
+    hasher.update(&settlement_unit.id);
     hasher.update(&birth_epoch.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
 fn deterministic_genesis_randomizer(
-    coin: &Coin,
+    settlement_unit: &SettlementUnit,
     birth_epoch: u64,
     chain_id: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_RANDOMIZER_DOMAIN);
     hasher.update(chain_id);
-    hasher.update(&coin.id);
-    hasher.update(&coin.creator_pk.bytes);
+    hasher.update(&settlement_unit.id);
+    hasher.update(&settlement_unit.creator_pk.bytes);
     hasher.update(&birth_epoch.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
 pub fn deterministic_genesis_note(
-    coin: &Coin,
+    settlement_unit: &SettlementUnit,
     birth_epoch: u64,
     chain_id: &[u8; 32],
 ) -> (ShieldedNote, [u8; 32], HistoricalUnspentCheckpoint) {
-    let note_key = deterministic_genesis_note_key(coin, chain_id);
+    let note_key = deterministic_genesis_note_key(settlement_unit, chain_id);
     let note = ShieldedNote::new(
-        coin.value,
+        settlement_unit.value,
         birth_epoch,
-        coin.creator_pk.clone(),
+        settlement_unit.creator_pk.clone(),
         TaggedKemPublicKey::zero_ml_kem_768(),
         note_key,
-        deterministic_genesis_rho(coin, birth_epoch, chain_id),
-        deterministic_genesis_randomizer(coin, birth_epoch, chain_id),
+        deterministic_genesis_rho(settlement_unit, birth_epoch, chain_id),
+        deterministic_genesis_randomizer(settlement_unit, birth_epoch, chain_id),
     );
     let checkpoint = HistoricalUnspentCheckpoint::genesis(note.commitment, birth_epoch);
     (note, note_key, checkpoint)

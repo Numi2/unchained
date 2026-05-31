@@ -280,7 +280,7 @@ fn build_single_action_fee_wallet(
     );
     let wallet_store = Arc::new(WalletStore::open(&dir.path().to_string_lossy())?);
     let wallet = finality_support::deterministic_wallet(wallet_store)?;
-    let _ = finality_support::seed_wallet_with_coin_values(store, &wallet, genesis, &[2])?;
+    let _ = finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
     Ok(wallet)
 }
 

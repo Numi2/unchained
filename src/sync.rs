@@ -278,41 +278,41 @@ pub fn spawn(
                         let window: u64 = 16; // scan recent epochs
                         let start = latest.num.saturating_sub(window);
                         for n in start..=latest.num {
-                            // Preferred path: use per-epoch selected ids index
-                            let mut ids: Vec<[u8;32]> = db.get_selected_coin_ids_for_epoch(n).unwrap_or_default();
-                            // Fallback: if selected index missing/empty, derive ids from stored confirmed coins for that epoch
+                            // Preferred path: use per-epoch settlement unit ids index
+                            let mut ids: Vec<[u8;32]> = db.get_settlement_unit_ids_for_epoch(n).unwrap_or_default();
+                            // Fallback: if selected index missing/empty, derive ids from stored confirmed settlement units for that epoch
                             if ids.is_empty() {
                                 if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
-                                    if let Ok(all_confirmed) = db.iterate_coins() {
+                                    if let Ok(all_confirmed) = db.iterate_settlement_units() {
                                         ids = all_confirmed
                                             .into_iter()
                                             .filter(|c| c.epoch_hash == anchor.hash)
                                             .map(|c| c.id)
                                             .collect();
                                         // If we could reconstruct a full set, persist it for future fast access
-                                        if ids.len() == anchor.coin_count as usize && anchor.coin_count > 0 {
-                                            let mut leaves: Vec<[u8;32]> = ids.iter().map(crate::coin::Coin::id_to_leaf_hash).collect();
+                                        if ids.len() == anchor.settlement_unit_count as usize && anchor.settlement_unit_count > 0 {
+                                            let mut leaves: Vec<[u8;32]> = ids.iter().map(crate::settlement_unit::SettlementUnit::id_to_leaf_hash).collect();
                                             leaves.sort();
                                             let root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                             if root == anchor.merkle_root {
-                                                if let Some(sel_cf) = db.db.cf_handle("epoch_selected") {
+                                                if let Some(sel_cf) = db.db.cf_handle("epoch_settlement_units") {
                                                     let mut batch = rocksdb::WriteBatch::default();
-                                                    for coin_id in &ids {
+                                                    for settlement_unit_id in &ids {
                                                         let mut key = Vec::with_capacity(8 + 32);
                                                         key.extend_from_slice(&n.to_le_bytes());
-                                                        key.extend_from_slice(coin_id);
+                                                        key.extend_from_slice(settlement_unit_id);
                                                         batch.put_cf(sel_cf, &key, &[]);
                                                     }
                                                     let _ = db.db.write(batch);
                                                 }
                                             } else {
                                                 // If reconstruction fails, ask peers explicitly
-                                                net.request_epoch_selected(n).await;
+                                                net.request_epoch_settlement_units(n).await;
                                                 net.request_epoch_leaves(n).await;
                                             }
-                                        } else if anchor.coin_count > 0 {
+                                        } else if anchor.settlement_unit_count > 0 {
                                             // Partial or empty reconstruction: ask peers
-                                            net.request_epoch_selected(n).await;
+                                            net.request_epoch_settlement_units(n).await;
                                             net.request_epoch_leaves(n).await;
                                         }
                                     }

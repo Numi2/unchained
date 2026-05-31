@@ -23,7 +23,10 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "none".to_string())
         );
         println!("   Ordering path: {:?}", latest_epoch.ordering_path);
-        println!("   Coins in epoch (selected): {}", latest_epoch.coin_count);
+        println!(
+            "   Bootstrap settlement units: {}",
+            latest_epoch.settlement_unit_count
+        );
         println!(
             "   Validator set hash: {}",
             hex::encode(latest_epoch.validator_set.committee_hash())
@@ -52,39 +55,36 @@ fn main() -> anyhow::Result<()> {
         println!("\n🌱 Genesis anchor not present in this DB");
     }
 
-    // Count total coins from epoch metadata
-    let mut coin_count_from_epochs = 0;
+    // Count total bootstrap settlement units from epoch metadata.
+    let mut bootstrap_units_from_epochs = 0;
     let mut total_epochs = 0;
 
-    println!("\n💰 Scanning epochs for coin counts...");
+    println!("\n💰 Scanning epochs for bootstrap settlement units...");
 
-    // Try to get some recent epochs to see coin counts
+    // Try to get some recent epochs to see settlement unit counts
     for epoch_num in 0u64..=20 {
         if let Ok(Some(epoch)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
             total_epochs += 1;
-            coin_count_from_epochs += epoch.coin_count as usize;
+            bootstrap_units_from_epochs += epoch.settlement_unit_count as usize;
             println!(
-                "   Epoch #{}: {} coins (from epoch metadata)",
-                epoch.num, epoch.coin_count
+                "   Epoch #{}: {} bootstrap settlement units (from epoch metadata)",
+                epoch.num, epoch.settlement_unit_count
             );
         }
     }
 
-    //ng to find actual coin records...");
-
-    // Let's try a different approach - scan recent epochs and try to find their actual coins
+    // Scan recent epochs and inspect their committed bootstrap unit indexes.
     for epoch_num in 0u64..=20 {
         if let Ok(Some(_epoch)) = db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
-            // For each epoch, we'd need to know the coin IDs to look them up
-            // This reveals the fundamental issue - we don't have a way to iterate coins!
+            // Per-epoch IDs live in the settlement-unit index store.
         }
     }
 
     println!("\n📈 Summary:");
     println!("   Total epochs: {total_epochs}");
-    println!("   Total coins (from epoch metadata): {coin_count_from_epochs}");
-    println!("   ⚠️  WARNING: This only counts coins recorded in epoch metadata!");
-    println!("   ⚠️  Some committed coins may not yet be indexed for per-epoch inspection.");
+    println!("   Total bootstrap settlement units: {bootstrap_units_from_epochs}");
+    println!("   ⚠️  WARNING: This only counts units recorded in epoch metadata!");
+    println!("   ⚠️  Some committed units may not yet be indexed for per-epoch inspection.");
 
     // Show database storage info
     println!("\n🗄️ Database Storage Info:");

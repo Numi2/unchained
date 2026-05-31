@@ -1,5 +1,5 @@
 use crate::{
-    coin::Coin,
+    settlement_unit::SettlementUnit,
     consensus::ValidatorSet,
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
@@ -33,14 +33,14 @@ use crate::sync::SyncState;
 const NODE_CONTROL_SOCKET_FILE: &str = "node-control.sock";
 const NODE_CONTROL_CAPABILITY_FILE: &str = "node-control.cap";
 const COMPACT_SHIELDED_OUTPUT_NONCE_LEN: usize = 24;
-const NODE_CONTROL_MAX_COMPACT_COINS_PER_DELTA: u32 = 512;
+const NODE_CONTROL_MAX_COMPACT_SETTLEMENT_UNITS_PER_DELTA: u32 = 512;
 const NODE_CONTROL_MAX_COMPACT_OUTPUTS_PER_DELTA: u32 = 2048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedRuntimeSnapshot {
     pub chain_id: [u8; 32],
     pub current_nullifier_epoch: u64,
-    pub committed_coins: Vec<(u64, Coin)>,
+    pub committed_settlement_units: Vec<(u64, SettlementUnit)>,
     pub shielded_outputs: Vec<([u8; 32], u32, ShieldedOutput)>,
     pub note_tree: NoteCommitmentTree,
     pub root_ledger: NullifierRootLedger,
@@ -48,10 +48,10 @@ pub struct ShieldedRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompactCommittedCoin {
+pub struct CompactCommittedSettlementUnit {
     pub scan_index: u64,
     pub birth_epoch: u64,
-    pub coin: Coin,
+    pub settlement_unit: SettlementUnit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,14 +93,14 @@ pub struct CompactWalletSyncHead {
     pub chain_id: [u8; 32],
     pub current_nullifier_epoch: u64,
     pub latest_finalized_anchor_num: u64,
-    pub committed_coin_count: u64,
+    pub committed_settlement_unit_count: u64,
     pub shielded_output_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactWalletSyncDelta {
     pub head: CompactWalletSyncHead,
-    pub committed_coins: Vec<CompactCommittedCoin>,
+    pub committed_settlement_units: Vec<CompactCommittedSettlementUnit>,
     pub shielded_outputs: Vec<CompactShieldedOutput>,
 }
 
@@ -155,7 +155,7 @@ pub fn build_shielded_runtime_snapshot(db: &Store) -> Result<ShieldedRuntimeSnap
     Ok(ShieldedRuntimeSnapshot {
         chain_id: db.effective_chain_id(),
         current_nullifier_epoch: transaction::current_nullifier_epoch(db)?,
-        committed_coins: db.iterate_committed_coins()?,
+        committed_settlement_units: db.iterate_committed_settlement_units()?,
         shielded_outputs: db.iterate_shielded_outputs()?,
         note_tree: db.load_shielded_note_tree()?.unwrap_or_default(),
         root_ledger: db.load_shielded_root_ledger()?.unwrap_or_default(),
@@ -173,27 +173,27 @@ pub fn build_compact_wallet_sync_head(db: &Store) -> Result<CompactWalletSyncHea
         chain_id: db.effective_chain_id(),
         current_nullifier_epoch: transaction::current_nullifier_epoch(db)?,
         latest_finalized_anchor_num,
-        committed_coin_count: db.count_committed_coins()?,
+        committed_settlement_unit_count: db.count_committed_settlement_units()?,
         shielded_output_count: db.count_shielded_outputs()?,
     })
 }
 
 pub fn build_compact_wallet_sync_delta(
     db: &Store,
-    next_coin_index: u64,
+    next_settlement_unit_index: u64,
     next_output_index: u64,
-    max_coins: u32,
+    max_settlement_units: u32,
     max_outputs: u32,
 ) -> Result<CompactWalletSyncDelta> {
     let head = build_compact_wallet_sync_head(db)?;
-    let committed_coins = db
-        .load_committed_coin_slice(next_coin_index, max_coins as usize)?
+    let committed_settlement_units = db
+        .load_committed_settlement_unit_slice(next_settlement_unit_index, max_settlement_units as usize)?
         .into_iter()
         .enumerate()
-        .map(|(offset, (birth_epoch, coin))| CompactCommittedCoin {
-            scan_index: next_coin_index.saturating_add(offset as u64),
+        .map(|(offset, (birth_epoch, settlement_unit))| CompactCommittedSettlementUnit {
+            scan_index: next_settlement_unit_index.saturating_add(offset as u64),
             birth_epoch,
-            coin,
+            settlement_unit,
         })
         .collect();
     let shielded_outputs = db
@@ -211,7 +211,7 @@ pub fn build_compact_wallet_sync_delta(
         .collect();
     Ok(CompactWalletSyncDelta {
         head,
-        committed_coins,
+        committed_settlement_units,
         shielded_outputs,
     })
 }
@@ -314,9 +314,9 @@ pub enum NodeControlRequest {
     RuntimeSnapshot,
     WalletSendRuntimeMaterial,
     CompactWalletSyncDelta {
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     },
     SubmitTx {
@@ -425,15 +425,15 @@ impl NodeControlClient {
 
     pub fn request_compact_wallet_sync_delta(
         &self,
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     ) -> Result<CompactWalletSyncDelta> {
         match self.call(NodeControlRequest::CompactWalletSyncDelta {
-            next_coin_index,
+            next_settlement_unit_index,
             next_output_index,
-            max_coins,
+            max_settlement_units,
             max_outputs,
         })? {
             NodeControlResponse::CompactWalletSyncDelta { delta } => Ok(delta),
@@ -443,17 +443,17 @@ impl NodeControlClient {
 
     pub async fn request_compact_wallet_sync_delta_async(
         &self,
-        next_coin_index: u64,
+        next_settlement_unit_index: u64,
         next_output_index: u64,
-        max_coins: u32,
+        max_settlement_units: u32,
         max_outputs: u32,
     ) -> Result<CompactWalletSyncDelta> {
         let client = self.clone();
         tokio::task::spawn_blocking(move || {
             client.request_compact_wallet_sync_delta(
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             )
         })
@@ -898,16 +898,16 @@ async fn handle_request(
                 })
             }
             NodeControlRequest::CompactWalletSyncDelta {
-                next_coin_index,
+                next_settlement_unit_index,
                 next_output_index,
-                max_coins,
+                max_settlement_units,
                 max_outputs,
             } => Ok(NodeControlResponse::CompactWalletSyncDelta {
                 delta: build_compact_wallet_sync_delta(
                     db,
-                    next_coin_index,
+                    next_settlement_unit_index,
                     next_output_index,
-                    max_coins.min(NODE_CONTROL_MAX_COMPACT_COINS_PER_DELTA),
+                    max_settlement_units.min(NODE_CONTROL_MAX_COMPACT_SETTLEMENT_UNITS_PER_DELTA),
                     max_outputs.min(NODE_CONTROL_MAX_COMPACT_OUTPUTS_PER_DELTA),
                 )?,
             }),

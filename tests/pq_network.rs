@@ -93,18 +93,18 @@ fn build_single_action_fee_wallet(
     );
     let wallet_store = Arc::new(WalletStore::open(&tempdir.path().to_string_lossy())?);
     let wallet = finality_support::deterministic_wallet(wallet_store)?;
-    let _ = finality_support::seed_wallet_with_coin_values(store, &wallet, genesis, &[2])?;
+    let _ = finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
     Ok(wallet)
 }
 
-fn mirror_wallet_coin_state(
+fn mirror_wallet_settlement_unit_state(
     stores: &[&Store],
     wallet: &Wallet,
     genesis: &Anchor,
     values: &[u64],
 ) -> anyhow::Result<()> {
     for store in stores {
-        let _ = finality_support::seed_wallet_with_coin_values(store, wallet, genesis, values)?;
+        let _ = finality_support::seed_wallet_with_settlement_unit_values(store, wallet, genesis, values)?;
     }
     Ok(())
 }
@@ -718,7 +718,7 @@ async fn pq_network_collects_multivalidator_qc_for_deterministic_leader() -> any
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
 
     let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: validator_a.id,
@@ -965,7 +965,7 @@ async fn pq_network_orders_shared_state_from_multivalidator_dag_frontier() -> an
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
 
     let action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: validator_a.id,
@@ -1157,7 +1157,7 @@ async fn pq_network_bootstrap_anchor_recovery_and_proof_roundtrip() -> anyhow::R
     store_anchor(db_b.as_ref(), &genesis)?;
     store_anchor(db_c.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
     let dummy_action = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: genesis.validator_set.validators[0].id,
         commission_bps: 325,
@@ -1341,7 +1341,7 @@ async fn pq_network_finalizes_fee_paid_profile_update_from_fresh_wallet() -> any
     db_c.store_validator_pool(&pool)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
     let update = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
         validator_id: pool.validator.id,
         commission_bps: 325,
@@ -1518,7 +1518,7 @@ async fn pq_network_finalizes_fee_paid_reactivation_from_fresh_wallet() -> anyho
     db_c.store_validator_pool(&jailed_pool)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
     let tx = signed_shared_state_tx(
         db_a.as_ref(),
         &wallet_a,
@@ -1695,7 +1695,7 @@ async fn pq_network_finalizes_fee_paid_penalty_admission_from_fresh_wallet() -> 
     let fault = LivenessFaultProof::new_missed_vote(&anchor1, slashed_validator.id)?;
 
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref(), db_c.as_ref()], &wallet_a, &genesis, &[2])?;
     let evidence_id = SlashableEvidence::Liveness(fault.clone()).evidence_id()?;
     let tx = finality_support::fee_paid_shared_state_tx(
         db_a.as_ref(),
@@ -1872,7 +1872,7 @@ async fn pq_network_rejoin_recovers_full_epoch_state_after_gap() -> anyhow::Resu
     store_anchor(db_a.as_ref(), &genesis)?;
     store_anchor(db_b.as_ref(), &genesis)?;
     let wallet_a = build_single_action_fee_wallet(&dir_a, db_a.as_ref(), &genesis)?;
-    mirror_wallet_coin_state(&[db_b.as_ref()], &wallet_a, &genesis, &[2])?;
+    mirror_wallet_settlement_unit_state(&[db_b.as_ref()], &wallet_a, &genesis, &[2])?;
 
     net_b.shutdown().await;
     db_b.close()?;

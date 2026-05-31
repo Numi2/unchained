@@ -3,7 +3,7 @@
 
 pub mod app;
 pub mod canonical;
-pub mod coin;
+pub mod settlement_unit;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
@@ -27,7 +27,7 @@ pub mod transaction;
 pub mod wallet;
 pub mod wallet_control;
 
-pub use coin::Coin;
+pub use settlement_unit::SettlementUnit;
 pub use crypto::{address_from_pk, blake3_hash, Address};
 pub use epoch::{Anchor, MerkleTree};
 pub use storage::Store;

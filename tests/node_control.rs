@@ -300,10 +300,10 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
     let wallet = Wallet::load_or_create_private(wallet_store)?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let seeded_coins =
-        finality_support::seed_wallet_with_coin_values(db.as_ref(), &wallet, &genesis, &[11, 13])?;
-    let mut expected_coins = seeded_coins.clone();
-    expected_coins.sort_by(|a, b| a.id.cmp(&b.id));
+    let seeded_settlement_units =
+        finality_support::seed_wallet_with_settlement_unit_values(db.as_ref(), &wallet, &genesis, &[11, 13])?;
+    let mut expected_settlement_units = seeded_settlement_units.clone();
+    expected_settlement_units.sort_by(|a, b| a.id.cmp(&b.id));
     transaction::ensure_shielded_runtime_state(db.as_ref())?;
     let first_output = ShieldedOutput {
         note_commitment: [0x11u8; 32],
@@ -339,17 +339,17 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
     client.ping()?;
     let head = client.compact_wallet_sync_head()?;
     assert_eq!(head.chain_id, genesis.hash);
-    assert_eq!(head.committed_coin_count, 2);
+    assert_eq!(head.committed_settlement_unit_count, 2);
     assert_eq!(head.shielded_output_count, 2);
 
     let first_delta = client.request_compact_wallet_sync_delta(0, 0, 1, 1)?;
     assert_eq!(first_delta.head, head);
-    assert_eq!(first_delta.committed_coins.len(), 1);
-    assert_eq!(first_delta.committed_coins[0].scan_index, 0);
-    assert_eq!(first_delta.committed_coins[0].coin.id, expected_coins[0].id);
+    assert_eq!(first_delta.committed_settlement_units.len(), 1);
+    assert_eq!(first_delta.committed_settlement_units[0].scan_index, 0);
+    assert_eq!(first_delta.committed_settlement_units[0].settlement_unit.id, expected_settlement_units[0].id);
     assert_eq!(
-        first_delta.committed_coins[0].coin.value,
-        expected_coins[0].value
+        first_delta.committed_settlement_units[0].settlement_unit.value,
+        expected_settlement_units[0].value
     );
     assert_eq!(first_delta.shielded_outputs.len(), 1);
     assert_eq!(first_delta.shielded_outputs[0].scan_index, 0);
@@ -364,15 +364,15 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
 
     let second_delta = client.request_compact_wallet_sync_delta(1, 1, 4, 4)?;
     assert_eq!(second_delta.head, head);
-    assert_eq!(second_delta.committed_coins.len(), 1);
-    assert_eq!(second_delta.committed_coins[0].scan_index, 1);
+    assert_eq!(second_delta.committed_settlement_units.len(), 1);
+    assert_eq!(second_delta.committed_settlement_units[0].scan_index, 1);
     assert_eq!(
-        second_delta.committed_coins[0].coin.id,
-        expected_coins[1].id
+        second_delta.committed_settlement_units[0].settlement_unit.id,
+        expected_settlement_units[1].id
     );
     assert_eq!(
-        second_delta.committed_coins[0].coin.value,
-        expected_coins[1].value
+        second_delta.committed_settlement_units[0].settlement_unit.value,
+        expected_settlement_units[1].value
     );
     assert_eq!(second_delta.shielded_outputs.len(), 1);
     assert_eq!(second_delta.shielded_outputs[0].scan_index, 1);
@@ -387,7 +387,7 @@ async fn node_control_serves_compact_wallet_sync_deltas_by_cursor() -> Result<()
 
     let empty_delta = client.request_compact_wallet_sync_delta(2, 2, 4, 4)?;
     assert_eq!(empty_delta.head, head);
-    assert!(empty_delta.committed_coins.is_empty());
+    assert!(empty_delta.committed_settlement_units.is_empty());
     assert!(empty_delta.shielded_outputs.is_empty());
 
     let _ = shutdown_tx.send(());

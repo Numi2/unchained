@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use unchained::{
-    coin::Coin,
+    settlement_unit::SettlementUnit,
     config::{Net, P2p},
     discovery,
     epoch::Anchor,
@@ -87,24 +87,24 @@ fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> R
     Ok(genesis)
 }
 
-fn seed_sender_coin(store: &Store, wallet: &Wallet, genesis: &Anchor) -> Result<Coin> {
+fn seed_sender_settlement_unit(store: &Store, wallet: &Wallet, genesis: &Anchor) -> Result<SettlementUnit> {
     let chain_id = genesis.hash;
     let nonce = 7;
-    let candidate_id = Coin::calculate_id(&genesis.hash, nonce, &wallet.address());
+    let candidate_id = SettlementUnit::calculate_id(&genesis.hash, nonce, &wallet.address());
     let lock_secret = wallet.compute_genesis_lock_secret(&candidate_id, &chain_id);
     let lock_hash =
         unchained::crypto::lock_hash_from_preimage(&chain_id, &candidate_id, &lock_secret);
-    let coin = Coin::new_with_creator_pk_and_lock(
+    let settlement_unit = SettlementUnit::new_with_creator_pk_and_lock(
         genesis.hash,
         nonce,
         wallet.address(),
         wallet.public_key().clone(),
         lock_hash,
     );
-    store.put("coin", &coin.id, &coin)?;
-    store.put_coin_epoch(&coin.id, genesis.num)?;
-    store.put_coin_epoch_rev(genesis.num, &coin.id)?;
-    Ok(coin)
+    store.put("settlement_unit", &settlement_unit.id, &settlement_unit)?;
+    store.put_settlement_unit_epoch(&settlement_unit.id, genesis.num)?;
+    store.put_settlement_unit_epoch_rev(genesis.num, &settlement_unit.id)?;
+    Ok(settlement_unit)
 }
 
 fn provision_runtime_identity(
@@ -145,8 +145,8 @@ fn deterministic_fee_payment_fixture_components(
     let wallet = finality_support::deterministic_wallet(wallet_store.clone())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let _coins =
-        finality_support::seed_wallet_with_coin_values(db.as_ref(), &wallet, &genesis, &[2])?;
+    let _settlement_units =
+        finality_support::seed_wallet_with_settlement_unit_values(db.as_ref(), &wallet, &genesis, &[2])?;
     Ok((db, wallet_store, wallet, genesis))
 }
 
@@ -162,7 +162,7 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
     let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let _coin = seed_sender_coin(db.as_ref(), &wallet, &genesis)?;
+    let _settlement_unit = seed_sender_settlement_unit(db.as_ref(), &wallet, &genesis)?;
 
     let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));
@@ -203,12 +203,12 @@ async fn wallet_control_serves_state_and_wallet_identity() -> Result<()> {
     assert_ne!(receive_address, wallet.address());
     assert_ne!(receive_signing_pk, wallet.public_key().clone());
 
-    let coin_id = [3u8; 32];
+    let settlement_unit_id = [3u8; 32];
     let chain_id = [7u8; 32];
-    let derived = client.derive_genesis_lock_secret(coin_id, chain_id).await?;
+    let derived = client.derive_genesis_lock_secret(settlement_unit_id, chain_id).await?;
     assert_eq!(
         derived,
-        wallet.compute_genesis_lock_secret(&coin_id, &chain_id)
+        wallet.compute_genesis_lock_secret(&settlement_unit_id, &chain_id)
     );
 
     client.force_sync().await?;
@@ -241,7 +241,7 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
     let wallet = Wallet::load_or_create_private(wallet_store.clone())?;
     let committee = finality_support::TestCommittee::single_validator();
     let genesis = seed_genesis(db.as_ref(), &committee)?;
-    let _coin = seed_sender_coin(db.as_ref(), &wallet, &genesis)?;
+    let _settlement_unit = seed_sender_settlement_unit(db.as_ref(), &wallet, &genesis)?;
 
     let net = spawn_network(&wallet_dir, db.clone(), &genesis).await?;
     let sync_state = Arc::new(Mutex::new(SyncState::default()));

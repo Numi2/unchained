@@ -311,7 +311,7 @@ enum WalletCmd {
     RequestHandle(RequestHandleArgs),
     /// Mint and print a one-time invoice capability for merchant-style direct payment
     Invoice(InvoiceArgs),
-    /// Send coins using a receive locator or an explicit invoice capability
+    /// Send settlement_units using a receive locator or an explicit invoice capability
     Send(SendArgs),
     /// Submit a signed fee-paid shared-state control document through the running wallet
     SubmitControl(SubmitControlArgs),
@@ -1215,7 +1215,7 @@ async fn run_send_flow(
     if guided {
         println!();
         println!(
-            "Ready to send {amount} coin{}.",
+            "Ready to send {amount} settlement unit{}.",
             if amount == 1 { "" } else { "s" }
         );
         println!(
@@ -1260,7 +1260,7 @@ async fn run_send_flow(
     println!("Sent");
     println!();
     println!(
-        "Broadcast shielded transaction consuming {} note{}, creating {} note{}, sending {} coin{}, and paying {} coin{} in shielded fees.",
+        "Broadcast shielded transaction consuming {} note{}, creating {} note{}, sending {} settlement unit{}, and paying {} settlement unit{} in shielded fees.",
         outcome.input_count,
         if outcome.input_count == 1 { "" } else { "s" },
         outcome.output_count,
@@ -1472,7 +1472,7 @@ fn print_balance_output(state: &wallet::WalletObservedState, args: &BalanceArgs)
     println!("Wallet");
     println!();
     println!(
-        "Spendable balance: {balance} coin{}",
+        "Spendable balance: {balance} settlement unit{}",
         if balance == 1 { "" } else { "s" }
     );
     println!("Spendable outputs: {outputs}");
@@ -1492,7 +1492,7 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
             .iter()
             .map(|record| {
                 serde_json::json!({
-                    "coin_id": hex::encode(record.coin_id),
+                    "settlement_unit_id": hex::encode(record.settlement_unit_id),
                     "transfer_hash": hex::encode(record.transfer_hash),
                     "epoch": record.commit_epoch,
                     "direction": if record.is_sender { "out" } else { "in" },
@@ -1516,7 +1516,7 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
     for record in history {
         let direction = if record.is_sender { "Sent" } else { "Received" };
         println!(
-            "{} {} coin{} at epoch #{} with {}",
+            "{} {} settlement unit{} at epoch #{} with {}",
             direction,
             record.amount,
             if record.amount == 1 { "" } else { "s" },
@@ -1525,12 +1525,12 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
         );
         if record.fee_amount > 0 {
             println!(
-                "  fee  {} coin{}",
+                "  fee  {} settlement unit{}",
                 record.fee_amount,
                 if record.fee_amount == 1 { "" } else { "s" }
             );
         }
-        println!("  coin {}", short_hex(&record.coin_id));
+        println!("  settlement unit {}", short_hex(&record.settlement_unit_id));
         println!("  tx   {}", short_hex(&record.transfer_hash));
     }
     Ok(())
@@ -1617,7 +1617,7 @@ pub async fn run_node_cli() -> Result<()> {
             println!("Local checkpoint cadence: {} seconds", cfg.epoch.seconds);
             println!("Consensus foundation: validator/BFT runtime");
             println!("Settlement manager: enabled");
-            println!("Epoch coin cap: {}", protocol::CURRENT.max_coins_per_epoch);
+            println!("Epoch settlement unit cap: {}", protocol::CURRENT.max_settlement_units_per_epoch);
             let shutdown_result = wait_for_shutdown("Unchained node", runtime).await;
             let node_control_result = node_control_task.await.map_err(|err| anyhow!(err))?;
             shutdown_result?;
@@ -2010,7 +2010,7 @@ pub async fn run_wallet_cli() -> Result<()> {
                 println!();
                 println!("Tx ID: {}", hex::encode(outcome.tx_id));
                 println!(
-                    "Shielded fee: {} coin{} via {} input note{} and {} output note{}.",
+                    "Shielded fee: {} settlement unit{} via {} input note{} and {} output note{}.",
                     outcome.fee_amount,
                     if outcome.fee_amount == 1 { "" } else { "s" },
                     outcome.input_count,

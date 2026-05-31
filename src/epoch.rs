@@ -1,9 +1,9 @@
 use crate::consensus::{
     ConsensusPosition, OrderingPath, QuorumCertificate, ValidatorSet, VoteTarget,
-    DEFAULT_SLOTS_PER_EPOCH, MAX_COINS_PER_CHECKPOINT,
+    DEFAULT_SLOTS_PER_EPOCH, MAX_SETTLEMENT_UNITS_PER_CHECKPOINT,
 };
 use crate::sync::SyncState;
-use crate::{coin::Coin, network::NetHandle, storage::Store};
+use crate::{settlement_unit::SettlementUnit, network::NetHandle, storage::Store};
 use anyhow::{bail, Result as AnyResult};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
@@ -17,7 +17,7 @@ pub struct AnchorProposal {
     pub position: ConsensusPosition,
     pub ordering_path: OrderingPath,
     pub merkle_root: [u8; 32],
-    pub coin_count: u32,
+    pub settlement_unit_count: u32,
     pub dag_round: u64,
     pub dag_frontier: Vec<[u8; 32]>,
     pub ordered_batch_ids: Vec<[u8; 32]>,
@@ -41,7 +41,7 @@ impl AnchorProposal {
         position: ConsensusPosition,
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         dag_round: u64,
         dag_frontier: &[[u8; 32]],
         ordered_batch_ids: &[[u8; 32]],
@@ -67,7 +67,7 @@ impl AnchorProposal {
             OrderingPath::DagBftSharedState => 1,
         }]);
         hasher.update(&merkle_root);
-        hasher.update(&coin_count.to_le_bytes());
+        hasher.update(&settlement_unit_count.to_le_bytes());
         hasher.update(&dag_round.to_le_bytes());
         hasher.update(&(dag_frontier.len() as u64).to_le_bytes());
         for batch_id in dag_frontier {
@@ -88,7 +88,7 @@ impl AnchorProposal {
         parent_hash: Option<[u8; 32]>,
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         dag_round: u64,
         dag_frontier: Vec<[u8; 32]>,
         ordered_batch_ids: Vec<[u8; 32]>,
@@ -105,7 +105,7 @@ impl AnchorProposal {
             position,
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             dag_round,
             &dag_frontier,
             &ordered_batch_ids,
@@ -120,7 +120,7 @@ impl AnchorProposal {
             position,
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             dag_round,
             dag_frontier,
             ordered_batch_ids,
@@ -157,7 +157,7 @@ impl AnchorProposal {
             position: self.position,
             ordering_path: self.ordering_path,
             merkle_root: self.merkle_root,
-            coin_count: self.coin_count,
+            settlement_unit_count: self.settlement_unit_count,
             dag_round: self.dag_round,
             dag_frontier: self.dag_frontier,
             ordered_batch_ids: self.ordered_batch_ids,
@@ -178,7 +178,7 @@ pub struct Anchor {
     pub position: ConsensusPosition,
     pub ordering_path: OrderingPath,
     pub merkle_root: [u8; 32],
-    pub coin_count: u32,
+    pub settlement_unit_count: u32,
     pub dag_round: u64,
     pub dag_frontier: Vec<[u8; 32]>,
     pub ordered_batch_ids: Vec<[u8; 32]>,
@@ -199,7 +199,7 @@ impl Anchor {
         position: ConsensusPosition,
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         dag_round: u64,
         dag_frontier: &[[u8; 32]],
         ordered_batch_ids: &[[u8; 32]],
@@ -213,7 +213,7 @@ impl Anchor {
             position,
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             dag_round,
             dag_frontier,
             ordered_batch_ids,
@@ -228,7 +228,7 @@ impl Anchor {
         parent_hash: Option<[u8; 32]>,
         ordering_path: OrderingPath,
         merkle_root: [u8; 32],
-        coin_count: u32,
+        settlement_unit_count: u32,
         dag_round: u64,
         dag_frontier: Vec<[u8; 32]>,
         ordered_batch_ids: Vec<[u8; 32]>,
@@ -242,7 +242,7 @@ impl Anchor {
             parent_hash,
             ordering_path,
             merkle_root,
-            coin_count,
+            settlement_unit_count,
             dag_round,
             dag_frontier,
             ordered_batch_ids,
@@ -262,7 +262,7 @@ impl Anchor {
                 position: self.position,
                 ordering_path: self.ordering_path,
                 merkle_root: self.merkle_root,
-                coin_count: self.coin_count,
+                settlement_unit_count: self.settlement_unit_count,
                 dag_round: self.dag_round,
                 dag_frontier: self.dag_frontier.clone(),
                 ordered_batch_ids: self.ordered_batch_ids.clone(),
@@ -371,11 +371,11 @@ fn validate_proposal_fields(proposal: &AnchorProposal, parent: Option<&Anchor>) 
 }
 
 fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
-    if proposal.coin_count > MAX_COINS_PER_CHECKPOINT {
+    if proposal.settlement_unit_count > MAX_SETTLEMENT_UNITS_PER_CHECKPOINT {
         bail!(
-            "checkpoint coin count exceeds protocol cap: {} > {}",
-            proposal.coin_count,
-            MAX_COINS_PER_CHECKPOINT
+            "checkpoint settlement unit count exceeds protocol cap: {} > {}",
+            proposal.settlement_unit_count,
+            MAX_SETTLEMENT_UNITS_PER_CHECKPOINT
         );
     }
     let expected_position = Anchor::position_for_num(proposal.num);
@@ -403,8 +403,8 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
             }
         }
         OrderingPath::DagBftSharedState => {
-            if proposal.coin_count != 0 || proposal.merkle_root != [0u8; 32] {
-                bail!("shared-state checkpoints cannot carry ordinary transfer coin commitments");
+            if proposal.settlement_unit_count != 0 || proposal.merkle_root != [0u8; 32] {
+                bail!("shared-state checkpoints cannot carry ordinary transfer settlement unit commitments");
             }
             if proposal.dag_round == 0 {
                 bail!("shared-state checkpoints must commit a non-zero DAG round");
@@ -445,7 +445,7 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
         proposal.position,
         proposal.ordering_path,
         proposal.merkle_root,
-        proposal.coin_count,
+        proposal.settlement_unit_count,
         proposal.dag_round,
         &proposal.dag_frontier,
         &proposal.ordered_batch_ids,
@@ -509,15 +509,15 @@ impl MerkleTree {
         }
         Some(proof)
     }
-    /// Compute Merkle root from a set of coin IDs. This method:
-    /// - Hashes each coin id into a leaf using `Coin::id_to_leaf_hash`
+    /// Compute Merkle root from a set of settlement unit IDs. This method:
+    /// - Hashes each settlement unit id into a leaf using `SettlementUnit::id_to_leaf_hash`
     /// - Sorts leaves ascending to obtain a canonical order
     /// - Reduces pairwise (duplicate last when odd) using BLAKE3
-    pub fn build_root(coin_ids: &HashSet<[u8; 32]>) -> [u8; 32] {
-        if coin_ids.is_empty() {
+    pub fn build_root(settlement_unit_ids: &HashSet<[u8; 32]>) -> [u8; 32] {
+        if settlement_unit_ids.is_empty() {
             return [0u8; 32];
         }
-        let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
+        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids.iter().map(SettlementUnit::id_to_leaf_hash).collect();
         leaves.sort();
         Self::compute_root_from_sorted_leaves(&leaves)
     }
@@ -543,15 +543,15 @@ impl MerkleTree {
         level[0]
     }
     pub fn build_proof(
-        coin_ids: &HashSet<[u8; 32]>,
+        settlement_unit_ids: &HashSet<[u8; 32]>,
         target_id: &[u8; 32],
     ) -> Option<Vec<([u8; 32], bool)>> {
-        if coin_ids.is_empty() {
+        if settlement_unit_ids.is_empty() {
             return None;
         }
-        let mut leaves: Vec<[u8; 32]> = coin_ids.iter().map(Coin::id_to_leaf_hash).collect();
+        let mut leaves: Vec<[u8; 32]> = settlement_unit_ids.iter().map(SettlementUnit::id_to_leaf_hash).collect();
         leaves.sort();
-        let leaf_hash = Coin::id_to_leaf_hash(target_id);
+        let leaf_hash = SettlementUnit::id_to_leaf_hash(target_id);
         let mut index = leaves.iter().position(|h| h == &leaf_hash)?;
         let mut level = leaves;
         let mut proof: Vec<([u8; 32], bool)> = Vec::new();
@@ -635,15 +635,15 @@ impl MerkleTree {
         &computed == root
     }
 
-    /// Expected proof length (tree height) for a Merkle tree with `coin_count` leaves,
+    /// Expected proof length (tree height) for a Merkle tree with `settlement_unit_count` leaves,
     /// using the canonical odd-node duplication strategy. For example:
     /// - 1 -> 0, 2 -> 1, 3..4 -> 2, 5..8 -> 3, etc.
     #[inline]
-    pub fn expected_proof_len(coin_count: u32) -> usize {
-        if coin_count <= 1 {
+    pub fn expected_proof_len(settlement_unit_count: u32) -> usize {
+        if settlement_unit_count <= 1 {
             0
         } else {
-            (32 - (coin_count - 1).leading_zeros()) as usize
+            (32 - (settlement_unit_count - 1).leading_zeros()) as usize
         }
     }
 }
@@ -796,7 +796,7 @@ impl Manager {
                         match self.net.finalize_available_fast_path_anchor().await {
                             Ok(Some(anchor)) => {
                                 crate::metrics::EPOCH_HEIGHT.set(anchor.num as i64);
-                                crate::metrics::SELECTED_COINS.set(anchor.coin_count as i64);
+                                crate::metrics::COMMITTED_SETTLEMENT_UNITS.set(anchor.settlement_unit_count as i64);
                                 if let Err(e) = self.anchor_tx.send(anchor.clone()) {
                                     eprintln!("⚠️  Failed to broadcast fast-path anchor: {}", e);
                                 }
@@ -854,9 +854,9 @@ pub fn select_candidates_for_epoch(
     parent: &Anchor,
     cap: usize,
     buffer: Option<&std::collections::HashSet<[u8; 32]>>,
-) -> (Vec<crate::coin::CoinCandidate>, usize) {
+) -> (Vec<crate::settlement_unit::SettlementUnitCandidate>, usize) {
     // Collect candidates for this epoch hash and optionally merge locally buffered ids
-    let mut candidates = match db.get_coin_candidates_by_epoch_hash(&parent.hash) {
+    let mut candidates = match db.get_settlement_unit_candidates_by_epoch_hash(&parent.hash) {
         Ok(v) => v,
         Err(_) => Vec::new(),
     };
@@ -869,7 +869,7 @@ pub fn select_candidates_for_epoch(
                 continue;
             }
             let key = crate::storage::Store::candidate_key(&parent.hash, id);
-            if let Ok(Some(c)) = db.get::<crate::coin::CoinCandidate>("coin_candidate", &key) {
+            if let Ok(Some(c)) = db.get::<crate::settlement_unit::SettlementUnitCandidate>("settlement_unit_candidate", &key) {
                 candidate_ids.insert(c.id);
                 candidates.push(c);
             }
@@ -880,7 +880,7 @@ pub fn select_candidates_for_epoch(
         return (Vec::new(), 0);
     }
 
-    let mut filtered: Vec<crate::coin::CoinCandidate> = Vec::new();
+    let mut filtered: Vec<crate::settlement_unit::SettlementUnitCandidate> = Vec::new();
     let mut total_candidates = 0usize;
     for cand in candidates.into_iter() {
         total_candidates += 1;
@@ -896,7 +896,7 @@ pub fn select_candidates_for_epoch(
 
     // Fair, round-based selection across creators while preserving global order.
     use std::collections::{HashMap, HashSet};
-    let mut picked: Vec<crate::coin::CoinCandidate> = Vec::with_capacity(cap);
+    let mut picked: Vec<crate::settlement_unit::SettlementUnitCandidate> = Vec::with_capacity(cap);
     let mut by_creator: HashMap<[u8; 32], usize> = HashMap::new();
     let mut round: usize = 0;
     let mut picked_ids: HashSet<[u8; 32]> = HashSet::new();

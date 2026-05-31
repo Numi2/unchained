@@ -692,7 +692,7 @@ fn validate_anchor_proposal_digest(proposal: &AnchorProposal) -> Result<()> {
         proposal.position,
         proposal.ordering_path,
         proposal.merkle_root,
-        proposal.coin_count,
+        proposal.settlement_unit_count,
         proposal.dag_round,
         &proposal.dag_frontier,
         &proposal.ordered_batch_ids,

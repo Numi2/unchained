@@ -96,10 +96,10 @@ fn open_db_with_families(db_path: &str, cf_names: &[&str]) -> Result<DB> {
         .iter()
         .map(|name| {
             let mut opts = cf_opts.clone();
-            if name == "coin_candidate" {
+            if name == "settlement_unit_candidate" {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
                 opts.set_optimize_filters_for_hits(true);
-            } else if name == "epoch_selected" || name == "coin_epoch_by_epoch" {
+            } else if name == "epoch_settlement_units" || name == "settlement_unit_epoch_by_epoch" {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 opts.set_optimize_filters_for_hits(true);
             }
@@ -308,10 +308,10 @@ impl Store {
             }
         }
 
-        // Also backup coins directory using cross-platform approach
-        let coins_backup = format!("{backup_dir}/coins");
-        if let Err(e) = copy_dir_all(&self.coins_dir(), &coins_backup) {
-            eprintln!("Warning: Coins backup failed: {e}");
+        // Also backup settlement_units directory using cross-platform approach
+        let settlement_units_backup = format!("{backup_dir}/settlement_units");
+        if let Err(e) = copy_dir_all(&self.settlement_units_dir(), &settlement_units_backup) {
+            eprintln!("Warning: Settlement unit backup failed: {e}");
         }
 
         println!("✅ Backup created at: {backup_dir}");
@@ -327,13 +327,13 @@ impl Store {
         let cf_names = [
             "default",
             "epoch",
-            "coin",
-            "coin_candidate",
-            "epoch_selected",      // per-epoch selected coin IDs
+            "settlement_unit",
+            "settlement_unit_candidate",
+            "epoch_settlement_units",      // per-epoch selected settlement unit IDs
             "epoch_leaves",        // per-epoch sorted leaf hashes for proofs
             "epoch_levels",        // per-epoch merkle levels for fast proofs
-            "coin_epoch", // coin_id -> epoch number mapping (child epoch that committed the coin)
-            "coin_epoch_by_epoch", // epoch_num||coin_id -> 1 (reverse index for range scans)
+            "settlement_unit_epoch", // settlement_unit_id -> epoch number mapping
+            "settlement_unit_epoch_by_epoch", // epoch_num||settlement_unit_id -> 1 (reverse index for range scans)
             "head",
             "anchor",
             "validator_pool",      // validator_id -> ValidatorPool
@@ -385,21 +385,21 @@ impl Store {
             }
         }
 
-        // Create coins directory for individual coin files
-        let coins_dir = format!("{db_path}/coins");
-        fs::create_dir_all(&coins_dir).ok();
+        // Create settlement_units directory for individual settlement unit files
+        let settlement_units_dir = format!("{db_path}/settlement_units");
+        fs::create_dir_all(&settlement_units_dir).ok();
 
         // ----------------------------------------------------
-        // Optional background coin mirroring for explicit operator opt-in.
-        // Disabled by default because it leaks canonical coin data to loose files.
+        // Optional background settlement unit mirroring for explicit operator opt-in.
+        // Disabled by default because it leaks canonical settlement unit data to loose files.
         // ----------------------------------------------------
-        let mirror_enabled = std::env::var("COIN_MIRRORING")
+        let mirror_enabled = std::env::var("SETTLEMENT_UNIT_MIRRORING")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mirror_tx = if mirror_enabled {
             let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
             std::thread::Builder::new()
-                .name("coin-mirror".into())
+                .name("settlement-unit-mirror".into())
                 .spawn(move || {
                     for (path, bytes) in rx {
                         if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -408,7 +408,7 @@ impl Store {
                         let _ = std::fs::write(&path, &bytes);
                     }
                 })
-                .expect("Failed to spawn coin mirror thread");
+                .expect("Failed to spawn settlement unit mirror thread");
             Some(tx)
         } else {
             None
@@ -445,10 +445,14 @@ impl Store {
             .put_cf_opt(handle, key, &data_to_store, &write_opts)
             .with_context(|| format!("Failed to PUT to database for key '{key:?}' in CF '{cf}'"))?;
 
-        // Queue coin mirroring in background thread (feature-guarded via env); off by default
-        if cf == "coin" {
+        // Queue settlement unit mirroring in background thread (feature-guarded via env); off by default.
+        if cf == "settlement_unit" {
             if let Some(tx) = &self.mirror_tx {
-                let mirror_path = format!("{}/coins/coin-{}.bin", self.path, hex::encode(key));
+                let mirror_path = format!(
+                    "{}/settlement_units/settlement-unit-{}.bin",
+                    self.path,
+                    hex::encode(key)
+                );
                 let _ = tx.send((mirror_path, data_to_store.clone()));
             }
         }
@@ -519,90 +523,90 @@ impl Store {
         Ok(())
     }
 
-    /// Absolute path to the directory where individual coin files are stored.
-    pub fn coins_dir(&self) -> String {
-        format!("{}/coins", self.path)
+    /// Absolute path to the directory where individual settlement unit files are stored.
+    pub fn settlement_units_dir(&self) -> String {
+        format!("{}/settlement_units", self.path)
     }
 
-    /// Gets all coins owned by a specific address
-    pub fn get_coins_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::coin::Coin>> {
+    /// Gets all settlement_units owned by a specific address
+    pub fn get_settlement_units_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
-            .cf_handle("coin")
-            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+            .cf_handle("settlement_unit")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut coins = Vec::new();
+        let mut settlement_units = Vec::new();
 
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = crate::coin::decode_coin(&value) {
-                if coin.creator_address == *owner_address {
-                    coins.push(coin);
+            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit(&value) {
+                if settlement_unit.creator_address == *owner_address {
+                    settlement_units.push(settlement_unit);
                 }
             }
         }
 
-        Ok(coins)
+        Ok(settlement_units)
     }
 
-    /// Iterates over all coins in the database
-    pub fn iterate_coins(&self) -> Result<Vec<crate::coin::Coin>> {
+    /// Iterates over all settlement_units in the database
+    pub fn iterate_settlement_units(&self) -> Result<Vec<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
-            .cf_handle("coin")
-            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+            .cf_handle("settlement_unit")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut coins = Vec::new();
+        let mut settlement_units = Vec::new();
 
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = crate::coin::decode_coin(&value) {
-                coins.push(coin);
+            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit(&value) {
+                settlement_units.push(settlement_unit);
             }
         }
 
-        Ok(coins)
+        Ok(settlement_units)
     }
 
-    /// Iterates over canonically committed coins in deterministic epoch/id order.
-    pub fn iterate_committed_coins(&self) -> Result<Vec<(u64, crate::coin::Coin)>> {
+    /// Iterates over canonically committed settlement_units in deterministic epoch/id order.
+    pub fn iterate_committed_settlement_units(&self) -> Result<Vec<(u64, crate::settlement_unit::SettlementUnit)>> {
         let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
             return Ok(Vec::new());
         };
         let mut committed = Vec::new();
         for epoch_num in 0..=latest.num {
-            for coin_id in self.get_coin_ids_for_epoch_committed(epoch_num)? {
-                let coin = self
-                    .get::<crate::coin::Coin>("coin", &coin_id)?
-                    .ok_or_else(|| anyhow!("missing committed coin {}", hex::encode(coin_id)))?;
-                committed.push((epoch_num, coin));
+            for settlement_unit_id in self.get_settlement_unit_ids_for_epoch_committed(epoch_num)? {
+                let settlement_unit = self
+                    .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
+                    .ok_or_else(|| anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id)))?;
+                committed.push((epoch_num, settlement_unit));
             }
         }
-        committed.sort_by(|(epoch_a, coin_a), (epoch_b, coin_b)| {
-            epoch_a.cmp(epoch_b).then(coin_a.id.cmp(&coin_b.id))
+        committed.sort_by(|(epoch_a, settlement_unit_a), (epoch_b, settlement_unit_b)| {
+            epoch_a.cmp(epoch_b).then(settlement_unit_a.id.cmp(&settlement_unit_b.id))
         });
         Ok(committed)
     }
 
-    pub fn count_committed_coins(&self) -> Result<u64> {
+    pub fn count_committed_settlement_units(&self) -> Result<u64> {
         let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
             return Ok(0);
         };
         let mut total = 0u64;
         for epoch_num in 0..=latest.num {
             total = total
-                .saturating_add(self.get_coin_ids_for_epoch_committed(epoch_num)?.len() as u64);
+                .saturating_add(self.get_settlement_unit_ids_for_epoch_committed(epoch_num)?.len() as u64);
         }
         Ok(total)
     }
 
-    pub fn load_committed_coin_slice(
+    pub fn load_committed_settlement_unit_slice(
         &self,
         start_index: u64,
         limit: usize,
-    ) -> Result<Vec<(u64, crate::coin::Coin)>> {
+    ) -> Result<Vec<(u64, crate::settlement_unit::SettlementUnit)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -612,17 +616,17 @@ impl Store {
         let mut next_index = 0u64;
         let mut committed = Vec::with_capacity(limit);
         for epoch_num in 0..=latest.num {
-            let mut coin_ids = self.get_coin_ids_for_epoch_committed(epoch_num)?;
-            coin_ids.sort();
-            for coin_id in coin_ids {
+            let mut settlement_unit_ids = self.get_settlement_unit_ids_for_epoch_committed(epoch_num)?;
+            settlement_unit_ids.sort();
+            for settlement_unit_id in settlement_unit_ids {
                 if next_index < start_index {
                     next_index = next_index.saturating_add(1);
                     continue;
                 }
-                let coin = self
-                    .get::<crate::coin::Coin>("coin", &coin_id)?
-                    .ok_or_else(|| anyhow!("missing committed coin {}", hex::encode(coin_id)))?;
-                committed.push((epoch_num, coin));
+                let settlement_unit = self
+                    .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
+                    .ok_or_else(|| anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id)))?;
+                committed.push((epoch_num, settlement_unit));
                 next_index = next_index.saturating_add(1);
                 if committed.len() >= limit {
                     return Ok(committed);
@@ -632,42 +636,42 @@ impl Store {
         Ok(committed)
     }
 
-    /// Iterates over all coin candidates in the database
-    pub fn iterate_coin_candidates(&self) -> Result<Vec<crate::coin::CoinCandidate>> {
+    /// Iterates over all settlement unit candidates in the database
+    pub fn iterate_settlement_unit_candidates(&self) -> Result<Vec<crate::settlement_unit::SettlementUnitCandidate>> {
         let cf = self
             .db
-            .cf_handle("coin_candidate")
-            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+            .cf_handle("settlement_unit_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_candidate' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        let mut coins = Vec::new();
+        let mut settlement_units = Vec::new();
         for item in iter {
             let (_key, value) = item?;
-            if let Ok(coin) = crate::coin::decode_candidate(&value) {
-                coins.push(coin);
+            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit_candidate(&value) {
+                settlement_units.push(settlement_unit);
             }
         }
-        Ok(coins)
+        Ok(settlement_units)
     }
 
-    /// Build the composite key for coin candidates: epoch_hash || coin_id
-    pub fn candidate_key(epoch_hash: &[u8; 32], coin_id: &[u8; 32]) -> Vec<u8> {
+    /// Build the composite key for settlement unit candidates: epoch_hash || settlement_unit_id
+    pub fn candidate_key(epoch_hash: &[u8; 32], settlement_unit_id: &[u8; 32]) -> Vec<u8> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(epoch_hash);
-        key.extend_from_slice(coin_id);
+        key.extend_from_slice(settlement_unit_id);
         key
     }
 
-    /// Iterate coin candidates by epoch hash using bounded prefix iteration
-    pub fn get_coin_candidates_by_epoch_hash(
+    /// Iterate settlement unit candidates by epoch hash using bounded prefix iteration
+    pub fn get_settlement_unit_candidates_by_epoch_hash(
         &self,
         epoch_hash: &[u8; 32],
-    ) -> Result<Vec<crate::coin::CoinCandidate>> {
+    ) -> Result<Vec<crate::settlement_unit::SettlementUnitCandidate>> {
         let cf = self
             .db
-            .cf_handle("coin_candidate")
-            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
-        let mut coins = Vec::new();
+            .cf_handle("settlement_unit_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_candidate' column family missing"))?;
+        let mut settlement_units = Vec::new();
         let mut upper = Vec::with_capacity(64);
         upper.extend_from_slice(epoch_hash);
         upper.extend_from_slice(&[0xFF; 32]);
@@ -688,21 +692,21 @@ impl Store {
             if &k[0..32] != &epoch_hash[..] {
                 break;
             }
-            if let Ok(coin) = crate::coin::decode_candidate(&v) {
-                coins.push(coin);
+            if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit_candidate(&v) {
+                settlement_units.push(settlement_unit);
             }
         }
-        Ok(coins)
+        Ok(settlement_units)
     }
 
-    /// Fetch a confirmed coin by id.
-    pub fn get_coin(&self, coin_id: &[u8; 32]) -> Result<Option<crate::coin::Coin>> {
+    /// Fetch a confirmed settlement unit by id.
+    pub fn get_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
-            .cf_handle("coin")
-            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
-        match self.db.get_cf(cf, coin_id)? {
-            Some(value) => match crate::coin::decode_coin(&value) {
+            .cf_handle("settlement_unit")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit' column family missing"))?;
+        match self.db.get_cf(cf, settlement_unit_id)? {
+            Some(value) => match crate::settlement_unit::decode_settlement_unit(&value) {
                 Ok(c) => Ok(Some(c)),
                 Err(_) => Ok(None),
             },
@@ -710,13 +714,13 @@ impl Store {
         }
     }
 
-    /// Deletes coin candidates older than or equal to a specific epoch hash (best-effort GC)
+    /// Deletes settlement unit candidates older than or equal to a specific epoch hash (best-effort GC)
     /// Keeps candidates for recent epochs to support reorgs
     pub fn prune_old_candidates(&self, keep_epoch_hash: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("coin_candidate")
-            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+            .cf_handle("settlement_unit_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_candidate' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
@@ -745,7 +749,7 @@ impl Store {
 
         self.write_batch(batch)?;
         if pruned > 0 {
-            crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64);
+            crate::metrics::PRUNED_SETTLEMENT_UNIT_CANDIDATES.inc_by(pruned as u64);
         }
         Ok(())
     }
@@ -1876,12 +1880,12 @@ impl Store {
             .is_some())
     }
 
-    /// Gets selected coin IDs for an epoch
-    pub fn get_selected_coin_ids_for_epoch(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+    /// Gets selected settlement unit IDs for an epoch
+    pub fn get_settlement_unit_ids_for_epoch(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
         let sel_cf = self
             .db
-            .cf_handle("epoch_selected")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_selected' column family missing"))?;
+            .cf_handle("epoch_settlement_units")
+            .ok_or_else(|| anyhow::anyhow!("'epoch_settlement_units' column family missing"))?;
         let mut ids = Vec::new();
         let start_key = epoch_num.to_le_bytes();
         let iter = self.db.iterator_cf(
@@ -1903,23 +1907,23 @@ impl Store {
         Ok(ids)
     }
 
-    pub fn put_coin_epoch_rev(&self, epoch_num: u64, coin_id: &[u8; 32]) -> Result<()> {
+    pub fn put_settlement_unit_epoch_rev(&self, epoch_num: u64, settlement_unit_id: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("coin_epoch_by_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_epoch_by_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch_by_epoch' column family missing"))?;
         let mut key = Vec::with_capacity(8 + 32);
         key.extend_from_slice(&epoch_num.to_le_bytes());
-        key.extend_from_slice(coin_id);
+        key.extend_from_slice(settlement_unit_id);
         self.db.put_cf(cf, &key, &[])?;
         Ok(())
     }
 
-    pub fn get_coin_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+    pub fn get_settlement_unit_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
         let cf = self
             .db
-            .cf_handle("coin_epoch_by_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'coin_epoch_by_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_epoch_by_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch_by_epoch' column family missing"))?;
         let start_key = epoch_num.to_le_bytes();
         let iter = self.db.iterator_cf(
             cf,
@@ -1941,35 +1945,35 @@ impl Store {
         Ok(ids)
     }
 
-    /// Persist a mapping coin_id -> epoch number that committed it
-    pub fn put_coin_epoch(&self, coin_id: &[u8; 32], epoch_num: u64) -> Result<()> {
+    /// Persist a mapping settlement_unit_id -> epoch number that committed it
+    pub fn put_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32], epoch_num: u64) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("coin_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&epoch_num.to_le_bytes());
-        self.db.put_cf(cf, coin_id, &bytes)?;
+        self.db.put_cf(cf, settlement_unit_id, &bytes)?;
         Ok(())
     }
 
-    /// Delete a mapping coin_id -> epoch number (used during reorgs)
-    pub fn delete_coin_epoch(&self, coin_id: &[u8; 32]) -> Result<()> {
+    /// Delete a mapping settlement_unit_id -> epoch number (used during reorgs)
+    pub fn delete_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("coin_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
-        self.db.delete_cf(cf, coin_id)?;
+            .cf_handle("settlement_unit_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
+        self.db.delete_cf(cf, settlement_unit_id)?;
         Ok(())
     }
 
-    /// Retrieve epoch number that committed the given coin, if known
-    pub fn get_coin_epoch(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
+    /// Retrieve epoch number that committed the given settlement_unit, if known
+    pub fn get_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
         let cf = self
             .db
-            .cf_handle("coin_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'coin_epoch' column family missing"))?;
-        match self.db.get_cf(cf, coin_id)? {
+            .cf_handle("settlement_unit_epoch")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
+        match self.db.get_cf(cf, settlement_unit_id)? {
             Some(v) => {
                 if v.len() != 8 {
                     return Ok(None);
@@ -1982,9 +1986,9 @@ impl Store {
         }
     }
 
-    /// Retrieve the epoch number for a coin from the committed reverse index.
-    pub fn get_epoch_for_coin(&self, coin_id: &[u8; 32]) -> Result<Option<u64>> {
-        self.get_coin_epoch(coin_id)
+    /// Retrieve the epoch number for a settlement_unit from the committed reverse index.
+    pub fn get_epoch_for_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
+        self.get_settlement_unit_epoch(settlement_unit_id)
     }
 
     /// Persist headers sync cursor (highest requested and highest stored header heights)
@@ -2023,12 +2027,12 @@ impl Store {
         self.get("epoch", &epoch_num.to_le_bytes())
     }
 
-    /// Gets the total number of coins in the database
-    pub fn coin_count(&self) -> Result<u64> {
+    /// Gets the total number of settlement_units in the database
+    pub fn settlement_unit_count(&self) -> Result<u64> {
         let cf = self
             .db
-            .cf_handle("coin")
-            .ok_or_else(|| anyhow::anyhow!("'coin' column family missing"))?;
+            .cf_handle("settlement_unit")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit' column family missing"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let count = iter.count() as u64;
@@ -2168,12 +2172,12 @@ impl Store {
 
     /// Gets statistics about the database
     pub fn get_stats(&self) -> Result<DatabaseStats> {
-        let coin_count = self.coin_count()?;
+        let settlement_unit_count = self.settlement_unit_count()?;
         let tx_count = self.tx_count()?;
         let epoch_count = self.epoch_count()?;
 
         Ok(DatabaseStats {
-            coin_count,
+            settlement_unit_count,
             tx_count,
             epoch_count,
         })
@@ -2203,13 +2207,13 @@ impl Store {
         Ok(count)
     }
 
-    /// Deletes coin candidates older than those referenced by the provided epoch hashes.
+    /// Deletes settlement unit candidates older than those referenced by the provided epoch hashes.
     /// Keeps candidate entries whose key prefix (epoch_hash) is in `keep_hashes`.
     pub fn prune_candidates_keep_hashes(&self, keep_hashes: &[[u8; 32]]) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("coin_candidate")
-            .ok_or_else(|| anyhow::anyhow!("'coin_candidate' column family missing"))?;
+            .cf_handle("settlement_unit_candidate")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_candidate' column family missing"))?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
@@ -2228,7 +2232,7 @@ impl Store {
         }
         self.write_batch(batch)?;
         if pruned > 0 {
-            crate::metrics::PRUNED_CANDIDATES.inc_by(pruned as u64);
+            crate::metrics::PRUNED_SETTLEMENT_UNIT_CANDIDATES.inc_by(pruned as u64);
         }
         Ok(())
     }
@@ -2273,7 +2277,7 @@ fn validate_anchor_snapshot(anchors: &[crate::epoch::Anchor], chain_id: [u8; 32]
 /// Database statistics
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
-    pub coin_count: u64,
+    pub settlement_unit_count: u64,
     pub tx_count: u64,
     pub epoch_count: u64,
 }
