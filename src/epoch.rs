@@ -136,7 +136,7 @@ impl AnchorProposal {
         VoteTarget {
             position: self.position,
             ordering_path: self.ordering_path,
-            block_digest: self.hash,
+            checkpoint_digest: self.hash,
         }
     }
 
@@ -279,8 +279,8 @@ impl Anchor {
         if self.qc.target.ordering_path != self.ordering_path {
             bail!("checkpoint QC ordering path mismatch");
         }
-        if self.qc.target.block_digest != self.hash {
-            bail!("checkpoint QC block digest mismatch");
+        if self.qc.target.checkpoint_digest != self.hash {
+            bail!("checkpoint QC digest mismatch");
         }
 
         match parent {
@@ -337,6 +337,9 @@ fn validate_proposal_fields(proposal: &AnchorProposal, parent: Option<&Anchor>) 
             if proposal.parent_hash.is_some() {
                 bail!("genesis checkpoint cannot reference a parent hash");
             }
+            if proposal.settlement_unit_count != 0 || proposal.merkle_root != [0u8; 32] {
+                bail!("genesis checkpoint cannot commit settlement units");
+            }
         }
         Some(parent) => {
             if proposal.num != parent.num.saturating_add(1) {
@@ -378,6 +381,9 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
             MAX_SETTLEMENT_UNITS_PER_CHECKPOINT
         );
     }
+    if (proposal.settlement_unit_count == 0) != (proposal.merkle_root == [0u8; 32]) {
+        bail!("checkpoint settlement unit count and root must be committed together");
+    }
     let expected_position = Anchor::position_for_num(proposal.num);
     if proposal.position != expected_position {
         bail!(
@@ -393,19 +399,17 @@ fn validate_proposal_invariants(proposal: &AnchorProposal) -> AnyResult<()> {
     }
     match proposal.ordering_path {
         OrderingPath::FastPathPrivateTransfer => {
-            if proposal.ordered_tx_count != 0
-                || proposal.ordered_tx_root != [0u8; 32]
-                || proposal.dag_round != 0
+            if proposal.dag_round != 0
                 || !proposal.dag_frontier.is_empty()
                 || !proposal.ordered_batch_ids.is_empty()
             {
                 bail!("fast-path checkpoints cannot commit shared-state batches");
             }
+            if (proposal.ordered_tx_count == 0) != (proposal.ordered_tx_root == [0u8; 32]) {
+                bail!("fast-path checkpoints must pair ordered tx count and root");
+            }
         }
         OrderingPath::DagBftSharedState => {
-            if proposal.settlement_unit_count != 0 || proposal.merkle_root != [0u8; 32] {
-                bail!("shared-state checkpoints cannot carry ordinary transfer settlement unit commitments");
-            }
             if proposal.dag_round == 0 {
                 bail!("shared-state checkpoints must commit a non-zero DAG round");
             }
@@ -847,19 +851,16 @@ impl Manager {
     }
 }
 
-/// Select candidates for a specific epoch based on parent anchor and capacity
-/// This function is used during reorgs to reconstruct the selected set
-pub fn select_candidates_for_epoch(
+/// Select settlement unit candidates for a checkpoint based on parent anchor and capacity.
+/// This function is used during reorgs to reconstruct the selected set.
+pub fn select_settlement_unit_candidates_for_checkpoint(
     db: &crate::storage::Store,
     parent: &Anchor,
     cap: usize,
     buffer: Option<&std::collections::HashSet<[u8; 32]>>,
-) -> (Vec<crate::settlement_unit::SettlementUnitCandidate>, usize) {
-    // Collect candidates for this epoch hash and optionally merge locally buffered ids
-    let mut candidates = match db.get_settlement_unit_candidates_by_epoch_hash(&parent.hash) {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
-    };
+) -> AnyResult<(Vec<crate::settlement_unit::SettlementUnitCandidate>, usize)> {
+    // Collect candidates for this parent checkpoint and optionally merge locally buffered ids.
+    let mut candidates = db.get_settlement_unit_candidates_by_parent_checkpoint_hash(&parent.hash)?;
     // Track existing candidate IDs to avoid O(n^2) scans during merge
     let mut candidate_ids: std::collections::HashSet<[u8; 32]> =
         std::collections::HashSet::from_iter(candidates.iter().map(|c| c.id));
@@ -869,7 +870,12 @@ pub fn select_candidates_for_epoch(
                 continue;
             }
             let key = crate::storage::Store::candidate_key(&parent.hash, id);
-            if let Ok(Some(c)) = db.get::<crate::settlement_unit::SettlementUnitCandidate>("settlement_unit_candidate", &key) {
+            if let Some(c) = db
+                .get::<crate::settlement_unit::SettlementUnitCandidate>(
+                    "settlement_unit_candidate",
+                    &key,
+                )?
+            {
                 candidate_ids.insert(c.id);
                 candidates.push(c);
             }
@@ -877,7 +883,7 @@ pub fn select_candidates_for_epoch(
     }
 
     if cap == 0 {
-        return (Vec::new(), 0);
+        return Ok((Vec::new(), 0));
     }
 
     let mut filtered: Vec<crate::settlement_unit::SettlementUnitCandidate> = Vec::new();
@@ -931,7 +937,7 @@ pub fn select_candidates_for_epoch(
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    (picked, total_candidates)
+    Ok((picked, total_candidates))
 }
 
 #[cfg(test)]
@@ -969,7 +975,7 @@ mod tests {
             parent_hash,
             position,
             OrderingPath::FastPathPrivateTransfer,
-            [num as u8; 32],
+            [0u8; 32],
             0,
             0,
             &[],
@@ -981,7 +987,7 @@ mod tests {
         let target = VoteTarget {
             position,
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: hash,
+            checkpoint_digest: hash,
         };
         let target_bytes = target.signing_bytes();
         let votes = validator_set
@@ -999,7 +1005,7 @@ mod tests {
             num,
             parent_hash,
             OrderingPath::FastPathPrivateTransfer,
-            [num as u8; 32],
+            [0u8; 32],
             0,
             0,
             Vec::new(),

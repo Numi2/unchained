@@ -56,9 +56,7 @@ fn build_p2p() -> P2p {
 }
 
 fn child_anchor(committee: &finality_support::TestCommittee, parent: &Anchor) -> Anchor {
-    let num = parent.num.saturating_add(1);
-    let merkle_root = [num as u8; 32];
-    committee.child_anchor(parent, merkle_root, 0)
+    committee.child_anchor(parent, [0u8; 32], 0)
 }
 
 fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> Result<Anchor> {
@@ -420,14 +418,14 @@ async fn node_control_surfaces_recent_consensus_evidence() -> Result<()> {
                 slot: genesis.position.slot.saturating_add(1),
             },
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: [1u8; 32],
+            checkpoint_digest: [1u8; 32],
         },
         signature: vec![1u8; 16],
     };
     let second_vote = ValidatorVote {
         voter: validator.id,
         target: VoteTarget {
-            block_digest: [2u8; 32],
+            checkpoint_digest: [2u8; 32],
             ..first_vote.target.clone()
         },
         signature: vec![2u8; 16],

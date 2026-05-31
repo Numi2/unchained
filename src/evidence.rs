@@ -263,7 +263,7 @@ impl VoteEquivocationEvidence {
             bail!("vote equivocation requires conflicting vote targets");
         }
         let mut pair = vec![first_vote, second_vote];
-        pair.sort_by_key(|vote| vote.target.block_digest);
+        pair.sort_by_key(|vote| vote.target.checkpoint_digest);
         let first_vote = pair.remove(0);
         let second_vote = pair.remove(0);
         Ok(Self {
@@ -911,7 +911,7 @@ mod tests {
         let target = crate::consensus::VoteTarget {
             position: ConsensusPosition { epoch: 0, slot: 1 },
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: [4u8; 32],
+            checkpoint_digest: [4u8; 32],
         };
         let first = ValidatorVote {
             voter: validator_set.validators[0].id,
@@ -921,7 +921,7 @@ mod tests {
         let second = ValidatorVote {
             voter: first.voter,
             target: crate::consensus::VoteTarget {
-                block_digest: [5u8; 32],
+                checkpoint_digest: [5u8; 32],
                 ..target
             },
             signature: vec![8u8; 12],
@@ -1041,7 +1041,7 @@ mod tests {
         let target = crate::consensus::VoteTarget {
             position,
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: Anchor::compute_hash(
+            checkpoint_digest: Anchor::compute_hash(
                 0,
                 None,
                 position,

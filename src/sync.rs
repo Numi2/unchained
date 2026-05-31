@@ -273,29 +273,37 @@ pub fn spawn(
                 }
 
                 _ = backfill_timer.tick() => {
-                    // Background epoch-state repair to ensure offline nodes catch up cleanly
+                    // Background checkpoint-state repair to ensure offline nodes catch up cleanly.
                     if let Ok(Some(latest)) = db.get::<Anchor>("epoch", b"latest") {
-                        let window: u64 = 16; // scan recent epochs
+                        let window: u64 = 16; // scan recent checkpoints
                         let start = latest.num.saturating_sub(window);
                         for n in start..=latest.num {
-                            // Preferred path: use per-epoch settlement unit ids index
-                            let mut ids: Vec<[u8;32]> = db.get_settlement_unit_ids_for_epoch(n).unwrap_or_default();
-                            // Fallback: if selected index missing/empty, derive ids from stored confirmed settlement units for that epoch
+                            // Preferred path: use the checkpoint settlement-unit id index.
+                            let mut ids: Vec<[u8; 32]> =
+                                db.get_selected_settlement_unit_ids_for_checkpoint(n).unwrap_or_default();
+                            // Fallback: if selected index is missing, derive ids from stored checkpoint settlement units.
                             if ids.is_empty() {
                                 if let Ok(Some(anchor)) = db.get::<Anchor>("epoch", &n.to_le_bytes()) {
                                     if let Ok(all_confirmed) = db.iterate_settlement_units() {
-                                        ids = all_confirmed
-                                            .into_iter()
-                                            .filter(|c| c.epoch_hash == anchor.hash)
-                                            .map(|c| c.id)
-                                            .collect();
+                                        ids = if let Some(parent_hash) = anchor.parent_hash {
+                                            all_confirmed
+                                                .into_iter()
+                                                .filter(|c| c.parent_checkpoint_hash == parent_hash)
+                                                .map(|c| c.id)
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
                                         // If we could reconstruct a full set, persist it for future fast access
                                         if ids.len() == anchor.settlement_unit_count as usize && anchor.settlement_unit_count > 0 {
-                                            let mut leaves: Vec<[u8;32]> = ids.iter().map(crate::settlement_unit::SettlementUnit::id_to_leaf_hash).collect();
+                                            let mut leaves: Vec<[u8; 32]> = ids
+                                                .iter()
+                                                .map(crate::settlement_unit::SettlementUnit::id_to_leaf_hash)
+                                                .collect();
                                             leaves.sort();
                                             let root = crate::epoch::MerkleTree::compute_root_from_sorted_leaves(&leaves);
                                             if root == anchor.merkle_root {
-                                                if let Some(sel_cf) = db.db.cf_handle("epoch_settlement_units") {
+                                                if let Some(sel_cf) = db.db.cf_handle("checkpoint_settlement_units") {
                                                     let mut batch = rocksdb::WriteBatch::default();
                                                     for settlement_unit_id in &ids {
                                                         let mut key = Vec::with_capacity(8 + 32);
@@ -307,13 +315,13 @@ pub fn spawn(
                                                 }
                                             } else {
                                                 // If reconstruction fails, ask peers explicitly
-                                                net.request_epoch_settlement_units(n).await;
-                                                net.request_epoch_leaves(n).await;
+                                                net.request_checkpoint_settlement_unit_ids(n).await;
+                                                net.request_checkpoint_leaves(n).await;
                                             }
                                         } else if anchor.settlement_unit_count > 0 {
                                             // Partial or empty reconstruction: ask peers
-                                            net.request_epoch_settlement_units(n).await;
-                                            net.request_epoch_leaves(n).await;
+                                            net.request_checkpoint_settlement_unit_ids(n).await;
+                                            net.request_checkpoint_leaves(n).await;
                                         }
                                     }
                                 }

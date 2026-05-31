@@ -311,7 +311,7 @@ enum WalletCmd {
     RequestHandle(RequestHandleArgs),
     /// Mint and print a one-time invoice capability for merchant-style direct payment
     Invoice(InvoiceArgs),
-    /// Send settlement_units using a receive locator or an explicit invoice capability
+    /// Send settlement units using a receive locator or an explicit invoice capability
     Send(SendArgs),
     /// Submit a signed fee-paid shared-state control document through the running wallet
     SubmitControl(SubmitControlArgs),
@@ -319,7 +319,7 @@ enum WalletCmd {
     Balance(BalanceArgs),
     /// Show wallet transaction history
     History(HistoryArgs),
-    /// Rescan local transactions against this wallet
+    /// Resync local wallet state from the node
     Rescan,
 }
 
@@ -1492,7 +1492,7 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
             .iter()
             .map(|record| {
                 serde_json::json!({
-                    "settlement_unit_id": hex::encode(record.settlement_unit_id),
+                    "entry_id": hex::encode(record.entry_id),
                     "transfer_hash": hex::encode(record.transfer_hash),
                     "epoch": record.commit_epoch,
                     "direction": if record.is_sender { "out" } else { "in" },
@@ -1530,15 +1530,15 @@ fn print_history_output(history: &[wallet::TransactionRecord], args: &HistoryArg
                 if record.fee_amount == 1 { "" } else { "s" }
             );
         }
-        println!("  settlement unit {}", short_hex(&record.settlement_unit_id));
+        println!("  entry {}", short_hex(&record.entry_id));
         println!("  tx   {}", short_hex(&record.transfer_hash));
     }
     Ok(())
 }
 
-async fn rescan_wallet_transactions(client: &wallet_control::WalletControlClient) -> Result<()> {
+async fn resync_wallet_state(client: &wallet_control::WalletControlClient) -> Result<()> {
     client.force_sync().await?;
-    println!("✅ Rescanned wallet state from the local node");
+    println!("Resynced wallet state from the local node");
     Ok(())
 }
 
@@ -1617,7 +1617,8 @@ pub async fn run_node_cli() -> Result<()> {
             println!("Local checkpoint cadence: {} seconds", cfg.epoch.seconds);
             println!("Consensus foundation: validator/BFT runtime");
             println!("Settlement manager: enabled");
-            println!("Epoch settlement unit cap: {}", protocol::CURRENT.max_settlement_units_per_epoch);
+            println!("Checkpoint settlement unit cap: {}", protocol::CURRENT.max_settlement_units_per_checkpoint);
+            println!("Fast-path transaction cap: {}", protocol::CURRENT.max_fast_path_txs_per_checkpoint);
             let shutdown_result = wait_for_shutdown("Unchained node", runtime).await;
             let node_control_result = node_control_task.await.map_err(|err| anyhow!(err))?;
             shutdown_result?;
@@ -1981,7 +1982,7 @@ pub async fn run_wallet_cli() -> Result<()> {
         }
         WalletCmd::Rescan => {
             let client = open_wallet_control_client(&cfg).await?;
-            rescan_wallet_transactions(&client).await?;
+            resync_wallet_state(&client).await?;
             Ok(())
         }
         WalletCmd::Send(args) => {

@@ -94,22 +94,22 @@ static RECENT_RANGE_REQS: Lazy<Mutex<HashMap<u64, Instant>>> =
 pub type NetHandle = Arc<Network>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochLeavesBundle {
-    pub epoch_num: u64,
+pub struct CheckpointLeavesBundle {
+    pub checkpoint_num: u64,
     pub merkle_root: [u8; 32],
     pub leaves: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettlementUnitIdsBundle {
-    pub epoch_num: u64,
+pub struct CheckpointSettlementUnitIdsBundle {
+    pub checkpoint_num: u64,
     pub merkle_root: [u8; 32],
     pub settlement_unit_ids: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochCandidatesResponse {
-    pub epoch_hash: [u8; 32],
+pub struct CheckpointSettlementUnitCandidatesResponse {
+    pub parent_checkpoint_hash: [u8; 32],
     pub candidates: Vec<SettlementUnitCandidate>,
 }
 
@@ -127,14 +127,14 @@ pub struct CompactEpoch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochGetSettlementUnitBatch {
-    pub epoch_hash: [u8; 32],
+pub struct CheckpointGetSettlementUnitBatch {
+    pub checkpoint_hash: [u8; 32],
     pub indexes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochSettlementUnitBatch {
-    pub epoch_hash: [u8; 32],
+pub struct CheckpointSettlementUnitBatch {
+    pub checkpoint_hash: [u8; 32],
     pub indexes: Vec<u32>,
     pub settlement_units: Vec<SettlementUnit>,
 }
@@ -178,24 +178,22 @@ enum WireTopic {
     FastPathBatch,
     SharedStateDagBatch,
     SettlementUnitCandidate,
-    SettlementUnit,
     Tx,
     CompactEpoch,
-    EpochLeaves,
-    EpochSettlementUnitIds,
-    EpochCandidatesResponse,
+    CheckpointLeaves,
+    CheckpointSettlementUnitIds,
+    CheckpointSettlementUnitCandidatesResponse,
     EpochHeadersResponse,
     EpochByHashResponse,
     RequestEpoch,
     RequestEpochHeadersRange,
     RequestEpochByHash,
-    RequestSettlementUnit,
     RequestLatestEpoch,
-    RequestEpochSettlementUnitBatch,
-    EpochSettlementUnitBatch,
-    RequestEpochSettlementUnitIds,
-    RequestEpochLeaves,
-    RequestEpochCandidates,
+    RequestCheckpointSettlementUnitBatch,
+    CheckpointSettlementUnitBatch,
+    RequestCheckpointSettlementUnitIds,
+    RequestCheckpointLeaves,
+    RequestCheckpointSettlementUnitCandidates,
     NodeRecord,
     ArchiveManifest,
     ArchiveReplica,
@@ -229,24 +227,22 @@ fn wire_topic_id(topic: WireTopic) -> u8 {
         WireTopic::FastPathBatch => 4,
         WireTopic::SharedStateDagBatch => 5,
         WireTopic::SettlementUnitCandidate => 6,
-        WireTopic::SettlementUnit => 7,
         WireTopic::Tx => 8,
         WireTopic::CompactEpoch => 9,
-        WireTopic::EpochLeaves => 10,
-        WireTopic::EpochSettlementUnitIds => 11,
-        WireTopic::EpochCandidatesResponse => 12,
+        WireTopic::CheckpointLeaves => 10,
+        WireTopic::CheckpointSettlementUnitIds => 11,
+        WireTopic::CheckpointSettlementUnitCandidatesResponse => 12,
         WireTopic::EpochHeadersResponse => 13,
         WireTopic::EpochByHashResponse => 14,
         WireTopic::RequestEpoch => 15,
         WireTopic::RequestEpochHeadersRange => 16,
         WireTopic::RequestEpochByHash => 17,
-        WireTopic::RequestSettlementUnit => 18,
         WireTopic::RequestLatestEpoch => 19,
-        WireTopic::RequestEpochSettlementUnitBatch => 20,
-        WireTopic::EpochSettlementUnitBatch => 21,
-        WireTopic::RequestEpochSettlementUnitIds => 22,
-        WireTopic::RequestEpochLeaves => 23,
-        WireTopic::RequestEpochCandidates => 24,
+        WireTopic::RequestCheckpointSettlementUnitBatch => 20,
+        WireTopic::CheckpointSettlementUnitBatch => 21,
+        WireTopic::RequestCheckpointSettlementUnitIds => 22,
+        WireTopic::RequestCheckpointLeaves => 23,
+        WireTopic::RequestCheckpointSettlementUnitCandidates => 24,
         WireTopic::NodeRecord => 25,
         WireTopic::ArchiveManifest => 26,
         WireTopic::ArchiveReplica => 27,
@@ -269,24 +265,22 @@ fn decode_wire_topic(id: u8) -> Result<WireTopic> {
         4 => WireTopic::FastPathBatch,
         5 => WireTopic::SharedStateDagBatch,
         6 => WireTopic::SettlementUnitCandidate,
-        7 => WireTopic::SettlementUnit,
         8 => WireTopic::Tx,
         9 => WireTopic::CompactEpoch,
-        10 => WireTopic::EpochLeaves,
-        11 => WireTopic::EpochSettlementUnitIds,
-        12 => WireTopic::EpochCandidatesResponse,
+        10 => WireTopic::CheckpointLeaves,
+        11 => WireTopic::CheckpointSettlementUnitIds,
+        12 => WireTopic::CheckpointSettlementUnitCandidatesResponse,
         13 => WireTopic::EpochHeadersResponse,
         14 => WireTopic::EpochByHashResponse,
         15 => WireTopic::RequestEpoch,
         16 => WireTopic::RequestEpochHeadersRange,
         17 => WireTopic::RequestEpochByHash,
-        18 => WireTopic::RequestSettlementUnit,
         19 => WireTopic::RequestLatestEpoch,
-        20 => WireTopic::RequestEpochSettlementUnitBatch,
-        21 => WireTopic::EpochSettlementUnitBatch,
-        22 => WireTopic::RequestEpochSettlementUnitIds,
-        23 => WireTopic::RequestEpochLeaves,
-        24 => WireTopic::RequestEpochCandidates,
+        20 => WireTopic::RequestCheckpointSettlementUnitBatch,
+        21 => WireTopic::CheckpointSettlementUnitBatch,
+        22 => WireTopic::RequestCheckpointSettlementUnitIds,
+        23 => WireTopic::RequestCheckpointLeaves,
+        24 => WireTopic::RequestCheckpointSettlementUnitCandidates,
         25 => WireTopic::NodeRecord,
         26 => WireTopic::ArchiveManifest,
         27 => WireTopic::ArchiveReplica,
@@ -609,13 +603,12 @@ enum NetworkCommand {
     RequestEpoch(u64),
     RequestEpochHeadersRange(EpochHeadersRange),
     RequestEpochByHash([u8; 32]),
-    RequestSettlementUnit([u8; 32]),
     RequestLatestEpoch,
-    RequestEpochSettlementUnitBatch(EpochGetSettlementUnitBatch),
-    RequestEpochSettlementUnitIds(u64),
-    RequestEpochLeaves(u64),
-    GossipEpochLeaves(EpochLeavesBundle),
-    RequestEpochCandidates([u8; 32]),
+    RequestCheckpointSettlementUnitBatch(CheckpointGetSettlementUnitBatch),
+    RequestCheckpointSettlementUnitIds(u64),
+    RequestCheckpointLeaves(u64),
+    GossipCheckpointLeaves(CheckpointLeavesBundle),
+    RequestCheckpointSettlementUnitCandidates([u8; 32]),
     RequestEpochDirect(u64),
     EnsureArchiveEpochs(Vec<u64>),
     RequestCheckpointBatch {
@@ -1925,16 +1918,17 @@ impl RuntimeState {
         self.observe_anchor_proposal(proposer_record, &proposal, proposal_envelope)?;
         match proposal.ordering_path {
             OrderingPath::FastPathPrivateTransfer => {
-                if self
-                    .db
-                    .load_fast_path_batch(&proposal.merkle_root)?
-                    .is_none()
+                if proposal.ordered_tx_count > 0
+                    && self
+                        .db
+                        .load_fast_path_batch(&proposal.ordered_tx_root)?
+                        .is_none()
                 {
                     net_log!(
                         "ℹ️  Queueing fast-path proposal for epoch {} slot {} until batch {} arrives",
                         proposal.position.epoch,
                         proposal.position.slot,
-                        hex::encode(proposal.merkle_root)
+                        hex::encode(proposal.ordered_tx_root)
                     );
                     self.queue_fast_path_proposal(
                         proposer_record.clone(),
@@ -1948,19 +1942,21 @@ impl RuntimeState {
                     .await;
                     self.request_fast_path_batch_from(
                         proposer_record.clone(),
-                        proposal.merkle_root,
+                        proposal.ordered_tx_root,
                     )
                     .await?;
                     return Ok(());
                 }
-                let batch = self
-                    .db
-                    .load_fast_path_batch(&proposal.merkle_root)?
-                    .ok_or_else(|| {
-                        anyhow!("fast-path batch disappeared during proposal validation")
-                    })?;
-                validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
-                    .map_err(|err| anyhow!(err))?;
+                if proposal.ordered_tx_count > 0 {
+                    let batch = self
+                        .db
+                        .load_fast_path_batch(&proposal.ordered_tx_root)?
+                        .ok_or_else(|| {
+                            anyhow!("fast-path batch disappeared during proposal validation")
+                        })?;
+                    validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
+                        .map_err(|err| anyhow!(err))?;
+                }
             }
             OrderingPath::DagBftSharedState => {
                 if let Some(missing_batch_id) =
@@ -2072,7 +2068,7 @@ impl RuntimeState {
         response_to_message_id: Option<[u8; 32]>,
         vote: ValidatorVote,
     ) -> Result<()> {
-        let proposal_hash = vote.target.block_digest;
+        let proposal_hash = vote.target.checkpoint_digest;
         let mut completion = None;
         {
             let mut guard = self.pending_anchor_certifications.lock().await;
@@ -2612,7 +2608,7 @@ impl RuntimeState {
                 let candidate = canonical::decode_settlement_unit_candidate(&frame.body)?;
                 match validate_settlement_unit_candidate(&candidate, &self.db) {
                     Ok(()) => {
-                        let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                        let key = Store::candidate_key(&candidate.parent_checkpoint_hash, &candidate.id);
                         self.db.put("settlement_unit_candidate", &key, &candidate)?;
                     }
                     Err(err) => {
@@ -2620,10 +2616,6 @@ impl RuntimeState {
                         bail!("rejecting invalid settlement unit candidate: {err}");
                     }
                 }
-            }
-            WireTopic::SettlementUnit => {
-                let _ = canonical::decode_settlement_unit(&frame.body)?;
-                bail!("unsolicited committed settlement unit frames are not part of the canonical protocol");
             }
             WireTopic::Tx => {
                 let tx = canonical::decode_tx(&frame.body)?;
@@ -2700,29 +2692,29 @@ impl RuntimeState {
                     self.schedule_dial(discovered);
                 }
             }
-            WireTopic::EpochLeaves => {
-                let bundle = canonical::decode_epoch_leaves_bundle(&frame.body)?;
-                let epoch_num = bundle.epoch_num;
-                self.store_epoch_leaves_bundle(bundle)?;
-                self.repair_epoch_state(epoch_num).await?;
+            WireTopic::CheckpointLeaves => {
+                let bundle = canonical::decode_checkpoint_leaves_bundle(&frame.body)?;
+                let checkpoint_num = bundle.checkpoint_num;
+                self.store_checkpoint_leaves_bundle(bundle)?;
+                self.repair_checkpoint_state(checkpoint_num).await?;
             }
-            WireTopic::EpochSettlementUnitIds => {
-                let bundle = canonical::decode_settlement_unit_ids_bundle(&frame.body)?;
-                let epoch_num = bundle.epoch_num;
-                self.store_settlement_unit_ids_bundle(bundle)?;
-                self.repair_epoch_state(epoch_num).await?;
+            WireTopic::CheckpointSettlementUnitIds => {
+                let bundle = canonical::decode_checkpoint_settlement_unit_ids_bundle(&frame.body)?;
+                let checkpoint_num = bundle.checkpoint_num;
+                self.store_checkpoint_settlement_unit_ids_bundle(bundle)?;
+                self.repair_checkpoint_state(checkpoint_num).await?;
             }
-            WireTopic::EpochCandidatesResponse => {
-                let response = canonical::decode_epoch_candidates_response(&frame.body)?;
+            WireTopic::CheckpointSettlementUnitCandidatesResponse => {
+                let response = canonical::decode_checkpoint_settlement_unit_candidates_response(&frame.body)?;
                 for candidate in response.candidates {
                     match validate_settlement_unit_candidate(&candidate, &self.db) {
                         Ok(()) => {
-                            let key = Store::candidate_key(&candidate.epoch_hash, &candidate.id);
+                            let key = Store::candidate_key(&candidate.parent_checkpoint_hash, &candidate.id);
                             let _ = self.db.put("settlement_unit_candidate", &key, &candidate);
                         }
                         Err(err) => {
                             metrics::VALIDATION_FAIL_SETTLEMENT_UNIT.inc();
-                            bail!("rejecting invalid epoch candidate response: {err}");
+                            bail!("rejecting invalid checkpoint settlement unit candidate response: {err}");
                         }
                     }
                 }
@@ -2787,10 +2779,6 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::RequestSettlementUnit => {
-                let _ = decode_bytes32_body(&frame.body)?;
-                bail!("settlement-unit-by-id recovery is unsupported; use epoch transaction recovery only");
-            }
             WireTopic::RequestLatestEpoch => {
                 decode_empty_body(&frame.body)?;
                 if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", b"latest") {
@@ -2804,83 +2792,85 @@ impl RuntimeState {
                         .await?;
                 }
             }
-            WireTopic::RequestEpochSettlementUnitBatch => {
-                let req = canonical::decode_epoch_get_settlement_unit_batch(&frame.body)?;
-                let txn = self.lookup_epoch_txn(&req)?;
-                if !txn.settlement_units.is_empty() {
+            WireTopic::RequestCheckpointSettlementUnitBatch => {
+                let req = canonical::decode_checkpoint_get_settlement_unit_batch(&frame.body)?;
+                let batch = self.lookup_checkpoint_settlement_unit_batch(&req)?;
+                if !batch.settlement_units.is_empty() {
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
-                            WireTopic::EpochSettlementUnitBatch,
-                            canonical::encode_epoch_settlement_unit_batch(&txn)?,
+                            WireTopic::CheckpointSettlementUnitBatch,
+                            canonical::encode_checkpoint_settlement_unit_batch(&batch)?,
                             Some(message_id),
                         )
                         .await?;
                 }
             }
-            WireTopic::EpochSettlementUnitBatch => {
-                let txn = canonical::decode_epoch_settlement_unit_batch(&frame.body)?;
-                let epoch_num = self
+            WireTopic::CheckpointSettlementUnitBatch => {
+                let batch = canonical::decode_checkpoint_settlement_unit_batch(&frame.body)?;
+                let checkpoint_num = self
                     .db
-                    .get::<Anchor>("anchor", &txn.epoch_hash)?
+                    .get::<Anchor>("anchor", &batch.checkpoint_hash)?
                     .map(|anchor| anchor.num)
-                    .ok_or_else(|| anyhow!("epoch settlement unit batch references unknown anchor"))?;
-                self.store_epoch_txn(txn)?;
-                self.repair_epoch_state(epoch_num).await?;
+                    .ok_or_else(|| anyhow!("checkpoint settlement unit batch references unknown anchor"))?;
+                self.store_checkpoint_settlement_unit_batch(batch)?;
+                self.repair_checkpoint_state(checkpoint_num).await?;
             }
-            WireTopic::RequestEpochSettlementUnitIds => {
-                let epoch_num = decode_u64_body(&frame.body)?;
-                let ids = self.db.get_settlement_unit_ids_for_epoch(epoch_num)?;
+            WireTopic::RequestCheckpointSettlementUnitIds => {
+                let checkpoint_num = decode_u64_body(&frame.body)?;
+                let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
                 if !ids.is_empty() {
                     let merkle_root = MerkleTree::build_root(&ids.iter().copied().collect());
-                    let bundle = SettlementUnitIdsBundle {
-                        epoch_num,
+                    let bundle = CheckpointSettlementUnitIdsBundle {
+                        checkpoint_num,
                         merkle_root,
                         settlement_unit_ids: ids,
                     };
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
-                            WireTopic::EpochSettlementUnitIds,
-                            canonical::encode_settlement_unit_ids_bundle(&bundle)?,
+                            WireTopic::CheckpointSettlementUnitIds,
+                            canonical::encode_checkpoint_settlement_unit_ids_bundle(&bundle)?,
                             Some(message_id),
                         )
                         .await?;
                 }
             }
-            WireTopic::RequestEpochLeaves => {
-                let epoch_num = decode_u64_body(&frame.body)?;
-                if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes()) {
-                    if let Ok(Some(leaves)) = self.db.get_epoch_leaves(epoch_num) {
-                        let bundle = EpochLeavesBundle {
-                            epoch_num,
+            WireTopic::RequestCheckpointLeaves => {
+                let checkpoint_num = decode_u64_body(&frame.body)?;
+                if let Ok(Some(anchor)) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes()) {
+                    if let Ok(Some(leaves)) = self.db.get_checkpoint_leaves(checkpoint_num) {
+                        let bundle = CheckpointLeavesBundle {
+                            checkpoint_num,
                             merkle_root: anchor.merkle_root,
                             leaves,
                         };
                         let _ = self
                             .sign_and_send_to_peer_related(
                                 record.node_id,
-                                WireTopic::EpochLeaves,
-                                canonical::encode_epoch_leaves_bundle(&bundle)?,
+                                WireTopic::CheckpointLeaves,
+                                canonical::encode_checkpoint_leaves_bundle(&bundle)?,
                                 Some(message_id),
                             )
                             .await?;
                     }
                 }
             }
-            WireTopic::RequestEpochCandidates => {
-                let epoch_hash = decode_bytes32_body(&frame.body)?;
-                let candidates = self.db.get_settlement_unit_candidates_by_epoch_hash(&epoch_hash)?;
+            WireTopic::RequestCheckpointSettlementUnitCandidates => {
+                let parent_checkpoint_hash = decode_bytes32_body(&frame.body)?;
+                let candidates = self
+                    .db
+                    .get_settlement_unit_candidates_by_parent_checkpoint_hash(&parent_checkpoint_hash)?;
                 if !candidates.is_empty() {
-                    let response = EpochCandidatesResponse {
-                        epoch_hash,
+                    let response = CheckpointSettlementUnitCandidatesResponse {
+                        parent_checkpoint_hash,
                         candidates,
                     };
                     let _ = self
                         .sign_and_send_to_peer_related(
                             record.node_id,
-                            WireTopic::EpochCandidatesResponse,
-                            canonical::encode_epoch_candidates_response(&response)?,
+                            WireTopic::CheckpointSettlementUnitCandidatesResponse,
+                            canonical::encode_checkpoint_settlement_unit_candidates_response(&response)?,
                             Some(message_id),
                         )
                         .await?;
@@ -3004,15 +2994,18 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn lookup_epoch_txn(&self, req: &EpochGetSettlementUnitBatch) -> Result<EpochSettlementUnitBatch> {
-        let Some(anchor) = self.db.get::<Anchor>("anchor", &req.epoch_hash)? else {
-            return Ok(EpochSettlementUnitBatch {
-                epoch_hash: req.epoch_hash,
+    fn lookup_checkpoint_settlement_unit_batch(
+        &self,
+        req: &CheckpointGetSettlementUnitBatch,
+    ) -> Result<CheckpointSettlementUnitBatch> {
+        let Some(anchor) = self.db.get::<Anchor>("anchor", &req.checkpoint_hash)? else {
+            return Ok(CheckpointSettlementUnitBatch {
+                checkpoint_hash: req.checkpoint_hash,
                 indexes: Vec::new(),
                 settlement_units: Vec::new(),
             });
         };
-        let ids = self.db.get_settlement_unit_ids_for_epoch(anchor.num)?;
+        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
         let mut indexes = Vec::new();
         let mut settlement_units = Vec::new();
         for index in &req.indexes {
@@ -3023,56 +3016,56 @@ impl RuntimeState {
                 }
             }
         }
-        Ok(EpochSettlementUnitBatch {
-            epoch_hash: req.epoch_hash,
+        Ok(CheckpointSettlementUnitBatch {
+            checkpoint_hash: req.checkpoint_hash,
             indexes,
             settlement_units,
         })
     }
 
-    fn store_epoch_leaves_bundle(&self, bundle: EpochLeavesBundle) -> Result<()> {
+    fn store_checkpoint_leaves_bundle(&self, bundle: CheckpointLeavesBundle) -> Result<()> {
         let computed = MerkleTree::compute_root_from_sorted_leaves(&bundle.leaves);
         if computed != bundle.merkle_root {
-            bail!("epoch leaves bundle merkle root mismatch");
+            bail!("checkpoint leaves bundle merkle root mismatch");
         }
         if let Some(anchor) = self
             .db
-            .get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes())?
+            .get::<Anchor>("epoch", &bundle.checkpoint_num.to_le_bytes())?
         {
             if anchor.merkle_root != bundle.merkle_root {
-                bail!("epoch leaves bundle does not match local anchor");
+                bail!("checkpoint leaves bundle does not match local anchor");
             }
         }
         self.db
-            .store_epoch_leaves(bundle.epoch_num, &bundle.leaves)?;
+            .store_checkpoint_leaves(bundle.checkpoint_num, &bundle.leaves)?;
         let levels = MerkleTree::build_levels_from_sorted_leaves(&bundle.leaves);
-        self.db.store_epoch_levels(bundle.epoch_num, &levels)?;
+        self.db.store_checkpoint_levels(bundle.checkpoint_num, &levels)?;
         Ok(())
     }
 
-    fn store_settlement_unit_ids_bundle(&self, bundle: SettlementUnitIdsBundle) -> Result<()> {
+    fn store_checkpoint_settlement_unit_ids_bundle(&self, bundle: CheckpointSettlementUnitIdsBundle) -> Result<()> {
         let computed_root = MerkleTree::build_root(&bundle.settlement_unit_ids.iter().copied().collect());
         if computed_root != bundle.merkle_root {
-            bail!("settlement unit ids bundle merkle root mismatch");
+            bail!("checkpoint settlement unit ids bundle merkle root mismatch");
         }
         if let Some(anchor) = self
             .db
-            .get::<Anchor>("epoch", &bundle.epoch_num.to_le_bytes())?
+            .get::<Anchor>("epoch", &bundle.checkpoint_num.to_le_bytes())?
         {
             if anchor.merkle_root != bundle.merkle_root {
-                bail!("settlement unit ids bundle does not match local anchor");
+                bail!("checkpoint settlement unit ids bundle does not match local anchor");
             }
             if anchor.settlement_unit_count as usize != bundle.settlement_unit_ids.len() {
-                bail!("settlement unit ids bundle settlement unit count does not match local anchor");
+                bail!("checkpoint settlement unit ids bundle count does not match local anchor");
             }
         }
         let mut batch = WriteBatch::default();
-        let Some(sel_cf) = self.db.db.cf_handle("epoch_settlement_units") else {
-            bail!("epoch_settlement_units column family missing");
+        let Some(sel_cf) = self.db.db.cf_handle("checkpoint_settlement_units") else {
+            bail!("checkpoint_settlement_units column family missing");
         };
         for settlement_unit_id in bundle.settlement_unit_ids {
             let mut key = Vec::with_capacity(8 + 32);
-            key.extend_from_slice(&bundle.epoch_num.to_le_bytes());
+            key.extend_from_slice(&bundle.checkpoint_num.to_le_bytes());
             key.extend_from_slice(&settlement_unit_id);
             batch.put_cf(sel_cf, &key, &[]);
         }
@@ -3080,16 +3073,16 @@ impl RuntimeState {
         Ok(())
     }
 
-    async fn repair_epoch_state(&self, epoch_num: u64) -> Result<()> {
-        let Some(anchor) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes())? else {
+    async fn repair_checkpoint_state(&self, checkpoint_num: u64) -> Result<()> {
+        let Some(anchor) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())? else {
             return Ok(());
         };
-        let ids = self.db.get_settlement_unit_ids_for_epoch(epoch_num)?;
+        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
         if ids.is_empty() {
             let _ = self
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochSettlementUnitIds,
-                    encode_u64_body(epoch_num),
+                    WireTopic::RequestCheckpointSettlementUnitIds,
+                    encode_u64_body(checkpoint_num),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
@@ -3103,9 +3096,9 @@ impl RuntimeState {
             if !indexes.is_empty() {
                 let _ = self
                     .sign_and_send_to_targets(
-                        WireTopic::RequestEpochSettlementUnitBatch,
-                        canonical::encode_epoch_get_settlement_unit_batch(&EpochGetSettlementUnitBatch {
-                            epoch_hash: anchor.hash,
+                        WireTopic::RequestCheckpointSettlementUnitBatch,
+                        canonical::encode_checkpoint_get_settlement_unit_batch(&CheckpointGetSettlementUnitBatch {
+                            checkpoint_hash: anchor.hash,
                             indexes,
                         })?,
                         REQUEST_FANOUT_RECOVERY,
@@ -3113,11 +3106,11 @@ impl RuntimeState {
                     .await?;
             }
         }
-        if self.db.get_epoch_leaves(epoch_num)?.is_none() {
+        if self.db.get_checkpoint_leaves(checkpoint_num)?.is_none() {
             let _ = self
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochLeaves,
-                    encode_u64_body(epoch_num),
+                    WireTopic::RequestCheckpointLeaves,
+                    encode_u64_body(checkpoint_num),
                     REQUEST_FANOUT_RECOVERY,
                 )
                 .await?;
@@ -3125,65 +3118,91 @@ impl RuntimeState {
         Ok(())
     }
 
-    async fn repair_recent_epochs(&self) -> Result<()> {
+    async fn repair_recent_checkpoints(&self) -> Result<()> {
         let Some(latest) = self.db.get::<Anchor>("epoch", b"latest")? else {
             return Ok(());
         };
         let start = latest
             .num
             .saturating_sub(EPOCH_REPAIR_LOOKBACK.saturating_sub(1));
-        for epoch_num in start..=latest.num {
-            let Some(anchor) = self.db.get::<Anchor>("epoch", &epoch_num.to_le_bytes())? else {
+        for checkpoint_num in start..=latest.num {
+            let Some(anchor) = self.db.get::<Anchor>("epoch", &checkpoint_num.to_le_bytes())? else {
                 continue;
             };
             if anchor.settlement_unit_count == 0 {
                 continue;
             }
-            self.repair_epoch_state(epoch_num).await?;
+            self.repair_checkpoint_state(checkpoint_num).await?;
         }
         Ok(())
     }
 
-    fn store_epoch_txn(&self, txn: EpochSettlementUnitBatch) -> Result<Vec<[u8; 32]>> {
-        if txn.indexes.len() != txn.settlement_units.len() {
-            bail!("epoch settlement unit batch indexes length does not match settlement unit payloads");
+    fn store_checkpoint_settlement_unit_batch(
+        &self,
+        batch: CheckpointSettlementUnitBatch,
+    ) -> Result<Vec<[u8; 32]>> {
+        if batch.indexes.len() != batch.settlement_units.len() {
+            bail!("checkpoint settlement unit batch indexes length does not match settlement unit payloads");
         }
-        let Some(anchor) = self.db.get::<Anchor>("anchor", &txn.epoch_hash)? else {
-            bail!("epoch settlement unit batch references unknown anchor");
+        let Some(anchor) = self.db.get::<Anchor>("anchor", &batch.checkpoint_hash)? else {
+            bail!("checkpoint settlement unit batch references unknown anchor");
         };
-        let ids = self.db.get_settlement_unit_ids_for_epoch(anchor.num)?;
+        let expected_parent_hash = anchor
+            .parent_hash
+            .ok_or_else(|| {
+                anyhow!("genesis checkpoint cannot recover settlement units from a parent")
+            })?;
+        let ids = self.db.get_selected_settlement_unit_ids_for_checkpoint(anchor.num)?;
         if ids.is_empty() {
-            bail!("epoch settlement unit batch arrived before settlement unit ids were recovered");
+            bail!("checkpoint settlement unit batch arrived before settlement unit ids were recovered");
         }
         let Some(settlement_unit_cf) = self.db.db.cf_handle("settlement_unit") else {
             bail!("settlement_unit column family missing");
         };
-        let Some(settlement_unit_epoch_cf) = self.db.db.cf_handle("settlement_unit_epoch") else {
-            bail!("settlement_unit_epoch column family missing");
+        let Some(settlement_unit_checkpoint_cf) = self.db.db.cf_handle("settlement_unit_checkpoint") else {
+            bail!("settlement_unit_checkpoint column family missing");
         };
-        let Some(rev_cf) = self.db.db.cf_handle("settlement_unit_epoch_by_epoch") else {
-            bail!("settlement_unit_epoch_by_epoch column family missing");
+        let Some(rev_cf) = self.db.db.cf_handle("settlement_unit_checkpoint_index") else {
+            bail!("settlement_unit_checkpoint_index column family missing");
         };
 
-        let mut batch = WriteBatch::default();
-        let mut recovered = Vec::with_capacity(txn.settlement_units.len());
-        for (index, settlement_unit) in txn.indexes.into_iter().zip(txn.settlement_units.into_iter()) {
+        let mut write_batch = WriteBatch::default();
+        let mut recovered = Vec::with_capacity(batch.settlement_units.len());
+        for (index, settlement_unit) in batch
+            .indexes
+            .into_iter()
+            .zip(batch.settlement_units.into_iter())
+        {
             let Some(expected_settlement_unit_id) = ids.get(index as usize) else {
-                bail!("epoch settlement unit batch index {} is out of range", index);
+                bail!("checkpoint settlement unit batch index {} is out of range", index);
             };
             if &settlement_unit.id != expected_settlement_unit_id {
-                bail!("epoch settlement unit batch settlement unit id does not match settlement unit ids bundle");
+                bail!("checkpoint settlement unit batch settlement unit id does not match checkpoint id bundle");
+            }
+            if settlement_unit.parent_checkpoint_hash != expected_parent_hash {
+                bail!("checkpoint settlement unit references the wrong parent checkpoint");
+            }
+            if settlement_unit.creator_pk.address() != settlement_unit.creator_address {
+                bail!("checkpoint settlement unit creator key/address mismatch");
+            }
+            let expected_id = SettlementUnit::calculate_id(
+                &settlement_unit.parent_checkpoint_hash,
+                settlement_unit.nonce,
+                &settlement_unit.creator_address,
+            );
+            if settlement_unit.id != expected_id {
+                bail!("checkpoint settlement unit id mismatch");
             }
             let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
-            batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
-            batch.put_cf(settlement_unit_epoch_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
+            write_batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
+            write_batch.put_cf(settlement_unit_checkpoint_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
             let mut rev_key = Vec::with_capacity(8 + 32);
             rev_key.extend_from_slice(&anchor.num.to_le_bytes());
             rev_key.extend_from_slice(&settlement_unit.id);
-            batch.put_cf(rev_cf, &rev_key, &[]);
+            write_batch.put_cf(rev_cf, &rev_key, &[]);
             recovered.push(settlement_unit.id);
         }
-        self.db.write_batch(batch)?;
+        self.db.write_batch(write_batch)?;
         Ok(recovered)
     }
 
@@ -3277,17 +3296,21 @@ impl RuntimeState {
             validator_set: anchor.validator_set.clone(),
         };
         if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
-            if self.db.load_fast_path_batch(&anchor.merkle_root)?.is_none() {
-                let _ = self.request_fast_path_batch(anchor.merkle_root).await;
+            if anchor.ordered_tx_count > 0
+                && self.db.load_fast_path_batch(&anchor.ordered_tx_root)?.is_none()
+            {
+                let _ = self.request_fast_path_batch(anchor.ordered_tx_root).await;
                 self.buffer_anchor(anchor).await;
                 return Ok(());
             }
-            let batch = self
-                .db
-                .load_fast_path_batch(&anchor.merkle_root)?
-                .ok_or_else(|| anyhow!("fast-path batch disappeared during anchor handling"))?;
-            validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
-                .map_err(anyhow::Error::msg)?;
+            if anchor.ordered_tx_count > 0 {
+                let batch = self
+                    .db
+                    .load_fast_path_batch(&anchor.ordered_tx_root)?
+                    .ok_or_else(|| anyhow!("fast-path batch disappeared during anchor handling"))?;
+                validate_fast_path_batch_for_proposal(&proposal, &batch, self.db.as_ref())
+                    .map_err(anyhow::Error::msg)?;
+            }
         } else if anchor.ordering_path == OrderingPath::DagBftSharedState {
             let proposal = AnchorProposal {
                 num: anchor.num,
@@ -3369,12 +3392,16 @@ impl RuntimeState {
                 .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
         };
         let finalized_batch = if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
-            Some(
-                self.db
-                    .load_fast_path_batch(&anchor.merkle_root)?
-                    .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is unavailable"))?
-                    .txs,
-            )
+            if anchor.ordered_tx_count > 0 {
+                Some(
+                    self.db
+                        .load_fast_path_batch(&anchor.ordered_tx_root)?
+                        .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is unavailable"))?
+                        .txs,
+                )
+            } else {
+                Some(Vec::new())
+            }
         } else if anchor.ordering_path == OrderingPath::DagBftSharedState {
             Some(
                 reconstruct_shared_state_dag_plan(
@@ -3394,15 +3421,13 @@ impl RuntimeState {
         };
         persist_finalized_anchor(self.db.as_ref(), &anchor)?;
         metrics::EPOCH_HEIGHT.set(anchor.num as i64);
-        if anchor.ordering_path == OrderingPath::FastPathPrivateTransfer {
-            let _ = ();
-        } else if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
+        if let Err(e) = persist_selected_for_anchor(&self.db, &anchor) {
             net_log!(
-                "⚠️  Unable to reconstruct selected settlement_units for epoch {}: {}",
+                "Unable to reconstruct selected settlement units for checkpoint {}: {}",
                 anchor.num,
                 e
             );
-            let _ = self.repair_epoch_state(anchor.num).await;
+            let _ = self.repair_checkpoint_state(anchor.num).await;
         }
         if let Some(txs) = finalized_batch {
             for tx in txs {
@@ -3764,8 +3789,8 @@ pub async fn spawn(
                 tokio::select! {
                     _ = state.shutdown.cancelled() => break,
                     _ = repair_tick.tick() => {
-                        if let Err(e) = state.repair_recent_epochs().await {
-                            net_log!("⚠️  Failed to repair recent epoch state: {}", e);
+                        if let Err(e) = state.repair_recent_checkpoints().await {
+                            net_log!("⚠️  Failed to repair recent checkpoint state: {}", e);
                         }
                         let wanted = state
                             .db
@@ -3874,10 +3899,6 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::RequestSettlementUnit(settlement_unit_id) => {
-            let _ = settlement_unit_id;
-            bail!("settlement-unit-by-id recovery is unsupported; use epoch transaction recovery only");
-        }
         NetworkCommand::RequestLatestEpoch => {
             let _ = state
                 .sign_and_send_to_targets(
@@ -3887,46 +3908,46 @@ async fn handle_command(state: &RuntimeState, command: NetworkCommand) -> Result
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochSettlementUnitBatch(req) => {
+        NetworkCommand::RequestCheckpointSettlementUnitBatch(req) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochSettlementUnitBatch,
-                    canonical::encode_epoch_get_settlement_unit_batch(&req)?,
+                    WireTopic::RequestCheckpointSettlementUnitBatch,
+                    canonical::encode_checkpoint_get_settlement_unit_batch(&req)?,
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochSettlementUnitIds(epoch_num) => {
+        NetworkCommand::RequestCheckpointSettlementUnitIds(checkpoint_num) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochSettlementUnitIds,
-                    encode_u64_body(epoch_num),
+                    WireTopic::RequestCheckpointSettlementUnitIds,
+                    encode_u64_body(checkpoint_num),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochLeaves(epoch_num) => {
+        NetworkCommand::RequestCheckpointLeaves(checkpoint_num) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochLeaves,
-                    encode_u64_body(epoch_num),
+                    WireTopic::RequestCheckpointLeaves,
+                    encode_u64_body(checkpoint_num),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
         }
-        NetworkCommand::GossipEpochLeaves(bundle) => {
+        NetworkCommand::GossipCheckpointLeaves(bundle) => {
             state
                 .sign_and_broadcast(
-                    WireTopic::EpochLeaves,
-                    canonical::encode_epoch_leaves_bundle(&bundle)?,
+                    WireTopic::CheckpointLeaves,
+                    canonical::encode_checkpoint_leaves_bundle(&bundle)?,
                 )
                 .await?;
         }
-        NetworkCommand::RequestEpochCandidates(epoch_hash) => {
+        NetworkCommand::RequestCheckpointSettlementUnitCandidates(parent_checkpoint_hash) => {
             let _ = state
                 .sign_and_send_to_targets(
-                    WireTopic::RequestEpochCandidates,
-                    encode_bytes32_body(&epoch_hash),
+                    WireTopic::RequestCheckpointSettlementUnitCandidates,
+                    encode_bytes32_body(&parent_checkpoint_hash),
                     REQUEST_FANOUT_DEFAULT,
                 )
                 .await?;
@@ -4228,21 +4249,32 @@ impl Network {
             return Ok(None);
         };
         self.publish_fast_path_batch(&batch).await?;
+        let (selected_settlement_units, settlement_unit_root, settlement_unit_count) =
+            checkpoint_settlement_unit_selection(
+                self.db.as_ref(),
+                parent.as_ref(),
+                PROTOCOL.max_settlement_units_per_checkpoint as usize,
+            )?;
         let anchor = self
             .certify_local_anchor(
                 next_num,
                 parent.as_ref(),
+                settlement_unit_root,
+                settlement_unit_count,
+                0,
+                Vec::new(),
+                Vec::new(),
                 batch.ordered_tx_root,
                 batch.ordered_tx_count()?,
-                0,
-                Vec::new(),
-                Vec::new(),
-                [0u8; 32],
-                0,
                 OrderingPath::FastPathPrivateTransfer,
             )
             .await?;
         persist_finalized_anchor(self.db.as_ref(), &anchor)?;
+        persist_selected_candidates_for_anchor(
+            self.db.as_ref(),
+            &anchor,
+            selected_settlement_units,
+        )?;
         let _ = self.anchor_tx.send(anchor.clone());
         for tx in &batch.txs {
             let _ = self.tx_tx.send(tx.clone());
@@ -4395,12 +4427,18 @@ impl Network {
             .iter()
             .map(|batch| batch.batch_id)
             .collect::<Vec<_>>();
+        let (selected_settlement_units, settlement_unit_root, settlement_unit_count) =
+            checkpoint_settlement_unit_selection(
+                self.db.as_ref(),
+                parent.as_ref(),
+                PROTOCOL.max_settlement_units_per_checkpoint as usize,
+            )?;
         let anchor = self
             .certify_local_anchor(
                 next_num,
                 parent.as_ref(),
-                [0u8; 32],
-                0,
+                settlement_unit_root,
+                settlement_unit_count,
                 plan.round,
                 plan.frontier.clone(),
                 ordered_batch_ids,
@@ -4410,6 +4448,11 @@ impl Network {
             )
             .await?;
         persist_finalized_anchor(self.db.as_ref(), &anchor)?;
+        persist_selected_candidates_for_anchor(
+            self.db.as_ref(),
+            &anchor,
+            selected_settlement_units,
+        )?;
         let _ = self.anchor_tx.send(anchor.clone());
         for tx in &plan.aggregate_batch.txs {
             let _ = self.tx_tx.send(tx.clone());
@@ -4480,45 +4523,45 @@ impl Network {
         }
     }
 
-    pub async fn request_settlement_unit(&self, settlement_unit_id: [u8; 32]) {
-        let _ = self.command_tx.send(NetworkCommand::RequestSettlementUnit(settlement_unit_id));
-    }
-
     pub async fn request_latest_epoch(&self) {
         let _ = self.command_tx.send(NetworkCommand::RequestLatestEpoch);
     }
 
-    pub async fn request_epoch_settlement_units(&self, epoch_num: u64) {
+    pub async fn request_checkpoint_settlement_unit_ids(&self, checkpoint_num: u64) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochSettlementUnitIds(epoch_num));
+            .send(NetworkCommand::RequestCheckpointSettlementUnitIds(checkpoint_num));
     }
 
-    pub async fn request_epoch_txn(&self, epoch_hash: [u8; 32], indexes: Vec<u32>) {
+    pub async fn request_checkpoint_settlement_unit_batch(
+        &self,
+        checkpoint_hash: [u8; 32],
+        indexes: Vec<u32>,
+    ) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochSettlementUnitBatch(EpochGetSettlementUnitBatch {
-                epoch_hash,
+            .send(NetworkCommand::RequestCheckpointSettlementUnitBatch(CheckpointGetSettlementUnitBatch {
+                checkpoint_hash,
                 indexes,
             }));
     }
 
-    pub async fn request_epoch_candidates(&self, epoch_hash: [u8; 32]) {
+    pub async fn request_checkpoint_settlement_unit_candidates(&self, parent_checkpoint_hash: [u8; 32]) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochCandidates(epoch_hash));
+            .send(NetworkCommand::RequestCheckpointSettlementUnitCandidates(parent_checkpoint_hash));
     }
 
-    pub async fn request_epoch_leaves(&self, epoch_num: u64) {
+    pub async fn request_checkpoint_leaves(&self, checkpoint_num: u64) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::RequestEpochLeaves(epoch_num));
+            .send(NetworkCommand::RequestCheckpointLeaves(checkpoint_num));
     }
 
-    pub async fn gossip_epoch_leaves(&self, bundle: EpochLeavesBundle) {
+    pub async fn gossip_checkpoint_leaves(&self, bundle: CheckpointLeavesBundle) {
         let _ = self
             .command_tx
-            .send(NetworkCommand::GossipEpochLeaves(bundle));
+            .send(NetworkCommand::GossipCheckpointLeaves(bundle));
     }
 
     pub fn peer_count(&self) -> usize {
@@ -5129,12 +5172,12 @@ mod tests {
         let target = VoteTarget {
             position,
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: Anchor::compute_hash(
+            checkpoint_digest: Anchor::compute_hash(
                 num,
                 parent_hash,
                 position,
                 OrderingPath::FastPathPrivateTransfer,
-                [num as u8; 32],
+                [0u8; 32],
                 0,
                 0,
                 &[],
@@ -5157,7 +5200,7 @@ mod tests {
             num,
             parent_hash,
             OrderingPath::FastPathPrivateTransfer,
-            [num as u8; 32],
+            [0u8; 32],
             0,
             0,
             Vec::new(),
@@ -5372,14 +5415,14 @@ mod tests {
 
 fn validate_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate, db: &Store) -> Result<(), String> {
     let _anchor: Anchor = db
-        .get_epoch_for_settlement_unit(&settlement_unit.id)
+        .get_checkpoint_for_settlement_unit(&settlement_unit.id)
         .ok()
         .flatten()
         .and_then(|n| db.get::<Anchor>("epoch", &n.to_le_bytes()).ok().flatten())
-        .or_else(|| db.get::<Anchor>("anchor", &settlement_unit.epoch_hash).ok().flatten())
+        .or_else(|| db.get::<Anchor>("anchor", &settlement_unit.parent_checkpoint_hash).ok().flatten())
         .ok_or_else(|| {
             format!(
-                "SettlementUnit references non-existent committed epoch (settlement_unit_id={})",
+                "SettlementUnit references non-existent committed checkpoint (settlement_unit_id={})",
                 hex::encode(settlement_unit.id)
             )
         })?;
@@ -5392,7 +5435,7 @@ fn validate_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate,
     }
 
     let expected_digest = SettlementUnitCandidate::admission_digest(
-        &settlement_unit.epoch_hash,
+        &settlement_unit.parent_checkpoint_hash,
         settlement_unit.nonce,
         &settlement_unit.creator_address,
         &settlement_unit.creator_pk,
@@ -5401,7 +5444,12 @@ fn validate_settlement_unit_candidate(settlement_unit: &SettlementUnitCandidate,
     if settlement_unit.admission_digest != expected_digest {
         return Err("candidate admission digest mismatch".into());
     }
-    if SettlementUnit::calculate_id(&settlement_unit.epoch_hash, settlement_unit.nonce, &settlement_unit.creator_address) != settlement_unit.id {
+    let expected_id = SettlementUnit::calculate_id(
+        &settlement_unit.parent_checkpoint_hash,
+        settlement_unit.nonce,
+        &settlement_unit.creator_address,
+    );
+    if expected_id != settlement_unit.id {
         return Err("SettlementUnit ID mismatch".into());
     }
     Ok(())
@@ -5542,11 +5590,13 @@ fn validate_anchor(anchor: &Anchor, db: &Store) -> Result<(), String> {
     };
     match anchor.ordering_path {
         OrderingPath::FastPathPrivateTransfer => {
-            let batch = db
-                .load_fast_path_batch(&anchor.merkle_root)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "fast-path batch for finalized anchor is unavailable".to_string())?;
-            validate_fast_path_batch_for_proposal(&proposal, &batch, db)?;
+            if anchor.ordered_tx_count > 0 {
+                let batch = db
+                    .load_fast_path_batch(&anchor.ordered_tx_root)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "fast-path batch for finalized anchor is unavailable".to_string())?;
+                validate_fast_path_batch_for_proposal(&proposal, &batch, db)?;
+            }
         }
         OrderingPath::DagBftSharedState => {
             validate_shared_state_dag_plan_for_proposal(&proposal, parent.as_ref(), db)?;
@@ -5569,13 +5619,38 @@ fn validate_fast_path_batch_for_proposal(
         .validate_against_store(db)
         .map_err(|e| e.to_string())?;
     let batch_count = batch.ordered_tx_count().map_err(|e| e.to_string())?;
-    if proposal.merkle_root != batch.ordered_tx_root {
-        return Err("fast-path batch root does not match the proposal commitment".to_string());
+    if proposal.ordered_tx_root != batch.ordered_tx_root {
+        return Err("fast-path ordered tx root does not match the proposal commitment".to_string());
     }
-    if proposal.settlement_unit_count != batch_count {
-        return Err("fast-path batch count does not match the proposal commitment".to_string());
+    if proposal.ordered_tx_count != batch_count {
+        return Err("fast-path ordered tx count does not match the proposal commitment".to_string());
     }
     Ok(())
+}
+
+fn checkpoint_settlement_unit_selection(
+    db: &Store,
+    parent: Option<&Anchor>,
+    cap: usize,
+) -> Result<(Vec<SettlementUnitCandidate>, [u8; 32], u32)> {
+    let Some(parent) = parent else {
+        return Ok((Vec::new(), [0u8; 32], 0));
+    };
+    let (candidates, _) =
+        crate::epoch::select_settlement_unit_candidates_for_checkpoint(db, parent, cap, None)?;
+    let (root, count) = checkpoint_settlement_unit_commitment(&candidates);
+    Ok((candidates, root, count))
+}
+
+fn checkpoint_settlement_unit_commitment(candidates: &[SettlementUnitCandidate]) -> ([u8; 32], u32) {
+    let settlement_unit_ids = candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<HashSet<_>>();
+    (
+        MerkleTree::build_root(&settlement_unit_ids),
+        settlement_unit_ids.len() as u32,
+    )
 }
 
 fn fast_path_nullifier_counts(db: &Store) -> Result<HashMap<[u8; 32], usize>> {
@@ -5638,7 +5713,7 @@ fn select_pending_fast_path_batch(db: &Store) -> Result<Option<FastPathBatch>> {
             seen_nullifiers.insert(*nullifier);
         }
         selected.push(tx);
-        if selected.len() >= PROTOCOL.max_settlement_units_per_epoch as usize {
+        if selected.len() >= PROTOCOL.max_fast_path_txs_per_checkpoint as usize {
             break;
         }
     }
@@ -5954,13 +6029,17 @@ fn persist_finalized_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
     };
     let total_fee_revenue = match anchor.ordering_path {
         OrderingPath::FastPathPrivateTransfer => {
-            let batch = db
-                .load_fast_path_batch(&anchor.merkle_root)?
-                .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is missing"))?;
-            validate_fast_path_batch_for_proposal(&proposal, &batch, db)
-                .map_err(anyhow::Error::msg)?;
-            batch.apply_finalized(db)?;
-            batch.total_fee_revenue()?
+            if anchor.ordered_tx_count > 0 {
+                let batch = db
+                    .load_fast_path_batch(&anchor.ordered_tx_root)?
+                    .ok_or_else(|| anyhow!("fast-path batch for finalized anchor is missing"))?;
+                validate_fast_path_batch_for_proposal(&proposal, &batch, db)
+                    .map_err(anyhow::Error::msg)?;
+                batch.apply_finalized(db)?;
+                batch.total_fee_revenue()?
+            } else {
+                0
+            }
         }
         OrderingPath::DagBftSharedState => {
             let parent = if anchor.num == 0 {
@@ -6200,8 +6279,26 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
     let parent = db
         .get::<Anchor>("epoch", &(anchor.num - 1).to_le_bytes())?
         .ok_or_else(|| anyhow!("missing parent anchor"))?;
-    let (candidates, _) =
-        crate::epoch::select_candidates_for_epoch(db, &parent, anchor.settlement_unit_count as usize, None);
+    let (candidates, _) = crate::epoch::select_settlement_unit_candidates_for_checkpoint(
+        db,
+        &parent,
+        anchor.settlement_unit_count as usize,
+        None,
+    )?;
+    persist_selected_candidates_for_anchor(db, anchor, candidates)
+}
+
+fn persist_selected_candidates_for_anchor(
+    db: &Store,
+    anchor: &Anchor,
+    candidates: Vec<SettlementUnitCandidate>,
+) -> Result<()> {
+    if anchor.num == 0 {
+        return Ok(());
+    }
+    let expected_parent_hash = anchor
+        .parent_hash
+        .ok_or_else(|| anyhow!("checkpoint settlement units require a parent checkpoint"))?;
     let settlement_unit_ids = candidates
         .iter()
         .map(|candidate| candidate.id)
@@ -6221,28 +6318,31 @@ fn persist_selected_for_anchor(db: &Store, anchor: &Anchor) -> Result<()> {
     let Some(settlement_unit_cf) = db.db.cf_handle("settlement_unit") else {
         bail!("settlement_unit column family missing");
     };
-    let Some(settlement_unit_epoch_cf) = db.db.cf_handle("settlement_unit_epoch") else {
-        bail!("settlement_unit_epoch column family missing");
+    let Some(settlement_unit_checkpoint_cf) = db.db.cf_handle("settlement_unit_checkpoint") else {
+        bail!("settlement_unit_checkpoint column family missing");
     };
-    let Some(rev_cf) = db.db.cf_handle("settlement_unit_epoch_by_epoch") else {
-        bail!("settlement_unit_epoch_by_epoch column family missing");
+    let Some(rev_cf) = db.db.cf_handle("settlement_unit_checkpoint_index") else {
+        bail!("settlement_unit_checkpoint_index column family missing");
     };
-    let Some(sel_cf) = db.db.cf_handle("epoch_settlement_units") else {
-        bail!("epoch_settlement_units column family missing");
+    let Some(sel_cf) = db.db.cf_handle("checkpoint_settlement_units") else {
+        bail!("checkpoint_settlement_units column family missing");
     };
-    let Some(leaves_cf) = db.db.cf_handle("epoch_leaves") else {
-        bail!("epoch_leaves column family missing");
+    let Some(leaves_cf) = db.db.cf_handle("checkpoint_leaves") else {
+        bail!("checkpoint_leaves column family missing");
     };
-    let Some(levels_cf) = db.db.cf_handle("epoch_levels") else {
-        bail!("epoch_levels column family missing");
+    let Some(levels_cf) = db.db.cf_handle("checkpoint_levels") else {
+        bail!("checkpoint_levels column family missing");
     };
 
     let mut batch = WriteBatch::default();
     for candidate in candidates {
+        if candidate.parent_checkpoint_hash != expected_parent_hash {
+            bail!("selected settlement unit references the wrong parent checkpoint");
+        }
         let settlement_unit = candidate.into_confirmed();
         let settlement_unit_bytes = bincode::serialize(&settlement_unit)?;
         batch.put_cf(settlement_unit_cf, &settlement_unit.id, &settlement_unit_bytes);
-        batch.put_cf(settlement_unit_epoch_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
+        batch.put_cf(settlement_unit_checkpoint_cf, &settlement_unit.id, &anchor.num.to_le_bytes());
         let mut rev_key = Vec::with_capacity(8 + 32);
         rev_key.extend_from_slice(&anchor.num.to_le_bytes());
         rev_key.extend_from_slice(&settlement_unit.id);

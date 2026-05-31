@@ -102,8 +102,8 @@ fn seed_sender_settlement_unit(store: &Store, wallet: &Wallet, genesis: &Anchor)
         lock_hash,
     );
     store.put("settlement_unit", &settlement_unit.id, &settlement_unit)?;
-    store.put_settlement_unit_epoch(&settlement_unit.id, genesis.num)?;
-    store.put_settlement_unit_epoch_rev(genesis.num, &settlement_unit.id)?;
+    store.put_settlement_unit_checkpoint(&settlement_unit.id, genesis.num)?;
+    store.put_committed_settlement_unit_checkpoint_index(genesis.num, &settlement_unit.id)?;
     Ok(settlement_unit)
 }
 

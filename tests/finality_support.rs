@@ -218,7 +218,7 @@ impl TestCommittee {
     ) -> Anchor {
         let position = Anchor::position_for_num(num);
         let validator_set = self.validator_set(position.epoch);
-        let block_digest = Anchor::compute_hash(
+        let checkpoint_digest = Anchor::compute_hash(
             num,
             parent.map(|anchor| anchor.hash),
             position,
@@ -235,7 +235,7 @@ impl TestCommittee {
         let target = VoteTarget {
             position,
             ordering_path,
-            block_digest,
+            checkpoint_digest,
         };
         let target_bytes = target.signing_bytes();
         let votes = self
@@ -312,7 +312,7 @@ impl TestCommittee {
         let ordered_tx_count = aggregate_batch
             .ordered_tx_count()
             .expect("aggregate ordered tx count");
-        let block_digest = Anchor::compute_hash(
+        let checkpoint_digest = Anchor::compute_hash(
             num,
             Some(parent.hash),
             position,
@@ -329,7 +329,7 @@ impl TestCommittee {
         let target = VoteTarget {
             position,
             ordering_path: OrderingPath::DagBftSharedState,
-            block_digest,
+            checkpoint_digest,
         };
         let target_bytes = target.signing_bytes();
         let votes = self
@@ -552,8 +552,8 @@ pub fn seed_wallet_with_settlement_units(
             lock_hash,
         );
         store.put("settlement_unit", &settlement_unit.id, &settlement_unit)?;
-        store.put_settlement_unit_epoch(&settlement_unit.id, genesis.num)?;
-        store.put_settlement_unit_epoch_rev(genesis.num, &settlement_unit.id)?;
+        store.put_settlement_unit_checkpoint(&settlement_unit.id, genesis.num)?;
+        store.put_committed_settlement_unit_checkpoint_index(genesis.num, &settlement_unit.id)?;
         settlement_units.push(settlement_unit);
     }
     Ok(settlement_units)

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::sync::Arc;
 // use std::process; // removed unused
 
@@ -22,6 +23,51 @@ pub struct Store {
     path: String,
     mirror_tx: Option<std::sync::mpsc::Sender<(String, Vec<u8>)>>, // background mirroring
 }
+
+const STORE_COLUMN_FAMILIES: &[&str] = &[
+    "default",
+    "epoch",
+    "settlement_unit",
+    "settlement_unit_candidate",
+    "checkpoint_settlement_units",
+    "checkpoint_leaves",
+    "checkpoint_levels",
+    "settlement_unit_checkpoint",
+    "settlement_unit_checkpoint_index",
+    "head",
+    "anchor",
+    "validator_pool",
+    "validator_committee",
+    "tx",
+    "consensus_evidence",
+    "liveness_fault",
+    "validator_penalty_event",
+    "validator_reward_event",
+    "anchor_proposal_observation",
+    "validator_vote_observation",
+    "shared_state_dag_observation",
+    "fast_path_pending_tx",
+    "fast_path_batch",
+    "shared_state_pending_tx",
+    "shared_state_batch",
+    "shared_state_dag_batch",
+    "shared_state_dag_round",
+    "shared_state_finalized_batch",
+    "peers",
+    "meta",
+    "shielded_note_tree",
+    "shielded_nullifier_epoch",
+    "shielded_root_ledger",
+    "shielded_output",
+    "shielded_active_nullifier",
+    "shielded_spent_note",
+    "shielded_archive_provider",
+    "shielded_archive_replica",
+    "shielded_archive_operator",
+    "shielded_archive_accounting",
+    "shielded_archive_custody",
+    "shielded_archive_receipt",
+];
 
 fn build_cf_options() -> Options {
     let mut cf_opts = Options::default();
@@ -99,7 +145,7 @@ fn open_db_with_families(db_path: &str, cf_names: &[&str]) -> Result<DB> {
             if name == "settlement_unit_candidate" {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(32));
                 opts.set_optimize_filters_for_hits(true);
-            } else if name == "epoch_settlement_units" || name == "settlement_unit_epoch_by_epoch" {
+            } else if name == "checkpoint_settlement_units" || name == "settlement_unit_checkpoint_index" {
                 opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                 opts.set_optimize_filters_for_hits(true);
             }
@@ -270,51 +316,37 @@ impl Store {
         std::fs::create_dir_all(&backup_dir)
             .with_context(|| "Failed to create backup directory")?;
 
-        // Backup critical chain-state column families.
-        for cf_name in [
-            "epoch",
-            "anchor",
-            "validator_pool",
-            "validator_committee",
-            "tx",
-            "consensus_evidence",
-            "liveness_fault",
-            "validator_penalty_event",
-            "validator_reward_event",
-            "anchor_proposal_observation",
-            "validator_vote_observation",
-            "shared_state_dag_observation",
-            "shared_state_pending_tx",
-            "shared_state_batch",
-            "meta",
-            "shielded_note_tree",
-            "shielded_nullifier_epoch",
-            "shielded_root_ledger",
-            "shielded_output",
-            "shielded_active_nullifier",
-            "shielded_spent_note",
-        ] {
+        std::fs::write(
+            format!("{backup_dir}/MANIFEST"),
+            "unchained rocksdb column-family backup v1\nentry: key_len_le_u32 || key || value_len_le_u32 || value\n",
+        )?;
+
+        for &cf_name in STORE_COLUMN_FAMILIES {
             if let Some(cf_handle) = self.db.cf_handle(cf_name) {
                 let iter = self.db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start);
-                let cf_backup_dir = format!("{backup_dir}/{cf_name}");
-                std::fs::create_dir_all(&cf_backup_dir)?;
+                let cf_backup_file = format!("{backup_dir}/{cf_name}.kv");
+                let mut file = std::fs::File::create(&cf_backup_file)?;
 
-                for (i, item) in iter.enumerate() {
+                for item in iter {
                     let (key, value) = item?;
-                    let backup_file = format!("{cf_backup_dir}/{i:05}.dat");
-                    let backup_data = format!("{key:?}:{value:?}");
-                    std::fs::write(backup_file, backup_data)?;
+                    if key.len() > u32::MAX as usize || value.len() > u32::MAX as usize {
+                        bail!("column family entry too large to back up from '{cf_name}'");
+                    }
+                    file.write_all(&(key.len() as u32).to_le_bytes())?;
+                    file.write_all(&key)?;
+                    file.write_all(&(value.len() as u32).to_le_bytes())?;
+                    file.write_all(&value)?;
                 }
             }
         }
 
-        // Also backup settlement_units directory using cross-platform approach
+        // Also back up the settlement-unit mirror directory when mirroring is enabled.
         let settlement_units_backup = format!("{backup_dir}/settlement_units");
         if let Err(e) = copy_dir_all(&self.settlement_units_dir(), &settlement_units_backup) {
             eprintln!("Warning: Settlement unit backup failed: {e}");
         }
 
-        println!("✅ Backup created at: {backup_dir}");
+        println!("Backup created at: {backup_dir}");
         Ok(backup_dir)
     }
 
@@ -324,55 +356,19 @@ impl Store {
 
         // Do not delete RocksDB LOCK file; if present and DB open fails, surface error to caller
 
-        let cf_names = [
-            "default",
-            "epoch",
-            "settlement_unit",
-            "settlement_unit_candidate",
-            "epoch_settlement_units",      // per-epoch selected settlement unit IDs
-            "epoch_leaves",        // per-epoch sorted leaf hashes for proofs
-            "epoch_levels",        // per-epoch merkle levels for fast proofs
-            "settlement_unit_epoch", // settlement_unit_id -> epoch number mapping
-            "settlement_unit_epoch_by_epoch", // epoch_num||settlement_unit_id -> 1 (reverse index for range scans)
-            "head",
-            "anchor",
-            "validator_pool",      // validator_id -> ValidatorPool
-            "validator_committee", // epoch -> ValidatorSet
-            "tx",
-            "consensus_evidence",      // evidence_id -> ConsensusEvidenceRecord
-            "liveness_fault",          // evidence_id -> LivenessFaultRecord
-            "validator_penalty_event", // evidence_id -> ValidatorPenaltyEvent
-            "validator_reward_event",  // anchor_num||validator_id -> ValidatorRewardEvent
-            "anchor_proposal_observation", // proposer||epoch||slot -> StoredAnchorProposalObservation
-            "validator_vote_observation",  // voter||epoch||slot -> StoredValidatorVoteObservation
-            "shared_state_dag_observation", // epoch||round||author -> StoredSharedStateDagObservation
-            "fast_path_pending_tx",         // tx_id -> pending ordinary fast-path Tx
-            "fast_path_batch",              // ordered_tx_root -> FastPathBatch
-            "shared_state_pending_tx",      // tx_id -> pending shared-state Tx
-            "shared_state_batch",           // ordered_tx_root -> SharedStateBatch
-            "shared_state_dag_batch",       // batch_id -> SharedStateDagBatch
-            "shared_state_dag_round",       // epoch||round||author -> batch_id
-            "shared_state_finalized_batch", // batch_id -> anchor_num
-            "peers",
-            "meta", // miscellaneous metadata (e.g., cursors)
-            // Shielded pool state
-            "shielded_note_tree", // singleton canonical note commitment tree
-            "shielded_nullifier_epoch", // epoch -> ArchivedNullifierEpoch
-            "shielded_root_ledger", // singleton historical nullifier root ledger
-            "shielded_output",    // tx_id||output_index -> ShieldedOutput
-            "shielded_active_nullifier", // singleton current ActiveNullifierEpoch
-            "shielded_spent_note", // note_commitment -> spent marker
-            "shielded_archive_provider", // provider_id -> ArchiveProviderManifest
-            "shielded_archive_replica", // provider_id||shard_id -> ArchiveReplicaAttestation
-            "shielded_archive_operator", // provider_id -> ArchiveOperatorScorecard
-            "shielded_archive_accounting", // provider_id -> ArchiveServiceLedger
-            "shielded_archive_custody", // provider_id||shard_id -> ArchiveCustodyCommitment
-            "shielded_archive_receipt", // receipt_digest -> ArchiveRetrievalReceipt
-        ];
-
-        let mut db = open_db_with_families(&db_path, &cf_names)?;
+        let mut db = open_db_with_families(&db_path, STORE_COLUMN_FAMILIES)?;
         for obsolete_cf in [
             "wallet",
+            "coin",
+            "coin_candidate",
+            "epoch_selected",
+            "coin_epoch",
+            "coin_epoch_by_epoch",
+            "epoch_settlement_units",
+            "epoch_leaves",
+            "epoch_levels",
+            "settlement_unit_epoch",
+            "settlement_unit_epoch_by_epoch",
             "shielded_checkpoint",
             "shielded_owned_note",
             "delegation_share",
@@ -385,7 +381,7 @@ impl Store {
             }
         }
 
-        // Create settlement_units directory for individual settlement unit files
+        // Create the settlement-unit mirror directory for optional loose-file exports.
         let settlement_units_dir = format!("{db_path}/settlement_units");
         fs::create_dir_all(&settlement_units_dir).ok();
 
@@ -528,8 +524,11 @@ impl Store {
         format!("{}/settlement_units", self.path)
     }
 
-    /// Gets all settlement_units owned by a specific address
-    pub fn get_settlement_units_by_owner(&self, owner_address: &[u8; 32]) -> Result<Vec<crate::settlement_unit::SettlementUnit>> {
+    /// Gets all settlement units owned by a specific address.
+    pub fn get_settlement_units_by_owner(
+        &self,
+        owner_address: &[u8; 32],
+    ) -> Result<Vec<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
             .cf_handle("settlement_unit")
@@ -550,7 +549,7 @@ impl Store {
         Ok(settlement_units)
     }
 
-    /// Iterates over all settlement_units in the database
+    /// Iterates over all settlement units in the database.
     pub fn iterate_settlement_units(&self) -> Result<Vec<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
@@ -570,22 +569,28 @@ impl Store {
         Ok(settlement_units)
     }
 
-    /// Iterates over canonically committed settlement_units in deterministic epoch/id order.
-    pub fn iterate_committed_settlement_units(&self) -> Result<Vec<(u64, crate::settlement_unit::SettlementUnit)>> {
+    /// Iterates over canonically committed settlement units in deterministic checkpoint/id order.
+    pub fn iterate_committed_settlement_units(
+        &self,
+    ) -> Result<Vec<(u64, crate::settlement_unit::SettlementUnit)>> {
         let Some(latest) = self.get::<crate::epoch::Anchor>("epoch", b"latest")? else {
             return Ok(Vec::new());
         };
         let mut committed = Vec::new();
-        for epoch_num in 0..=latest.num {
-            for settlement_unit_id in self.get_settlement_unit_ids_for_epoch_committed(epoch_num)? {
+        for checkpoint_num in 0..=latest.num {
+            for settlement_unit_id in self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)? {
                 let settlement_unit = self
                     .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
-                    .ok_or_else(|| anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id)))?;
-                committed.push((epoch_num, settlement_unit));
+                    .ok_or_else(|| {
+                        anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id))
+                    })?;
+                committed.push((checkpoint_num, settlement_unit));
             }
         }
-        committed.sort_by(|(epoch_a, settlement_unit_a), (epoch_b, settlement_unit_b)| {
-            epoch_a.cmp(epoch_b).then(settlement_unit_a.id.cmp(&settlement_unit_b.id))
+        committed.sort_by(|(checkpoint_a, settlement_unit_a), (checkpoint_b, settlement_unit_b)| {
+            checkpoint_a
+                .cmp(checkpoint_b)
+                .then(settlement_unit_a.id.cmp(&settlement_unit_b.id))
         });
         Ok(committed)
     }
@@ -595,9 +600,10 @@ impl Store {
             return Ok(0);
         };
         let mut total = 0u64;
-        for epoch_num in 0..=latest.num {
-            total = total
-                .saturating_add(self.get_settlement_unit_ids_for_epoch_committed(epoch_num)?.len() as u64);
+        for checkpoint_num in 0..=latest.num {
+            total = total.saturating_add(
+                self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?.len() as u64,
+            );
         }
         Ok(total)
     }
@@ -615,8 +621,8 @@ impl Store {
         };
         let mut next_index = 0u64;
         let mut committed = Vec::with_capacity(limit);
-        for epoch_num in 0..=latest.num {
-            let mut settlement_unit_ids = self.get_settlement_unit_ids_for_epoch_committed(epoch_num)?;
+        for checkpoint_num in 0..=latest.num {
+            let mut settlement_unit_ids = self.get_committed_settlement_unit_ids_for_checkpoint(checkpoint_num)?;
             settlement_unit_ids.sort();
             for settlement_unit_id in settlement_unit_ids {
                 if next_index < start_index {
@@ -625,8 +631,10 @@ impl Store {
                 }
                 let settlement_unit = self
                     .get::<crate::settlement_unit::SettlementUnit>("settlement_unit", &settlement_unit_id)?
-                    .ok_or_else(|| anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id)))?;
-                committed.push((epoch_num, settlement_unit));
+                    .ok_or_else(|| {
+                        anyhow!("missing committed settlement unit {}", hex::encode(settlement_unit_id))
+                    })?;
+                committed.push((checkpoint_num, settlement_unit));
                 next_index = next_index.saturating_add(1);
                 if committed.len() >= limit {
                     return Ok(committed);
@@ -654,18 +662,19 @@ impl Store {
         Ok(settlement_units)
     }
 
-    /// Build the composite key for settlement unit candidates: epoch_hash || settlement_unit_id
-    pub fn candidate_key(epoch_hash: &[u8; 32], settlement_unit_id: &[u8; 32]) -> Vec<u8> {
+    /// Build the composite key for settlement unit candidates:
+    /// parent_checkpoint_hash || settlement_unit_id.
+    pub fn candidate_key(parent_checkpoint_hash: &[u8; 32], settlement_unit_id: &[u8; 32]) -> Vec<u8> {
         let mut key = Vec::with_capacity(64);
-        key.extend_from_slice(epoch_hash);
+        key.extend_from_slice(parent_checkpoint_hash);
         key.extend_from_slice(settlement_unit_id);
         key
     }
 
-    /// Iterate settlement unit candidates by epoch hash using bounded prefix iteration
-    pub fn get_settlement_unit_candidates_by_epoch_hash(
+    /// Iterate settlement unit candidates by parent checkpoint hash using bounded prefix iteration.
+    pub fn get_settlement_unit_candidates_by_parent_checkpoint_hash(
         &self,
-        epoch_hash: &[u8; 32],
+        parent_checkpoint_hash: &[u8; 32],
     ) -> Result<Vec<crate::settlement_unit::SettlementUnitCandidate>> {
         let cf = self
             .db
@@ -673,15 +682,15 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("'settlement_unit_candidate' column family missing"))?;
         let mut settlement_units = Vec::new();
         let mut upper = Vec::with_capacity(64);
-        upper.extend_from_slice(epoch_hash);
+        upper.extend_from_slice(parent_checkpoint_hash);
         upper.extend_from_slice(&[0xFF; 32]);
         let mut ro = rocksdb::ReadOptions::default();
-        ro.set_iterate_lower_bound(epoch_hash.to_vec());
+        ro.set_iterate_lower_bound(parent_checkpoint_hash.to_vec());
         ro.set_iterate_upper_bound(upper);
         let iter = self.db.iterator_cf_opt(
             cf,
             ro,
-            rocksdb::IteratorMode::From(epoch_hash, rocksdb::Direction::Forward),
+            rocksdb::IteratorMode::From(parent_checkpoint_hash, rocksdb::Direction::Forward),
         );
         for item in iter {
             let (k, v) = item?;
@@ -689,7 +698,7 @@ impl Store {
                 continue;
             }
             // within bounds due to iterate_upper_bound; keep prefix guard for safety
-            if &k[0..32] != &epoch_hash[..] {
+            if &k[0..32] != &parent_checkpoint_hash[..] {
                 break;
             }
             if let Ok(settlement_unit) = crate::settlement_unit::decode_settlement_unit_candidate(&v) {
@@ -700,7 +709,10 @@ impl Store {
     }
 
     /// Fetch a confirmed settlement unit by id.
-    pub fn get_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<crate::settlement_unit::SettlementUnit>> {
+    pub fn get_settlement_unit(
+        &self,
+        settlement_unit_id: &[u8; 32],
+    ) -> Result<Option<crate::settlement_unit::SettlementUnit>> {
         let cf = self
             .db
             .cf_handle("settlement_unit")
@@ -714,9 +726,9 @@ impl Store {
         }
     }
 
-    /// Deletes settlement unit candidates older than or equal to a specific epoch hash (best-effort GC)
-    /// Keeps candidates for recent epochs to support reorgs
-    pub fn prune_old_candidates(&self, keep_epoch_hash: &[u8; 32]) -> Result<()> {
+    /// Deletes settlement unit candidates outside the kept parent-checkpoint hashes.
+    /// Keeps recent candidates to support reorgs.
+    pub fn prune_old_candidates(&self, keep_parent_checkpoint_hash: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
             .cf_handle("settlement_unit_candidate")
@@ -725,20 +737,17 @@ impl Store {
         let mut batch = WriteBatch::default();
         let mut pruned: u64 = 0;
 
-        // Collect all epoch hashes to determine which ones to keep
-        let mut epoch_hashes = std::collections::HashSet::new();
-        epoch_hashes.insert(keep_epoch_hash.to_vec());
+        let mut parent_checkpoint_hashes = std::collections::HashSet::new();
+        parent_checkpoint_hashes.insert(keep_parent_checkpoint_hash.to_vec());
 
-        // Keep candidates for the current epoch hash and recent epochs to support reorgs
+        // Keep candidates for the current parent checkpoint to support reorgs.
         // For now, be very conservative and don't prune aggressively
         // This can be made more aggressive later once reorg stability is confirmed
         for item in iter {
             let (key, _) = item?;
             if key.len() >= 32 {
-                let epoch_hash = &key[0..32];
-                // Only prune if the candidate is for a significantly older epoch
-                // Keep candidates for recent epochs to support reorgs
-                if !epoch_hashes.contains(epoch_hash) {
+                let parent_checkpoint_hash = &key[0..32];
+                if !parent_checkpoint_hashes.contains(parent_checkpoint_hash) {
                     // For now, be very conservative and only prune very old candidates
                     // This can be made more aggressive later once reorg stability is confirmed
                     batch.delete_cf(cf, key);
@@ -754,50 +763,50 @@ impl Store {
         Ok(())
     }
 
-    /// Store sorted leaf hashes for an epoch for faster proof construction
-    pub fn store_epoch_leaves(&self, epoch_num: u64, leaves: &Vec<[u8; 32]>) -> Result<()> {
+    /// Store sorted leaf hashes for a checkpoint for faster proof construction.
+    pub fn store_checkpoint_leaves(&self, checkpoint_num: u64, leaves: &Vec<[u8; 32]>) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("epoch_leaves")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
-        let key = epoch_num.to_le_bytes();
+            .cf_handle("checkpoint_leaves")
+            .ok_or_else(|| anyhow::anyhow!("'checkpoint_leaves' column family missing"))?;
+        let key = checkpoint_num.to_le_bytes();
         let data = bincode::serialize(leaves)?;
         self.db.put_cf(cf, &key, &data)?;
         Ok(())
     }
 
-    /// Load sorted leaf hashes for an epoch if present
-    pub fn get_epoch_leaves(&self, epoch_num: u64) -> Result<Option<Vec<[u8; 32]>>> {
+    /// Load sorted leaf hashes for a checkpoint if present.
+    pub fn get_checkpoint_leaves(&self, checkpoint_num: u64) -> Result<Option<Vec<[u8; 32]>>> {
         let cf = self
             .db
-            .cf_handle("epoch_leaves")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_leaves' column family missing"))?;
-        let key = epoch_num.to_le_bytes();
+            .cf_handle("checkpoint_leaves")
+            .ok_or_else(|| anyhow::anyhow!("'checkpoint_leaves' column family missing"))?;
+        let key = checkpoint_num.to_le_bytes();
         match self.db.get_cf(cf, &key)? {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None => Ok(None),
         }
     }
 
-    /// Store full Merkle levels for an epoch for O(log N) proof generation without recomputation
-    pub fn store_epoch_levels(&self, epoch_num: u64, levels: &Vec<Vec<[u8; 32]>>) -> Result<()> {
+    /// Store full Merkle levels for a checkpoint for O(log N) proof generation without recomputation.
+    pub fn store_checkpoint_levels(&self, checkpoint_num: u64, levels: &Vec<Vec<[u8; 32]>>) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("epoch_levels")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
-        let key = epoch_num.to_le_bytes();
+            .cf_handle("checkpoint_levels")
+            .ok_or_else(|| anyhow::anyhow!("'checkpoint_levels' column family missing"))?;
+        let key = checkpoint_num.to_le_bytes();
         let data = bincode::serialize(levels)?;
         self.db.put_cf(cf, &key, &data)?;
         Ok(())
     }
 
-    /// Load Merkle levels for an epoch if present. Level 0 must be sorted leaves.
-    pub fn get_epoch_levels(&self, epoch_num: u64) -> Result<Option<Vec<Vec<[u8; 32]>>>> {
+    /// Load Merkle levels for a checkpoint if present. Level 0 must be sorted leaves.
+    pub fn get_checkpoint_levels(&self, checkpoint_num: u64) -> Result<Option<Vec<Vec<[u8; 32]>>>> {
         let cf = self
             .db
-            .cf_handle("epoch_levels")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_levels' column family missing"))?;
-        let key = epoch_num.to_le_bytes();
+            .cf_handle("checkpoint_levels")
+            .ok_or_else(|| anyhow::anyhow!("'checkpoint_levels' column family missing"))?;
+        let key = checkpoint_num.to_le_bytes();
         match self.db.get_cf(cf, &key)? {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None => Ok(None),
@@ -1880,14 +1889,14 @@ impl Store {
             .is_some())
     }
 
-    /// Gets selected settlement unit IDs for an epoch
-    pub fn get_settlement_unit_ids_for_epoch(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+    /// Gets settlement unit IDs selected by a checkpoint commitment.
+    pub fn get_selected_settlement_unit_ids_for_checkpoint(&self, checkpoint_num: u64) -> Result<Vec<[u8; 32]>> {
         let sel_cf = self
             .db
-            .cf_handle("epoch_settlement_units")
-            .ok_or_else(|| anyhow::anyhow!("'epoch_settlement_units' column family missing"))?;
+            .cf_handle("checkpoint_settlement_units")
+            .ok_or_else(|| anyhow::anyhow!("'checkpoint_settlement_units' column family missing"))?;
         let mut ids = Vec::new();
-        let start_key = epoch_num.to_le_bytes();
+        let start_key = checkpoint_num.to_le_bytes();
         let iter = self.db.iterator_cf(
             sel_cf,
             rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
@@ -1907,24 +1916,30 @@ impl Store {
         Ok(ids)
     }
 
-    pub fn put_settlement_unit_epoch_rev(&self, epoch_num: u64, settlement_unit_id: &[u8; 32]) -> Result<()> {
+    /// Records a fully recovered settlement unit in checkpoint/id scan order.
+    pub fn put_committed_settlement_unit_checkpoint_index(
+        &self,
+        checkpoint_num: u64,
+        settlement_unit_id: &[u8; 32],
+    ) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("settlement_unit_epoch_by_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch_by_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_checkpoint_index")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing"))?;
         let mut key = Vec::with_capacity(8 + 32);
-        key.extend_from_slice(&epoch_num.to_le_bytes());
+        key.extend_from_slice(&checkpoint_num.to_le_bytes());
         key.extend_from_slice(settlement_unit_id);
         self.db.put_cf(cf, &key, &[])?;
         Ok(())
     }
 
-    pub fn get_settlement_unit_ids_for_epoch_committed(&self, epoch_num: u64) -> Result<Vec<[u8; 32]>> {
+    /// Gets fully recovered settlement unit IDs in checkpoint/id scan order.
+    pub fn get_committed_settlement_unit_ids_for_checkpoint(&self, checkpoint_num: u64) -> Result<Vec<[u8; 32]>> {
         let cf = self
             .db
-            .cf_handle("settlement_unit_epoch_by_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch_by_epoch' column family missing"))?;
-        let start_key = epoch_num.to_le_bytes();
+            .cf_handle("settlement_unit_checkpoint_index")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint_index' column family missing"))?;
+        let start_key = checkpoint_num.to_le_bytes();
         let iter = self.db.iterator_cf(
             cf,
             rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
@@ -1939,40 +1954,40 @@ impl Store {
                 break;
             }
             let mut id = [0u8; 32];
-            id.copy_from_slice(&k[8..]);
+            id.copy_from_slice(&k[8..8 + 32]);
             ids.push(id);
         }
         Ok(ids)
     }
 
-    /// Persist a mapping settlement_unit_id -> epoch number that committed it
-    pub fn put_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32], epoch_num: u64) -> Result<()> {
+    /// Persist a mapping settlement_unit_id -> checkpoint number that committed it.
+    pub fn put_settlement_unit_checkpoint(&self, settlement_unit_id: &[u8; 32], checkpoint_num: u64) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("settlement_unit_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_checkpoint")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint' column family missing"))?;
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&epoch_num.to_le_bytes());
+        bytes.copy_from_slice(&checkpoint_num.to_le_bytes());
         self.db.put_cf(cf, settlement_unit_id, &bytes)?;
         Ok(())
     }
 
-    /// Delete a mapping settlement_unit_id -> epoch number (used during reorgs)
-    pub fn delete_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32]) -> Result<()> {
+    /// Delete a mapping settlement_unit_id -> checkpoint number (used during reorgs).
+    pub fn delete_settlement_unit_checkpoint(&self, settlement_unit_id: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
-            .cf_handle("settlement_unit_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_checkpoint")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint' column family missing"))?;
         self.db.delete_cf(cf, settlement_unit_id)?;
         Ok(())
     }
 
-    /// Retrieve epoch number that committed the given settlement_unit, if known
-    pub fn get_settlement_unit_epoch(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
+    /// Retrieve the checkpoint number that committed the given settlement unit, if known.
+    pub fn get_settlement_unit_checkpoint(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
         let cf = self
             .db
-            .cf_handle("settlement_unit_epoch")
-            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_epoch' column family missing"))?;
+            .cf_handle("settlement_unit_checkpoint")
+            .ok_or_else(|| anyhow::anyhow!("'settlement_unit_checkpoint' column family missing"))?;
         match self.db.get_cf(cf, settlement_unit_id)? {
             Some(v) => {
                 if v.len() != 8 {
@@ -1986,9 +2001,9 @@ impl Store {
         }
     }
 
-    /// Retrieve the epoch number for a settlement_unit from the committed reverse index.
-    pub fn get_epoch_for_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
-        self.get_settlement_unit_epoch(settlement_unit_id)
+    /// Retrieve the checkpoint number for a settlement unit from the committed index.
+    pub fn get_checkpoint_for_settlement_unit(&self, settlement_unit_id: &[u8; 32]) -> Result<Option<u64>> {
+        self.get_settlement_unit_checkpoint(settlement_unit_id)
     }
 
     /// Persist headers sync cursor (highest requested and highest stored header heights)
@@ -2022,12 +2037,12 @@ impl Store {
         Ok((0, 0))
     }
 
-    /// Convenience: fetch anchor by epoch number
-    pub fn get_anchor_by_epoch_num(&self, epoch_num: u64) -> Result<Option<crate::epoch::Anchor>> {
-        self.get("epoch", &epoch_num.to_le_bytes())
+    /// Convenience: fetch anchor by checkpoint number.
+    pub fn get_anchor_by_checkpoint_num(&self, checkpoint_num: u64) -> Result<Option<crate::epoch::Anchor>> {
+        self.get("epoch", &checkpoint_num.to_le_bytes())
     }
 
-    /// Gets the total number of settlement_units in the database
+    /// Gets the total number of settlement units in the database.
     pub fn settlement_unit_count(&self) -> Result<u64> {
         let cf = self
             .db
@@ -2039,7 +2054,7 @@ impl Store {
         Ok(count)
     }
 
-    /// Export all known anchors (by epoch number) into a compressed snapshot file.
+    /// Export all known anchors (by checkpoint number) into a compressed snapshot file.
     /// Returns the number of anchors written.
     pub fn export_anchors_snapshot(&self, out_path: &str) -> Result<usize> {
         use std::io::Write as _;
@@ -2053,7 +2068,7 @@ impl Store {
         let mut anchors: Vec<crate::epoch::Anchor> = Vec::new();
         for item in iter {
             let (k, v) = item?;
-            // Only include keys that are exactly 8 bytes (epoch number). Skip the "latest" marker and others.
+            // Only include keys that are exactly 8 bytes. Skip the "latest" marker and others.
             if k.len() != 8 {
                 continue;
             }
@@ -2063,7 +2078,7 @@ impl Store {
             };
             anchors.push(anchor);
         }
-        // Sort by epoch number to make snapshot deterministic
+        // Sort by checkpoint number to make snapshot deterministic.
         anchors.sort_by_key(|a| a.num);
         if anchors.is_empty() {
             anyhow::bail!("No anchors found to export");
@@ -2207,8 +2222,8 @@ impl Store {
         Ok(count)
     }
 
-    /// Deletes settlement unit candidates older than those referenced by the provided epoch hashes.
-    /// Keeps candidate entries whose key prefix (epoch_hash) is in `keep_hashes`.
+    /// Deletes settlement unit candidates older than those referenced by the provided parent checkpoints.
+    /// Keeps candidate entries whose key prefix is in `keep_hashes`.
     pub fn prune_candidates_keep_hashes(&self, keep_hashes: &[[u8; 32]]) -> Result<()> {
         let cf = self
             .db

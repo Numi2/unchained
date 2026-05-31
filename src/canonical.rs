@@ -17,8 +17,10 @@ use crate::{
         VoteEquivocationEvidence,
     },
     network::{
-        CompactEpoch, EpochByHash, EpochCandidatesResponse, EpochGetSettlementUnitBatch, EpochHeadersBatch,
-        EpochHeadersRange, EpochLeavesBundle, EpochSettlementUnitBatch, SettlementUnitIdsBundle,
+        CheckpointGetSettlementUnitBatch, CheckpointLeavesBundle,
+        CheckpointSettlementUnitBatch, CheckpointSettlementUnitCandidatesResponse,
+        CheckpointSettlementUnitIdsBundle, CompactEpoch, EpochByHash, EpochHeadersBatch,
+        EpochHeadersRange,
     },
     node_identity::{
         NodeRecordV2, SignedEnvelope, TrustApprovalV1, TrustUpdateAction, TrustUpdateV1,
@@ -1103,14 +1105,14 @@ pub fn decode_shared_state_dag_batch(bytes: &[u8]) -> Result<SharedStateDagBatch
 fn write_vote_target(writer: &mut CanonicalWriter, target: &crate::consensus::VoteTarget) {
     write_consensus_position(writer, &target.position);
     write_ordering_path(writer, target.ordering_path);
-    writer.write_fixed(&target.block_digest);
+    writer.write_fixed(&target.checkpoint_digest);
 }
 
 fn read_vote_target(reader: &mut CanonicalReader<'_>) -> Result<crate::consensus::VoteTarget> {
     Ok(crate::consensus::VoteTarget {
         position: read_consensus_position(reader)?,
         ordering_path: read_ordering_path(reader)?,
-        block_digest: reader.read_fixed()?,
+        checkpoint_digest: reader.read_fixed()?,
     })
 }
 
@@ -1362,7 +1364,7 @@ pub fn decode_anchor_proposal(bytes: &[u8]) -> Result<AnchorProposal> {
 pub fn write_settlement_unit(writer: &mut CanonicalWriter, settlement_unit: &SettlementUnit) -> Result<()> {
     writer.write_fixed(&settlement_unit.id);
     writer.write_u64(settlement_unit.value);
-    writer.write_fixed(&settlement_unit.epoch_hash);
+    writer.write_fixed(&settlement_unit.parent_checkpoint_hash);
     writer.write_u64(settlement_unit.nonce);
     write_address(writer, &settlement_unit.creator_address);
     write_tagged_signing_public_key(writer, &settlement_unit.creator_pk);
@@ -1374,7 +1376,7 @@ pub fn read_settlement_unit(reader: &mut CanonicalReader<'_>) -> Result<Settleme
     Ok(SettlementUnit {
         id: reader.read_fixed()?,
         value: reader.read_u64()?,
-        epoch_hash: reader.read_fixed()?,
+        parent_checkpoint_hash: reader.read_fixed()?,
         nonce: reader.read_u64()?,
         creator_address: read_address(reader)?,
         creator_pk: read_tagged_signing_public_key(reader)?,
@@ -1395,10 +1397,13 @@ pub fn decode_settlement_unit(bytes: &[u8]) -> Result<SettlementUnit> {
     Ok(settlement_unit)
 }
 
-pub fn write_settlement_unit_candidate(writer: &mut CanonicalWriter, settlement_unit: &SettlementUnitCandidate) -> Result<()> {
+pub fn write_settlement_unit_candidate(
+    writer: &mut CanonicalWriter,
+    settlement_unit: &SettlementUnitCandidate,
+) -> Result<()> {
     writer.write_fixed(&settlement_unit.id);
     writer.write_u64(settlement_unit.value);
-    writer.write_fixed(&settlement_unit.epoch_hash);
+    writer.write_fixed(&settlement_unit.parent_checkpoint_hash);
     writer.write_u64(settlement_unit.nonce);
     write_address(writer, &settlement_unit.creator_address);
     write_tagged_signing_public_key(writer, &settlement_unit.creator_pk);
@@ -1411,7 +1416,7 @@ pub fn read_settlement_unit_candidate(reader: &mut CanonicalReader<'_>) -> Resul
     Ok(SettlementUnitCandidate {
         id: reader.read_fixed()?,
         value: reader.read_u64()?,
-        epoch_hash: reader.read_fixed()?,
+        parent_checkpoint_hash: reader.read_fixed()?,
         nonce: reader.read_u64()?,
         creator_address: read_address(reader)?,
         creator_pk: read_tagged_signing_public_key(reader)?,
@@ -1578,9 +1583,9 @@ pub fn decode_recipient_handle(bytes: &[u8]) -> Result<RecipientHandle> {
     Ok(doc)
 }
 
-pub fn encode_epoch_leaves_bundle(bundle: &EpochLeavesBundle) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_leaves_bundle(bundle: &CheckpointLeavesBundle) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_u64(bundle.epoch_num);
+    writer.write_u64(bundle.checkpoint_num);
     writer.write_fixed(&bundle.merkle_root);
     writer.write_vec(&bundle.leaves, |writer, leaf| {
         writer.write_fixed(leaf);
@@ -1589,10 +1594,10 @@ pub fn encode_epoch_leaves_bundle(bundle: &EpochLeavesBundle) -> Result<Vec<u8>>
     Ok(writer.into_vec())
 }
 
-pub fn decode_epoch_leaves_bundle(bytes: &[u8]) -> Result<EpochLeavesBundle> {
+pub fn decode_checkpoint_leaves_bundle(bytes: &[u8]) -> Result<CheckpointLeavesBundle> {
     let mut reader = CanonicalReader::new(bytes);
-    let bundle = EpochLeavesBundle {
-        epoch_num: reader.read_u64()?,
+    let bundle = CheckpointLeavesBundle {
+        checkpoint_num: reader.read_u64()?,
         merkle_root: reader.read_fixed()?,
         leaves: reader.read_vec(|reader| reader.read_fixed())?,
     };
@@ -1600,9 +1605,9 @@ pub fn decode_epoch_leaves_bundle(bytes: &[u8]) -> Result<EpochLeavesBundle> {
     Ok(bundle)
 }
 
-pub fn encode_settlement_unit_ids_bundle(bundle: &SettlementUnitIdsBundle) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_settlement_unit_ids_bundle(bundle: &CheckpointSettlementUnitIdsBundle) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_u64(bundle.epoch_num);
+    writer.write_u64(bundle.checkpoint_num);
     writer.write_fixed(&bundle.merkle_root);
     writer.write_vec(&bundle.settlement_unit_ids, |writer, id| {
         writer.write_fixed(id);
@@ -1611,10 +1616,10 @@ pub fn encode_settlement_unit_ids_bundle(bundle: &SettlementUnitIdsBundle) -> Re
     Ok(writer.into_vec())
 }
 
-pub fn decode_settlement_unit_ids_bundle(bytes: &[u8]) -> Result<SettlementUnitIdsBundle> {
+pub fn decode_checkpoint_settlement_unit_ids_bundle(bytes: &[u8]) -> Result<CheckpointSettlementUnitIdsBundle> {
     let mut reader = CanonicalReader::new(bytes);
-    let bundle = SettlementUnitIdsBundle {
-        epoch_num: reader.read_u64()?,
+    let bundle = CheckpointSettlementUnitIdsBundle {
+        checkpoint_num: reader.read_u64()?,
         merkle_root: reader.read_fixed()?,
         settlement_unit_ids: reader.read_vec(|reader| reader.read_fixed())?,
     };
@@ -1622,19 +1627,23 @@ pub fn decode_settlement_unit_ids_bundle(bytes: &[u8]) -> Result<SettlementUnitI
     Ok(bundle)
 }
 
-pub fn encode_epoch_candidates_response(response: &EpochCandidatesResponse) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_settlement_unit_candidates_response(
+    response: &CheckpointSettlementUnitCandidatesResponse,
+) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&response.epoch_hash);
+    writer.write_fixed(&response.parent_checkpoint_hash);
     writer.write_vec(&response.candidates, |writer, settlement_unit| {
         write_settlement_unit_candidate(writer, settlement_unit)
     })?;
     Ok(writer.into_vec())
 }
 
-pub fn decode_epoch_candidates_response(bytes: &[u8]) -> Result<EpochCandidatesResponse> {
+pub fn decode_checkpoint_settlement_unit_candidates_response(
+    bytes: &[u8],
+) -> Result<CheckpointSettlementUnitCandidatesResponse> {
     let mut reader = CanonicalReader::new(bytes);
-    let response = EpochCandidatesResponse {
-        epoch_hash: reader.read_fixed()?,
+    let response = CheckpointSettlementUnitCandidatesResponse {
+        parent_checkpoint_hash: reader.read_fixed()?,
         candidates: reader.read_vec(read_settlement_unit_candidate)?,
     };
     reader.finish()?;
@@ -1687,9 +1696,9 @@ pub fn decode_compact_epoch(bytes: &[u8]) -> Result<CompactEpoch> {
     Ok(compact)
 }
 
-pub fn encode_epoch_get_settlement_unit_batch(request: &EpochGetSettlementUnitBatch) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_get_settlement_unit_batch(request: &CheckpointGetSettlementUnitBatch) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&request.epoch_hash);
+    writer.write_fixed(&request.checkpoint_hash);
     writer.write_vec(&request.indexes, |writer, index| {
         writer.write_u32(*index);
         Ok(())
@@ -1697,31 +1706,33 @@ pub fn encode_epoch_get_settlement_unit_batch(request: &EpochGetSettlementUnitBa
     Ok(writer.into_vec())
 }
 
-pub fn decode_epoch_get_settlement_unit_batch(bytes: &[u8]) -> Result<EpochGetSettlementUnitBatch> {
+pub fn decode_checkpoint_get_settlement_unit_batch(bytes: &[u8]) -> Result<CheckpointGetSettlementUnitBatch> {
     let mut reader = CanonicalReader::new(bytes);
-    let request = EpochGetSettlementUnitBatch {
-        epoch_hash: reader.read_fixed()?,
+    let request = CheckpointGetSettlementUnitBatch {
+        checkpoint_hash: reader.read_fixed()?,
         indexes: reader.read_vec(|reader| reader.read_u32())?,
     };
     reader.finish()?;
     Ok(request)
 }
 
-pub fn encode_epoch_settlement_unit_batch(response: &EpochSettlementUnitBatch) -> Result<Vec<u8>> {
+pub fn encode_checkpoint_settlement_unit_batch(response: &CheckpointSettlementUnitBatch) -> Result<Vec<u8>> {
     let mut writer = CanonicalWriter::new();
-    writer.write_fixed(&response.epoch_hash);
+    writer.write_fixed(&response.checkpoint_hash);
     writer.write_vec(&response.indexes, |writer, index| {
         writer.write_u32(*index);
         Ok(())
     })?;
-    writer.write_vec(&response.settlement_units, |writer, settlement_unit| write_settlement_unit(writer, settlement_unit))?;
+    writer.write_vec(&response.settlement_units, |writer, settlement_unit| {
+        write_settlement_unit(writer, settlement_unit)
+    })?;
     Ok(writer.into_vec())
 }
 
-pub fn decode_epoch_settlement_unit_batch(bytes: &[u8]) -> Result<EpochSettlementUnitBatch> {
+pub fn decode_checkpoint_settlement_unit_batch(bytes: &[u8]) -> Result<CheckpointSettlementUnitBatch> {
     let mut reader = CanonicalReader::new(bytes);
-    let response = EpochSettlementUnitBatch {
-        epoch_hash: reader.read_fixed()?,
+    let response = CheckpointSettlementUnitBatch {
+        checkpoint_hash: reader.read_fixed()?,
         indexes: reader.read_vec(|reader| reader.read_u32())?,
         settlement_units: reader.read_vec(read_settlement_unit)?,
     };

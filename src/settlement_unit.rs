@@ -11,7 +11,7 @@ const CANDIDATE_ADMISSION_DOMAIN: &str = "unchained.settlement-unit-candidate.ad
 pub struct SettlementUnit {
     pub id: [u8; 32],
     pub value: u64,
-    pub epoch_hash: [u8; 32],
+    pub parent_checkpoint_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
     /// Full creator signing key tagged with its PQ signature algorithm.
@@ -30,7 +30,7 @@ pub struct SettlementUnit {
 pub struct SettlementUnitCandidate {
     pub id: [u8; 32],
     pub value: u64,
-    pub epoch_hash: [u8; 32],
+    pub parent_checkpoint_hash: [u8; 32],
     pub nonce: u64,
     pub creator_address: Address,
     /// Full creator signing key tagged with its PQ signature algorithm.
@@ -43,18 +43,18 @@ pub struct SettlementUnitCandidate {
 
 impl SettlementUnit {
     /// Creates the canonical bytes that identify a bootstrap settlement unit.
-    pub fn header_bytes(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> Vec<u8> {
+    pub fn header_bytes(parent_checkpoint_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32 + 8 + 32);
-        bytes.extend_from_slice(epoch_hash);
+        bytes.extend_from_slice(parent_checkpoint_hash);
         bytes.extend_from_slice(&nonce.to_le_bytes());
         bytes.extend_from_slice(creator_address);
         bytes
     }
 
     /// Calculate the settlement unit ID from its components.
-    pub fn calculate_id(epoch_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
+    pub fn calculate_id(parent_checkpoint_hash: &[u8; 32], nonce: u64, creator_address: &Address) -> [u8; 32] {
         let mut id_hasher = blake3::Hasher::new();
-        id_hasher.update(epoch_hash);
+        id_hasher.update(parent_checkpoint_hash);
         id_hasher.update(&nonce.to_le_bytes());
         id_hasher.update(creator_address);
         *id_hasher.finalize().as_bytes()
@@ -62,17 +62,17 @@ impl SettlementUnit {
 
     /// Creates a new confirmed settlement unit (value=1) from raw fields.
     pub fn new_with_creator_pk_and_lock(
-        epoch_hash: [u8; 32],
+        parent_checkpoint_hash: [u8; 32],
         nonce: u64,
         creator_address: Address,
         creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
     ) -> Self {
-        let id = Self::calculate_id(&epoch_hash, nonce, &creator_address);
+        let id = Self::calculate_id(&parent_checkpoint_hash, nonce, &creator_address);
         SettlementUnit {
             id,
             value: 1,
-            epoch_hash,
+            parent_checkpoint_hash,
             nonce,
             creator_address,
             creator_pk,
@@ -80,9 +80,9 @@ impl SettlementUnit {
         }
     }
 
-    pub fn new(epoch_hash: [u8; 32], nonce: u64, creator_address: Address) -> Self {
+    pub fn new(parent_checkpoint_hash: [u8; 32], nonce: u64, creator_address: Address) -> Self {
         Self::new_with_creator_pk_and_lock(
-            epoch_hash,
+            parent_checkpoint_hash,
             nonce,
             creator_address,
             TaggedSigningPublicKey::zero_ml_dsa_65(),
@@ -98,14 +98,14 @@ impl SettlementUnit {
 
 impl SettlementUnitCandidate {
     pub fn admission_digest(
-        epoch_hash: &[u8; 32],
+        parent_checkpoint_hash: &[u8; 32],
         nonce: u64,
         creator_address: &Address,
         creator_pk: &TaggedSigningPublicKey,
         lock_hash: &[u8; 32],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(CANDIDATE_ADMISSION_DOMAIN);
-        hasher.update(epoch_hash);
+        hasher.update(parent_checkpoint_hash);
         hasher.update(&nonce.to_le_bytes());
         hasher.update(creator_address);
         hasher.update(creator_pk.as_slice());
@@ -114,23 +114,23 @@ impl SettlementUnitCandidate {
     }
 
     pub fn new(
-        epoch_hash: [u8; 32],
+        parent_checkpoint_hash: [u8; 32],
         nonce: u64,
         creator_address: Address,
         creator_pk: TaggedSigningPublicKey,
         lock_hash: [u8; 32],
     ) -> Self {
-        let id = SettlementUnit::calculate_id(&epoch_hash, nonce, &creator_address);
+        let id = SettlementUnit::calculate_id(&parent_checkpoint_hash, nonce, &creator_address);
         SettlementUnitCandidate {
             id,
             value: 1,
-            epoch_hash,
+            parent_checkpoint_hash,
             nonce,
             creator_address,
             creator_pk: creator_pk.clone(),
             lock_hash,
             admission_digest: Self::admission_digest(
-                &epoch_hash,
+                &parent_checkpoint_hash,
                 nonce,
                 &creator_address,
                 &creator_pk,
@@ -143,7 +143,7 @@ impl SettlementUnitCandidate {
         SettlementUnit {
             id: self.id,
             value: self.value,
-            epoch_hash: self.epoch_hash,
+            parent_checkpoint_hash: self.parent_checkpoint_hash,
             nonce: self.nonce,
             creator_address: self.creator_address,
             creator_pk: self.creator_pk,

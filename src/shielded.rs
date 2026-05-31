@@ -4242,7 +4242,7 @@ pub fn deterministic_genesis_note_key(settlement_unit: &SettlementUnit, chain_id
     let mut hasher = blake3::Hasher::new_derive_key(GENESIS_NOTE_KEY_DOMAIN);
     hasher.update(chain_id);
     hasher.update(&settlement_unit.id);
-    hasher.update(&settlement_unit.epoch_hash);
+    hasher.update(&settlement_unit.parent_checkpoint_hash);
     hasher.update(&settlement_unit.creator_pk.bytes);
     *hasher.finalize().as_bytes()
 }

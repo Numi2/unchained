@@ -354,12 +354,12 @@ fn finalized_fast_path_anchor(
     let target = VoteTarget {
         position,
         ordering_path: OrderingPath::FastPathPrivateTransfer,
-        block_digest: Anchor::compute_hash(
+        checkpoint_digest: Anchor::compute_hash(
             num,
             parent_hash,
             position,
             OrderingPath::FastPathPrivateTransfer,
-            [num as u8; 32],
+            [0u8; 32],
             0,
             0,
             &[],
@@ -386,7 +386,7 @@ fn finalized_fast_path_anchor(
         num,
         parent_hash,
         OrderingPath::FastPathPrivateTransfer,
-        [num as u8; 32],
+        [0u8; 32],
         0,
         0,
         Vec::new(),
@@ -535,7 +535,7 @@ fn liveness_fault_admission_slashes_pool_without_changing_share_ownership() -> R
     let target = VoteTarget {
         position,
         ordering_path: OrderingPath::FastPathPrivateTransfer,
-        block_digest: Anchor::compute_hash(
+        checkpoint_digest: Anchor::compute_hash(
             0,
             None,
             position,
@@ -824,10 +824,10 @@ fn repeated_safety_faults_retire_validator_permanently() -> Result<()> {
         let first_target = VoteTarget {
             position: ConsensusPosition { epoch: 0, slot },
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: [slot as u8 + 1; 32],
+            checkpoint_digest: [slot as u8 + 1; 32],
         };
         let second_target = VoteTarget {
-            block_digest: [slot as u8 + 2; 32],
+            checkpoint_digest: [slot as u8 + 2; 32],
             ..first_target.clone()
         };
         Ok(SlashableEvidence::Consensus(

@@ -3839,7 +3839,7 @@ impl Wallet {
 
         for record in self.sent_tx_records(store)? {
             history.push(TransactionRecord {
-                settlement_unit_id: record.tx_id,
+                entry_id: record.tx_id,
                 transfer_hash: record.tx_id,
                 commit_epoch: record.commit_epoch,
                 is_sender: true,
@@ -3852,7 +3852,7 @@ impl Wallet {
         for owned in self.iterate_owned_note_records(store)? {
             if let OwnedShieldedNoteSource::Received { tx_id, .. } = owned.source {
                 history.push(TransactionRecord {
-                    settlement_unit_id: owned.note.commitment,
+                    entry_id: owned.note.commitment,
                     transfer_hash: tx_id,
                     commit_epoch: owned.note.birth_epoch,
                     is_sender: false,
@@ -3866,7 +3866,7 @@ impl Wallet {
         history.sort_by(|a, b| {
             b.commit_epoch
                 .cmp(&a.commit_epoch)
-                .then(b.settlement_unit_id.cmp(&a.settlement_unit_id))
+                .then(b.entry_id.cmp(&a.entry_id))
         });
         Ok(history)
     }
@@ -3895,7 +3895,7 @@ impl Wallet {
 /// Represents a transaction record for wallet history
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransactionRecord {
-    pub settlement_unit_id: [u8; 32],
+    pub entry_id: [u8; 32],
     pub transfer_hash: [u8; 32],
     pub commit_epoch: u64,
     pub is_sender: bool,

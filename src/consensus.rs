@@ -9,7 +9,7 @@ pub const DEFAULT_SLOTS_PER_EPOCH: u32 = PROTOCOL.slots_per_epoch;
 pub const DEFAULT_SLOT_DURATION_MS: u64 = PROTOCOL.slot_duration_ms;
 pub const FAST_PATH_TIMEOUT_MS: u64 = PROTOCOL.fast_path_timeout_ms;
 pub const DAG_BFT_TIMEOUT_MS: u64 = PROTOCOL.dag_bft_timeout_ms;
-pub const MAX_SETTLEMENT_UNITS_PER_CHECKPOINT: u32 = PROTOCOL.max_settlement_units_per_epoch;
+pub const MAX_SETTLEMENT_UNITS_PER_CHECKPOINT: u32 = PROTOCOL.max_settlement_units_per_checkpoint;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValidatorId(pub [u8; 32]);
@@ -190,7 +190,7 @@ pub struct ConsensusPosition {
 pub struct VoteTarget {
     pub position: ConsensusPosition,
     pub ordering_path: OrderingPath,
-    pub block_digest: [u8; 32],
+    pub checkpoint_digest: [u8; 32],
 }
 
 impl VoteTarget {
@@ -203,7 +203,7 @@ impl VoteTarget {
             OrderingPath::FastPathPrivateTransfer => 0,
             OrderingPath::DagBftSharedState => 1,
         });
-        out.extend_from_slice(&self.block_digest);
+        out.extend_from_slice(&self.checkpoint_digest);
         out
     }
 }
@@ -437,7 +437,7 @@ mod tests {
         let target = VoteTarget {
             position: ConsensusPosition { epoch: 11, slot: 3 },
             ordering_path: OrderingPath::FastPathPrivateTransfer,
-            block_digest: [42u8; 32],
+            checkpoint_digest: [42u8; 32],
         };
         let target_bytes = target.signing_bytes();
         let votes = vec![
@@ -464,7 +464,7 @@ mod tests {
                 &VoteTarget {
                     position: ConsensusPosition { epoch: 11, slot: 3 },
                     ordering_path: OrderingPath::FastPathPrivateTransfer,
-                    block_digest: [42u8; 32],
+                    checkpoint_digest: [42u8; 32],
                 }
                 .signing_bytes(),
             )
@@ -475,7 +475,7 @@ mod tests {
             VoteTarget {
                 position: ConsensusPosition { epoch: 11, slot: 3 },
                 ordering_path: OrderingPath::FastPathPrivateTransfer,
-                block_digest: [42u8; 32],
+                checkpoint_digest: [42u8; 32],
             },
             insufficient_votes,
         )

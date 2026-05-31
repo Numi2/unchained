@@ -2081,7 +2081,7 @@ mod tests {
         let target = VoteTarget {
             position: ConsensusPosition { epoch: 0, slot: 0 },
             ordering_path: OrderingPath::DagBftSharedState,
-            block_digest: [5u8; 32],
+            checkpoint_digest: [5u8; 32],
         };
         let vote = ValidatorVote {
             voter: validator.id,

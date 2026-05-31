@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| "none".to_string())
             );
             println!("   ordering_path: {:?}", anchor.ordering_path);
-            println!("   merkle_root: {}", hex::encode(anchor.merkle_root));
+            println!("   settlement_unit_root: {}", hex::encode(anchor.merkle_root));
             println!("   bootstrap_units: {}", anchor.settlement_unit_count);
             println!(
                 "   validator_set_hash: {}",
@@ -56,11 +56,11 @@ fn main() -> anyhow::Result<()> {
             println!("   qc_votes: {}", anchor.qc.votes.len());
             println!("   qc_signed_power: {}", anchor.qc.signed_voting_power);
 
-            // Bootstrap settlement unit IDs recorded for this epoch (if any)
-            match db.get_settlement_unit_ids_for_epoch(anchor.num) {
+            // Bootstrap settlement unit IDs selected for this checkpoint (if any).
+            match db.get_selected_settlement_unit_ids_for_checkpoint(anchor.num) {
                 Ok(ids) => {
                     let len = ids.len();
-                    println!("   committed_bootstrap_unit_ids: {}", len);
+                    println!("   selected_bootstrap_unit_ids: {}", len);
                     if len > 0 {
                         let preview = len.min(5);
                         for (i, id) in ids.iter().take(preview).enumerate() {
@@ -70,10 +70,15 @@ fn main() -> anyhow::Result<()> {
                             println!("     … {} more", len - preview);
                         }
 
-                        // Show creator distribution for this epoch
+                        // Show creator distribution for this checkpoint
                         let mut creators = std::collections::HashSet::new();
                         for id in &ids {
-                            if let Ok(Some(settlement_unit)) = db.get::<unchained::settlement_unit::SettlementUnit>("settlement_unit", id) {
+                            if let Ok(Some(settlement_unit)) =
+                                db.get::<unchained::settlement_unit::SettlementUnit>(
+                                    "settlement_unit",
+                                    id,
+                                )
+                            {
                                 creators.insert(settlement_unit.creator_address);
                             }
                         }
@@ -89,12 +94,12 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    println!("   committed_bootstrap_unit_ids: n/a ({})", e);
+                    println!("   selected_bootstrap_unit_ids: n/a ({})", e);
                 }
             }
 
-            // Stored sorted leaves for this epoch (if present)
-            match db.get_epoch_leaves(anchor.num) {
+            // Stored sorted leaves for this checkpoint (if present)
+            match db.get_checkpoint_leaves(anchor.num) {
                 Ok(Some(leaves)) => {
                     println!("   leaves: {} ({} bytes each)", leaves.len(), 32);
                     if leaves.len() as u32 != anchor.settlement_unit_count {

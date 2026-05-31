@@ -395,12 +395,12 @@ fn finalized_fast_path_anchor_from_identities(
     let target = unchained::consensus::VoteTarget {
         position,
         ordering_path: OrderingPath::FastPathPrivateTransfer,
-        block_digest: Anchor::compute_hash(
+        checkpoint_digest: Anchor::compute_hash(
             num,
             parent_hash,
             position,
             OrderingPath::FastPathPrivateTransfer,
-            [num as u8; 32],
+            [0u8; 32],
             0,
             0,
             &[],
@@ -426,7 +426,7 @@ fn finalized_fast_path_anchor_from_identities(
         num,
         parent_hash,
         OrderingPath::FastPathPrivateTransfer,
-        [num as u8; 32],
+        [0u8; 32],
         0,
         0,
         Vec::new(),
