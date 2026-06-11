@@ -377,7 +377,7 @@ impl TrustUpdateV1 {
         }
         if required_approvals == 0 {
             if !self.approvals.is_empty() {
-                bail!("trust update approvals provided without configured trustees");
+                bail!("trust update approvals provided without code-defined trustees");
             }
             return Ok(());
         }
@@ -846,7 +846,7 @@ impl NodeIdentity {
             bail!("installed node record chain_id does not match local chain");
         }
         if record.addresses != addresses {
-            bail!("installed node record addresses differ from configured published addresses");
+            bail!("installed node record addresses differ from code-defined published addresses");
         }
         let node_id = derive_node_id(&record.root_spki);
         if node_id != record.node_id {
@@ -1339,7 +1339,7 @@ fn refresh_runtime_record(
     let root_path = dir.join(NODE_ROOT_KEY_PATH);
     if !root_path.exists() {
         bail!(
-            "installed node record is stale for the local chain/config and the node root key is unavailable for automatic refresh"
+            "installed node record is stale for the local chain/runtime profile and the node root key is unavailable for automatic refresh"
         );
     }
     let root = load_key(&root_path)?;

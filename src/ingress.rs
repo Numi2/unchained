@@ -421,7 +421,7 @@ impl AccessRelayServer {
         policy: AccessRelayPolicy,
     ) -> Result<Self> {
         if gateway_records.is_empty() {
-            bail!("access relay requires at least one configured submission gateway");
+            bail!("access relay requires at least one code-defined submission gateway");
         }
         let mut by_id = HashMap::new();
         let gateway_expected_peers = ExpectedPeerStore::new();
@@ -510,7 +510,7 @@ impl AccessRelayServer {
                 .context("access relay failed while reading the padded wallet envelope")?;
             if envelope.len() != self.policy.envelope_size_bytes {
                 bail!(
-                    "wallet ingress envelope size {} does not match the configured fixed size {}",
+                    "wallet ingress envelope size {} does not match the code-defined fixed size {}",
                     envelope.len(),
                     self.policy.envelope_size_bytes
                 );
@@ -595,7 +595,7 @@ impl SubmissionGatewayServer {
         policy: SubmissionGatewayPolicy,
     ) -> Result<Self> {
         if allowed_relays.is_empty() {
-            bail!("submission gateway requires at least one configured access relay");
+            bail!("submission gateway requires at least one authorized access relay");
         }
         let mut allowed_by_auth_spki = HashMap::new();
         for relay in allowed_relays {
@@ -661,7 +661,7 @@ impl SubmissionGatewayServer {
             .context("relay ingress handshake timed out")??;
         let tls_spki = tls_peer_spki(connection.peer_identity())?;
         if !self.allowed_relays_by_auth_spki.contains_key(&tls_spki) {
-            bail!("submission gateway rejected an unconfigured access relay");
+            bail!("submission gateway rejected an unauthorized access relay");
         }
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
@@ -840,12 +840,12 @@ fn seal_submission_to_gateway(
     let envelope_size_bytes = envelope_size_bytes.max(DEFAULT_ENVELOPE_SIZE_BYTES);
     let header_size = 1 + 32 + 32 + ML_KEM_768_CT_BYTES + 24;
     if envelope_size_bytes <= header_size + 16 + 4 {
-        bail!("configured ingress envelope size is too small");
+        bail!("code-defined ingress envelope size is too small");
     }
     let plaintext_capacity = envelope_size_bytes - header_size - 16;
     let plaintext = encode_gateway_submission(submission)?;
     if plaintext.len() + 4 > plaintext_capacity {
-        bail!("transaction exceeds the configured fixed ingress envelope size");
+        bail!("transaction exceeds the code-defined fixed ingress envelope size");
     }
     let mut padded_plaintext = vec![0u8; plaintext_capacity];
     padded_plaintext[..4].copy_from_slice(&(plaintext.len() as u32).to_le_bytes());

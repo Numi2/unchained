@@ -406,6 +406,9 @@ pub struct ProofPrivateExternalStakeWitness {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub asset_id: [u8; 32],
+    pub zcash_protocol: u8,
+    pub zcash_anchor_height: u64,
+    pub zcash_anchor_hash: [u8; 32],
     pub activation_epoch: u64,
     pub external_nullifier: [u8; 32],
     pub stake_position_commitment: [u8; 32],
@@ -417,11 +420,34 @@ pub struct ProofPrivateExternalStakeJournal {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub asset_id: [u8; 32],
+    pub zcash_protocol: u8,
+    pub zcash_anchor_height: u64,
+    pub zcash_anchor_hash: [u8; 32],
     pub activation_epoch: u64,
     pub external_nullifier: [u8; 32],
     pub stake_position_commitment: [u8; 32],
     pub receipt_note_commitment: [u8; 32],
     pub receipt_output: ProofShieldedOutputBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofExternalAssetAnchorWitness {
+    pub chain_id: [u8; 32],
+    pub current_epoch: u64,
+    pub asset_id: [u8; 32],
+    pub zcash_protocol: u8,
+    pub zcash_anchor_height: u64,
+    pub zcash_anchor_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofExternalAssetAnchorJournal {
+    pub chain_id: [u8; 32],
+    pub current_epoch: u64,
+    pub asset_id: [u8; 32],
+    pub zcash_protocol: u8,
+    pub zcash_anchor_height: u64,
+    pub zcash_anchor_hash: [u8; 32],
 }
 
 fn validate_input_history(

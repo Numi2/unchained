@@ -1899,8 +1899,8 @@ fn verify_snapshot_bundle(bundle: &DiscoverySnapshotBundle) -> Result<()> {
     Ok(())
 }
 
-pub fn discovery_state_path(base_path: &str, configured: Option<&str>) -> String {
-    configured
+pub fn discovery_state_path(base_path: &str, profile_path: Option<&str>) -> String {
+    profile_path
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
@@ -2564,7 +2564,7 @@ fn verify_query_budget_proof(
 ) -> Result<()> {
     let digest = query_budget_digest(manifest, request_id, query, &proof.nonce);
     if leading_zero_bits(&digest) < manifest.query_budget_work_bits as u32 {
-        bail!("discovery query budget proof is below the configured work target");
+        bail!("discovery query budget proof is below the code-defined work target");
     }
     Ok(())
 }
@@ -2689,7 +2689,7 @@ fn seal_request_to_server(
 ) -> Result<Vec<u8>> {
     let plaintext = encode_request(request)?;
     if plaintext.len() > max_request_bytes {
-        bail!("discovery request exceeds configured maximum size");
+        bail!("discovery request exceeds code-defined maximum size");
     }
     let x25519_secret = X25519StaticSecret::random_from_rng(rand::rngs::OsRng);
     let x25519_public = X25519PublicKey::from(&x25519_secret);

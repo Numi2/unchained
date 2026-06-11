@@ -17,7 +17,7 @@ use unchained::{
     epoch::Anchor,
     ingress, node_control,
     node_identity::{validator_from_record, NodeIdentity},
-    proof, proof_assistant, protocol,
+    proof, protocol,
     settlement_unit::SettlementUnit,
     staking::{ValidatorMetadata, ValidatorPool, ValidatorStatus},
     storage::WalletStore,
@@ -73,13 +73,6 @@ pub struct TestIngressHarness {
 }
 
 #[allow(dead_code)]
-pub struct TestProofAssistantHarness {
-    pub client: proof_assistant::ProofAssistantClient,
-    shutdown_tx: broadcast::Sender<()>,
-    task: JoinHandle<anyhow::Result<()>>,
-}
-
-#[allow(dead_code)]
 impl TestIngressHarness {
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(());
@@ -89,15 +82,6 @@ impl TestIngressHarness {
         self.gateway_task
             .await
             .map_err(|err| anyhow::anyhow!(err))??;
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-impl TestProofAssistantHarness {
-    pub async fn shutdown(self) -> anyhow::Result<()> {
-        let _ = self.shutdown_tx.send(());
-        self.task.await.map_err(|err| anyhow::anyhow!(err))??;
         Ok(())
     }
 }
@@ -494,39 +478,6 @@ pub async fn spawn_test_ingress(
         shutdown_tx,
         relay_task,
         gateway_task,
-    })
-}
-
-#[allow(dead_code)]
-pub async fn spawn_test_proof_assistant(
-    root_dir: &Path,
-    chain_id: [u8; 32],
-) -> anyhow::Result<TestProofAssistantHarness> {
-    let port = reserve_udp_port()?;
-    let assistant_dir = root_dir.join("proof-assistant");
-    let assistant_identity = install_runtime_identity(&assistant_dir, 0, chain_id, port)?;
-    let assistant_record = assistant_identity.record().clone();
-    let server = proof_assistant::ProofAssistantServer::bind(
-        &assistant_identity,
-        SocketAddr::from(([127, 0, 0, 1], port)),
-        proof_assistant::ProofAssistantPolicy::default(),
-    )?;
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let task = tokio::spawn({
-        let shutdown_rx = shutdown_tx.subscribe();
-        async move { server.serve(shutdown_rx).await }
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let client = proof_assistant::ProofAssistantClient::new(
-        assistant_record,
-        32 * 1024 * 1024,
-        16 * 1024 * 1024,
-        Duration::from_secs(30),
-    )?;
-    Ok(TestProofAssistantHarness {
-        client,
-        shutdown_tx,
-        task,
     })
 }
 

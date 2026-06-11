@@ -7,12 +7,12 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 use unchained::{
-    config::Net,
     consensus::{ConsensusPosition, OrderingPath, ValidatorVote, VoteTarget},
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
     evidence, network, node_control, node_identity,
     protocol::CURRENT as PROTOCOL,
+    runtime_profile::NetworkProfile,
     staking::ValidatorRewardEvent,
     storage::{Store, WalletStore},
     sync::SyncState,
@@ -28,8 +28,8 @@ fn pick_udp_port() -> u16 {
         .port()
 }
 
-fn build_net(port: u16) -> Net {
-    Net {
+fn build_net(port: u16) -> NetworkProfile {
+    NetworkProfile {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),

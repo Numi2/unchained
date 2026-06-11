@@ -241,7 +241,7 @@ pub fn spawn(
                                             } else if highest_seen == 0 {
                             if local_epoch > 0 {
                                 if has_bootstrap {
-                                    // With bootstrap configured, do not self-declare synced; keep polling peers.
+                                    // With bootstrap records present, do not self-declare synced; keep polling peers.
                                     sync_routine!("⏳ No peer anchors observed yet; requesting latest epoch (local {}).", local_epoch);
                                     net.request_latest_epoch().await;
                                 } else {

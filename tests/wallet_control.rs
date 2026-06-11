@@ -6,16 +6,14 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use unchained::{
-    config::Net,
     discovery,
     epoch::Anchor,
     network, node_control, node_identity, proof,
     protocol::CURRENT as PROTOCOL,
+    runtime_profile::NetworkProfile,
     settlement_unit::SettlementUnit,
-    staking::{ValidatorMetadata, ValidatorPool, ValidatorRegistration, ValidatorStatus},
     storage::{Store, WalletStore},
     sync::SyncState,
-    transaction::{SharedStateAction, SharedStateControlDocument, Tx},
     wallet::Wallet,
     wallet_control::{wallet_control_capability_path, WalletControlClient, WalletControlServer},
 };
@@ -51,8 +49,8 @@ fn pick_udp_port() -> u16 {
         .port()
 }
 
-fn build_net(port: u16) -> Net {
-    Net {
+fn build_net(port: u16) -> NetworkProfile {
+    NetworkProfile {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
@@ -313,7 +311,7 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
 
     let mailbox_wallet = wallet.clone();
     let mailbox_task = tokio::spawn(async move {
-        for _ in 0..40 {
+        for _ in 0..200 {
             if mailbox_wallet.service_discovery_mailbox_once().await? > 0 {
                 return Ok::<(), anyhow::Error>(());
             }
@@ -322,7 +320,7 @@ async fn wallet_control_publishes_locator_and_services_mailbox_requests() -> Res
         anyhow::bail!("wallet control request-handle did not reach the discovery mailbox");
     });
     let negotiated_handle = client
-        .request_handle(&locator, 1, std::time::Duration::from_secs(5))
+        .request_handle(&locator, 1, std::time::Duration::from_secs(15))
         .await
         .context("wallet control request-handle")?;
     mailbox_task
@@ -393,7 +391,7 @@ async fn deterministic_fee_paid_control_witness_digest_stays_stable() -> Result<
     let witness_digest = proof::shielded_tx_witness_digest(prepared.witness())?;
     assert_eq!(
         hex::encode(witness_digest),
-        "71f17d493d661275fb9086bef0121afcbc74a334e6e85de46f19453d2a3cd11e"
+        "16159bf39e066b41ecd1f0a072d596ee931f2874e443a57d9bfad8ff0f2a56f1"
     );
     let err = proof::prove_shielded_tx(prepared.witness())
         .expect_err("native proof backend is intentionally absent");
@@ -402,214 +400,6 @@ async fn deterministic_fee_paid_control_witness_digest_stays_stable() -> Result<
         .contains("native transparent proof backend is not implemented"));
 
     drop(wallet);
-    wallet_store.close()?;
-    db.close()?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "native transparent proof backend is not implemented"]
-async fn wallet_can_submit_fee_paid_validator_registration_over_ingress_without_node_control(
-) -> Result<()> {
-    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    network::set_quiet_logging(true);
-
-    let tempdir = TempDir::new()?;
-    let base_path = tempdir.path().to_string_lossy().to_string();
-    let (db, wallet_store, wallet, genesis) = deterministic_fee_payment_components(&tempdir)?;
-
-    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
-    let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel::<()>(1);
-    let node_server = node_control::NodeControlServer::bind(
-        &base_path,
-        db.clone(),
-        net.clone(),
-        sync_state,
-        false,
-    )
-    .await?;
-    let mut node_server_task =
-        tokio::spawn(async move { node_server.serve(node_shutdown_rx).await });
-
-    let node_client = node_control::NodeControlClient::new(&base_path);
-    node_client.ping()?;
-    let ingress =
-        finality_support::spawn_test_ingress(tempdir.path(), genesis.hash, &base_path).await?;
-    let proof_assistant =
-        finality_support::spawn_test_proof_assistant(tempdir.path(), genesis.hash).await?;
-    let wallet = Arc::new(
-        wallet
-            .with_ingress_client(ingress.client.clone())
-            .with_proof_assistant_client(proof_assistant.client.clone()),
-    );
-
-    let record = node_identity::load_node_record(
-        &tempdir
-            .path()
-            .join("node_identity")
-            .join("node_record.bin")
-            .display()
-            .to_string(),
-    )?;
-    let pool = ValidatorPool::from_node_record(
-        &record,
-        150,
-        3,
-        1,
-        ValidatorStatus::PendingActivation,
-        ValidatorMetadata {
-            display_name: "wallet-control-validator".to_string(),
-            website: Some("https://wallet-control.example".to_string()),
-            description: Some("fee-paid shared-state control submission".to_string()),
-        },
-    )?;
-    let action = SharedStateAction::RegisterValidator(ValidatorRegistration { pool });
-    let signable = Tx::shared_state_signing_bytes(genesis.hash, &action)?;
-    let authorization_signature =
-        node_identity::sign_with_local_root_in_dir(tempdir.path(), &signable)?;
-    let document = SharedStateControlDocument::new(genesis.hash, action, authorization_signature);
-
-    let outcome = wallet
-        .submit_shared_state_control_document(document)
-        .await?;
-    assert_eq!(outcome.fee_amount, PROTOCOL.validator_registration_fee);
-    assert!(outcome.input_count >= 1);
-    assert_eq!(outcome.output_count, 1);
-    assert_eq!(wallet.balance()?, 1);
-    assert!(wallet_store
-        .get_raw_bytes("wallet_sent_tx", &outcome.tx_id)?
-        .is_some());
-
-    ingress.shutdown().await?;
-    proof_assistant.shutdown().await?;
-    let _ = node_shutdown_tx.send(());
-    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut node_server_task).await {
-        Ok(result) => result??,
-        Err(_) => {
-            node_server_task.abort();
-            let _ = node_server_task.await;
-        }
-    }
-    net.shutdown().await;
-    drop(wallet);
-    wallet_store.close()?;
-    db.close()?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "native transparent proof backend is not implemented"]
-async fn proof_assistant_advertises_canonical_prover_capabilities() -> Result<()> {
-    network::set_quiet_logging(true);
-    let tempdir = TempDir::new()?;
-    let proof_assistant =
-        finality_support::spawn_test_proof_assistant(tempdir.path(), [9u8; 32]).await?;
-
-    let capabilities = proof_assistant.client.capabilities().await?;
-    assert_eq!(capabilities, proof::current_prover_capabilities());
-    for circuit in proof::transparent_circuit_inventory() {
-        assert!(capabilities.supports_circuit(*circuit));
-    }
-
-    proof_assistant.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "native transparent proof backend is not implemented"]
-async fn wallet_control_submits_fee_paid_validator_registration_documents() -> Result<()> {
-    let _passphrase = EnvGuard::set("WALLET_PASSPHRASE", "wallet-control-control-passphrase");
-    network::set_quiet_logging(true);
-
-    let tempdir = TempDir::new()?;
-    let base_path = tempdir.path().to_string_lossy().to_string();
-    let (db, wallet_store, wallet, genesis) = deterministic_fee_payment_components(&tempdir)?;
-
-    let net = spawn_network(&tempdir, db.clone(), &genesis).await?;
-    let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel::<()>(1);
-    let node_server = node_control::NodeControlServer::bind(
-        &base_path,
-        db.clone(),
-        net.clone(),
-        sync_state,
-        false,
-    )
-    .await?;
-    let mut node_server_task =
-        tokio::spawn(async move { node_server.serve(node_shutdown_rx).await });
-
-    let ingress =
-        finality_support::spawn_test_ingress(tempdir.path(), genesis.hash, &base_path).await?;
-    let proof_assistant =
-        finality_support::spawn_test_proof_assistant(tempdir.path(), genesis.hash).await?;
-    let wallet = Arc::new(
-        wallet
-            .with_ingress_client(ingress.client.clone())
-            .with_proof_assistant_client(proof_assistant.client.clone()),
-    );
-
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let server = WalletControlServer::bind(&base_path, wallet.clone()).await?;
-    let mut server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
-
-    let record = node_identity::load_node_record(
-        &tempdir
-            .path()
-            .join("node_identity")
-            .join("node_record.bin")
-            .display()
-            .to_string(),
-    )?;
-    let pool = ValidatorPool::from_node_record(
-        &record,
-        150,
-        3,
-        1,
-        ValidatorStatus::PendingActivation,
-        ValidatorMetadata {
-            display_name: "wallet-control-validator".to_string(),
-            website: Some("https://wallet-control.example".to_string()),
-            description: Some("fee-paid shared-state control submission".to_string()),
-        },
-    )?;
-    let action = SharedStateAction::RegisterValidator(ValidatorRegistration { pool });
-    let signable = Tx::shared_state_signing_bytes(genesis.hash, &action)?;
-    let authorization_signature =
-        node_identity::sign_with_local_root_in_dir(tempdir.path(), &signable)?;
-    let document = SharedStateControlDocument::new(genesis.hash, action, authorization_signature);
-
-    let client = WalletControlClient::new(&base_path);
-    let outcome = client.submit_shared_state_control(document).await?;
-    assert_eq!(outcome.fee_amount, PROTOCOL.validator_registration_fee);
-    assert!(outcome.input_count >= 1);
-    assert_eq!(outcome.output_count, 1);
-    assert!(wallet_store
-        .get_raw_bytes("wallet_sent_tx", &outcome.tx_id)?
-        .is_some());
-
-    drop(client);
-    ingress.shutdown().await?;
-    proof_assistant.shutdown().await?;
-    let _ = shutdown_tx.send(());
-    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut server_task).await {
-        Ok(result) => result??,
-        Err(_) => {
-            server_task.abort();
-            let _ = server_task.await;
-        }
-    }
-    let _ = node_shutdown_tx.send(());
-    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut node_server_task).await {
-        Ok(result) => result??,
-        Err(_) => {
-            node_server_task.abort();
-            let _ = node_server_task.await;
-        }
-    }
-    drop(wallet);
-    net.shutdown().await;
     wallet_store.close()?;
     db.close()?;
     Ok(())

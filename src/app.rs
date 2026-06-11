@@ -8,8 +8,8 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 
 use crate::{
-    canonical, config, discovery, epoch, ingress, metrics, network, node_control, node_identity,
-    proof_assistant, protocol, storage, sync, wallet, wallet_control,
+    canonical, discovery, epoch, ingress, metrics, network, node_control, node_identity, protocol,
+    runtime_profile, storage, sync, wallet, wallet_control,
 };
 use crate::{
     consensus::ValidatorId,
@@ -28,13 +28,6 @@ const WALLET_COVER_TRAFFIC_INTERVAL_SECS: u64 = 30;
 const WALLET_DISCOVERY_PUBLISH_INTERVAL_SECS: u64 = 300;
 const WALLET_DISCOVERY_POLL_INTERVAL_SECS: u64 = 5;
 
-#[derive(Args, Clone)]
-struct CommonArgs {
-    /// Suppress routine network gossip logs
-    #[arg(long, default_value_t = false)]
-    quiet_net: bool,
-}
-
 #[derive(Parser)]
 #[command(
     author,
@@ -44,9 +37,6 @@ struct CommonArgs {
     after_help = "Examples:\n  unchained_node init-root\n  unchained_node auth-prepare --out auth_request.txt\n  unchained_node auth-sign --request auth_request.txt --out node_record.txt\n  unchained_node auth-install --record node_record.txt\n  unchained_node validator-register-doc --bonded-stake 100 --activation-epoch 2 --commission-bps 250 --display-name \"Validator\" --out validator_register.json\n  unchained_node discovery-status --json\n  unchained_node discovery-export-snapshot --out discovery.snapshot\n  unchained_node discovery-import-snapshot --input discovery.snapshot\n  unchained_node start\n"
 )]
 struct NodeCli {
-    #[command(flatten)]
-    common: CommonArgs,
-
     #[command(subcommand)]
     cmd: NodeCmd,
 }
@@ -60,9 +50,6 @@ struct NodeCli {
     after_help = "Examples:\n  unchained_node start\n  unchained_node start-discovery\n  unchained_wallet serve\n  unchained_wallet receive\n  unchained_wallet receive-rotate\n  unchained_wallet receive-compromise\n  unchained_wallet resolve --locator <LOCATOR>\n  unchained_wallet request-handle --locator <LOCATOR> --amount 100\n  unchained_wallet invoice --amount 100\n  unchained_wallet send --to <LOCATOR> --amount 100\n  unchained_wallet send --invoice <RECIPIENT_INVOICE_JSON> --amount 100\n  unchained_wallet submit-control --document validator_register.json\n  unchained_wallet balance\n  unchained_wallet history\n"
 )]
 struct WalletCli {
-    #[command(flatten)]
-    common: CommonArgs,
-
     #[command(subcommand)]
     cmd: WalletCmd,
 }
@@ -370,33 +357,29 @@ fn short_text(value: &str) -> String {
     }
 }
 
-fn load_config() -> Result<config::Config> {
-    Ok(config::load())
+fn load_runtime_profile() -> Result<runtime_profile::RuntimeProfile> {
+    Ok(runtime_profile::load())
 }
 
-fn apply_quiet_logging(common: &CommonArgs) {
-    if common.quiet_net {
-        network::set_quiet_logging(true);
-    }
+fn open_store(cfg: &runtime_profile::RuntimeProfile) -> Result<Arc<Store>> {
+    Store::open(&cfg.storage.path)
+        .map(Arc::new)
+        .with_context(|| format!("database failed to open at '{}'", cfg.storage.path))
 }
 
-fn open_store(cfg: &config::Config) -> Result<Arc<Store>> {
-    storage::open(&cfg.storage)
-}
-
-fn open_wallet_store(cfg: &config::Config) -> Result<Arc<WalletStore>> {
+fn open_wallet_store(cfg: &runtime_profile::RuntimeProfile) -> Result<Arc<WalletStore>> {
     WalletStore::open(&cfg.storage.path).map(Arc::new)
 }
 
 fn open_optional_node_control_client(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
 ) -> Result<Option<node_control::NodeControlClient>> {
     let client = node_control::NodeControlClient::new(&cfg.storage.path);
     match client.ping() {
         Ok(()) => Ok(Some(client)),
         Err(_err)
-            if normalized_config_item(cfg.ingress.wallet.relay.as_deref()).is_some()
-                && normalized_config_item(cfg.ingress.wallet.gateway.as_deref()).is_some() =>
+            if normalized_profile_item(cfg.ingress.wallet.relay.as_deref()).is_some()
+                && normalized_profile_item(cfg.ingress.wallet.gateway.as_deref()).is_some() =>
         {
             Ok(None)
         }
@@ -405,7 +388,7 @@ fn open_optional_node_control_client(
 }
 
 async fn open_wallet_control_client(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
 ) -> Result<wallet_control::WalletControlClient> {
     let client = wallet_control::WalletControlClient::new(&cfg.storage.path);
     client.ping().await?;
@@ -413,12 +396,12 @@ async fn open_wallet_control_client(
 }
 
 async fn try_open_wallet_control_client(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
 ) -> Option<wallet_control::WalletControlClient> {
     open_wallet_control_client(cfg).await.ok()
 }
 
-fn published_identity_addresses(cfg: &config::Config) -> Vec<String> {
+fn published_identity_addresses(cfg: &runtime_profile::RuntimeProfile) -> Vec<String> {
     vec![std::net::SocketAddr::new(
         cfg.net
             .public_ip
@@ -504,7 +487,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn normalized_config_item(value: Option<&str>) -> Option<&str> {
+fn normalized_profile_item(value: Option<&str>) -> Option<&str> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -527,17 +510,19 @@ fn validator_metadata(
     }
 }
 
-fn require_local_chain_id(cfg: &config::Config) -> Result<[u8; 32]> {
+fn require_local_chain_id(cfg: &runtime_profile::RuntimeProfile) -> Result<[u8; 32]> {
     load_identity_chain_id(&cfg.storage.path)?.ok_or_else(|| {
         anyhow!("local chain id is unavailable; initialize canonical chain state first")
     })
 }
 
-fn listen_addr(cfg: &config::Config) -> std::net::SocketAddr {
+fn listen_addr(cfg: &runtime_profile::RuntimeProfile) -> std::net::SocketAddr {
     std::net::SocketAddr::from(([0, 0, 0, 0], cfg.net.listen_port))
 }
 
-fn load_runtime_identity(cfg: &config::Config) -> Result<node_identity::NodeIdentity> {
+fn load_runtime_identity(
+    cfg: &runtime_profile::RuntimeProfile,
+) -> Result<node_identity::NodeIdentity> {
     node_identity::NodeIdentity::load_runtime_in_dir(
         &cfg.storage.path,
         protocol::CURRENT.version,
@@ -584,11 +569,11 @@ fn load_ingress_records(
 }
 
 fn build_wallet_ingress_client(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     expected_chain_id: Option<[u8; 32]>,
 ) -> Result<Option<ingress::IngressClient>> {
-    let relay = normalized_config_item(cfg.ingress.wallet.relay.as_deref());
-    let gateway = normalized_config_item(cfg.ingress.wallet.gateway.as_deref());
+    let relay = normalized_profile_item(cfg.ingress.wallet.relay.as_deref());
+    let gateway = normalized_profile_item(cfg.ingress.wallet.gateway.as_deref());
     match (relay, gateway) {
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => bail!(
@@ -616,41 +601,11 @@ fn build_wallet_ingress_client(
     }
 }
 
-fn build_wallet_proof_assistant_client(
-    cfg: &config::Config,
-    expected_chain_id: Option<[u8; 32]>,
-) -> Result<Option<proof_assistant::ProofAssistantClient>> {
-    let server = normalized_config_item(cfg.proof_assistant.wallet.server.as_deref());
-    let Some(server) = server else {
-        return Ok(None);
-    };
-    let record = load_validated_service_record(server, "proof assistant")?;
-    let chain_id = record
-        .chain_id
-        .ok_or_else(|| anyhow!("proof assistant node record must be bound to a chain"))?;
-    if let Some(expected_chain_id) = expected_chain_id {
-        if chain_id != expected_chain_id {
-            bail!(
-                "proof assistant node record is bound to chain {}, expected {}",
-                hex::encode(chain_id),
-                hex::encode(expected_chain_id),
-            );
-        }
-    }
-    let policy = proof_assistant::ProofAssistantPolicy::default();
-    Ok(Some(proof_assistant::ProofAssistantClient::new(
-        record,
-        policy.max_request_bytes,
-        policy.max_response_bytes,
-        policy.submit_timeout,
-    )?))
-}
-
 fn build_wallet_discovery_client(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     expected_chain_id: Option<[u8; 32]>,
 ) -> Result<Option<discovery::DiscoveryClient>> {
-    let server = normalized_config_item(cfg.discovery.wallet.server.as_deref());
+    let server = normalized_profile_item(cfg.discovery.wallet.server.as_deref());
     let Some(server) = server else {
         return Ok(None);
     };
@@ -696,7 +651,9 @@ fn build_wallet_discovery_client(
     )?))
 }
 
-fn build_local_discovery_status_client(cfg: &config::Config) -> Result<discovery::DiscoveryClient> {
+fn build_local_discovery_status_client(
+    cfg: &runtime_profile::RuntimeProfile,
+) -> Result<discovery::DiscoveryClient> {
     let identity = load_runtime_identity(cfg)?;
     let policy = discovery::DiscoveryPolicy::default();
     discovery::DiscoveryClient::new(
@@ -716,14 +673,14 @@ fn submission_gateway_policy() -> ingress::SubmissionGatewayPolicy {
     ingress::SubmissionGatewayPolicy::default()
 }
 
-fn discovery_policy(cfg: &config::Config) -> discovery::DiscoveryPolicy {
+fn discovery_policy(cfg: &runtime_profile::RuntimeProfile) -> discovery::DiscoveryPolicy {
     let mut policy = discovery::DiscoveryPolicy::default();
     policy.allow_mutations = !cfg.discovery.server.query_only_replica;
     policy
 }
 
 fn load_operator_node_record(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     provided: Option<&str>,
 ) -> Result<node_identity::NodeRecordV2> {
     let record = if let Some(item) = provided {
@@ -746,7 +703,7 @@ fn load_operator_node_record(
 }
 
 fn sign_local_control_document(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     action: SharedStateAction,
 ) -> Result<SharedStateControlDocument> {
     let chain_id = require_local_chain_id(cfg)?;
@@ -756,7 +713,7 @@ fn sign_local_control_document(
 }
 
 fn build_validator_register_document(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     args: &ValidatorRegisterDocArgs,
 ) -> Result<SharedStateControlDocument> {
     let record = load_operator_node_record(cfg, args.node_record.as_deref())?;
@@ -783,7 +740,7 @@ fn build_validator_register_document(
 }
 
 fn build_validator_profile_document(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     args: &ValidatorProfileDocArgs,
 ) -> Result<SharedStateControlDocument> {
     let validator_id = if let Some(value) = args.validator_id.as_deref() {
@@ -807,7 +764,7 @@ fn build_validator_profile_document(
 }
 
 fn build_validator_reactivate_document(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     args: &ValidatorReactivateDocArgs,
 ) -> Result<SharedStateControlDocument> {
     let validator_id = if let Some(value) = args.validator_id.as_deref() {
@@ -823,7 +780,7 @@ fn build_validator_reactivate_document(
 }
 
 fn build_penalty_evidence_document(
-    cfg: &config::Config,
+    cfg: &runtime_profile::RuntimeProfile,
     args: &PenaltyEvidenceDocArgs,
 ) -> Result<SharedStateControlDocument> {
     let evidence: SlashableEvidence = load_json_document(&args.evidence, "slashable evidence")?;
@@ -834,7 +791,7 @@ fn build_penalty_evidence_document(
     ))
 }
 
-fn print_peer_id_output(cfg: &config::Config) -> Result<()> {
+fn print_peer_id_output(cfg: &runtime_profile::RuntimeProfile) -> Result<()> {
     let db = storage::Store::open(&cfg.storage.path)?;
     let chain_id = Some(db.effective_chain_id());
     let addresses = published_identity_addresses(cfg);
@@ -854,7 +811,10 @@ fn print_peer_id_output(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Result<bool> {
+async fn handle_node_operator_command(
+    cmd: &NodeCmd,
+    cfg: &runtime_profile::RuntimeProfile,
+) -> Result<bool> {
     match cmd {
         NodeCmd::InitRoot { out } => {
             let (node_id, root_info) = node_identity::init_root_in_dir(&cfg.storage.path)?;
@@ -1023,7 +983,7 @@ async fn handle_node_operator_command(cmd: &NodeCmd, cfg: &config::Config) -> Re
     }
 }
 
-async fn start_network_runtime(cfg: &config::Config) -> Result<NetworkRuntime> {
+async fn start_network_runtime(cfg: &runtime_profile::RuntimeProfile) -> Result<NetworkRuntime> {
     let db = open_store(cfg)?;
     let sync_state = Arc::new(Mutex::new(sync::SyncState::default()));
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -1453,8 +1413,7 @@ async fn resync_wallet_state(client: &wallet_control::WalletControlClient) -> Re
 
 pub async fn run_node_cli() -> Result<()> {
     let cli = NodeCli::parse();
-    let cfg = load_config()?;
-    apply_quiet_logging(&cli.common);
+    let cfg = load_runtime_profile()?;
 
     if handle_node_operator_command(&cli.cmd, &cfg).await? {
         return Ok(());
@@ -1571,7 +1530,7 @@ pub async fn run_node_cli() -> Result<()> {
                 "access relay",
                 chain_id,
             )?;
-            let validator_control_base_path = normalized_config_item(
+            let validator_control_base_path = normalized_profile_item(
                 cfg.ingress
                     .submission_gateway
                     .validator_control_base_path
@@ -1634,8 +1593,7 @@ pub async fn run_node_cli() -> Result<()> {
 
 pub async fn run_wallet_cli() -> Result<()> {
     let cli = WalletCli::parse();
-    let cfg = load_config()?;
-    apply_quiet_logging(&cli.common);
+    let cfg = load_runtime_profile()?;
 
     match cli.cmd {
         WalletCmd::Serve => {
@@ -1653,18 +1611,13 @@ pub async fn run_wallet_cli() -> Result<()> {
             if let Some(ingress_client) = ingress_client.clone() {
                 wallet = wallet.with_ingress_client(ingress_client);
             }
-            let proof_expected_chain_id = match (expected_chain_id, ingress_client.as_ref()) {
+            let discovery_expected_chain_id = match (expected_chain_id, ingress_client.as_ref()) {
                 (Some(chain_id), _) => Some(chain_id),
                 (None, Some(ingress_client)) => Some(ingress_client.chain_id()?),
                 (None, None) => None,
             };
-            if let Some(proof_assistant_client) =
-                build_wallet_proof_assistant_client(&cfg, proof_expected_chain_id)?
-            {
-                wallet = wallet.with_proof_assistant_client(proof_assistant_client);
-            }
             if let Some(discovery_client) =
-                build_wallet_discovery_client(&cfg, proof_expected_chain_id)?
+                build_wallet_discovery_client(&cfg, discovery_expected_chain_id)?
             {
                 wallet = wallet.with_discovery_client(discovery_client);
             }
@@ -1727,9 +1680,6 @@ pub async fn run_wallet_cli() -> Result<()> {
                 "Wallet ingress cover cadence: {} seconds",
                 WALLET_COVER_TRAFFIC_INTERVAL_SECS
             );
-            if wallet.has_proof_assistant_client() {
-                println!("Wallet remote proof assistant: enabled");
-            }
             if wallet.has_discovery_client() {
                 println!("Wallet discovery locator: {}", wallet.locator());
             }
@@ -1815,7 +1765,7 @@ pub async fn run_wallet_cli() -> Result<()> {
                     Err(err)
                         if err
                             .to_string()
-                            .contains("wallet discovery client is not configured") => {}
+                            .contains("wallet discovery client is not available") => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -1849,7 +1799,7 @@ pub async fn run_wallet_cli() -> Result<()> {
                     Err(err)
                         if err
                             .to_string()
-                            .contains("wallet discovery client is not configured") => {}
+                            .contains("wallet discovery client is not available") => {}
                     Err(err) => return Err(err),
                 }
             }

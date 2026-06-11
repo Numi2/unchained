@@ -44,11 +44,13 @@ use crate::{
         ValidatorReactivation, ValidatorRegistration, ValidatorStatus,
     },
     transaction::{
-        FastPathBatch, OrdinaryPrivateTransfer, PenaltyEvidenceAdmission, PrivateExternalStake,
-        SharedStateAction, SharedStateAuthorization, SharedStateBatch, SharedStateDagBatch,
-        SharedStateTx, ShieldedOutput, ShieldedOutputPlaintext, Tx,
+        ExternalAssetAnchorAdmission, FastPathBatch, OrdinaryPrivateTransfer,
+        PenaltyEvidenceAdmission, PrivateExternalStake, SharedStateAction,
+        SharedStateAuthorization, SharedStateBatch, SharedStateDagBatch, SharedStateTx,
+        ShieldedOutput, ShieldedOutputPlaintext, Tx,
     },
     wallet::RecipientHandle,
+    zcash::{ZcashShieldedProtocol, ZcashStakeAnchor},
 };
 
 pub struct CanonicalWriter {
@@ -810,11 +812,67 @@ fn read_external_asset(reader: &mut CanonicalReader<'_>) -> Result<ExternalAsset
     }
 }
 
+fn write_zcash_shielded_protocol(writer: &mut CanonicalWriter, protocol: ZcashShieldedProtocol) {
+    writer.write_u8(match protocol {
+        ZcashShieldedProtocol::OrchardV1 => 1,
+        ZcashShieldedProtocol::TachyonV1 => 2,
+    });
+}
+
+fn read_zcash_shielded_protocol(reader: &mut CanonicalReader<'_>) -> Result<ZcashShieldedProtocol> {
+    match reader.read_u8()? {
+        1 => Ok(ZcashShieldedProtocol::OrchardV1),
+        2 => Ok(ZcashShieldedProtocol::TachyonV1),
+        other => bail!("unsupported Zcash shielded protocol tag {}", other),
+    }
+}
+
+fn write_zcash_stake_anchor(writer: &mut CanonicalWriter, anchor: &ZcashStakeAnchor) {
+    write_zcash_shielded_protocol(writer, anchor.protocol);
+    writer.write_u64(anchor.height);
+    writer.write_fixed(&anchor.block_hash);
+    writer.write_fixed(&anchor.note_commitment_root);
+    writer.write_fixed(&anchor.nullifier_root);
+    writer.write_u32(anchor.confirmation_depth);
+}
+
+fn read_zcash_stake_anchor(reader: &mut CanonicalReader<'_>) -> Result<ZcashStakeAnchor> {
+    Ok(ZcashStakeAnchor {
+        protocol: read_zcash_shielded_protocol(reader)?,
+        height: reader.read_u64()?,
+        block_hash: reader.read_fixed()?,
+        note_commitment_root: reader.read_fixed()?,
+        nullifier_root: reader.read_fixed()?,
+        confirmation_depth: reader.read_u32()?,
+    })
+}
+
+fn write_external_asset_anchor_admission(
+    writer: &mut CanonicalWriter,
+    admission: &ExternalAssetAnchorAdmission,
+) -> Result<()> {
+    write_external_asset(writer, admission.asset);
+    write_zcash_stake_anchor(writer, &admission.zcash_anchor);
+    writer.write_bytes(&encode_transparent_proof(&admission.proof)?)?;
+    Ok(())
+}
+
+fn read_external_asset_anchor_admission(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<ExternalAssetAnchorAdmission> {
+    Ok(ExternalAssetAnchorAdmission {
+        asset: read_external_asset(reader)?,
+        zcash_anchor: read_zcash_stake_anchor(reader)?,
+        proof: decode_transparent_proof(&reader.read_bytes()?)?,
+    })
+}
+
 fn write_private_external_stake(
     writer: &mut CanonicalWriter,
     stake: &PrivateExternalStake,
 ) -> Result<()> {
     write_external_asset(writer, stake.asset);
+    write_zcash_stake_anchor(writer, &stake.zcash_anchor);
     writer.write_u64(stake.activation_epoch);
     writer.write_fixed(&stake.external_nullifier);
     writer.write_fixed(&stake.stake_position_commitment);
@@ -826,6 +884,7 @@ fn write_private_external_stake(
 fn read_private_external_stake(reader: &mut CanonicalReader<'_>) -> Result<PrivateExternalStake> {
     Ok(PrivateExternalStake {
         asset: read_external_asset(reader)?,
+        zcash_anchor: read_zcash_stake_anchor(reader)?,
         activation_epoch: reader.read_u64()?,
         external_nullifier: reader.read_fixed()?,
         stake_position_commitment: reader.read_fixed()?,
@@ -860,6 +919,10 @@ fn write_shared_state_action(
         SharedStateAction::ClaimUnbonding(claim) => {
             writer.write_u8(5);
             write_ordinary_private_transfer(writer, &claim.transfer)?;
+        }
+        SharedStateAction::AdmitExternalAssetAnchor(admission) => {
+            writer.write_u8(9);
+            write_external_asset_anchor_admission(writer, admission)?;
         }
         SharedStateAction::PrivateExternalStake(stake) => {
             writer.write_u8(8);
@@ -902,6 +965,9 @@ fn read_shared_state_action(reader: &mut CanonicalReader<'_>) -> Result<SharedSt
                 transfer: read_ordinary_private_transfer(reader)?,
             },
         )),
+        9 => Ok(SharedStateAction::AdmitExternalAssetAnchor(
+            read_external_asset_anchor_admission(reader)?,
+        )),
         8 => Ok(SharedStateAction::PrivateExternalStake(
             read_private_external_stake(reader)?,
         )),
@@ -940,7 +1006,8 @@ pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
         TransparentProofStatement::PrivateUndelegation => 2,
         TransparentProofStatement::UnbondingClaim => 3,
         TransparentProofStatement::PrivateExternalStake => 4,
-        TransparentProofStatement::CheckpointAccumulator => 5,
+        TransparentProofStatement::ExternalAssetAnchor => 5,
+        TransparentProofStatement::CheckpointAccumulator => 6,
     });
     writer.write_u8(match proof.circuit {
         TransparentCircuit::OrdinaryTransferV1 => 0,
@@ -948,7 +1015,8 @@ pub fn encode_transparent_proof(proof: &TransparentProof) -> Result<Vec<u8>> {
         TransparentCircuit::PrivateUndelegationV1 => 2,
         TransparentCircuit::UnbondingClaimV1 => 3,
         TransparentCircuit::ZcashShieldedStakeV1 => 4,
-        TransparentCircuit::CheckpointAccumulatorV1 => 5,
+        TransparentCircuit::ExternalAssetAnchorV1 => 5,
+        TransparentCircuit::CheckpointAccumulatorV1 => 6,
     });
     writer.write_u8(match proof.backend {
         TransparentProofBackend::NativeTransparentStarkV1 => 0,
@@ -968,7 +1036,8 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             2 => TransparentProofStatement::PrivateUndelegation,
             3 => TransparentProofStatement::UnbondingClaim,
             4 => TransparentProofStatement::PrivateExternalStake,
-            5 => TransparentProofStatement::CheckpointAccumulator,
+            5 => TransparentProofStatement::ExternalAssetAnchor,
+            6 => TransparentProofStatement::CheckpointAccumulator,
             other => bail!("unsupported transparent proof statement {}", other),
         },
         circuit: match reader.read_u8()? {
@@ -977,7 +1046,8 @@ pub fn decode_transparent_proof(bytes: &[u8]) -> Result<TransparentProof> {
             2 => TransparentCircuit::PrivateUndelegationV1,
             3 => TransparentCircuit::UnbondingClaimV1,
             4 => TransparentCircuit::ZcashShieldedStakeV1,
-            5 => TransparentCircuit::CheckpointAccumulatorV1,
+            5 => TransparentCircuit::ExternalAssetAnchorV1,
+            6 => TransparentCircuit::CheckpointAccumulatorV1,
             other => bail!("unsupported transparent proof circuit {}", other),
         },
         backend: match reader.read_u8()? {

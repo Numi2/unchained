@@ -3,7 +3,6 @@ mod finality_support;
 use anyhow::Result;
 use aws_lc_rs::{signature::UnparsedPublicKey, unstable::signature::ML_DSA_65};
 use rocksdb::WriteBatch;
-use std::sync::Arc;
 use tempfile::TempDir;
 use unchained::{
     consensus::{
@@ -16,14 +15,12 @@ use unchained::{
     protocol::CURRENT as PROTOCOL,
     staking::{
         expected_validator_set_for_epoch, load_or_compute_active_validator_set, PenaltyCause,
-        PenaltyFaultClass, PenaltyPolicy, ValidatorAccountability, ValidatorMetadata,
-        ValidatorPenaltyEvent, ValidatorPool, ValidatorProfileUpdate, ValidatorReactivation,
-        ValidatorRegistration, ValidatorStatus,
+        PenaltyFaultClass, PenaltyPolicy, ValidatorMetadata, ValidatorPenaltyEvent, ValidatorPool,
+        ValidatorProfileUpdate, ValidatorReactivation, ValidatorStatus,
     },
     transaction::{PenaltyEvidenceAdmission, SharedStateAction, Tx},
     Store,
 };
-use unchained::{storage::WalletStore, wallet::Wallet};
 
 fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> Result<Anchor> {
     let genesis = committee.genesis_anchor();
@@ -66,18 +63,6 @@ fn build_active_validator_pool(
         },
     )?;
     Ok((pool, hot_key, cold_key))
-}
-
-fn signed_shared_state_tx(
-    store: &Store,
-    wallet: &Wallet,
-    action: SharedStateAction,
-    cold_key: &aws_lc_rs::unstable::signature::PqdsaKeyPair,
-) -> Result<Tx> {
-    let signable = Tx::shared_state_signing_bytes(store.effective_chain_id(), &action)
-        .expect("encode shared-state signing message");
-    let signature = ml_dsa_65_sign(cold_key, &signable).expect("sign shared-state action");
-    finality_support::fee_paid_shared_state_tx(store, wallet, action, signature)
 }
 
 fn sign_shared_state_action(
@@ -255,6 +240,7 @@ fn apply_control_action_without_fee(
         SharedStateAction::PrivateDelegation(_)
         | SharedStateAction::PrivateUndelegation(_)
         | SharedStateAction::ClaimUnbonding(_)
+        | SharedStateAction::AdmitExternalAssetAnchor(_)
         | SharedStateAction::PrivateExternalStake(_) => {
             anyhow::bail!("test helper only supports fee-less control actions");
         }
@@ -266,19 +252,6 @@ fn apply_control_action_without_fee(
         store.db.write(batch)?;
     }
     Ok(())
-}
-
-fn build_single_action_fee_wallet(
-    dir: &TempDir,
-    store: &Store,
-    genesis: &Anchor,
-) -> Result<Wallet> {
-    std::env::set_var("WALLET_PASSPHRASE", "staking-transactions-passphrase");
-    let wallet_store = Arc::new(WalletStore::open(&dir.path().to_string_lossy())?);
-    let wallet = finality_support::deterministic_wallet(wallet_store)?;
-    let _ =
-        finality_support::seed_wallet_with_settlement_unit_values(store, &wallet, genesis, &[2])?;
-    Ok(wallet)
 }
 
 fn build_pending_validator_pool(
@@ -393,80 +366,6 @@ fn finalized_fast_path_anchor(
         validator_set.clone(),
         qc,
     )?)
-}
-
-#[test]
-#[ignore = "native transparent proof backend is not implemented"]
-fn validator_registration_transaction_updates_pools_and_future_committee() -> Result<()> {
-    let dir = TempDir::new()?;
-    let store = Store::open(&dir.path().to_string_lossy())?;
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(&store, &committee)?;
-    let wallet = build_single_action_fee_wallet(&dir, &store, &genesis)?;
-    let (pool, cold_key) = build_pending_validator_pool(9, genesis.position.epoch + 1)?;
-
-    let action = SharedStateAction::RegisterValidator(ValidatorRegistration { pool: pool.clone() });
-    let tx = signed_shared_state_tx(&store, &wallet, action, &cold_key)?;
-    let tx_id = tx.apply(&store)?;
-
-    assert!(store.get_raw_bytes("tx", &tx_id)?.is_some());
-    assert_eq!(
-        store.load_validator_pool(&pool.validator.id)?.as_ref(),
-        Some(&pool)
-    );
-
-    let next_epoch = genesis.position.epoch + 1;
-    let next_committee =
-        expected_validator_set_for_epoch(&store, next_epoch)?.expect("next epoch committee");
-    assert!(next_committee.validator(&pool.validator.id).is_some());
-    assert_eq!(
-        store
-            .load_validator_committee(genesis.position.epoch)?
-            .unwrap()
-            .epoch,
-        0
-    );
-
-    store.close()?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "native transparent proof backend is not implemented"]
-fn validator_profile_update_transaction_applies_from_fresh_fee_paid_control_submission(
-) -> Result<()> {
-    let dir = TempDir::new()?;
-    let store = Store::open(&dir.path().to_string_lossy())?;
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(&store, &committee)?;
-    let wallet = build_single_action_fee_wallet(&dir, &store, &genesis)?;
-    let (pool, cold_key) = build_pending_validator_pool(5, genesis.position.epoch + 1)?;
-    store.store_validator_pool(&pool)?;
-
-    let update = SharedStateAction::UpdateValidatorProfile(ValidatorProfileUpdate {
-        validator_id: pool.validator.id,
-        commission_bps: 325,
-        metadata: ValidatorMetadata {
-            display_name: "updated validator".to_string(),
-            website: Some("https://updated.example".to_string()),
-            description: Some("updated canonical profile".to_string()),
-        },
-    });
-    let tx = signed_shared_state_tx(&store, &wallet, update, &cold_key)?;
-    tx.apply(&store)?;
-
-    let stored = store
-        .load_validator_pool(&pool.validator.id)?
-        .expect("updated validator pool");
-    assert_eq!(stored.commission_bps, 325);
-    assert_eq!(stored.metadata.display_name, "updated validator");
-    assert_eq!(
-        stored.metadata.website.as_deref(),
-        Some("https://updated.example")
-    );
-
-    store.close()?;
-    Ok(())
 }
 
 #[test]
@@ -632,54 +531,6 @@ fn liveness_fault_admission_slashes_pool_without_changing_share_ownership() -> R
         store.load_liveness_fault_record(&liveness_records[0].evidence_id)?,
         Some(liveness_records[0].clone())
     );
-
-    store.close()?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "native transparent proof backend is not implemented"]
-fn validator_reactivation_transaction_applies_from_fresh_fee_paid_control_submission() -> Result<()>
-{
-    let dir = TempDir::new()?;
-    let store = Store::open(&dir.path().to_string_lossy())?;
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(&store, &committee)?;
-    let wallet = build_single_action_fee_wallet(&dir, &store, &genesis)?;
-    let (pool, _hot_key, cold_key) =
-        build_active_validator_pool(9, genesis.position.epoch, [0x44; 32])?;
-    let jailed_pool = ValidatorPool {
-        status: ValidatorStatus::Jailed,
-        accountability: ValidatorAccountability {
-            liveness_faults: PROTOCOL.liveness_fault_jail_threshold,
-            safety_faults: 0,
-            jailed_until_epoch: Some(genesis.position.epoch),
-        },
-        ..pool
-    };
-    jailed_pool.validate()?;
-    store.store_validator_pool(&jailed_pool)?;
-
-    let tx = signed_shared_state_tx(
-        &store,
-        &wallet,
-        SharedStateAction::ReactivateValidator(ValidatorReactivation {
-            validator_id: jailed_pool.validator.id,
-        }),
-        &cold_key,
-    )?;
-    tx.apply(&store)?;
-
-    let reactivated = store
-        .load_validator_pool(&jailed_pool.validator.id)?
-        .expect("reactivated validator pool");
-    assert_eq!(reactivated.status, ValidatorStatus::PendingActivation);
-    assert_eq!(reactivated.activation_epoch, genesis.position.epoch + 1);
-    assert_eq!(
-        reactivated.accountability.liveness_faults,
-        jailed_pool.accountability.liveness_faults
-    );
-    assert_eq!(reactivated.accountability.jailed_until_epoch, None);
 
     store.close()?;
     Ok(())

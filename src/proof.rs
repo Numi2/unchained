@@ -7,8 +7,9 @@ use proof_core::{
     HistoricalUnspentStratum as ProofHistoricalUnspentStratum,
     NoteMembershipProof as ProofNoteMembershipProof,
     NullifierMembershipWitness as ProofNullifierMembershipWitness,
-    NullifierNonMembershipProof as ProofNullifierNonMembershipProof, ProofPrivateDelegationJournal,
-    ProofPrivateDelegationWitness, ProofPrivateExternalStakeJournal,
+    NullifierNonMembershipProof as ProofNullifierNonMembershipProof,
+    ProofExternalAssetAnchorJournal, ProofExternalAssetAnchorWitness,
+    ProofPrivateDelegationJournal, ProofPrivateDelegationWitness, ProofPrivateExternalStakeJournal,
     ProofPrivateExternalStakeWitness, ProofPrivateUndelegationJournal,
     ProofPrivateUndelegationWitness, ProofShieldedInputWitness, ProofShieldedNote,
     ProofShieldedNoteKind, ProofShieldedOutput, ProofShieldedOutputBinding,
@@ -41,6 +42,7 @@ pub enum TransparentProofStatement {
     PrivateUndelegation,
     UnbondingClaim,
     PrivateExternalStake,
+    ExternalAssetAnchor,
     CheckpointAccumulator,
 }
 
@@ -66,6 +68,7 @@ pub enum TransparentCircuit {
     PrivateUndelegationV1,
     UnbondingClaimV1,
     ZcashShieldedStakeV1,
+    ExternalAssetAnchorV1,
     CheckpointAccumulatorV1,
 }
 
@@ -113,18 +116,18 @@ pub struct CheckpointAccumulatorProof {
     pub proof: TransparentProof,
 }
 
-fn configured_backend_for_circuit(_circuit: TransparentCircuit) -> TransparentProofBackend {
+fn canonical_backend_for_circuit(_circuit: TransparentCircuit) -> TransparentProofBackend {
     TransparentProofBackend::NativeTransparentStarkV1
 }
 
 fn ensure_canonical_backend_for_proof(proof: &TransparentProof) -> Result<()> {
-    let configured_backend = configured_backend_for_circuit(proof.circuit);
-    if configured_backend != proof.backend {
+    let canonical_backend = canonical_backend_for_circuit(proof.circuit);
+    if canonical_backend != proof.backend {
         bail!(
             "transparent proof circuit {:?} was produced by backend {:?}, but canonical backend is {:?}",
             proof.circuit,
             proof.backend,
-            configured_backend
+            canonical_backend
         );
     }
     Ok(())
@@ -134,14 +137,14 @@ fn supported_circuits_for_backend(backend: TransparentProofBackend) -> Vec<Trans
     transparent_circuit_inventory()
         .iter()
         .copied()
-        .filter(|circuit| configured_backend_for_circuit(*circuit) == backend)
+        .filter(|circuit| canonical_backend_for_circuit(*circuit) == backend)
         .collect()
 }
 
 impl TransparentProof {
     pub fn new(statement: TransparentProofStatement, seal: Vec<u8>) -> Self {
         let circuit = canonical_circuit_for_statement(statement);
-        let backend = configured_backend_for_circuit(circuit);
+        let backend = canonical_backend_for_circuit(circuit);
         Self {
             version: TRANSPARENT_PROOF_VERSION,
             statement,
@@ -161,7 +164,7 @@ impl TransparentProof {
         statement_digest: [u8; 32],
         seal: Vec<u8>,
     ) -> Self {
-        let backend = configured_backend_for_circuit(circuit);
+        let backend = canonical_backend_for_circuit(circuit);
         Self {
             version: TRANSPARENT_PROOF_VERSION,
             statement: transparent_circuit_descriptor(circuit).statement,
@@ -219,6 +222,7 @@ pub fn transparent_circuit_inventory() -> &'static [TransparentCircuit] {
         TransparentCircuit::PrivateUndelegationV1,
         TransparentCircuit::UnbondingClaimV1,
         TransparentCircuit::ZcashShieldedStakeV1,
+        TransparentCircuit::ExternalAssetAnchorV1,
         TransparentCircuit::CheckpointAccumulatorV1,
     ];
     INVENTORY
@@ -289,8 +293,16 @@ pub fn transparent_circuit_descriptor(circuit: TransparentCircuit) -> Transparen
             statement: TransparentProofStatement::PrivateExternalStake,
             proof_family: TransparentProofFamily::Stark,
             target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
-            public_input_shape: "zcash-shielded-stake-journal-v1",
+            public_input_shape: "zcash-shielded-stake-anchor-journal-v1",
             name: "zcash-shielded-stake-v1",
+        },
+        TransparentCircuit::ExternalAssetAnchorV1 => TransparentCircuitDescriptor {
+            circuit,
+            statement: TransparentProofStatement::ExternalAssetAnchor,
+            proof_family: TransparentProofFamily::Stark,
+            target_security_bits: MIN_TRANSPARENT_PROOF_SECURITY_BITS,
+            public_input_shape: "external-asset-anchor-journal-v1",
+            name: "external-asset-anchor-v1",
         },
         TransparentCircuit::CheckpointAccumulatorV1 => TransparentCircuitDescriptor {
             circuit,
@@ -357,7 +369,7 @@ impl TransparentProverCapabilities {
                     circuit
                 );
             }
-            if configured_backend_for_circuit(*circuit) != self.backend {
+            if canonical_backend_for_circuit(*circuit) != self.backend {
                 bail!(
                     "transparent prover backend {:?} is not canonical for circuit {:?}",
                     self.backend,
@@ -376,6 +388,7 @@ pub fn canonical_circuit_for_statement(statement: TransparentProofStatement) -> 
         TransparentProofStatement::PrivateUndelegation => TransparentCircuit::PrivateUndelegationV1,
         TransparentProofStatement::UnbondingClaim => TransparentCircuit::UnbondingClaimV1,
         TransparentProofStatement::PrivateExternalStake => TransparentCircuit::ZcashShieldedStakeV1,
+        TransparentProofStatement::ExternalAssetAnchor => TransparentCircuit::ExternalAssetAnchorV1,
         TransparentProofStatement::CheckpointAccumulator => {
             TransparentCircuit::CheckpointAccumulatorV1
         }
@@ -390,7 +403,8 @@ fn transparent_statement_tag(statement: TransparentProofStatement) -> u8 {
         TransparentProofStatement::PrivateUndelegation => 2,
         TransparentProofStatement::UnbondingClaim => 3,
         TransparentProofStatement::PrivateExternalStake => 4,
-        TransparentProofStatement::CheckpointAccumulator => 5,
+        TransparentProofStatement::ExternalAssetAnchor => 5,
+        TransparentProofStatement::CheckpointAccumulator => 6,
     }
 }
 
@@ -402,7 +416,8 @@ fn transparent_circuit_tag(circuit: TransparentCircuit) -> u8 {
         TransparentCircuit::PrivateUndelegationV1 => 2,
         TransparentCircuit::UnbondingClaimV1 => 3,
         TransparentCircuit::ZcashShieldedStakeV1 => 4,
-        TransparentCircuit::CheckpointAccumulatorV1 => 5,
+        TransparentCircuit::ExternalAssetAnchorV1 => 5,
+        TransparentCircuit::CheckpointAccumulatorV1 => 6,
     }
 }
 
@@ -539,6 +554,24 @@ pub fn verify_private_external_stake_proof(
         proof,
         TransparentProofStatement::PrivateExternalStake,
         "private external stake proof",
+    )?;
+    ensure_canonical_backend_for_proof(proof)?;
+    proof_backend_unavailable()
+}
+
+pub fn prove_external_asset_anchor(
+    _witness: &ProofExternalAssetAnchorWitness,
+) -> Result<(TransparentProof, ProofExternalAssetAnchorJournal)> {
+    proof_backend_unavailable()
+}
+
+pub fn verify_external_asset_anchor_proof(
+    proof: &TransparentProof,
+) -> Result<ProofExternalAssetAnchorJournal> {
+    require_transparent_statement(
+        proof,
+        TransparentProofStatement::ExternalAssetAnchor,
+        "external asset anchor proof",
     )?;
     ensure_canonical_backend_for_proof(proof)?;
     proof_backend_unavailable()

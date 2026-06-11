@@ -239,7 +239,7 @@ pub fn build_wallet_send_runtime_material(db: &Store) -> Result<WalletSendRuntim
 fn build_consensus_status(
     db: &Store,
     sync_state: &Arc<Mutex<SyncState>>,
-    bootstrap_configured: bool,
+    bootstrap_records_present: bool,
 ) -> Result<ConsensusStatus> {
     let latest_finalized_anchor = db.get::<Anchor>("epoch", b"latest")?;
     let active_validator_set = latest_finalized_anchor
@@ -278,7 +278,7 @@ fn build_consensus_status(
             )
         })
         .unwrap_or((false, 0, false));
-    let settlement_ready = if bootstrap_configured {
+    let settlement_ready = if bootstrap_records_present {
         synced && highest_seen_epoch > 0 && local_tip >= highest_seen_epoch && peer_confirmed_tip
     } else {
         latest_finalized_anchor.is_some()
@@ -304,11 +304,11 @@ fn build_consensus_status(
 fn build_node_control_state(
     db: &Store,
     sync_state: &Arc<Mutex<SyncState>>,
-    bootstrap_configured: bool,
+    bootstrap_records_present: bool,
 ) -> Result<NodeControlState> {
     Ok(NodeControlState {
         compact_wallet_sync: build_compact_wallet_sync_head(db)?,
-        consensus_status: build_consensus_status(db, sync_state, bootstrap_configured)?,
+        consensus_status: build_consensus_status(db, sync_state, bootstrap_records_present)?,
     })
 }
 
@@ -685,7 +685,7 @@ pub struct NodeControlServer {
     db: Arc<Store>,
     net: NetHandle,
     sync_state: Arc<Mutex<SyncState>>,
-    bootstrap_configured: bool,
+    bootstrap_records_present: bool,
     state_tx: watch::Sender<NodeControlStateEnvelope>,
     state_refresh_tx: mpsc::UnboundedSender<()>,
     state_refresh_rx: mpsc::UnboundedReceiver<()>,
@@ -697,7 +697,7 @@ impl NodeControlServer {
         db: Arc<Store>,
         net: NetHandle,
         sync_state: Arc<Mutex<SyncState>>,
-        bootstrap_configured: bool,
+        bootstrap_records_present: bool,
     ) -> Result<Self> {
         let socket_path = node_control_socket_path(base_path);
         let capability_path = node_control_capability_path(base_path);
@@ -705,7 +705,7 @@ impl NodeControlServer {
         let capability = local_control::write_capability_file(&capability_path, "node control")?;
         let initial_state = NodeControlStateEnvelope {
             sequence: 0,
-            state: build_node_control_state(db.as_ref(), &sync_state, bootstrap_configured)?,
+            state: build_node_control_state(db.as_ref(), &sync_state, bootstrap_records_present)?,
         };
         let (state_tx, _) = watch::channel(initial_state);
         let (state_refresh_tx, state_refresh_rx) = mpsc::unbounded_channel();
@@ -718,7 +718,7 @@ impl NodeControlServer {
             db,
             net,
             sync_state,
-            bootstrap_configured,
+            bootstrap_records_present,
             state_tx,
             state_refresh_tx,
             state_refresh_rx,
@@ -734,7 +734,7 @@ impl NodeControlServer {
         let publisher = tokio::spawn(run_state_publisher(
             self.db.clone(),
             self.sync_state.clone(),
-            self.bootstrap_configured,
+            self.bootstrap_records_present,
             self.state_tx.clone(),
             std::mem::replace(&mut self.state_refresh_rx, mpsc::unbounded_channel().1),
             publisher_shutdown,
@@ -936,7 +936,7 @@ async fn handle_request(
 async fn run_state_publisher(
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
-    bootstrap_configured: bool,
+    bootstrap_records_present: bool,
     state_tx: watch::Sender<NodeControlStateEnvelope>,
     mut state_refresh_rx: mpsc::UnboundedReceiver<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -958,7 +958,7 @@ async fn run_state_publisher(
             }
         }
         let next_state =
-            match build_node_control_state(db.as_ref(), &sync_state, bootstrap_configured) {
+            match build_node_control_state(db.as_ref(), &sync_state, bootstrap_records_present) {
                 Ok(state) => state,
                 Err(err) => {
                     eprintln!("node control state publisher failed to rebuild state: {err}");

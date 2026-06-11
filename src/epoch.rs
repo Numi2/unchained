@@ -668,7 +668,7 @@ impl MerkleTree {
 
 pub struct Manager {
     db: Arc<Store>,
-    net_cfg: crate::config::Net,
+    net_cfg: crate::runtime_profile::NetworkProfile,
     net: NetHandle,
     anchor_tx: broadcast::Sender<Anchor>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -677,7 +677,7 @@ pub struct Manager {
 impl Manager {
     pub fn new(
         db: Arc<Store>,
-        net_cfg: crate::config::Net,
+        net_cfg: crate::runtime_profile::NetworkProfile,
         net: NetHandle,
         shutdown_rx: broadcast::Receiver<()>,
         sync_state: std::sync::Arc<std::sync::Mutex<SyncState>>,
@@ -725,9 +725,9 @@ impl Manager {
 
                 if current_epoch == 0 {
                     if self.net_cfg.bootstrap.is_empty() {
-                        println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis (no bootstrap configured).");
+                        println!("⚠️  Network synchronization timeout or no peers found. Starting from genesis (no bootstrap records present).");
                     } else {
-                        println!("⚠️  Network sync timed out but bootstrap peers are configured; not creating local genesis. Waiting for network.");
+                        println!("⚠️  Network sync timed out but bootstrap peers are present in the runtime profile; not creating local genesis. Waiting for network.");
                     }
                 }
             }
@@ -751,7 +751,7 @@ impl Manager {
                             }
                         }
 
-                        // When bootstrap peers are configured, strictly avoid producing epochs until fully synced with peers.
+                        // When bootstrap peers are present in the runtime profile, strictly avoid producing epochs until fully synced with peers.
                         if !self.net_cfg.bootstrap.is_empty() {
                             let (synced, highest_seen, peer_confirmed) = self
                                 .sync_state
@@ -781,10 +781,10 @@ impl Manager {
 
                         if current_epoch == 0 {
                             if self.net_cfg.bootstrap.is_empty() {
-                                println!("🌱 No existing epochs found. Creating genesis anchor (no bootstrap configured)...");
+                                println!("🌱 No existing epochs found. Creating genesis anchor (no bootstrap records present)...");
                             } else {
                                 // Avoid creating a forked genesis when we expect a network
-                                println!("⏳ Waiting for network genesis (bootstrap configured), not creating local genesis.");
+                                println!("⏳ Waiting for network genesis (bootstrap records present), not creating local genesis.");
                                 continue;
                             }
                         }

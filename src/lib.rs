@@ -3,7 +3,6 @@
 
 pub mod app;
 pub mod canonical;
-pub mod config;
 pub mod consensus;
 pub mod crypto;
 pub mod discovery;
@@ -17,8 +16,8 @@ pub mod network;
 pub mod node_control;
 pub mod node_identity;
 pub mod proof;
-pub mod proof_assistant;
 pub mod protocol;
+pub mod runtime_profile;
 pub mod settlement_unit;
 pub mod shielded;
 pub mod staking;
@@ -27,6 +26,7 @@ pub mod sync;
 pub mod transaction;
 pub mod wallet;
 pub mod wallet_control;
+pub mod zcash;
 
 pub use crypto::{address_from_pk, blake3_hash, Address};
 pub use epoch::{Anchor, MerkleTree};

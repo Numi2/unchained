@@ -60,13 +60,16 @@ Transaction validity is enforced through purpose-built, transparent STARK-family
 
 Unchained now has a protocol-native external-stake action shape for shielded
 ZEC. The action commits to the external Zcash stake nullifier, a hidden stake
-position, and a shielded Unchained receipt note. Validators can use the external
-nullifier as a public double-stake prevention key without learning the Zcash
-address, ZEC amount, or Unchained receipt owner.
+position, an accepted Zcash stake anchor, and a shielded Unchained receipt note.
+Anchors are admitted through their own proof-authorized shared-state action and
+bind protocol tag, Zcash height, block hash, note commitment root, and nullifier
+root; `OrchardV1` and `TachyonV1` are code-defined protocol variants.
+Validators can use the external nullifier as a public double-stake prevention
+key without learning the Zcash address, ZEC amount, or Unchained receipt owner.
 
 This path is intentionally not live until the native transparent backend can
-prove the Zcash-side lock and receipt binding. The checked-in code fails closed
-rather than accepting attestation-only staking.
+prove the Zcash-side lock, accepted anchor, and receipt binding. The checked-in
+code fails closed rather than accepting attestation-only staking.
 
 ## Repository Status and Build Instructions
 
@@ -75,14 +78,13 @@ Legacy Proof-of-Work artifacts are deprecated, and requester-linked archive
 receipt accounting has been removed from the live protocol. `ARCHITECTURE.md`
 serves as the definitive specification.
 
-## Configuration Posture
+## Runtime Profile Posture
 
 Unchained is intentionally not a tuneable protocol kit. The node and wallet do
-not parse a config file. Local storage, listen address, bootstrap trust records,
+not parse a runtime settings file. Local storage, listen address, bootstrap trust records,
 role endpoint records, consensus timing, validator/P2P limits, transport
-windows, privacy padding, batching, proof-assistant limits, discovery
-PIR/query-budget policy, metrics binding, and anti-abuse thresholds are
-code-defined.
+windows, privacy padding, batching, discovery PIR/query-budget policy, metrics
+binding, and anti-abuse thresholds are code-defined.
 
 ## Product Definition
 
@@ -171,7 +173,7 @@ locator payments use that descriptor directly, so wallet-to-wallet sends remain
 asynchronous even when the recipient is offline. Negotiated one-time
 `RecipientHandle`s remain for flows that need explicit recipient authorization,
 request-specific policy, or invoice semantics. Wallets can also verify locator
-resolution against multiple configured discovery mirrors, and negotiated
+resolution against multiple code-defined discovery mirrors, and negotiated
 handles or direct invoices can bind an exact requested amount when the receive
 flow requires it. Discovery operators can inspect the live manifest, PIR
 envelope, manifest dataset ID, snapshot epoch, and mailbox queue state through
@@ -421,12 +423,12 @@ wallet prepare/submit flows no longer depend on a local node-control socket
 either. The heavyweight full shielded runtime snapshot remains only as an
 explicit local/test utility.
 
-Those send, staking, ingress, and proof-assistant paths now also use a
-canonical `TransparentProof` object with an explicit statement kind instead of
-passing raw backend seal bytes through transaction and wallet state. Proof
-metadata validation now lives behind `src/proof.rs`, which keeps the
-steady-state protocol and wallet model stable while the native proving backend
-is implemented.
+Those send, staking, and ingress paths now use a canonical `TransparentProof`
+object with an explicit statement kind instead of passing raw backend seal
+bytes through transaction and wallet state. The remote proof-assistant service
+was pruned until a native prover exists; proof metadata validation now lives
+behind `src/proof.rs`, which keeps the steady-state protocol and wallet model
+stable while the native proving backend is implemented.
 
 That proof boundary now carries an explicit canonical circuit inventory as
 well: ordinary transfer, private delegation, private undelegation, unbonding
@@ -468,7 +470,7 @@ critical path.
 
 Ordinary-path submission now runs through the real two-role ingress boundary.
 `unchained_node start-access-relay` and `unchained_node start-submission-gateway`
-host distinct ingress roles, `unchained_wallet serve` submits through configured
+host distinct ingress roles, `unchained_wallet serve` submits through code-defined
 relay/gateway records instead of direct validator submission, and the ingress
 wire path uses hybrid X25519+ML-KEM768 sealing, fixed-size padded envelopes,
 short release windows, and micro-batched validator ingress. While the wallet is

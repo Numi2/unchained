@@ -32,7 +32,7 @@ Hardened the network against traffic analysis:
 ## 6. Wallet Sync & Light Clients
 Optimized the wallet experience for privacy and performance:
 - **Compact Sync**: Replaced requester-linked historical queries with a compact light-client sync path that keeps ownership detection local to the wallet.
-- **Remote Proving**: Introduced a proof-assistant role, allowing mobile and remote wallets to offload heavy proving work without sacrificing privacy.
+- **Proof Boundary**: Standardized wallet and transaction flows on canonical proof objects while keeping verification fail-closed until the native backend exists.
 
 ## 7. Testing & Verification
 Established a robust verification suite:

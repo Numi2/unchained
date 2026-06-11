@@ -21,7 +21,7 @@ use crate::storage::{protocol_chain_id, Store};
 use crate::sync::SyncState;
 use crate::transaction::{FastPathBatch, SharedStateBatch, SharedStateDagBatch};
 use crate::{
-    config,
+    runtime_profile,
     settlement_unit::{SettlementUnit, SettlementUnitCandidate},
     shielded::{
         local_archive_custody_commitments, local_archive_provider_manifest,
@@ -691,7 +691,7 @@ impl RuntimeState {
         state.messages_in_window = state.messages_in_window.saturating_add(1);
         if state.messages_in_window > self.p2p_policy.max_messages_per_window {
             state.banned_until = Some(now + self.p2p_policy.peer_ban_duration);
-            bail!("peer exceeded the configured ingress message budget");
+            bail!("peer exceeded the code-defined ingress message budget");
         }
         Ok(())
     }
@@ -3367,7 +3367,7 @@ impl RuntimeState {
 }
 
 pub async fn spawn(
-    net_cfg: config::Net,
+    net_cfg: runtime_profile::NetworkProfile,
     db: Arc<Store>,
     sync_state: Arc<Mutex<SyncState>>,
 ) -> Result<NetHandle> {
@@ -4833,7 +4833,7 @@ async fn read_hello_message(recv: &mut quinn::RecvStream) -> Result<HelloMessage
     }
 }
 
-fn published_addresses(net_cfg: &config::Net) -> Vec<String> {
+fn published_addresses(net_cfg: &runtime_profile::NetworkProfile) -> Vec<String> {
     let ip = net_cfg
         .public_ip
         .as_ref()

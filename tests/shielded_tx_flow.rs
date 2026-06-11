@@ -6,14 +6,13 @@ use std::sync::{Arc, LazyLock as Lazy, Mutex};
 use tempfile::TempDir;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{timeout, Duration};
-use unchained::config::Net;
-use unchained::consensus::OrderingPath;
 use unchained::epoch::Anchor;
 use unchained::network;
 use unchained::node_control;
 use unchained::node_identity;
 use unchained::proof::{TransparentProof, TransparentProofStatement};
 use unchained::protocol::CURRENT as PROTOCOL;
+use unchained::runtime_profile::NetworkProfile;
 use unchained::settlement_unit::SettlementUnit;
 use unchained::shielded::ShieldedNoteKind;
 use unchained::storage::{Store, WalletStore};
@@ -37,8 +36,8 @@ fn pick_udp_port() -> u16 {
         .port()
 }
 
-fn build_net(port: u16) -> Net {
-    Net {
+fn build_net(port: u16) -> NetworkProfile {
+    NetworkProfile {
         listen_port: port,
         bootstrap: Vec::new(),
         trust_updates: Vec::new(),
@@ -120,10 +119,20 @@ async fn spawn_sender_network(
     sender_db: Arc<Store>,
     genesis: &Anchor,
 ) -> anyhow::Result<unchained::network::NetHandle> {
-    let port = pick_udp_port();
-    provision_runtime_identity(sender_dir, genesis.hash, format!("127.0.0.1:{port}"))?;
-    let sync_state = Arc::new(Mutex::new(SyncState::default()));
-    network::spawn(build_net(port), sender_db, sync_state).await
+    let mut last_err = None;
+    for _ in 0..8 {
+        let port = pick_udp_port();
+        provision_runtime_identity(sender_dir, genesis.hash, format!("127.0.0.1:{port}"))?;
+        let sync_state = Arc::new(Mutex::new(SyncState::default()));
+        match network::spawn(build_net(port), sender_db.clone(), sync_state).await {
+            Ok(handle) => return Ok(handle),
+            Err(err) if err.to_string().contains("Address already in use") => {
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to reserve sender network port")))
 }
 
 async fn spawn_node_control(
@@ -399,87 +408,6 @@ async fn wallet_can_prepare_shielded_send_over_remote_ingress_without_node_contr
 
     ingress.shutdown().await?;
     net.shutdown().await;
-    let _ = node_control_shutdown.send(());
-    node_control_task.await??;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "native transparent proof backend is not implemented"]
-async fn shielded_wallet_send_and_receive_roundtrip_soak() -> anyhow::Result<()> {
-    let _guard = test_guard();
-    network::set_quiet_logging(true);
-    std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
-
-    let sender_dir = TempDir::new()?;
-    let receiver_dir = TempDir::new()?;
-
-    let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
-    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
-    let receiver_wallet_db = Arc::new(WalletStore::open(&receiver_dir.path().to_string_lossy())?);
-
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
-    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let receiver_wallet = Wallet::load_or_create_private(receiver_wallet_db)?;
-
-    let _sender_settlement_units =
-        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
-
-    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
-    let (node_control_shutdown, node_control_task) = spawn_node_control(
-        &sender_dir.path().to_string_lossy(),
-        sender_db.clone(),
-        net.clone(),
-    )
-    .await?;
-    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
-    node_client.ping()?;
-    let ingress = finality_support::spawn_test_ingress(
-        sender_dir.path(),
-        genesis.hash,
-        &sender_dir.path().to_string_lossy(),
-    )
-    .await?;
-    let sender_wallet = Arc::new(
-        sender_wallet
-            .with_node_client(node_client.clone())
-            .with_ingress_client(ingress.client.clone()),
-    );
-    let receiver_wallet = Arc::new(receiver_wallet.with_node_client(node_client));
-    let recipient_handle = receiver_wallet.mint_invoice()?;
-    let _ = Wallet::parse_invoice(&recipient_handle)?;
-
-    assert_eq!(sender_wallet.balance()?, 2);
-    assert_eq!(receiver_wallet.balance()?, 0);
-
-    let outcome = sender_wallet.send_to_invoice(&recipient_handle, 1).await?;
-    let tx_id = outcome.tx_id;
-    assert_eq!(outcome.input_count, 2);
-    assert_eq!(outcome.output_count, 1);
-
-    let tx_bytes = sender_db
-        .get_raw_bytes("tx", &tx_id)?
-        .expect("persisted tx bytes");
-    let tx = unchained::canonical::decode_tx(&tx_bytes)?;
-    assert_eq!(tx.input_count(), 2);
-    assert_eq!(tx.output_count(), 1);
-    assert!(sender_db.load_fast_path_pending_tx(&tx_id)?.is_none());
-    assert!(sender_db.load_shared_state_pending_tx(&tx_id)?.is_none());
-    assert_eq!(
-        sender_db
-            .get::<Anchor>("epoch", b"latest")?
-            .expect("latest finalized anchor")
-            .ordering_path,
-        OrderingPath::FastPathPrivateTransfer
-    );
-
-    assert_eq!(sender_wallet.balance()?, 0);
-    assert_eq!(receiver_wallet.balance()?, 1);
-    assert_eq!(receiver_wallet.list_owned_shielded_notes()?.len(), 1);
-
-    net.shutdown().await;
-    ingress.shutdown().await?;
     let _ = node_control_shutdown.send(());
     node_control_task.await??;
     Ok(())
@@ -807,244 +735,6 @@ async fn wallet_cover_traffic_loop_does_not_persist_transactions_or_advance_fina
     assert_eq!(tx_count, 0);
 
     ingress.shutdown().await?;
-    net.shutdown().await;
-    let _ = node_control_shutdown.send(());
-    node_control_task.await??;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "expensive private staking proving plus ordered-finality soak"]
-async fn private_staking_flows_finalize_through_ordered_shared_state_checkpoints(
-) -> anyhow::Result<()> {
-    let _guard = test_guard();
-    network::set_quiet_logging(true);
-    std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
-
-    let sender_dir = TempDir::new()?;
-    let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
-    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
-
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
-    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units =
-        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 3)?;
-
-    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
-    let (node_control_shutdown, node_control_task) = spawn_node_control(
-        &sender_dir.path().to_string_lossy(),
-        sender_db.clone(),
-        net.clone(),
-    )
-    .await?;
-    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
-    node_client.ping()?;
-    let mut state_rx = node_client.subscribe_state()?;
-    let state_client = node_client.clone();
-    let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client));
-
-    let validator_set = sender_db
-        .load_validator_committee(genesis.position.epoch)?
-        .expect("genesis validator committee");
-    let validator_id = validator_set.validators[0].id;
-
-    let delegation_state = state_client.state()?;
-    let delegation_tx_id = sender_wallet.delegate_to_validator(validator_id, 2).await?;
-    assert!(sender_db.get_raw_bytes("tx", &delegation_tx_id)?.is_none());
-    assert!(sender_db
-        .load_shared_state_pending_tx(&delegation_tx_id)?
-        .is_some());
-
-    let delegation_batch = net
-        .select_pending_shared_state_batch()?
-        .expect("pending delegation batch");
-    assert_eq!(delegation_batch.ordered_tx_count()?, 1);
-    let delegation_anchor = net
-        .finalize_local_shared_state_batch(&delegation_batch)
-        .await?;
-    assert_eq!(
-        delegation_anchor.ordering_path,
-        OrderingPath::DagBftSharedState
-    );
-    assert_eq!(
-        delegation_anchor.ordered_tx_root,
-        delegation_batch.ordered_tx_root
-    );
-    assert_eq!(
-        delegation_anchor.ordered_tx_count,
-        delegation_batch.ordered_tx_count()?
-    );
-    let delegated_state =
-        wait_for_state_update(&mut state_rx, delegation_state.sequence, |state| {
-            state
-                .state
-                .consensus_status
-                .latest_finalized_anchor
-                .as_ref()
-                .map(|anchor| anchor.hash == delegation_anchor.hash)
-                .unwrap_or(false)
-                && state
-                    .state
-                    .consensus_status
-                    .registered_validator_pools
-                    .iter()
-                    .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 3)
-        })
-        .await?;
-    assert_eq!(
-        delegated_state
-            .state
-            .consensus_status
-            .latest_finalized_anchor
-            .as_ref()
-            .map(|anchor| anchor.ordering_path),
-        Some(OrderingPath::DagBftSharedState)
-    );
-    assert!(sender_db.get_raw_bytes("tx", &delegation_tx_id)?.is_some());
-    assert!(sender_db
-        .load_shared_state_pending_tx(&delegation_tx_id)?
-        .is_none());
-
-    let undelegation_state = state_client.state()?;
-    let undelegation_tx_id = sender_wallet
-        .undelegate_from_validator(validator_id, 2)
-        .await?;
-    assert!(sender_db
-        .get_raw_bytes("tx", &undelegation_tx_id)?
-        .is_none());
-    assert!(sender_db
-        .load_shared_state_pending_tx(&undelegation_tx_id)?
-        .is_some());
-
-    let undelegation_batch = net
-        .select_pending_shared_state_batch()?
-        .expect("pending undelegation batch");
-    assert_eq!(undelegation_batch.ordered_tx_count()?, 1);
-    let undelegation_anchor = net
-        .finalize_local_shared_state_batch(&undelegation_batch)
-        .await?;
-    assert_eq!(
-        undelegation_anchor.ordering_path,
-        OrderingPath::DagBftSharedState
-    );
-    let undelegated_state =
-        wait_for_state_update(&mut state_rx, undelegation_state.sequence, |state| {
-            state
-                .state
-                .consensus_status
-                .latest_finalized_anchor
-                .as_ref()
-                .map(|anchor| anchor.hash == undelegation_anchor.hash)
-                .unwrap_or(false)
-                && state
-                    .state
-                    .consensus_status
-                    .registered_validator_pools
-                    .iter()
-                    .any(|pool| pool.validator.id == validator_id && pool.total_bonded_stake == 1)
-        })
-        .await?;
-    assert_eq!(
-        undelegated_state
-            .state
-            .consensus_status
-            .latest_finalized_anchor
-            .as_ref()
-            .map(|anchor| anchor.ordering_path),
-        Some(OrderingPath::DagBftSharedState)
-    );
-    assert!(sender_db
-        .get_raw_bytes("tx", &undelegation_tx_id)?
-        .is_some());
-    assert!(sender_db
-        .load_shared_state_pending_tx(&undelegation_tx_id)?
-        .is_none());
-
-    let owned_notes = sender_wallet.list_owned_shielded_notes()?;
-    assert_eq!(sender_wallet.balance()?, 0);
-    assert_eq!(owned_notes.len(), 1);
-    assert!(matches!(
-        owned_notes[0].note.kind,
-        ShieldedNoteKind::UnbondingClaim {
-            validator_id: note_validator_id,
-            ..
-        } if note_validator_id == validator_id.0
-    ));
-
-    let final_pool = sender_db
-        .load_validator_pool(&validator_id)?
-        .expect("final validator pool");
-    assert_eq!(final_pool.total_bonded_stake, 1);
-    assert_eq!(final_pool.total_delegation_shares, 1);
-
-    net.shutdown().await;
-    let _ = node_control_shutdown.send(());
-    node_control_task.await??;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "native transparent proof backend is not implemented"]
-async fn private_delegation_end_to_end_proving_soak() -> anyhow::Result<()> {
-    let _guard = test_guard();
-    network::set_quiet_logging(true);
-    std::env::set_var("WALLET_PASSPHRASE", "shielded-test-passphrase");
-
-    let sender_dir = TempDir::new()?;
-    let sender_db = Arc::new(Store::open(&sender_dir.path().to_string_lossy())?);
-    let sender_wallet_db = Arc::new(WalletStore::open(&sender_dir.path().to_string_lossy())?);
-
-    let committee = finality_support::TestCommittee::single_validator();
-    let genesis = seed_genesis(sender_db.as_ref(), &committee)?;
-    let sender_wallet = Wallet::load_or_create_private(sender_wallet_db.clone())?;
-    let _sender_settlement_units =
-        seed_sender_settlement_units(sender_db.as_ref(), &sender_wallet, &genesis, 2)?;
-
-    let net = spawn_sender_network(&sender_dir, sender_db.clone(), &genesis).await?;
-    let (node_control_shutdown, node_control_task) = spawn_node_control(
-        &sender_dir.path().to_string_lossy(),
-        sender_db.clone(),
-        net.clone(),
-    )
-    .await?;
-    let node_client = node_control::NodeControlClient::new(&sender_dir.path().to_string_lossy());
-    node_client.ping()?;
-    let sender_wallet = Arc::new(sender_wallet.with_node_client(node_client));
-
-    let validator_set = sender_db
-        .load_validator_committee(genesis.position.epoch)?
-        .expect("genesis validator committee");
-    let validator_id = validator_set.validators[0].id;
-
-    let tx_id = sender_wallet.delegate_to_validator(validator_id, 1).await?;
-    let batch = net
-        .select_pending_shared_state_batch()?
-        .expect("pending delegation batch");
-    let _anchor = net.finalize_local_shared_state_batch(&batch).await?;
-    let tx_bytes = sender_db
-        .get_raw_bytes("tx", &tx_id)?
-        .expect("persisted delegation tx bytes");
-    let tx = unchained::canonical::decode_tx(&tx_bytes)?;
-    assert!(!tx.is_fast_path_eligible());
-
-    let updated_pool = sender_db
-        .load_validator_pool(&validator_id)?
-        .expect("updated validator pool");
-    assert_eq!(updated_pool.total_bonded_stake, 2);
-    assert_eq!(updated_pool.total_delegation_shares, 2);
-
-    let owned_notes = sender_wallet.list_owned_shielded_notes()?;
-    assert_eq!(sender_wallet.balance()?, 0);
-    assert_eq!(owned_notes.len(), 1);
-    assert!(matches!(
-        owned_notes[0].note.kind,
-        ShieldedNoteKind::DelegationShare {
-            validator_id: note_validator_id
-        } if note_validator_id == validator_id.0
-    ));
-    assert_eq!(owned_notes[0].note.value, 1);
-
     net.shutdown().await;
     let _ = node_control_shutdown.send(());
     node_control_task.await??;

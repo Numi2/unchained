@@ -10,42 +10,39 @@ const WALLET_SUBMISSION_GATEWAY_RECORD: Option<&str> = None;
 const ACCESS_RELAY_GATEWAY_RECORDS: &[&str] = &[];
 const SUBMISSION_GATEWAY_ALLOWED_RELAYS: &[&str] = &[];
 const SUBMISSION_GATEWAY_VALIDATOR_CONTROL_BASE_PATH: Option<&str> = None;
-const WALLET_PROOF_ASSISTANT_RECORD: Option<&str> = None;
 const WALLET_DISCOVERY_RECORD: Option<&str> = None;
 const WALLET_DISCOVERY_MIRROR_RECORDS: &[&str] = &[];
 const DISCOVERY_STATE_PATH: Option<&str> = None;
 const DISCOVERY_QUERY_ONLY_REPLICA: bool = false;
 
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub net: Net,
-    pub storage: Storage,
-    pub ingress: Ingress,
-    pub proof_assistant: ProofAssistant,
-    pub discovery: Discovery,
+pub struct RuntimeProfile {
+    pub net: NetworkProfile,
+    pub storage: StorageProfile,
+    pub ingress: IngressProfile,
+    pub discovery: DiscoveryProfile,
 }
 
-impl Default for Config {
+impl Default for RuntimeProfile {
     fn default() -> Self {
         Self {
-            net: Net::default(),
-            storage: Storage::default(),
-            ingress: Ingress::default(),
-            proof_assistant: ProofAssistant::default(),
-            discovery: Discovery::default(),
+            net: NetworkProfile::default(),
+            storage: StorageProfile::default(),
+            ingress: IngressProfile::default(),
+            discovery: DiscoveryProfile::default(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Net {
+pub struct NetworkProfile {
     pub listen_port: u16,
     pub bootstrap: Vec<String>,
     pub trust_updates: Vec<String>,
     pub public_ip: Option<String>,
 }
 
-impl Default for Net {
+impl Default for NetworkProfile {
     fn default() -> Self {
         Self {
             listen_port: LISTEN_PORT,
@@ -57,11 +54,11 @@ impl Default for Net {
 }
 
 #[derive(Debug, Clone)]
-pub struct Storage {
+pub struct StorageProfile {
     pub path: String,
 }
 
-impl Default for Storage {
+impl Default for StorageProfile {
     fn default() -> Self {
         Self {
             path: resolve_storage_path("unchained_data"),
@@ -70,19 +67,14 @@ impl Default for Storage {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Ingress {
+pub struct IngressProfile {
     pub wallet: WalletIngress,
     pub access_relay: AccessRelay,
     pub submission_gateway: SubmissionGateway,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ProofAssistant {
-    pub wallet: WalletProofAssistant,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Discovery {
+pub struct DiscoveryProfile {
     pub wallet: WalletDiscovery,
     pub server: DiscoveryServer,
 }
@@ -98,19 +90,6 @@ impl Default for WalletIngress {
         Self {
             relay: WALLET_ACCESS_RELAY_RECORD.map(str::to_string),
             gateway: WALLET_SUBMISSION_GATEWAY_RECORD.map(str::to_string),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WalletProofAssistant {
-    pub server: Option<String>,
-}
-
-impl Default for WalletProofAssistant {
-    fn default() -> Self {
-        Self {
-            server: WALLET_PROOF_ASSISTANT_RECORD.map(str::to_string),
         }
     }
 }
@@ -174,8 +153,8 @@ impl Default for DiscoveryServer {
     }
 }
 
-pub fn load() -> Config {
-    Config::default()
+pub fn load() -> RuntimeProfile {
+    RuntimeProfile::default()
 }
 
 pub fn resolve_storage_path(path: &str) -> String {

@@ -240,17 +240,16 @@ Rules:
 The protocol should not depend on non-standard PQ randomness gadgets when a
 deterministic schedule is good enough.
 
-Operator configuration is not part of protocol policy. The runtime does not
-parse a config file; local storage path, listen/public address, bootstrap and
+Operator tuning is not part of protocol policy. The runtime does not
+parse a runtime settings file; local storage path, listen/public address, bootstrap and
 trust records, and role endpoint records are compiled into the code-defined
 runtime profile. Consensus timing, validator/P2P limits, ingress padding and
-batching, discovery PIR/query-budget policy, proof-assistant limits, transport
-windows, metrics binding, and anti-abuse thresholds are fixed in code.
+batching, discovery PIR/query-budget policy, transport windows, metrics
+binding, and anti-abuse thresholds are fixed in code.
 
-Public node builds are verifier-only. They hardcode the canonical proof method
-IDs needed for transaction verification and do not compile the RISC0 prover or
-guest ELF embedding path. The dedicated proof-assistant build carries the
-current prover surface until the native transparent backend replaces it.
+Public node builds are verifier-only and fail closed while the native
+transparent backend is absent. The remote proof-assistant surface was pruned
+instead of kept as a network service that cannot produce valid proofs.
 
 ### Certificates
 
@@ -705,15 +704,21 @@ The first external asset is code-defined as shielded ZEC. A stake transaction
 publishes only:
 
 - the canonical external asset id
+- a Zcash stake anchor with a fixed shielded-protocol tag
 - an external stake nullifier for double-stake prevention
 - a stake-position commitment
 - a shielded Unchained receipt output
 
 The Zcash address, note details, amount, and receipt owner remain private. The
-native proof backend must prove that the external Zcash-side lock and the
-Unchained receipt are bound to the same hidden stake position before validators
-accept the action. Until that backend exists, the transaction type is present
-but verification fails closed.
+anchor commits to the Zcash height, block hash, note commitment root, and
+nullifier root, with `OrchardV1` and `TachyonV1` reserved as code-defined
+protocol variants. Anchors enter local chain state through
+`AdmitExternalAssetAnchor`, a separate proof-authorized shared-state action.
+Nodes only accept stake actions that reference an anchor already admitted into
+local chain state. The native proof backend must prove that the external
+Zcash-side lock, accepted anchor, and Unchained receipt are bound to the same
+hidden stake position before validators accept the action. Until that backend
+exists, both anchor admission and stake receipt verification fail closed.
 
 ## 6. Execution Scope
 

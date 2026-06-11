@@ -5,7 +5,6 @@ use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::Arc;
 // use std::process; // removed unused
 
 // Using bincode for fast, compact binary serialization instead of JSON.
@@ -61,6 +60,7 @@ const STORE_COLUMN_FAMILIES: &[&str] = &[
     "shielded_active_nullifier",
     "shielded_spent_note",
     "external_stake_nullifier",
+    "external_asset_anchor",
     "shielded_archive_provider",
     "shielded_archive_replica",
     "shielded_archive_accounting",
@@ -1811,6 +1811,27 @@ impl Store {
         self.put("external_stake_nullifier", &key, stake_position_commitment)
     }
 
+    pub fn external_asset_anchor_exists(
+        &self,
+        asset: crate::external_asset::ExternalAsset,
+        anchor_hash: &[u8; 32],
+    ) -> Result<bool> {
+        let key = crate::zcash::external_anchor_storage_key(asset, anchor_hash);
+        Ok(self.get_raw_bytes("external_asset_anchor", &key)?.is_some())
+    }
+
+    pub fn store_zcash_stake_anchor(
+        &self,
+        asset: crate::external_asset::ExternalAsset,
+        anchor: &crate::zcash::ZcashStakeAnchor,
+    ) -> Result<[u8; 32]> {
+        anchor.validate_for_asset(asset)?;
+        let anchor_hash = anchor.anchor_hash();
+        let key = crate::zcash::external_anchor_storage_key(asset, &anchor_hash);
+        self.put("external_asset_anchor", &key, anchor)?;
+        Ok(anchor_hash)
+    }
+
     pub fn store_shielded_active_nullifier_epoch(
         &self,
         active: &crate::shielded::ActiveNullifierEpoch,
@@ -2282,10 +2303,4 @@ pub struct DatabaseStats {
     pub settlement_unit_count: u64,
     pub tx_count: u64,
     pub epoch_count: u64,
-}
-
-pub fn open(cfg: &crate::config::Storage) -> Result<Arc<Store>> {
-    Store::open(&cfg.path)
-        .map(Arc::new)
-        .with_context(|| format!("database failed to open at '{}'", cfg.path))
 }

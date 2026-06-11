@@ -13,7 +13,6 @@ use crate::{
         WalletSendRuntimeMaterial,
     },
     proof,
-    proof_assistant::ProofAssistantClient,
     protocol::CURRENT as PROTOCOL,
     shielded,
     storage::WalletStore,
@@ -181,7 +180,6 @@ pub struct Wallet {
     wallet_db: Arc<WalletStore>,
     node_client: Option<NodeControlClient>,
     ingress_client: Option<IngressClient>,
-    proof_assistant_client: Option<ProofAssistantClient>,
     discovery_client: Option<DiscoveryClient>,
     signing_key_pkcs8: Vec<u8>,
     signing_pk: TaggedSigningPublicKey,
@@ -638,7 +636,7 @@ impl Wallet {
     fn require_ingress_client(&self) -> Result<&IngressClient> {
         self.ingress_client.as_ref().ok_or_else(|| {
             anyhow!(
-                "wallet requires an access relay and submission gateway; configure [ingress.wallet] and restart `unchained_wallet serve`"
+                "wallet requires a code-defined access relay and submission gateway in the runtime profile; restart `unchained_wallet serve` after rebuilding with those records"
             )
         })
     }
@@ -657,14 +655,6 @@ impl Wallet {
         self
     }
 
-    pub fn with_proof_assistant_client(
-        mut self,
-        proof_assistant_client: ProofAssistantClient,
-    ) -> Self {
-        self.proof_assistant_client = Some(proof_assistant_client);
-        self
-    }
-
     pub fn with_discovery_client(mut self, discovery_client: DiscoveryClient) -> Self {
         self.discovery_client = Some(discovery_client);
         self
@@ -674,10 +664,6 @@ impl Wallet {
         self.ingress_client.is_some()
     }
 
-    pub fn has_proof_assistant_client(&self) -> bool {
-        self.proof_assistant_client.is_some()
-    }
-
     pub fn has_discovery_client(&self) -> bool {
         self.discovery_client.is_some()
     }
@@ -685,7 +671,7 @@ impl Wallet {
     fn require_discovery_client(&self) -> Result<&DiscoveryClient> {
         self.discovery_client.as_ref().ok_or_else(|| {
             anyhow!(
-                "wallet requires a discovery service; configure [discovery.wallet].server and restart `unchained_wallet serve`"
+                "wallet requires a code-defined discovery service in the runtime profile; restart `unchained_wallet serve` after rebuilding with that record"
             )
         })
     }
@@ -697,15 +683,10 @@ impl Wallet {
         if let Some(ingress_client) = &self.ingress_client {
             return ingress_client.chain_id();
         }
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client.chain_id();
-        }
         if let Some(discovery_client) = &self.discovery_client {
             return discovery_client.chain_id();
         }
-        bail!(
-            "wallet requires node control, ingress, proof assistant, or discovery for chain binding"
-        )
+        bail!("wallet requires node control, ingress, or discovery for chain binding")
     }
 
     async fn wallet_send_runtime_material_async(&self) -> Result<WalletSendRuntimeMaterial> {
@@ -722,9 +703,6 @@ impl Wallet {
         &self,
         witness: &proof_core::ProofShieldedTxWitness,
     ) -> Result<proof::TransparentProof> {
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client.prove_shielded_tx(witness).await;
-        }
         let (proof, _journal) = proof::prove_shielded_tx(witness)?;
         Ok(proof)
     }
@@ -733,11 +711,6 @@ impl Wallet {
         &self,
         witness: &proof_core::ProofPrivateDelegationWitness,
     ) -> Result<proof::TransparentProof> {
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client
-                .prove_private_delegation(witness)
-                .await;
-        }
         let (proof, _journal) = proof::prove_private_delegation(witness)?;
         Ok(proof)
     }
@@ -746,11 +719,6 @@ impl Wallet {
         &self,
         witness: &proof_core::ProofPrivateUndelegationWitness,
     ) -> Result<proof::TransparentProof> {
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client
-                .prove_private_undelegation(witness)
-                .await;
-        }
         let (proof, _journal) = proof::prove_private_undelegation(witness)?;
         Ok(proof)
     }
@@ -759,9 +727,6 @@ impl Wallet {
         &self,
         witness: &proof_core::ProofShieldedTxWitness,
     ) -> Result<proof::TransparentProof> {
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client.prove_unbonding_claim(witness).await;
-        }
         let (proof, _journal) = proof::prove_unbonding_claim(witness)?;
         Ok(proof)
     }
@@ -772,11 +737,6 @@ impl Wallet {
         extension: &shielded::HistoricalUnspentExtension,
         prior: Option<&proof::CheckpointAccumulatorProof>,
     ) -> Result<proof::CheckpointAccumulatorProof> {
-        if let Some(proof_assistant_client) = &self.proof_assistant_client {
-            return proof_assistant_client
-                .prove_checkpoint_accumulator(checkpoint, extension, prior)
-                .await;
-        }
         proof::prove_checkpoint_accumulator(checkpoint, extension, prior)
     }
 
@@ -982,7 +942,6 @@ impl Wallet {
                 wallet_db,
                 node_client: None,
                 ingress_client: None,
-                proof_assistant_client: None,
                 discovery_client: None,
                 signing_key_pkcs8: secrets.signing_key_pkcs8,
                 signing_pk: signing_pk.clone(),
@@ -1036,7 +995,6 @@ impl Wallet {
             wallet_db,
             node_client: None,
             ingress_client: None,
-            proof_assistant_client: None,
             discovery_client: None,
             signing_key_pkcs8: secrets.signing_key_pkcs8,
             signing_pk,
@@ -1062,7 +1020,6 @@ impl Wallet {
             wallet_db,
             node_client: None,
             ingress_client: None,
-            proof_assistant_client: None,
             discovery_client: None,
             signing_key_pkcs8: signing_key_pkcs8.to_vec(),
             signing_pk: signing_pk.clone(),

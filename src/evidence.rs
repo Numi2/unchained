@@ -839,7 +839,7 @@ mod tests {
             Some([7u8; 32]),
             ordering_path,
             merkle_root,
-            0,
+            if merkle_root == [0u8; 32] { 0 } else { 1 },
             if ordering_path == OrderingPath::DagBftSharedState {
                 1
             } else {
