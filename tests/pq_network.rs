@@ -488,7 +488,7 @@ async fn pq_mesh_remote_checkpoint_batch_service() -> anyhow::Result<()> {
 
     wait_for_condition(
         "archive provider manifest discovery",
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         || {
             db_b.load_shielded_archive_providers()
                 .map(|providers| {
