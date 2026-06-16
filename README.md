@@ -63,13 +63,18 @@ ZEC. The action commits to the external Zcash stake nullifier, a hidden stake
 position, an accepted Zcash stake anchor, and a shielded Unchained receipt note.
 Anchors are admitted through their own proof-authorized shared-state action and
 bind protocol tag, Zcash height, block hash, note commitment root, and nullifier
-root; `OrchardV1` and `TachyonV1` are code-defined protocol variants.
+root; `OrchardV1` and `IronwoodV1` are code-defined protocol variants.
 Validators can use the external nullifier as a public double-stake prevention
 key without learning the Zcash address, ZEC amount, or Unchained receipt owner.
 
-This path is intentionally not live until the native transparent backend can
-prove the Zcash-side lock, accepted anchor, and receipt binding. The checked-in
-code fails closed rather than accepting attestation-only staking.
+The public anchor-admission path now has a native Winterfell STARK seal for the
+canonical ZEC anchor public-input statement. Private external stake witnesses
+now carry a Zcash lock evidence envelope that is bound into the public statement
+by action commitment, lock commitment, proof digest, and claim digest. Private
+external stake remains closed until the native circuit proves that envelope's
+Orchard/Ironwood lock relation and receipt binding without exposing the hidden
+stake position. The native proof boundary and remaining operational checklist
+are tracked in `ZEC_NATIVE_PROOF_BACKEND.md`.
 
 ## Repository Status and Build Instructions
 
@@ -439,13 +444,16 @@ system reasons about circuit identity rather than backend method constants.
 Checkpoint history bindings also commit only to a verifier-key digest instead
 of exposing backend-specific identifiers in transaction-visible journals.
 
-The proof layer now also carries explicit backend identity and capability
-manifests. Canonical proofs include their backend, circuit, and statement
-metadata. Canonical proof metadata also treats seal bytes as opaque adapter
-output rather than naming a specific receipt serialization format, and each
-proof now commits to a backend-agnostic statement digest of the decoded public
-journal. There is intentionally no installed prover/verifier adapter in this
-tree until the native transparent backend is implemented; proof-bearing
+The proof layer now also carries explicit backend identity, capability
+reporting, and an activation manifest with artifact commitments for native
+prover/verifier availability, vector coverage, and operator activation.
+Canonical proofs include their backend, circuit, and statement metadata.
+Canonical proof metadata also treats seal bytes as opaque adapter output rather
+than naming a specific receipt serialization format, and each proof now commits
+to a backend-agnostic
+statement digest of the decoded public journal. There is intentionally no
+installed prover/verifier adapter in this tree until the native transparent
+backend is implemented; proof-bearing
 transactions fail closed instead of accepting placeholder proofs.
 
 Backend selection is routed through a canonical per-circuit backend policy

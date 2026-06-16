@@ -9,16 +9,22 @@ use unchained::{
         ConsensusPosition, OrderingPath, QuorumCertificate, Validator, ValidatorKeys, ValidatorSet,
         ValidatorVote, VoteTarget,
     },
-    crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign},
+    crypto::{ml_dsa_65_generate, ml_dsa_65_public_key_spki, ml_dsa_65_sign, ML_KEM_768_CT_BYTES},
     epoch::Anchor,
     evidence::{self, ConsensusEvidence, SlashableEvidence, VoteEquivocationEvidence},
+    external_asset::ExternalAsset,
+    proof::{self, TransparentProof, TransparentProofStatement},
     protocol::CURRENT as PROTOCOL,
     staking::{
         expected_validator_set_for_epoch, load_or_compute_active_validator_set, PenaltyCause,
         PenaltyFaultClass, PenaltyPolicy, ValidatorMetadata, ValidatorPenaltyEvent, ValidatorPool,
         ValidatorProfileUpdate, ValidatorReactivation, ValidatorStatus,
     },
-    transaction::{PenaltyEvidenceAdmission, SharedStateAction, Tx},
+    transaction::{
+        ExternalAssetAnchorAdmission, OrdinaryPrivateTransfer, PenaltyEvidenceAdmission,
+        PrivateExternalStake, SharedStateAction, ShieldedOutput, Tx,
+    },
+    zcash::{ZcashShieldedProtocol, ZcashStakeAnchor},
     Store,
 };
 
@@ -29,6 +35,45 @@ fn seed_genesis(store: &Store, committee: &finality_support::TestCommittee) -> R
     store.put("epoch", b"latest", &genesis)?;
     store.put("anchor", &genesis.hash, &genesis)?;
     Ok(genesis)
+}
+
+fn dummy_proof(statement: TransparentProofStatement, seed: u8) -> TransparentProof {
+    TransparentProof::new(statement, vec![seed, seed.wrapping_add(1)])
+}
+
+fn shielded_output(seed: u8) -> ShieldedOutput {
+    ShieldedOutput {
+        note_commitment: [seed; 32],
+        kem_ct: [seed.wrapping_add(1); ML_KEM_768_CT_BYTES],
+        nonce: [seed.wrapping_add(2); 24],
+        view_tag: seed.wrapping_add(3),
+        ciphertext: vec![seed.wrapping_add(4), seed.wrapping_add(5)],
+    }
+}
+
+fn control_fee_payment(seed: u8, fee_amount: u64) -> OrdinaryPrivateTransfer {
+    OrdinaryPrivateTransfer {
+        nullifiers: vec![[seed; 32]],
+        outputs: vec![shielded_output(seed.wrapping_add(1))],
+        fee_amount,
+        proof: dummy_proof(
+            TransparentProofStatement::ShieldedTransfer,
+            seed.wrapping_add(2),
+        ),
+    }
+}
+
+fn zcash_stake_anchor(seed: u8) -> ZcashStakeAnchor {
+    ZcashStakeAnchor {
+        protocol: ZcashShieldedProtocol::OrchardV1,
+        height: 1_000 + u64::from(seed),
+        block_hash: [seed; 32],
+        note_commitment_root: [seed.wrapping_add(1); 32],
+        nullifier_root: [seed.wrapping_add(2); 32],
+        confirmation_depth: ExternalAsset::ZcashShieldedZec
+            .policy()
+            .minimum_external_confirmations,
+    }
 }
 
 fn build_active_validator_pool(
@@ -366,6 +411,110 @@ fn finalized_fast_path_anchor(
         validator_set.clone(),
         qc,
     )?)
+}
+
+#[test]
+fn zcash_anchor_admission_tx_validation_reaches_fee_proof_after_native_anchor() -> Result<()> {
+    let dir = TempDir::new()?;
+    let store = Store::open(&dir.path().to_string_lossy())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&store, &committee)?;
+
+    let asset = ExternalAsset::ZcashShieldedZec;
+    let zcash_anchor = zcash_stake_anchor(0x41);
+    let anchor_witness = proof_core::ProofExternalAssetAnchorWitness {
+        chain_id: store.effective_chain_id(),
+        current_epoch: genesis.position.epoch,
+        asset_id: asset.asset_id(),
+        zcash_protocol: zcash_anchor.protocol.code(),
+        zcash_anchor_height: zcash_anchor.height,
+        zcash_block_hash: zcash_anchor.block_hash,
+        zcash_note_commitment_root: zcash_anchor.note_commitment_root,
+        zcash_nullifier_root: zcash_anchor.nullifier_root,
+        zcash_anchor_hash: zcash_anchor.anchor_hash(),
+        zcash_confirmation_depth: zcash_anchor.confirmation_depth,
+    };
+    let (anchor_proof, _) = proof::prove_external_asset_anchor(&anchor_witness)?;
+    let admission = ExternalAssetAnchorAdmission {
+        asset,
+        zcash_anchor,
+        proof: anchor_proof,
+    };
+    let tx = Tx::new_shared_state_with_fee_payment(
+        SharedStateAction::AdmitExternalAssetAnchor(admission.clone()),
+        Vec::new(),
+        Some(control_fee_payment(
+            0x43,
+            PROTOCOL.external_asset_anchor_admission_fee,
+        )),
+    );
+
+    let err = tx
+        .validate(&store)
+        .expect_err("ordinary fee proof backend is still unavailable");
+    assert!(
+        err.to_string()
+            .contains(proof::NATIVE_TRANSPARENT_PROOF_UNAVAILABLE_REASON),
+        "{err}"
+    );
+    assert!(!store.external_asset_anchor_exists(asset, &admission.zcash_anchor.anchor_hash())?);
+
+    store.close()?;
+    Ok(())
+}
+
+#[test]
+fn zcash_private_external_stake_tx_validation_fails_closed_until_native_proofs_exist() -> Result<()>
+{
+    let dir = TempDir::new()?;
+    let store = Store::open(&dir.path().to_string_lossy())?;
+    let committee = finality_support::TestCommittee::single_validator();
+    let genesis = seed_genesis(&store, &committee)?;
+
+    let asset = ExternalAsset::ZcashShieldedZec;
+    let zcash_anchor = zcash_stake_anchor(0x51);
+    store.store_zcash_stake_anchor(asset, &zcash_anchor)?;
+
+    let stake = PrivateExternalStake {
+        asset,
+        zcash_anchor,
+        activation_epoch: genesis
+            .position
+            .epoch
+            .saturating_add(asset.policy().minimum_lock_epochs),
+        external_nullifier: [0x52; 32],
+        stake_position_commitment: [0x53; 32],
+        receipt_output: shielded_output(0x54),
+        proof: dummy_proof(TransparentProofStatement::PrivateExternalStake, 0x55),
+    };
+    let external_nullifier = stake.external_nullifier;
+    let tx = Tx::new_shared_state_with_fee_payment(
+        SharedStateAction::PrivateExternalStake(stake),
+        Vec::new(),
+        Some(control_fee_payment(
+            0x56,
+            PROTOCOL.private_external_stake_fee,
+        )),
+    );
+
+    let err = tx
+        .validate(&store)
+        .expect_err("ZEC private external stake must fail closed without native proofs");
+    assert!(
+        err.to_string()
+            .contains(proof::ZCASH_ORCHARD_IRONWOOD_PROOF_UNAVAILABLE_REASON),
+        "{err}"
+    );
+
+    let mut nullifier_key = Vec::with_capacity(64);
+    nullifier_key.extend_from_slice(&asset.asset_id());
+    nullifier_key.extend_from_slice(&external_nullifier);
+    assert!(store
+        .get_raw_bytes("external_stake_nullifier", &nullifier_key)?
+        .is_none());
+
+    store.close()?;
+    Ok(())
 }
 
 #[test]

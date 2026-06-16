@@ -201,6 +201,25 @@ fn shared_state_action_requires_fee_payment(action: &SharedStateAction) -> bool 
     shared_state_action_embedded_transfer(action).is_none()
 }
 
+fn validate_shared_state_fee_shape(
+    shared: &SharedStateTx,
+) -> Result<Option<&OrdinaryPrivateTransfer>> {
+    match (
+        shared_state_action_embedded_transfer(&shared.action),
+        shared.fee_payment.as_ref(),
+    ) {
+        (Some(_), Some(_)) => bail!(
+            "shared-state actions with embedded shielded transfers must not carry a separate fee-payment sidecar"
+        ),
+        (Some(_), None) => Ok(None),
+        (None, Some(fee_payment)) => Ok(Some(fee_payment)),
+        (None, None) if shared_state_action_requires_fee_payment(&shared.action) => {
+            bail!("shared-state control actions require a shielded fee-payment sidecar")
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 impl SharedStateBatch {
     pub fn ordered_tx_root_for_ids(tx_ids: &[[u8; 32]]) -> [u8; 32] {
         let mut hasher =
@@ -451,6 +470,10 @@ impl SharedStateBatch {
                         SharedStateAction::AdmitExternalAssetAnchor(admission) => {
                             let journal =
                                 proof::verify_external_asset_anchor_proof(&admission.proof)?;
+                            proof::validate_external_asset_anchor_proof_journal(
+                                &admission.proof,
+                                &journal,
+                            )?;
                             validate_external_anchor_journal(
                                 admission,
                                 &journal,
@@ -461,6 +484,10 @@ impl SharedStateBatch {
                         }
                         SharedStateAction::PrivateExternalStake(stake) => {
                             let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                            proof::validate_private_external_stake_proof_journal(
+                                &stake.proof,
+                                &journal,
+                            )?;
                             if journal.asset_id != stake.asset.asset_id() {
                                 bail!("private external stake proof asset mismatch");
                             }
@@ -1039,26 +1066,17 @@ impl Tx {
         let chain_id = db.effective_chain_id();
         let required_fee_amount = self.required_fee_amount();
 
-        match (
-            shared_state_action_embedded_transfer(&shared.action),
-            shared.fee_payment.as_ref(),
-        ) {
-            (Some(_), Some(_)) => bail!(
-                "shared-state actions with embedded shielded transfers must not carry a separate fee-payment sidecar"
-            ),
-            (Some(_), None) => {}
-            (None, Some(fee_payment)) => {
-                self.validate_ordinary_transfer_against_store(
-                    fee_payment,
-                    db,
-                    required_fee_amount,
-                    "shared-state control action fee payment",
-                )?;
-            }
-            (None, None) if shared_state_action_requires_fee_payment(&shared.action) => {
-                bail!("shared-state control actions require a shielded fee-payment sidecar")
-            }
-            (None, None) => {}
+        let fee_payment = validate_shared_state_fee_shape(shared)?;
+        validate_zcash_shared_state_preconditions(shared, db, current_epoch)?;
+        fail_closed_zcash_shared_state_proof_if_unavailable(&shared.action)?;
+
+        if let Some(fee_payment) = fee_payment {
+            self.validate_ordinary_transfer_against_store(
+                fee_payment,
+                db,
+                required_fee_amount,
+                "shared-state control action fee payment",
+            )?;
         }
 
         match &shared.action {
@@ -1292,6 +1310,7 @@ impl Tx {
                     bail!("external asset anchor is already finalized");
                 }
                 let journal = proof::verify_external_asset_anchor_proof(&admission.proof)?;
+                proof::validate_external_asset_anchor_proof_journal(&admission.proof, &journal)?;
                 validate_external_anchor_journal(admission, &journal, chain_id, current_epoch)?;
             }
             SharedStateAction::PrivateExternalStake(stake) => {
@@ -1315,6 +1334,7 @@ impl Tx {
                 }
 
                 let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                proof::validate_private_external_stake_proof_journal(&stake.proof, &journal)?;
                 if journal.chain_id != chain_id {
                     bail!("private external stake proof chain id mismatch");
                 }
@@ -1332,6 +1352,18 @@ impl Tx {
                 }
                 if journal.zcash_protocol != stake.zcash_anchor.protocol.code() {
                     bail!("private external stake proof Zcash protocol mismatch");
+                }
+                if journal.zcash_block_hash != stake.zcash_anchor.block_hash {
+                    bail!("private external stake proof Zcash block hash mismatch");
+                }
+                if journal.zcash_note_commitment_root != stake.zcash_anchor.note_commitment_root {
+                    bail!("private external stake proof Zcash note commitment root mismatch");
+                }
+                if journal.zcash_nullifier_root != stake.zcash_anchor.nullifier_root {
+                    bail!("private external stake proof Zcash nullifier root mismatch");
+                }
+                if journal.zcash_confirmation_depth != stake.zcash_anchor.confirmation_depth {
+                    bail!("private external stake proof Zcash confirmation depth mismatch");
                 }
                 if journal.activation_epoch != stake.activation_epoch {
                     bail!("private external stake activation epoch mismatch");
@@ -1472,6 +1504,7 @@ impl Tx {
             }
             SharedStateAction::AdmitExternalAssetAnchor(admission) => {
                 let journal = proof::verify_external_asset_anchor_proof(&admission.proof)?;
+                proof::validate_external_asset_anchor_proof_journal(&admission.proof, &journal)?;
                 validate_external_anchor_journal(
                     admission,
                     &journal,
@@ -1482,6 +1515,7 @@ impl Tx {
             }
             SharedStateAction::PrivateExternalStake(stake) => {
                 let journal = proof::verify_private_external_stake_proof(&stake.proof)?;
+                proof::validate_private_external_stake_proof_journal(&stake.proof, &journal)?;
                 append_external_stake_to_batch(db, &mut batch, &tx_id, stake, &journal)?;
             }
             SharedStateAction::AdmitPenaltyEvidence(admission) => {
@@ -1767,6 +1801,10 @@ fn append_external_stake_to_overlay(
         || journal.zcash_anchor_hash != stake.zcash_anchor.anchor_hash()
         || journal.zcash_anchor_height != stake.zcash_anchor.height
         || journal.zcash_protocol != stake.zcash_anchor.protocol.code()
+        || journal.zcash_block_hash != stake.zcash_anchor.block_hash
+        || journal.zcash_note_commitment_root != stake.zcash_anchor.note_commitment_root
+        || journal.zcash_nullifier_root != stake.zcash_anchor.nullifier_root
+        || journal.zcash_confirmation_depth != stake.zcash_anchor.confirmation_depth
         || journal.external_nullifier != stake.external_nullifier
         || journal.stake_position_commitment != stake.stake_position_commitment
         || journal.receipt_note_commitment != stake.receipt_output.note_commitment
@@ -1866,8 +1904,91 @@ fn validate_external_anchor_journal(
     if journal.zcash_anchor_height != admission.zcash_anchor.height {
         bail!("external asset anchor proof Zcash height mismatch");
     }
+    if journal.zcash_block_hash != admission.zcash_anchor.block_hash {
+        bail!("external asset anchor proof Zcash block hash mismatch");
+    }
+    if journal.zcash_note_commitment_root != admission.zcash_anchor.note_commitment_root {
+        bail!("external asset anchor proof Zcash note commitment root mismatch");
+    }
+    if journal.zcash_nullifier_root != admission.zcash_anchor.nullifier_root {
+        bail!("external asset anchor proof Zcash nullifier root mismatch");
+    }
+    if journal.zcash_confirmation_depth != admission.zcash_anchor.confirmation_depth {
+        bail!("external asset anchor proof Zcash confirmation depth mismatch");
+    }
     if journal.zcash_anchor_hash != admission.zcash_anchor.anchor_hash() {
         bail!("external asset anchor proof anchor hash mismatch");
+    }
+    Ok(())
+}
+
+fn validate_zcash_shared_state_preconditions(
+    shared: &SharedStateTx,
+    db: &Store,
+    current_epoch: u64,
+) -> Result<()> {
+    match &shared.action {
+        SharedStateAction::AdmitExternalAssetAnchor(admission) => {
+            if !shared.authorization.signature.is_empty() {
+                bail!(
+                    "external asset anchor admission does not accept an external authorization signature"
+                );
+            }
+            admission.zcash_anchor.validate_for_asset(admission.asset)?;
+            if db.external_asset_anchor_exists(
+                admission.asset,
+                &admission.zcash_anchor.anchor_hash(),
+            )? {
+                bail!("external asset anchor is already finalized");
+            }
+            Ok(())
+        }
+        SharedStateAction::PrivateExternalStake(stake) => {
+            if !shared.authorization.signature.is_empty() {
+                bail!("private external stake does not accept an external authorization signature");
+            }
+            external_asset::validate_external_stake_shape(
+                stake.asset,
+                current_epoch,
+                stake.activation_epoch,
+                &stake.external_nullifier,
+                &stake.stake_position_commitment,
+            )?;
+            ensure_external_stake_anchor_is_known(db, stake)?;
+            ensure_external_stake_nullifier_is_new(db, stake)?;
+            let tree = db.load_shielded_note_tree()?.unwrap_or_default();
+            if tree.contains_commitment(&stake.receipt_output.note_commitment) {
+                bail!("private external stake receipt output commitment already exists");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn fail_closed_zcash_shared_state_proof_if_unavailable(action: &SharedStateAction) -> Result<()> {
+    match action {
+        SharedStateAction::AdmitExternalAssetAnchor(admission) => {
+            let status =
+                proof::transparent_circuit_status(proof::TransparentCircuit::ExternalAssetAnchorV1);
+            if status.fail_closed {
+                match proof::verify_external_asset_anchor_proof(&admission.proof) {
+                    Ok(_) => bail!("{}", status.reason),
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        SharedStateAction::PrivateExternalStake(stake) => {
+            let status =
+                proof::transparent_circuit_status(proof::TransparentCircuit::ZcashShieldedStakeV1);
+            if status.fail_closed {
+                match proof::verify_private_external_stake_proof(&stake.proof) {
+                    Ok(_) => bail!("{}", status.reason),
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2328,6 +2449,25 @@ mod tests {
                 b"external-asset-anchor",
                 &external_anchor_key_material(&admission)
             )]
+        );
+
+        let encoded = crate::canonical::encode_tx(&tx).unwrap();
+        let decoded = crate::canonical::decode_tx(&encoded).unwrap();
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn external_asset_anchor_admission_round_trips_ironwood_protocol() {
+        let mut zcash_anchor = zcash_stake_anchor(39);
+        zcash_anchor.protocol = ZcashShieldedProtocol::IronwoodV1;
+        let tx = Tx::new_shared_state_with_fee_payment(
+            SharedStateAction::AdmitExternalAssetAnchor(ExternalAssetAnchorAdmission {
+                asset: ExternalAsset::ZcashShieldedZec,
+                zcash_anchor,
+                proof: dummy_proof(TransparentProofStatement::ExternalAssetAnchor, &[2, 3, 5]),
+            }),
+            Vec::new(),
+            Some(control_fee_payment(93)),
         );
 
         let encoded = crate::canonical::encode_tx(&tx).unwrap();

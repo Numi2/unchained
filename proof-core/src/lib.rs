@@ -19,6 +19,9 @@ pub const SHIELDED_EXTENSION_VERSION: u8 = 1;
 pub const CHECKPOINT_ACCUMULATOR_VERSION: u8 = 1;
 pub const SHIELDED_OUTPUT_NONCE_LEN: usize = 24;
 pub const SHIELDED_OUTPUT_ENCAPSULATION_SEED_LEN: usize = 32;
+pub const ZCASH_ORCHARD_PROTOCOL: u8 = 1;
+pub const ZCASH_IRONWOOD_PROTOCOL: u8 = 2;
+pub const ZCASH_LOCK_PROOF_ENVELOPE_VERSION: u8 = 1;
 
 type MlKem768PublicKey = <MlKem768 as KemCore>::EncapsulationKey;
 type MlKem768Ciphertext = ml_kem::Ciphertext<MlKem768>;
@@ -50,6 +53,14 @@ const CHECKPOINT_ACCUMULATOR_STRATUM_DOMAIN: &str =
 const CHECKPOINT_ACCUMULATOR_ROOT_DOMAIN: &str =
     "unchained-shielded-checkpoint-accumulator-root-v1";
 const TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN: &str = "unchained-transparent-verifier-key-v1";
+const ZCASH_STAKE_ANCHOR_DOMAIN: &str = "unchained-zcash-stake-anchor-v1";
+const ZCASH_LOCK_PROOF_DIGEST_DOMAIN: &str = "unchained-zcash-lock-proof-digest-v1";
+const ZCASH_LOCK_CLAIM_DIGEST_DOMAIN: &str = "unchained-zcash-lock-claim-digest-v1";
+const ZCASH_LOCK_CLAIM_PUBLIC_INPUT_DOMAIN: &str = "unchained-zcash-lock-claim-public-input-v1";
+const ZCASH_EXTERNAL_ASSET_ANCHOR_PUBLIC_INPUT_DOMAIN: &str =
+    "unchained-zcash-external-asset-anchor-public-input-v1";
+const ZCASH_PRIVATE_EXTERNAL_STAKE_PUBLIC_INPUT_DOMAIN: &str =
+    "unchained-zcash-private-external-stake-public-input-v1";
 const OUTPUT_BINDING_DOMAIN: &str = "unchained-shielded-output-binding-v1";
 const HISTORICAL_ROOT_DIGEST_DOMAIN: &str = "unchained-shielded-historical-ledger-digest-v1";
 
@@ -402,16 +413,51 @@ pub struct ProofPrivateUndelegationJournal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofZcashShieldedLockWitness {
+    pub version: u8,
+    pub protocol: u8,
+    pub anchor_hash: [u8; 32],
+    pub external_nullifier: [u8; 32],
+    pub stake_position_commitment: [u8; 32],
+    pub action_commitment: [u8; 32],
+    pub lock_commitment: [u8; 32],
+    pub proof: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofZcashShieldedLockBinding {
+    pub action_commitment: [u8; 32],
+    pub lock_commitment: [u8; 32],
+    pub proof_digest: [u8; 32],
+    pub claim_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofZcashShieldedLockClaimJournal {
+    pub version: u8,
+    pub protocol: u8,
+    pub anchor_hash: [u8; 32],
+    pub external_nullifier: [u8; 32],
+    pub stake_position_commitment: [u8; 32],
+    pub binding: ProofZcashShieldedLockBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProofPrivateExternalStakeWitness {
     pub chain_id: [u8; 32],
     pub current_epoch: u64,
     pub asset_id: [u8; 32],
     pub zcash_protocol: u8,
     pub zcash_anchor_height: u64,
+    pub zcash_block_hash: [u8; 32],
+    pub zcash_note_commitment_root: [u8; 32],
+    pub zcash_nullifier_root: [u8; 32],
     pub zcash_anchor_hash: [u8; 32],
+    pub zcash_confirmation_depth: u32,
     pub activation_epoch: u64,
     pub external_nullifier: [u8; 32],
     pub stake_position_commitment: [u8; 32],
+    pub zcash_lock: ProofZcashShieldedLockWitness,
     pub receipt_output: ProofShieldedOutputWitness,
 }
 
@@ -422,10 +468,15 @@ pub struct ProofPrivateExternalStakeJournal {
     pub asset_id: [u8; 32],
     pub zcash_protocol: u8,
     pub zcash_anchor_height: u64,
+    pub zcash_block_hash: [u8; 32],
+    pub zcash_note_commitment_root: [u8; 32],
+    pub zcash_nullifier_root: [u8; 32],
     pub zcash_anchor_hash: [u8; 32],
+    pub zcash_confirmation_depth: u32,
     pub activation_epoch: u64,
     pub external_nullifier: [u8; 32],
     pub stake_position_commitment: [u8; 32],
+    pub zcash_lock: ProofZcashShieldedLockBinding,
     pub receipt_note_commitment: [u8; 32],
     pub receipt_output: ProofShieldedOutputBinding,
 }
@@ -437,7 +488,11 @@ pub struct ProofExternalAssetAnchorWitness {
     pub asset_id: [u8; 32],
     pub zcash_protocol: u8,
     pub zcash_anchor_height: u64,
+    pub zcash_block_hash: [u8; 32],
+    pub zcash_note_commitment_root: [u8; 32],
+    pub zcash_nullifier_root: [u8; 32],
     pub zcash_anchor_hash: [u8; 32],
+    pub zcash_confirmation_depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -447,7 +502,11 @@ pub struct ProofExternalAssetAnchorJournal {
     pub asset_id: [u8; 32],
     pub zcash_protocol: u8,
     pub zcash_anchor_height: u64,
+    pub zcash_block_hash: [u8; 32],
+    pub zcash_note_commitment_root: [u8; 32],
+    pub zcash_nullifier_root: [u8; 32],
     pub zcash_anchor_hash: [u8; 32],
+    pub zcash_confirmation_depth: u32,
 }
 
 fn validate_input_history(
@@ -541,6 +600,311 @@ pub fn transparent_verifier_key_commitment_from_hint(method_id: [u32; 8]) -> [u8
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     proof_hash_bytes(TRANSPARENT_VERIFIER_KEY_COMMITMENT_DOMAIN, &bytes)
+}
+
+pub fn zcash_stake_anchor_hash(
+    protocol: u8,
+    height: u64,
+    block_hash: &[u8; 32],
+    note_commitment_root: &[u8; 32],
+    nullifier_root: &[u8; 32],
+) -> [u8; 32] {
+    proof_hash_domain_parts(
+        ZCASH_STAKE_ANCHOR_DOMAIN,
+        &[
+            &[protocol],
+            &height.to_le_bytes(),
+            block_hash.as_slice(),
+            note_commitment_root.as_slice(),
+            nullifier_root.as_slice(),
+        ],
+    )
+}
+
+pub fn zcash_lock_proof_digest(proof: &[u8]) -> [u8; 32] {
+    proof_hash_bytes(ZCASH_LOCK_PROOF_DIGEST_DOMAIN, proof)
+}
+
+pub fn zcash_lock_claim_digest(
+    version: u8,
+    protocol: u8,
+    anchor_hash: &[u8; 32],
+    external_nullifier: &[u8; 32],
+    stake_position_commitment: &[u8; 32],
+    binding: &ProofZcashShieldedLockBinding,
+) -> [u8; 32] {
+    proof_hash_domain_parts(
+        ZCASH_LOCK_CLAIM_DIGEST_DOMAIN,
+        &[
+            &[version],
+            &[protocol],
+            anchor_hash.as_slice(),
+            external_nullifier.as_slice(),
+            stake_position_commitment.as_slice(),
+            binding.action_commitment.as_slice(),
+            binding.lock_commitment.as_slice(),
+            binding.proof_digest.as_slice(),
+        ],
+    )
+}
+
+pub fn validate_zcash_shielded_lock_witness(
+    witness: &ProofZcashShieldedLockWitness,
+    expected_protocol: u8,
+    expected_anchor_hash: &[u8; 32],
+    expected_external_nullifier: &[u8; 32],
+    expected_stake_position_commitment: &[u8; 32],
+) -> Result<ProofZcashShieldedLockBinding> {
+    if witness.version != ZCASH_LOCK_PROOF_ENVELOPE_VERSION {
+        bail!(
+            "unsupported Zcash lock proof envelope version {}",
+            witness.version
+        );
+    }
+    validate_zcash_shielded_protocol(witness.protocol)?;
+    if witness.protocol != expected_protocol {
+        bail!("Zcash lock proof protocol mismatch");
+    }
+    if &witness.anchor_hash != expected_anchor_hash {
+        bail!("Zcash lock proof anchor hash mismatch");
+    }
+    if &witness.external_nullifier != expected_external_nullifier {
+        bail!("Zcash lock proof external nullifier mismatch");
+    }
+    if &witness.stake_position_commitment != expected_stake_position_commitment {
+        bail!("Zcash lock proof stake position mismatch");
+    }
+    if witness.action_commitment == [0u8; 32] {
+        bail!("Zcash lock proof action commitment cannot be zero");
+    }
+    if witness.lock_commitment == [0u8; 32] {
+        bail!("Zcash lock commitment cannot be zero");
+    }
+    if witness.proof.is_empty() {
+        bail!("Zcash lock proof envelope cannot be empty");
+    }
+
+    let proof_digest = zcash_lock_proof_digest(&witness.proof);
+    let mut binding = ProofZcashShieldedLockBinding {
+        action_commitment: witness.action_commitment,
+        lock_commitment: witness.lock_commitment,
+        proof_digest,
+        claim_digest: [0u8; 32],
+    };
+    binding.claim_digest = zcash_lock_claim_digest(
+        witness.version,
+        witness.protocol,
+        expected_anchor_hash,
+        expected_external_nullifier,
+        expected_stake_position_commitment,
+        &binding,
+    );
+    Ok(binding)
+}
+
+pub fn validate_zcash_shielded_lock_claim_witness(
+    witness: &ProofZcashShieldedLockWitness,
+) -> Result<ProofZcashShieldedLockClaimJournal> {
+    if witness.anchor_hash == [0u8; 32] {
+        bail!("Zcash lock proof anchor hash cannot be zero");
+    }
+    if witness.external_nullifier == [0u8; 32] {
+        bail!("Zcash lock proof external nullifier cannot be zero");
+    }
+    if witness.stake_position_commitment == [0u8; 32] {
+        bail!("Zcash lock proof stake position cannot be zero");
+    }
+    let binding = validate_zcash_shielded_lock_witness(
+        witness,
+        witness.protocol,
+        &witness.anchor_hash,
+        &witness.external_nullifier,
+        &witness.stake_position_commitment,
+    )?;
+    Ok(ProofZcashShieldedLockClaimJournal {
+        version: witness.version,
+        protocol: witness.protocol,
+        anchor_hash: witness.anchor_hash,
+        external_nullifier: witness.external_nullifier,
+        stake_position_commitment: witness.stake_position_commitment,
+        binding,
+    })
+}
+
+pub fn validate_zcash_shielded_lock_binding(
+    binding: &ProofZcashShieldedLockBinding,
+    protocol: u8,
+    anchor_hash: &[u8; 32],
+    external_nullifier: &[u8; 32],
+    stake_position_commitment: &[u8; 32],
+) -> Result<()> {
+    validate_zcash_shielded_protocol(protocol)?;
+    if binding.action_commitment == [0u8; 32] {
+        bail!("Zcash lock proof action commitment cannot be zero");
+    }
+    if binding.lock_commitment == [0u8; 32] {
+        bail!("Zcash lock commitment cannot be zero");
+    }
+    if binding.proof_digest == [0u8; 32] {
+        bail!("Zcash lock proof digest cannot be zero");
+    }
+    let expected_claim_digest = zcash_lock_claim_digest(
+        ZCASH_LOCK_PROOF_ENVELOPE_VERSION,
+        protocol,
+        anchor_hash,
+        external_nullifier,
+        stake_position_commitment,
+        binding,
+    );
+    if binding.claim_digest != expected_claim_digest {
+        bail!("Zcash lock proof claim digest mismatch");
+    }
+    Ok(())
+}
+
+pub fn validate_zcash_shielded_lock_claim_journal(
+    journal: &ProofZcashShieldedLockClaimJournal,
+) -> Result<()> {
+    if journal.version != ZCASH_LOCK_PROOF_ENVELOPE_VERSION {
+        bail!(
+            "unsupported Zcash lock proof envelope version {}",
+            journal.version
+        );
+    }
+    if journal.anchor_hash == [0u8; 32] {
+        bail!("Zcash lock proof anchor hash cannot be zero");
+    }
+    if journal.external_nullifier == [0u8; 32] {
+        bail!("Zcash lock proof external nullifier cannot be zero");
+    }
+    if journal.stake_position_commitment == [0u8; 32] {
+        bail!("Zcash lock proof stake position cannot be zero");
+    }
+    validate_zcash_shielded_lock_binding(
+        &journal.binding,
+        journal.protocol,
+        &journal.anchor_hash,
+        &journal.external_nullifier,
+        &journal.stake_position_commitment,
+    )
+}
+
+pub fn encode_zcash_lock_claim_public_inputs(
+    journal: &ProofZcashShieldedLockClaimJournal,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(226);
+    out.push(journal.version);
+    out.push(journal.protocol);
+    out.extend_from_slice(&journal.anchor_hash);
+    out.extend_from_slice(&journal.external_nullifier);
+    out.extend_from_slice(&journal.stake_position_commitment);
+    out.extend_from_slice(&journal.binding.action_commitment);
+    out.extend_from_slice(&journal.binding.lock_commitment);
+    out.extend_from_slice(&journal.binding.proof_digest);
+    out.extend_from_slice(&journal.binding.claim_digest);
+    out
+}
+
+pub fn zcash_lock_claim_public_input_digest(
+    journal: &ProofZcashShieldedLockClaimJournal,
+) -> [u8; 32] {
+    proof_hash_bytes(
+        ZCASH_LOCK_CLAIM_PUBLIC_INPUT_DOMAIN,
+        &encode_zcash_lock_claim_public_inputs(journal),
+    )
+}
+
+pub fn encode_external_asset_anchor_public_inputs(
+    journal: &ProofExternalAssetAnchorJournal,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(213);
+    write_zcash_anchor_public_inputs(
+        &mut out,
+        journal.chain_id,
+        journal.current_epoch,
+        journal.asset_id,
+        journal.zcash_protocol,
+        journal.zcash_anchor_height,
+        journal.zcash_block_hash,
+        journal.zcash_note_commitment_root,
+        journal.zcash_nullifier_root,
+        journal.zcash_anchor_hash,
+        journal.zcash_confirmation_depth,
+    );
+    out
+}
+
+pub fn external_asset_anchor_public_input_digest(
+    journal: &ProofExternalAssetAnchorJournal,
+) -> [u8; 32] {
+    proof_hash_bytes(
+        ZCASH_EXTERNAL_ASSET_ANCHOR_PUBLIC_INPUT_DOMAIN,
+        &encode_external_asset_anchor_public_inputs(journal),
+    )
+}
+
+pub fn encode_private_external_stake_public_inputs(
+    journal: &ProofPrivateExternalStakeJournal,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(509);
+    write_zcash_anchor_public_inputs(
+        &mut out,
+        journal.chain_id,
+        journal.current_epoch,
+        journal.asset_id,
+        journal.zcash_protocol,
+        journal.zcash_anchor_height,
+        journal.zcash_block_hash,
+        journal.zcash_note_commitment_root,
+        journal.zcash_nullifier_root,
+        journal.zcash_anchor_hash,
+        journal.zcash_confirmation_depth,
+    );
+    out.extend_from_slice(&journal.activation_epoch.to_le_bytes());
+    out.extend_from_slice(&journal.external_nullifier);
+    out.extend_from_slice(&journal.stake_position_commitment);
+    out.extend_from_slice(&journal.zcash_lock.action_commitment);
+    out.extend_from_slice(&journal.zcash_lock.lock_commitment);
+    out.extend_from_slice(&journal.zcash_lock.proof_digest);
+    out.extend_from_slice(&journal.zcash_lock.claim_digest);
+    out.extend_from_slice(&journal.receipt_note_commitment);
+    out.extend_from_slice(&journal.receipt_output.note_commitment);
+    out.extend_from_slice(&journal.receipt_output.public_output_digest);
+    out
+}
+
+pub fn private_external_stake_public_input_digest(
+    journal: &ProofPrivateExternalStakeJournal,
+) -> [u8; 32] {
+    proof_hash_bytes(
+        ZCASH_PRIVATE_EXTERNAL_STAKE_PUBLIC_INPUT_DOMAIN,
+        &encode_private_external_stake_public_inputs(journal),
+    )
+}
+
+fn write_zcash_anchor_public_inputs(
+    out: &mut Vec<u8>,
+    chain_id: [u8; 32],
+    current_epoch: u64,
+    asset_id: [u8; 32],
+    zcash_protocol: u8,
+    zcash_anchor_height: u64,
+    zcash_block_hash: [u8; 32],
+    zcash_note_commitment_root: [u8; 32],
+    zcash_nullifier_root: [u8; 32],
+    zcash_anchor_hash: [u8; 32],
+    zcash_confirmation_depth: u32,
+) {
+    out.extend_from_slice(&chain_id);
+    out.extend_from_slice(&current_epoch.to_le_bytes());
+    out.extend_from_slice(&asset_id);
+    out.push(zcash_protocol);
+    out.extend_from_slice(&zcash_anchor_height.to_le_bytes());
+    out.extend_from_slice(&zcash_block_hash);
+    out.extend_from_slice(&zcash_note_commitment_root);
+    out.extend_from_slice(&zcash_nullifier_root);
+    out.extend_from_slice(&zcash_anchor_hash);
+    out.extend_from_slice(&zcash_confirmation_depth.to_le_bytes());
 }
 
 pub fn validate_shielded_tx_witness(
@@ -1098,6 +1462,176 @@ pub fn validate_unbonding_claim_witness(
         inputs: input_bindings,
         outputs: output_bindings,
     })
+}
+
+pub fn validate_private_external_stake_witness(
+    witness: &ProofPrivateExternalStakeWitness,
+) -> Result<ProofPrivateExternalStakeJournal> {
+    if witness.asset_id == [0u8; 32] {
+        bail!("external stake asset id cannot be zero");
+    }
+    validate_zcash_shielded_protocol(witness.zcash_protocol)?;
+    if witness.zcash_anchor_height == 0 {
+        bail!("external stake Zcash anchor height cannot be zero");
+    }
+    if witness.zcash_anchor_hash == [0u8; 32] {
+        bail!("external stake Zcash anchor hash cannot be zero");
+    }
+    if witness.zcash_confirmation_depth == 0 {
+        bail!("external stake Zcash confirmation depth cannot be zero");
+    }
+    validate_zcash_anchor_material(
+        witness.zcash_protocol,
+        witness.zcash_anchor_height,
+        &witness.zcash_block_hash,
+        &witness.zcash_note_commitment_root,
+        &witness.zcash_nullifier_root,
+        &witness.zcash_anchor_hash,
+    )?;
+    if witness.activation_epoch < witness.current_epoch {
+        bail!("external stake activation epoch cannot be in the past");
+    }
+    if witness.external_nullifier == [0u8; 32] {
+        bail!("external stake nullifier cannot be zero");
+    }
+    if witness.stake_position_commitment == [0u8; 32] {
+        bail!("external stake position commitment cannot be zero");
+    }
+    let zcash_lock = validate_zcash_shielded_lock_witness(
+        &witness.zcash_lock,
+        witness.zcash_protocol,
+        &witness.zcash_anchor_hash,
+        &witness.external_nullifier,
+        &witness.stake_position_commitment,
+    )?;
+
+    let receipt = &witness.receipt_output;
+    receipt.plaintext.note.validate()?;
+    if !receipt
+        .plaintext
+        .note
+        .kind
+        .is_external_stake_receipt_for(&witness.asset_id, &witness.stake_position_commitment)
+    {
+        bail!("external stake receipt note kind does not match the proven stake position");
+    }
+    if receipt.plaintext.note.birth_epoch != witness.current_epoch {
+        bail!("external stake receipt birth epoch must match current epoch");
+    }
+    if note_key_commitment(&receipt.plaintext.note_key)
+        != receipt.plaintext.note.note_key_commitment
+    {
+        bail!("external stake receipt note key commitment mismatch");
+    }
+    let expected_checkpoint = HistoricalUnspentCheckpoint::genesis(
+        receipt.plaintext.note.commitment,
+        witness.current_epoch,
+    );
+    if receipt.plaintext.checkpoint != expected_checkpoint {
+        bail!("external stake receipt checkpoint mismatch");
+    }
+    if receipt.public_output.note_commitment != receipt.plaintext.note.commitment {
+        bail!("external stake public receipt commitment mismatch");
+    }
+    verify_public_output_encryption(receipt)?;
+
+    Ok(ProofPrivateExternalStakeJournal {
+        chain_id: witness.chain_id,
+        current_epoch: witness.current_epoch,
+        asset_id: witness.asset_id,
+        zcash_protocol: witness.zcash_protocol,
+        zcash_anchor_height: witness.zcash_anchor_height,
+        zcash_block_hash: witness.zcash_block_hash,
+        zcash_note_commitment_root: witness.zcash_note_commitment_root,
+        zcash_nullifier_root: witness.zcash_nullifier_root,
+        zcash_anchor_hash: witness.zcash_anchor_hash,
+        zcash_confirmation_depth: witness.zcash_confirmation_depth,
+        activation_epoch: witness.activation_epoch,
+        external_nullifier: witness.external_nullifier,
+        stake_position_commitment: witness.stake_position_commitment,
+        zcash_lock,
+        receipt_note_commitment: receipt.public_output.note_commitment,
+        receipt_output: ProofShieldedOutputBinding {
+            note_commitment: receipt.public_output.note_commitment,
+            public_output_digest: public_output_digest(&receipt.public_output),
+        },
+    })
+}
+
+pub fn validate_external_asset_anchor_witness(
+    witness: &ProofExternalAssetAnchorWitness,
+) -> Result<ProofExternalAssetAnchorJournal> {
+    if witness.asset_id == [0u8; 32] {
+        bail!("external asset anchor asset id cannot be zero");
+    }
+    validate_zcash_shielded_protocol(witness.zcash_protocol)?;
+    if witness.zcash_anchor_height == 0 {
+        bail!("external asset anchor height cannot be zero");
+    }
+    if witness.zcash_anchor_hash == [0u8; 32] {
+        bail!("external asset anchor hash cannot be zero");
+    }
+    if witness.zcash_confirmation_depth == 0 {
+        bail!("external asset anchor confirmation depth cannot be zero");
+    }
+    validate_zcash_anchor_material(
+        witness.zcash_protocol,
+        witness.zcash_anchor_height,
+        &witness.zcash_block_hash,
+        &witness.zcash_note_commitment_root,
+        &witness.zcash_nullifier_root,
+        &witness.zcash_anchor_hash,
+    )?;
+
+    Ok(ProofExternalAssetAnchorJournal {
+        chain_id: witness.chain_id,
+        current_epoch: witness.current_epoch,
+        asset_id: witness.asset_id,
+        zcash_protocol: witness.zcash_protocol,
+        zcash_anchor_height: witness.zcash_anchor_height,
+        zcash_block_hash: witness.zcash_block_hash,
+        zcash_note_commitment_root: witness.zcash_note_commitment_root,
+        zcash_nullifier_root: witness.zcash_nullifier_root,
+        zcash_anchor_hash: witness.zcash_anchor_hash,
+        zcash_confirmation_depth: witness.zcash_confirmation_depth,
+    })
+}
+
+fn validate_zcash_anchor_material(
+    protocol: u8,
+    height: u64,
+    block_hash: &[u8; 32],
+    note_commitment_root: &[u8; 32],
+    nullifier_root: &[u8; 32],
+    anchor_hash: &[u8; 32],
+) -> Result<()> {
+    if block_hash == &[0u8; 32] {
+        bail!("Zcash anchor block hash cannot be zero");
+    }
+    if note_commitment_root == &[0u8; 32] {
+        bail!("Zcash anchor note commitment root cannot be zero");
+    }
+    if nullifier_root == &[0u8; 32] {
+        bail!("Zcash anchor nullifier root cannot be zero");
+    }
+    let expected_anchor_hash = zcash_stake_anchor_hash(
+        protocol,
+        height,
+        block_hash,
+        note_commitment_root,
+        nullifier_root,
+    );
+    if anchor_hash != &expected_anchor_hash {
+        bail!("Zcash anchor hash does not match anchor material");
+    }
+    Ok(())
+}
+
+fn validate_zcash_shielded_protocol(protocol: u8) -> Result<()> {
+    match protocol {
+        ZCASH_ORCHARD_PROTOCOL | ZCASH_IRONWOOD_PROTOCOL => Ok(()),
+        other => bail!("unsupported Zcash shielded protocol tag {other}"),
+    }
 }
 
 impl ProofShieldedNote {
@@ -2386,6 +2920,49 @@ mod tests {
         sample_output_witness_with_kind(seed, ProofShieldedNoteKind::Payment, value, birth_epoch)
     }
 
+    fn sample_zcash_anchor_material(
+        protocol: u8,
+    ) -> (u64, [u8; 32], [u8; 32], [u8; 32], [u8; 32], u32) {
+        let height = 500_000;
+        let block_hash = [3u8; 32];
+        let note_commitment_root = [4u8; 32];
+        let nullifier_root = [5u8; 32];
+        let confirmation_depth = 24;
+        let anchor_hash = zcash_stake_anchor_hash(
+            protocol,
+            height,
+            &block_hash,
+            &note_commitment_root,
+            &nullifier_root,
+        );
+        (
+            height,
+            block_hash,
+            note_commitment_root,
+            nullifier_root,
+            anchor_hash,
+            confirmation_depth,
+        )
+    }
+
+    fn sample_zcash_lock_witness(
+        protocol: u8,
+        anchor_hash: [u8; 32],
+        external_nullifier: [u8; 32],
+        stake_position_commitment: [u8; 32],
+    ) -> ProofZcashShieldedLockWitness {
+        ProofZcashShieldedLockWitness {
+            version: ZCASH_LOCK_PROOF_ENVELOPE_VERSION,
+            protocol,
+            anchor_hash,
+            external_nullifier,
+            stake_position_commitment,
+            action_commitment: [6u8; 32],
+            lock_commitment: [7u8; 32],
+            proof: vec![8, 9, 10, 11],
+        }
+    }
+
     fn sample_accumulator(
         checkpoint: &HistoricalUnspentCheckpoint,
         extension: &HistoricalUnspentExtension,
@@ -2793,6 +3370,321 @@ mod tests {
         let err = validate_unbonding_claim_witness(&witness).expect_err("immature claim");
         assert!(
             err.to_string().contains("not matured"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn private_external_stake_journal_binds_receipt_to_stake_position() {
+        let asset_id = [8u8; 32];
+        let stake_position_commitment = [9u8; 32];
+        let (
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+        ) = sample_zcash_anchor_material(ZCASH_ORCHARD_PROTOCOL);
+        let receipt_output = sample_output_witness_with_kind(
+            44,
+            ProofShieldedNoteKind::ExternalStakeReceipt {
+                asset_id,
+                stake_position_commitment,
+            },
+            0,
+            12,
+        );
+        let witness = ProofPrivateExternalStakeWitness {
+            chain_id: [7u8; 32],
+            current_epoch: 12,
+            asset_id,
+            zcash_protocol: ZCASH_ORCHARD_PROTOCOL,
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+            activation_epoch: 44,
+            external_nullifier: [4u8; 32],
+            stake_position_commitment,
+            zcash_lock: sample_zcash_lock_witness(
+                ZCASH_ORCHARD_PROTOCOL,
+                zcash_anchor_hash,
+                [4u8; 32],
+                stake_position_commitment,
+            ),
+            receipt_output,
+        };
+
+        let journal =
+            validate_private_external_stake_witness(&witness).expect("valid external stake");
+        assert_eq!(journal.chain_id, witness.chain_id);
+        assert_eq!(journal.current_epoch, witness.current_epoch);
+        assert_eq!(journal.asset_id, asset_id);
+        assert_eq!(journal.zcash_protocol, ZCASH_ORCHARD_PROTOCOL);
+        assert_eq!(journal.zcash_anchor_height, zcash_anchor_height);
+        assert_eq!(journal.zcash_block_hash, zcash_block_hash);
+        assert_eq!(
+            journal.zcash_note_commitment_root,
+            zcash_note_commitment_root
+        );
+        assert_eq!(journal.zcash_nullifier_root, zcash_nullifier_root);
+        assert_eq!(journal.zcash_anchor_hash, zcash_anchor_hash);
+        assert_eq!(journal.zcash_confirmation_depth, zcash_confirmation_depth);
+        assert_eq!(journal.activation_epoch, 44);
+        assert_eq!(journal.external_nullifier, [4u8; 32]);
+        assert_eq!(journal.stake_position_commitment, stake_position_commitment);
+        validate_zcash_shielded_lock_binding(
+            &journal.zcash_lock,
+            journal.zcash_protocol,
+            &journal.zcash_anchor_hash,
+            &journal.external_nullifier,
+            &journal.stake_position_commitment,
+        )
+        .expect("valid Zcash lock binding");
+        assert_eq!(
+            journal.receipt_note_commitment,
+            witness.receipt_output.public_output.note_commitment
+        );
+        assert_eq!(
+            journal.receipt_output.public_output_digest,
+            public_output_digest(&witness.receipt_output.public_output)
+        );
+        let public_inputs = encode_private_external_stake_public_inputs(&journal);
+        assert_eq!(public_inputs.len(), 509);
+        assert_ne!(
+            private_external_stake_public_input_digest(&journal),
+            [0u8; 32]
+        );
+    }
+
+    #[test]
+    fn zcash_lock_claim_public_inputs_bind_envelope_digest() {
+        let (
+            _zcash_anchor_height,
+            _zcash_block_hash,
+            _zcash_note_commitment_root,
+            _zcash_nullifier_root,
+            zcash_anchor_hash,
+            _zcash_confirmation_depth,
+        ) = sample_zcash_anchor_material(ZCASH_IRONWOOD_PROTOCOL);
+        let witness = sample_zcash_lock_witness(
+            ZCASH_IRONWOOD_PROTOCOL,
+            zcash_anchor_hash,
+            [4u8; 32],
+            [9u8; 32],
+        );
+        let journal = validate_zcash_shielded_lock_claim_witness(&witness)
+            .expect("valid Zcash lock claim witness");
+        validate_zcash_shielded_lock_claim_journal(&journal)
+            .expect("valid Zcash lock claim journal");
+
+        let public_inputs = encode_zcash_lock_claim_public_inputs(&journal);
+        assert_eq!(public_inputs.len(), 226);
+        assert_eq!(
+            journal.binding.proof_digest,
+            zcash_lock_proof_digest(&witness.proof)
+        );
+        assert_eq!(
+            journal.binding.claim_digest,
+            zcash_lock_claim_digest(
+                witness.version,
+                witness.protocol,
+                &witness.anchor_hash,
+                &witness.external_nullifier,
+                &witness.stake_position_commitment,
+                &journal.binding,
+            )
+        );
+        assert_ne!(zcash_lock_claim_public_input_digest(&journal), [0u8; 32]);
+
+        let mut forged = journal.clone();
+        forged.external_nullifier[0] ^= 1;
+        let err = validate_zcash_shielded_lock_claim_journal(&forged)
+            .expect_err("forged lock claim digest must not validate");
+        assert!(
+            err.to_string().contains("claim digest"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn private_external_stake_rejects_receipt_for_wrong_position() {
+        let asset_id = [8u8; 32];
+        let (
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+        ) = sample_zcash_anchor_material(ZCASH_ORCHARD_PROTOCOL);
+        let receipt_output = sample_output_witness_with_kind(
+            44,
+            ProofShieldedNoteKind::ExternalStakeReceipt {
+                asset_id,
+                stake_position_commitment: [9u8; 32],
+            },
+            0,
+            12,
+        );
+        let witness = ProofPrivateExternalStakeWitness {
+            chain_id: [7u8; 32],
+            current_epoch: 12,
+            asset_id,
+            zcash_protocol: ZCASH_ORCHARD_PROTOCOL,
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+            activation_epoch: 44,
+            external_nullifier: [4u8; 32],
+            stake_position_commitment: [10u8; 32],
+            zcash_lock: sample_zcash_lock_witness(
+                ZCASH_ORCHARD_PROTOCOL,
+                zcash_anchor_hash,
+                [4u8; 32],
+                [10u8; 32],
+            ),
+            receipt_output,
+        };
+
+        let err = validate_private_external_stake_witness(&witness)
+            .expect_err("receipt stake position mismatch");
+        assert!(
+            err.to_string().contains("receipt note kind"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn private_external_stake_rejects_lock_proof_for_wrong_nullifier() {
+        let asset_id = [8u8; 32];
+        let stake_position_commitment = [9u8; 32];
+        let (
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+        ) = sample_zcash_anchor_material(ZCASH_ORCHARD_PROTOCOL);
+        let receipt_output = sample_output_witness_with_kind(
+            44,
+            ProofShieldedNoteKind::ExternalStakeReceipt {
+                asset_id,
+                stake_position_commitment,
+            },
+            0,
+            12,
+        );
+        let witness = ProofPrivateExternalStakeWitness {
+            chain_id: [7u8; 32],
+            current_epoch: 12,
+            asset_id,
+            zcash_protocol: ZCASH_ORCHARD_PROTOCOL,
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+            activation_epoch: 44,
+            external_nullifier: [4u8; 32],
+            stake_position_commitment,
+            zcash_lock: sample_zcash_lock_witness(
+                ZCASH_ORCHARD_PROTOCOL,
+                zcash_anchor_hash,
+                [5u8; 32],
+                stake_position_commitment,
+            ),
+            receipt_output,
+        };
+
+        let err = validate_private_external_stake_witness(&witness)
+            .expect_err("lock proof nullifier mismatch");
+        assert!(
+            err.to_string().contains("external nullifier"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn external_asset_anchor_journal_rejects_empty_anchor_shape() {
+        let (
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+        ) = sample_zcash_anchor_material(ZCASH_IRONWOOD_PROTOCOL);
+        let witness = ProofExternalAssetAnchorWitness {
+            chain_id: [7u8; 32],
+            current_epoch: 12,
+            asset_id: [8u8; 32],
+            zcash_protocol: ZCASH_IRONWOOD_PROTOCOL,
+            zcash_anchor_height,
+            zcash_block_hash,
+            zcash_note_commitment_root,
+            zcash_nullifier_root,
+            zcash_anchor_hash,
+            zcash_confirmation_depth,
+        };
+        let journal =
+            validate_external_asset_anchor_witness(&witness).expect("valid external anchor");
+        assert_eq!(journal.chain_id, witness.chain_id);
+        assert_eq!(journal.current_epoch, witness.current_epoch);
+        assert_eq!(journal.asset_id, witness.asset_id);
+        assert_eq!(journal.zcash_protocol, witness.zcash_protocol);
+        assert_eq!(journal.zcash_anchor_height, witness.zcash_anchor_height);
+        assert_eq!(journal.zcash_block_hash, witness.zcash_block_hash);
+        assert_eq!(
+            journal.zcash_note_commitment_root,
+            witness.zcash_note_commitment_root
+        );
+        assert_eq!(journal.zcash_nullifier_root, witness.zcash_nullifier_root);
+        assert_eq!(journal.zcash_anchor_hash, witness.zcash_anchor_hash);
+        assert_eq!(
+            journal.zcash_confirmation_depth,
+            witness.zcash_confirmation_depth
+        );
+        let public_inputs = encode_external_asset_anchor_public_inputs(&journal);
+        assert_eq!(public_inputs.len(), 213);
+        assert_ne!(
+            external_asset_anchor_public_input_digest(&journal),
+            [0u8; 32]
+        );
+
+        let mut empty_hash = witness.clone();
+        empty_hash.zcash_anchor_hash = [0u8; 32];
+        let err =
+            validate_external_asset_anchor_witness(&empty_hash).expect_err("empty anchor hash");
+        assert!(
+            err.to_string().contains("anchor hash cannot be zero"),
+            "unexpected error: {err:?}"
+        );
+
+        let mut mismatched_material = witness.clone();
+        mismatched_material.zcash_note_commitment_root[0] ^= 0x80;
+        let err = validate_external_asset_anchor_witness(&mismatched_material)
+            .expect_err("mismatched anchor material");
+        assert!(
+            err.to_string().contains("anchor hash does not match"),
+            "unexpected error: {err:?}"
+        );
+
+        let mut unsupported_protocol = witness;
+        unsupported_protocol.zcash_protocol = 3;
+        let err = validate_external_asset_anchor_witness(&unsupported_protocol)
+            .expect_err("unsupported Zcash protocol");
+        assert!(
+            err.to_string()
+                .contains("unsupported Zcash shielded protocol"),
             "unexpected error: {err:?}"
         );
     }

@@ -5,6 +5,7 @@ use crate::{
     evidence::ConsensusEvidenceRecord,
     local_control::{self, AuthenticatedControlMessage, ControlCapability},
     network::NetHandle,
+    proof,
     settlement_unit::SettlementUnit,
     shielded::{ArchivedNullifierEpoch, NoteCommitmentTree, NullifierRootLedger},
     staking::{ValidatorPool, ValidatorRewardEvent},
@@ -130,6 +131,8 @@ pub struct ConsensusStatus {
     pub peer_confirmed_tip: bool,
     pub synced: bool,
     pub settlement_ready: bool,
+    pub transparent_proof_backend_manifest: proof::TransparentNativeBackendActivationManifest,
+    pub transparent_proof_circuits: Vec<proof::TransparentCircuitStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +286,10 @@ fn build_consensus_status(
     } else {
         latest_finalized_anchor.is_some()
     };
+    let transparent_proof_backend_manifest = proof::current_native_backend_activation_manifest();
+    transparent_proof_backend_manifest
+        .validate()
+        .context("validate transparent proof backend activation manifest")?;
     Ok(ConsensusStatus {
         chain_id: db.effective_chain_id(),
         latest_finalized_anchor,
@@ -298,6 +305,8 @@ fn build_consensus_status(
         peer_confirmed_tip,
         synced,
         settlement_ready,
+        transparent_proof_backend_manifest,
+        transparent_proof_circuits: proof::transparent_circuit_status_inventory(),
     })
 }
 

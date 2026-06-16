@@ -187,11 +187,19 @@ See [COMPLETED_FEATURES.md](./COMPLETED_FEATURES.md) for detailed summaries.
   The transaction layer now has a code-defined `PrivateExternalStake` action
   and a Zcash-only external asset policy. It commits to an external stake
   nullifier, a hidden stake-position commitment, an accepted Zcash stake anchor,
-  and a shielded Unchained receipt output. The anchor layer is Tachyon-ready via
-  fixed `OrchardV1` and `TachyonV1` protocol tags, and anchors are admitted via
-  `AdmitExternalAssetAnchor`. Verification still fails closed until the native
-  backend can prove Zcash-side anchor facts, the Zcash-side lock, accepted
-  anchor, and receipt binding.
+  and a shielded Unchained receipt output. The anchor layer is Ironwood-ready via
+  fixed `OrchardV1` and `IronwoodV1` protocol tags, and anchors are admitted via
+  `AdmitExternalAssetAnchor`. Public anchor admission now has a native
+  Winterfell STARK seal over the canonical ZEC anchor public-input statement.
+  Private stake witnesses now carry a Zcash lock evidence envelope whose action
+  commitment, lock commitment, proof digest, and claim digest are bound into the
+  native public statement.
+  Private external stake verification still fails closed until the native
+  backend can prove the Zcash-side lock, accepted anchor, and receipt binding.
+  Node-control now exposes a native backend activation manifest with
+  implementation/vector/operator evidence commitments.
+  `ZEC_NATIVE_PROOF_BACKEND.md` records the required public inputs, live anchor
+  path, remaining fail-closed gate, and implementation sequence.
 - `[ ]` Implement native circuits for issuance and redemption
 - `[x]` Remove general-purpose proof-VM assumptions from the steady-state critical
   path

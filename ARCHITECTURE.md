@@ -711,14 +711,22 @@ publishes only:
 
 The Zcash address, note details, amount, and receipt owner remain private. The
 anchor commits to the Zcash height, block hash, note commitment root, and
-nullifier root, with `OrchardV1` and `TachyonV1` reserved as code-defined
+nullifier root, with `OrchardV1` and `IronwoodV1` reserved as code-defined
 protocol variants. Anchors enter local chain state through
 `AdmitExternalAssetAnchor`, a separate proof-authorized shared-state action.
 Nodes only accept stake actions that reference an anchor already admitted into
-local chain state. The native proof backend must prove that the external
-Zcash-side lock, accepted anchor, and Unchained receipt are bound to the same
-hidden stake position before validators accept the action. Until that backend
-exists, both anchor admission and stake receipt verification fail closed.
+local chain state. Public anchor admission is backed by a native Winterfell
+STARK seal over the canonical ZEC anchor public-input statement. Private stake
+witnesses carry a Zcash lock evidence envelope whose action commitment, lock
+commitment, proof digest, and claim digest are bound into the native public
+statement. The private stake proof backend must still prove that the external
+Zcash-side lock, accepted Orchard/Ironwood anchor, and Unchained receipt are
+bound to the same hidden stake position before validators accept the action.
+Until that private stake backend exists, stake receipt verification fails
+closed. Node-control
+exposes the current transparent backend activation manifest, which requires
+nonzero commitments for native implementation, test-vector, and operator
+evidence.
 
 ## 6. Execution Scope
 

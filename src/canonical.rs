@@ -814,15 +814,15 @@ fn read_external_asset(reader: &mut CanonicalReader<'_>) -> Result<ExternalAsset
 
 fn write_zcash_shielded_protocol(writer: &mut CanonicalWriter, protocol: ZcashShieldedProtocol) {
     writer.write_u8(match protocol {
-        ZcashShieldedProtocol::OrchardV1 => 1,
-        ZcashShieldedProtocol::TachyonV1 => 2,
+        ZcashShieldedProtocol::OrchardV1 => proof_core::ZCASH_ORCHARD_PROTOCOL,
+        ZcashShieldedProtocol::IronwoodV1 => proof_core::ZCASH_IRONWOOD_PROTOCOL,
     });
 }
 
 fn read_zcash_shielded_protocol(reader: &mut CanonicalReader<'_>) -> Result<ZcashShieldedProtocol> {
     match reader.read_u8()? {
-        1 => Ok(ZcashShieldedProtocol::OrchardV1),
-        2 => Ok(ZcashShieldedProtocol::TachyonV1),
+        proof_core::ZCASH_ORCHARD_PROTOCOL => Ok(ZcashShieldedProtocol::OrchardV1),
+        proof_core::ZCASH_IRONWOOD_PROTOCOL => Ok(ZcashShieldedProtocol::IronwoodV1),
         other => bail!("unsupported Zcash shielded protocol tag {}", other),
     }
 }

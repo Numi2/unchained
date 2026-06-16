@@ -10,7 +10,7 @@ use unchained::{
     consensus::{ConsensusPosition, OrderingPath, ValidatorVote, VoteTarget},
     crypto::ML_KEM_768_CT_BYTES,
     epoch::Anchor,
-    evidence, network, node_control, node_identity,
+    evidence, network, node_control, node_identity, proof,
     protocol::CURRENT as PROTOCOL,
     runtime_profile::NetworkProfile,
     staking::ValidatorRewardEvent,
@@ -161,6 +161,58 @@ async fn node_control_serves_consensus_status() -> Result<()> {
     assert_eq!(status.registered_validator_pools.len(), 1);
     assert_eq!(status.consensus_evidence_count, 0);
     assert!(status.recent_consensus_evidence.is_empty());
+    status.transparent_proof_backend_manifest.validate()?;
+    assert_eq!(
+        status.transparent_proof_backend_manifest,
+        proof::current_native_backend_activation_manifest()
+    );
+    assert_eq!(
+        status
+            .transparent_proof_backend_manifest
+            .circuits
+            .iter()
+            .map(|entry| entry.circuit)
+            .collect::<Vec<_>>(),
+        proof::transparent_circuit_inventory().to_vec()
+    );
+    for entry in &status.transparent_proof_backend_manifest.circuits {
+        assert_eq!(
+            entry.evidence,
+            proof::transparent_circuit_activation_evidence(entry.circuit)
+        );
+    }
+    assert_eq!(
+        status
+            .transparent_proof_circuits
+            .iter()
+            .map(|status| status.circuit)
+            .collect::<Vec<_>>(),
+        proof::transparent_circuit_inventory().to_vec()
+    );
+    for circuit_status in &status.transparent_proof_circuits {
+        circuit_status.validate()?;
+        let anchor = circuit_status.circuit == proof::TransparentCircuit::ExternalAssetAnchorV1;
+        assert_eq!(circuit_status.prover_enabled, anchor);
+        assert_eq!(circuit_status.verifier_enabled, anchor);
+        assert_eq!(circuit_status.fail_closed, !anchor);
+        assert_eq!(
+            circuit_status.verifier_key_commitment,
+            proof::transparent_verifier_key_commitment(circuit_status.circuit)
+        );
+        assert_eq!(
+            circuit_status.readiness,
+            proof::transparent_circuit_readiness(circuit_status.circuit)
+        );
+    }
+    let zec_stake_status = status
+        .transparent_proof_circuits
+        .iter()
+        .find(|status| status.circuit == proof::TransparentCircuit::ZcashShieldedStakeV1)
+        .expect("ZEC stake status");
+    assert_eq!(
+        zec_stake_status.reason,
+        proof::ZCASH_ORCHARD_IRONWOOD_PROOF_UNAVAILABLE_REASON
+    );
     assert_eq!(
         status
             .latest_finalized_anchor

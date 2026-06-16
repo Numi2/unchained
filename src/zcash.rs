@@ -3,19 +3,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::external_asset::{ExternalAsset, ExternalAssetPolicy};
 
-const ZCASH_STAKE_ANCHOR_DOMAIN: &str = "unchained-zcash-stake-anchor-v1";
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ZcashShieldedProtocol {
     OrchardV1,
-    TachyonV1,
+    IronwoodV1,
 }
 
 impl ZcashShieldedProtocol {
     pub fn code(self) -> u8 {
         match self {
-            Self::OrchardV1 => 1,
-            Self::TachyonV1 => 2,
+            Self::OrchardV1 => proof_core::ZCASH_ORCHARD_PROTOCOL,
+            Self::IronwoodV1 => proof_core::ZCASH_IRONWOOD_PROTOCOL,
         }
     }
 }
@@ -32,15 +30,12 @@ pub struct ZcashStakeAnchor {
 
 impl ZcashStakeAnchor {
     pub fn anchor_hash(&self) -> [u8; 32] {
-        proof_core::proof_hash_domain_parts(
-            ZCASH_STAKE_ANCHOR_DOMAIN,
-            &[
-                &[self.protocol.code()],
-                &self.height.to_le_bytes(),
-                &self.block_hash,
-                &self.note_commitment_root,
-                &self.nullifier_root,
-            ],
+        proof_core::zcash_stake_anchor_hash(
+            self.protocol.code(),
+            self.height,
+            &self.block_hash,
+            &self.note_commitment_root,
+            &self.nullifier_root,
         )
     }
 
